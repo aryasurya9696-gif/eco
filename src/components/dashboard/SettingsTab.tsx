@@ -28,6 +28,8 @@ export const SettingsTab: React.FC = () => {
     setSweepTime,
     sweepCadence,
     setSweepCadence,
+    minIntentThreshold,
+    setMinIntentThreshold,
     saveSettings,
     addToast,
   } = useEcho();
@@ -35,7 +37,6 @@ export const SettingsTab: React.FC = () => {
   const [fullName, setFullName] = useState<string>(profile?.full_name || '');
   const [website, setWebsite] = useState<string>(profile?.website || '');
   const [coreOffer, setCoreOffer] = useState<string>(profile?.core_offer || '');
-  const [minIntentThreshold, setMinIntentThreshold] = useState<number>(90);
   const [isSaving, setIsSaving] = useState<boolean>(false);
 
   const handleSaveProfile = async (e: React.FormEvent) => {
@@ -190,7 +191,7 @@ export const SettingsTab: React.FC = () => {
                     Alerts & Webhook Integrations
                   </h3>
                   <p className="text-xs text-[#8a8a86] font-mono">
-                    Receive automated notifications when high-intent leads appear on X and LinkedIn.
+                    Receive automated notifications when high-intent leads appear on connected social channels and communities.
                   </p>
                 </div>
               </div>

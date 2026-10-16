@@ -288,7 +288,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
                       What should we watch for?
                     </h2>
                     <p className="text-xs text-[#8a8a86] mt-1 font-mono">
-                      Add up to 10 keywords. We'll search X and LinkedIn daily for these mentions.
+                      Add up to 10 keywords. We'll search connected social channels and web communities daily for these mentions.
                     </p>
                   </div>
 

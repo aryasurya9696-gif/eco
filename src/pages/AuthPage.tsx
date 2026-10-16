@@ -82,7 +82,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({
             <p className="text-xs text-[#8a8a86] font-mono">
               {mode === 'signup'
                 ? 'Instant setup. No email verification required.'
-                : 'Access your daily X and LinkedIn lead feed.'}
+                : 'Access your live multi-channel buyer intent feed.'}
             </p>
           </div>
 

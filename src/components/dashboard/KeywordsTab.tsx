@@ -41,7 +41,7 @@ export const KeywordsTab: React.FC = () => {
               Tracked Keywords
             </h2>
             <p className="text-xs text-[#8a8a86] font-mono mt-1">
-              Active keywords scanned daily across X and LinkedIn for buyer-intent mentions.
+              Active keywords scanned daily across connected social channels and web communities for buyer-intent mentions.
             </p>
           </div>
 

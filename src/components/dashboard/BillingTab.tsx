@@ -76,7 +76,7 @@ export const BillingTab: React.FC = () => {
               Current Subscription & Usage
             </h2>
             <p className="text-xs text-[#8a8a86] font-mono mt-0.5">
-              Active plan: <strong className="text-[#141414] uppercase">{currentPlan}</strong> ({currentPlanDetails.price}/mo). Renews on June 1, 2025.
+              Active plan: <strong className="text-[#141414] uppercase">{currentPlan}</strong> ({currentPlanDetails.price}/mo). Renews on the 1st of next billing cycle.
             </p>
           </div>
 

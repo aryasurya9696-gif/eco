@@ -318,6 +318,7 @@ export async function performSocialFetchSweep(
   userId: string
 ): Promise<MonitoredPost[]> {
   const allPosts: MonitoredPost[] = [];
+  const seenUrls = new Set<string>();
 
   for (const kw of keywords) {
     try {
@@ -328,14 +329,23 @@ export async function performSocialFetchSweep(
         fetchWebPostsForKeyword(kw.keyword, userId, kw.id),
       ]);
 
+      const candidatePosts: MonitoredPost[] = [];
       if (redditResults.status === 'fulfilled') {
-        allPosts.push(...redditResults.value);
+        candidatePosts.push(...redditResults.value);
       }
       if (twitterResults.status === 'fulfilled') {
-        allPosts.push(...twitterResults.value);
+        candidatePosts.push(...twitterResults.value);
       }
       if (webResults.status === 'fulfilled') {
-        allPosts.push(...webResults.value);
+        candidatePosts.push(...webResults.value);
+      }
+
+      for (const post of candidatePosts) {
+        const normalizedUrl = post.post_url?.trim().toLowerCase();
+        if (normalizedUrl && !seenUrls.has(normalizedUrl)) {
+          seenUrls.add(normalizedUrl);
+          allPosts.push(post);
+        }
       }
     } catch (err) {
       console.error(`[SocialFetch] Failed to sweep keyword "${kw.keyword}":`, err);

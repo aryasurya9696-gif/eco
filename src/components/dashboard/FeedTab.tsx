@@ -260,7 +260,7 @@ export const FeedTab: React.FC = () => {
               First Daily Sweep Scheduled
             </h3>
             <p className="text-xs text-[#8a8a86] font-mono leading-relaxed max-w-md mx-auto">
-              Your first sweep runs at <span className="text-[#141414] font-semibold">{sweepTime} UTC</span>. Mentions will start showing up here once we've searched X and LinkedIn for your keywords.
+              Your first sweep runs at <span className="text-[#141414] font-semibold">{sweepTime} UTC</span>. Mentions will start showing up here once we've searched connected channels (X, Reddit & Web) for your keywords.
             </p>
           </div>
           <button
@@ -269,7 +269,7 @@ export const FeedTab: React.FC = () => {
             className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#121212] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer shadow-xs"
           >
             <Sparkles className="w-3.5 h-3.5" />
-            <span>{isSweeping ? 'Scanning X & LinkedIn...' : 'Run Test Sweep Now'}</span>
+            <span>{isSweeping ? 'Scanning Social Channels...' : 'Run Sweep Now'}</span>
           </button>
         </div>
       ) : filteredPosts.length === 0 ? (

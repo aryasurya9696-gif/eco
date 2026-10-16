@@ -37,6 +37,8 @@ interface EchoContextType {
   suggestKeywordsFromOffer: (offerText: string) => string[];
   // Phase 3: Export & Integrations
   exportPostsToCsv: (customPosts?: MonitoredPost[]) => void;
+  minIntentThreshold: number;
+  setMinIntentThreshold: (threshold: number) => void;
   exportPostsToJson: (customPosts?: MonitoredPost[]) => void;
   slackWebhook: string;
   setSlackWebhook: (url: string) => void;
@@ -63,7 +65,7 @@ const LOCAL_STORAGE_POSTS_KEY = 'echo_mock_posts';
 const LOCAL_STORAGE_SETTINGS_KEY = 'echo_mock_settings';
 
 export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { user } = useAuth();
+  const { user, profile } = useAuth();
   const [keywords, setKeywords] = useState<Keyword[]>([]);
   const [posts, setPosts] = useState<MonitoredPost[]>([]);
   const [isLoadingKeywords, setIsLoadingKeywords] = useState<boolean>(true);
@@ -83,6 +85,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [lookbackHours, setLookbackHours] = useState<number>(24);
   const [sweepTime, setSweepTime] = useState<string>('06:00');
   const [sweepCadence, setSweepCadence] = useState<'24h' | '12h' | '6h'>('24h');
+  const [minIntentThreshold, setMinIntentThreshold] = useState<number>(85);
 
   // Billing
   const [currentPlan, setCurrentPlan] = useState<'starter' | 'pro' | 'scale'>('starter');
@@ -114,10 +117,31 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     loadKeywords();
     loadPosts();
     loadSettings();
-  }, [user]);
+  }, [user, profile]);
 
   const loadSettings = () => {
     if (!user) return;
+
+    // Load server-persisted profile fields first
+    if (profile) {
+      if (profile.slack_webhook !== undefined && profile.slack_webhook !== null) {
+        setSlackWebhook(profile.slack_webhook);
+      }
+      if (profile.email_digest !== undefined) {
+        setEmailDigest(profile.email_digest);
+      }
+      if (profile.lookback_hours !== undefined && profile.lookback_hours !== null) {
+        setLookbackHours(profile.lookback_hours);
+      }
+      if ((profile as any).sweep_time_utc) {
+        setSweepTime((profile as any).sweep_time_utc);
+      }
+      if ((profile as any).sweep_frequency) {
+        setSweepCadence((profile as any).sweep_frequency);
+      }
+    }
+
+    // Overlay any client-side cached settings
     const saved = localStorage.getItem(`${LOCAL_STORAGE_SETTINGS_KEY}_${user.id}`);
     if (saved) {
       try {
@@ -128,6 +152,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (parsed.currentPlan !== undefined) setCurrentPlan(parsed.currentPlan);
         if (parsed.sweepTime !== undefined) setSweepTime(parsed.sweepTime);
         if (parsed.sweepCadence !== undefined) setSweepCadence(parsed.sweepCadence);
+        if (parsed.minIntentThreshold !== undefined) setMinIntentThreshold(parsed.minIntentThreshold);
       } catch (err) {
         console.error('Error loading settings:', err);
       }
@@ -143,8 +168,27 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       currentPlan,
       sweepTime,
       sweepCadence,
+      minIntentThreshold,
     };
     localStorage.setItem(`${LOCAL_STORAGE_SETTINGS_KEY}_${user.id}`, JSON.stringify(settings));
+
+    if (isConfigured && supabase) {
+      try {
+        await supabase
+          .from('profiles')
+          .update({
+            slack_webhook: slackWebhook || null,
+            email_digest: emailDigest,
+            lookback_hours: lookbackHours,
+            sweep_time_utc: sweepTime,
+            sweep_frequency: sweepCadence,
+          })
+          .eq('id', user.id);
+      } catch (err) {
+        console.error('Error syncing profile settings to database:', err);
+      }
+    }
+
     addToast('Preferences saved successfully.', 'success');
   };
 
@@ -318,7 +362,10 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
           keyword: k,
           is_active: true,
         }));
-        const { data, error } = await supabase.from('keywords').insert(rows).select();
+        const { data, error } = await supabase
+          .from('keywords')
+          .upsert(rows, { onConflict: 'user_id,keyword' })
+          .select();
         if (error) {
           console.error('Error saving initial keywords:', error);
           return false;
@@ -344,19 +391,30 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const updatePostStatus = async (postId: string, status: LeadStatus) => {
+    const targetPost = posts.find((p) => p.id === postId);
+
     setPosts((prev) =>
       prev.map((p) => (p.id === postId ? { ...p, status } : p))
     );
 
     if (isConfigured && supabase && user) {
       try {
-        await supabase
-          .from('monitored_posts')
-          .update({ status })
-          .eq('id', postId)
-          .eq('user_id', user.id);
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(postId);
+        if (isUuid) {
+          await supabase
+            .from('monitored_posts')
+            .update({ status })
+            .eq('id', postId)
+            .eq('user_id', user.id);
+        } else if (targetPost?.post_url) {
+          await supabase
+            .from('monitored_posts')
+            .update({ status })
+            .eq('post_url', targetPost.post_url)
+            .eq('user_id', user.id);
+        }
       } catch (err: any) {
-        console.error('Error updating post status in Supabase:', err);
+        console.error('Error updating post status in database:', err);
       }
     } else if (user) {
       const updated = posts.map((p) => (p.id === postId ? { ...p, status } : p));
@@ -373,7 +431,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     try {
       const activeKeywords = keywords.filter((k) => k.is_active);
-      const activeKwTexts = activeKeywords.map((k) => k.keyword);
       const startedAt = new Date().toISOString();
 
       // 1. Fetch live posts across channels via Social Fetch API
@@ -408,15 +465,18 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
             .upsert(postsToUpsert, { onConflict: 'user_id,post_url', ignoreDuplicates: true });
         }
 
-        // Record sweep run in Supabase
-        await supabase.from('sweep_runs').insert({
-          user_id: user.id,
-          status: 'completed',
-          started_at: startedAt,
-          completed_at: new Date().toISOString(),
-          posts_found: fetchedPosts.length,
-          keywords_checked: activeKwTexts,
-        });
+        // Record sweep run in database audit log
+        try {
+          await supabase.from('sweep_runs').insert({
+            started_at: startedAt,
+            finished_at: new Date().toISOString(),
+            users_processed: 1,
+            posts_inserted: fetchedPosts.length,
+            errors: [],
+          });
+        } catch {
+          // Non-blocking telemetry
+        }
 
         // Query fresh posts from Supabase database
         const { data: freshPosts, error } = await supabase
@@ -498,7 +558,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return ['b2b lead gen', 'outbound pipeline', 'sales automation', 'buyer intent signal', 'cold outreach alternative'];
     }
     if (clean.includes('dev') || clean.includes('api') || clean.includes('code')) {
-      return ['developer api', 'backend workflow', 'supabase edge functions', 'automation webhook', 'social scraping api'];
+      return ['developer api', 'backend workflow', 'serverless automation', 'automation webhook', 'social scraping api'];
     }
 
     return defaults;
@@ -619,6 +679,8 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         sweepCadence,
         setSweepCadence,
         saveSettings,
+        minIntentThreshold,
+        setMinIntentThreshold,
         currentPlan,
         setCurrentPlan,
         monthlyCreditsUsed,

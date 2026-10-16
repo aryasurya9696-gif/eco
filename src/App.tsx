@@ -11,24 +11,37 @@ type Route = '/' | '/auth' | '/dashboard';
 const MainRouter: React.FC = () => {
   const { user, isLoading } = useAuth();
   const [currentRoute, setCurrentRoute] = useState<Route>(() => {
-    const path = window.location.hash.replace('#', '') || window.location.pathname;
-    if (path === '/auth') return '/auth';
-    if (path === '/dashboard') return '/dashboard';
+    const rawHash = window.location.hash.replace(/^#\/?/, '');
+    if (rawHash.startsWith('auth')) return '/auth';
+    if (rawHash.startsWith('dashboard') || rawHash.includes('access_token')) return '/dashboard';
+    if (window.location.pathname === '/auth') return '/auth';
+    if (window.location.pathname === '/dashboard') return '/dashboard';
     return '/';
   });
 
   // Sync hash routing
   useEffect(() => {
     const handleHashChange = () => {
-      const hash = window.location.hash.replace('#', '');
-      if (hash === '/auth') setCurrentRoute('/auth');
-      else if (hash === '/dashboard') setCurrentRoute('/dashboard');
-      else setCurrentRoute('/');
+      const rawHash = window.location.hash.replace(/^#\/?/, '');
+      if (rawHash.startsWith('auth')) {
+        setCurrentRoute('/auth');
+      } else if (rawHash.startsWith('dashboard') || rawHash.includes('access_token')) {
+        setCurrentRoute('/dashboard');
+      } else {
+        setCurrentRoute('/');
+      }
     };
 
     window.addEventListener('hashchange', handleHashChange);
     return () => window.removeEventListener('hashchange', handleHashChange);
   }, []);
+
+  // When user is authenticated and on auth or token callback, smoothly transition to dashboard
+  useEffect(() => {
+    if (user && (currentRoute === '/auth' || window.location.hash.includes('access_token'))) {
+      navigate('/dashboard');
+    }
+  }, [user, currentRoute]);
 
   const navigate = (route: Route) => {
     window.location.hash = route;
