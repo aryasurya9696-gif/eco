@@ -39,8 +39,6 @@ create table if not exists public.profiles (
   core_offer             text,
   onboarding_completed   boolean not null default false,
   onboarding_step        smallint not null default 0,
-  email_digest           boolean not null default true,
-  slack_webhook          text,
   lookback_hours         int not null default 24,
   sweep_time_utc         text not null default '06:00',
   sweep_frequency        text not null default '24h',
@@ -257,8 +255,18 @@ ADD COLUMN IF NOT EXISTS enabled_channels text[] NOT NULL DEFAULT ARRAY['twitter
 --   3. sweep_runs had RLS enabled with zero policies, so client audit writes
 --      silently failed. It is service-role only, which is who actually writes.
 --   4. Added the missing profiles.min_intent_threshold column.
---   5. slack_webhook accepted any string; now restricted to Slack/Discord hosts.
+--   5. Dropped the unused profiles.email_digest and profiles.slack_webhook
+--      columns along with guard_profile_webhook() -- no delivery channel was
+--      ever wired to them, so keeping the columns only invited dead settings.
 -- ============================================================================
+
+-- ---------------------------------------------------------------------------
+-- 5. Notification surface removal
+-- ---------------------------------------------------------------------------
+alter table public.profiles drop column if exists slack_webhook;
+alter table public.profiles drop column if exists email_digest;
+drop trigger if exists trg_profiles_webhook_guard on public.profiles;
+drop function if exists public.guard_profile_webhook();
 
 -- ---------------------------------------------------------------------------
 -- 1. Intent threshold (used by both the sweep and the feed filter)
@@ -375,8 +383,6 @@ grant update (
   core_offer,
   onboarding_completed,
   onboarding_step,
-  email_digest,
-  slack_webhook,
   lookback_hours,
   sweep_time_utc,
   sweep_frequency,
@@ -456,31 +462,6 @@ begin
   return new;
 end;
 $$;
-
--- ---------------------------------------------------------------------------
--- 8. Webhook URLs must be real Slack/Discord endpoints
--- ---------------------------------------------------------------------------
-create or replace function public.guard_profile_webhook()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-begin
-  if new.slack_webhook is not null
-     and new.slack_webhook <> ''
-     and new.slack_webhook !~ '^https://[a-zA-Z0-9.-]*\.(hooks\.slack\.com|slack\.com|discord\.com|discordapp\.com)/' then
-    raise exception 'slack_webhook must be an https Slack or Discord webhook URL'
-      using errcode = 'check_violation';
-  end if;
-  return new;
-end;
-$$;
-
-drop trigger if exists trg_profiles_webhook_guard on public.profiles;
-create trigger trg_profiles_webhook_guard
-  before insert or update on public.profiles
-  for each row execute function public.guard_profile_webhook();
 
 -- ---------------------------------------------------------------------------
 -- 9. Client read access
@@ -650,13 +631,11 @@ grant execute on function public.apply_subscription_plan(uuid, text, text, times
 -- ---------------------------------------------------------------------------
 revoke execute on function public.enforce_keyword_limit()      from public, anon, authenticated;
 revoke execute on function public.guard_profile_server_columns() from public, anon, authenticated;
-revoke execute on function public.guard_profile_webhook()      from public, anon, authenticated;
 revoke execute on function public.handle_new_user()             from public, anon, authenticated;
 revoke execute on function public.set_updated_at()              from public, anon, authenticated;
 
 grant execute on function public.enforce_keyword_limit()       to service_role;
 grant execute on function public.guard_profile_server_columns() to service_role;
-grant execute on function public.guard_profile_webhook()       to service_role;
 grant execute on function public.handle_new_user()              to service_role;
 grant execute on function public.set_updated_at()               to service_role;
 

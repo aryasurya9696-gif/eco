@@ -576,7 +576,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     </li>
                     <li className="flex items-start gap-2.5">
                       <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>Daily email digest alerts</span>
+                      <span>AI keyword auto-suggest from your offer</span>
                     </li>
                     <li className="flex items-start gap-2.5">
                       <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
@@ -660,7 +660,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     </li>
                     <li className="flex items-start gap-2.5">
                       <Check className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
-                      <span>Real-time Slack & Discord alerts</span>
+                      <span>Hourly automated sweeps on a schedule</span>
                     </li>
                     <li className="flex items-start gap-2.5">
                       <Check className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />

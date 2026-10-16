@@ -7,24 +7,6 @@
  */
 
 /**
- * Webhook URL allow-list. MUST stay in sync with the
- * guard_profile_webhook() trigger in
- * supabase/migrations/20261017_security_hardening.sql
- */
-export const WEBHOOK_PATTERN =
-  /^https:\/\/[a-zA-Z0-9.-]*\.(hooks\.slack\.com|slack\.com|discord\.com|discordapp\.com)\//;
-
-/** Returns an error message, or null when the URL is acceptable. */
-export function validateWebhookUrl(value: string): string | null {
-  const url = value.trim();
-  if (!url) return null;
-  if (!WEBHOOK_PATTERN.test(url)) {
-    return 'Webhook must be an https Slack (hooks.slack.com) or Discord (discord.com) URL.';
-  }
-  return null;
-}
-
-/**
  * Platforms the sweep functions actually implement.
  * Must stay in sync with profiles_enabled_channels_supported in Postgres.
  * `news` is served by a free treg endpoint that carries a date on every result.

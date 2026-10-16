@@ -2,14 +2,12 @@ import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useEcho } from '../../context/EchoContext';
 import {
-  validateWebhookUrl,
   INTENT_THRESHOLD_OPTIONS,
   RETENTION_OPTIONS,
 } from '../../lib/constants';
 import {
   Save,
-  Bell,
-  MessageSquare,
+  Filter,
   Clock,
   ShieldCheck,
   Building2,
@@ -22,19 +20,12 @@ import {
 import { PlatformBadge } from '../common/PlatformBadge';
 import { getPlan } from '../../lib/billing';
 
-/** Single source of truth for webhook rules lives in lib/constants. */
-const validateWebhook = validateWebhookUrl;
-
 export const SettingsTab: React.FC = () => {
-  const { user, profile, updateProfile } = useAuth();
+  const { profile, updateProfile } = useAuth();
   const {
     keywords,
     keywordLimit,
     posts,
-    slackWebhook,
-    setSlackWebhook,
-    emailDigest,
-    setEmailDigest,
     lookbackHours,
     setLookbackHours,
     sweepTime,
@@ -49,7 +40,6 @@ export const SettingsTab: React.FC = () => {
     enabledChannels,
     toggleChannel,
     saveSettings,
-    sendTestWebhook,
     subscriptionPlan,
     addToast,
   } = useEcho();
@@ -58,17 +48,8 @@ export const SettingsTab: React.FC = () => {
   const [website, setWebsite] = useState<string>(profile?.website || '');
   const [coreOffer, setCoreOffer] = useState<string>(profile?.core_offer || '');
   const [isSaving, setIsSaving] = useState<boolean>(false);
-  const [isSendingTest, setIsSendingTest] = useState<boolean>(false);
-  const [webhookError, setWebhookError] = useState<string | null>(null);
 
   const planDetails = getPlan(subscriptionPlan);
-
-  const handleWebhookChange = (value: string) => {
-    setSlackWebhook(value);
-    if (webhookError) setWebhookError(validateWebhook(value));
-  };
-
-  const handleWebhookBlur = () => setWebhookError(validateWebhook(slackWebhook));
 
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -85,23 +66,6 @@ export const SettingsTab: React.FC = () => {
     }
   };
 
-  const handleTestSlack = async () => {
-    if (isSendingTest) return;
-
-    const invalid = validateWebhook(slackWebhook);
-    if (invalid) {
-      setWebhookError(invalid);
-      return;
-    }
-
-    setIsSendingTest(true);
-    const result = await sendTestWebhook();
-    setIsSendingTest(false);
-    if (!result.success) {
-      addToast(result.error || 'Could not reach the webhook.', 'error');
-    }
-  };
-
   return (
     <div className="max-w-6xl mx-auto space-y-6">
       {/* Page Header */}
@@ -111,7 +75,7 @@ export const SettingsTab: React.FC = () => {
             Settings & Workspace Preferences
           </h2>
           <p className="text-xs text-[#8a8a86] font-mono mt-0.5">
-            Configure buyer intent parameters, webhook alerts, and workspace identity.
+            Configure buyer intent parameters, sweep schedule, and workspace identity.
           </p>
         </div>
 
@@ -342,98 +306,25 @@ export const SettingsTab: React.FC = () => {
             </div>
           </div>
 
-          {/* Notifications & Webhooks */}
+          {/* Intent Filtering */}
           <div className="bg-white border border-[#e3e3de] p-6 space-y-6">
             <div className="flex items-start justify-between border-b border-[#eeeeea] pb-4">
               <div className="flex items-center gap-2.5">
                 <div className="p-2 bg-[#f6f6f4] border border-[#e3e3de]">
-                  <Bell className="w-4 h-4 text-[#141414]" />
+                  <Filter className="w-4 h-4 text-[#141414]" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-bold text-[#141414]">
-                    Alerts & Webhook Integrations
-                  </h3>
+                  <h3 className="text-sm font-bold text-[#141414]">Intent Filtering</h3>
                   <p className="text-xs text-[#8a8a86] font-mono">
-                    Receive automated notifications when high-intent leads appear on connected social channels and communities.
+                    How strict the sweep is before anything reaches your feed.
                   </p>
                 </div>
               </div>
             </div>
 
             <div className="space-y-5">
-              {/* Email Digest */}
-              <div className="flex items-center justify-between p-3.5 bg-[#fbfbfa] border border-[#eeeeea]">
-                <div className="space-y-0.5">
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-semibold text-[#141414]">
-                      Daily Automated Digest ({sweepTime} UTC)
-                    </span>
-                    <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 bg-white border border-[#deded8] text-[#4a4a47]">
-                      Email
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-[#8a8a86] font-mono">
-                    Delivered to <span className="text-[#141414] font-medium">{user?.email || 'your registered email'}</span> after each {sweepTime} UTC sweep.
-                  </p>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => setEmailDigest(!emailDigest)}
-                  className={`w-11 h-6 flex items-center p-0.5 border border-[#141414] transition-colors cursor-pointer ${
-                    emailDigest ? 'bg-[#141414] justify-end' : 'bg-white justify-start'
-                  }`}
-                  aria-label="Toggle email digest"
-                >
-                  <span className={`w-4 h-4 block ${emailDigest ? 'bg-white' : 'bg-[#141414]'}`} />
-                </button>
-              </div>
-
-              {/* Slack / Discord Webhook */}
-              <div className="space-y-2 pt-1">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-semibold text-[#141414] flex items-center gap-1.5 font-mono">
-                    <MessageSquare className="w-3.5 h-3.5" />
-                    <span>Slack or Discord Webhook URL</span>
-                  </label>
-                  <button
-                    type="button"
-                    onClick={() => void handleTestSlack()}
-                    disabled={isSendingTest || !slackWebhook}
-                    className="text-[11px] font-mono text-[#141414] hover:underline cursor-pointer font-medium disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {isSendingTest ? 'Sending…' : 'Send Test Ping →'}
-                  </button>
-                </div>
-
-                <input
-                  type="url"
-                  value={slackWebhook}
-                  onChange={(e) => handleWebhookChange(e.target.value)}
-                  onBlur={handleWebhookBlur}
-                  aria-invalid={Boolean(webhookError)}
-                  placeholder="https://hooks.slack.com/services/... or https://discord.com/api/webhooks/..."
-                  className={`w-full px-3.5 py-2.5 bg-white border hover:border-[#b5b5b0] focus:ring-1 focus:ring-[#141414] text-xs font-mono text-[#141414] transition-colors outline-none ${
-                    webhookError
-                      ? 'border-red-400 focus:border-red-500 focus:ring-red-200'
-                      : 'border-[#deded8] focus:border-[#141414]'
-                  }`}
-                />
-
-                {webhookError && (
-                  <p className="text-[11px] font-mono text-red-600">{webhookError}</p>
-                )}
-
-                <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] font-mono text-[#8a8a86]">
-                  <span>Triggers in real-time when new matching leads are parsed.</span>
-                  <span className={slackWebhook ? 'text-emerald-700 font-medium' : 'text-[#8a8a86]'}>
-                    {slackWebhook ? '● Webhook Connected' : '○ Webhook Unconfigured'}
-                  </span>
-                </div>
-              </div>
-
               {/* Minimum Intent Filter Threshold */}
-              <div className="space-y-2 pt-2 border-t border-[#eeeeea]">
+              <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-semibold text-[#141414] font-mono">
                     Minimum Intent Alert Threshold
@@ -752,13 +643,6 @@ export const SettingsTab: React.FC = () => {
                   {sweepCadence === '24h'
                     ? `Daily at ${sweepTime} UTC`
                     : `Every ${sweepCadence} (${sweepTime} UTC)`}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">
-                <span className="text-[#8a8a86]">Email Digest:</span>
-                <span className={emailDigest ? 'text-emerald-700 font-medium' : 'text-[#8a8a86]'}>
-                  {emailDigest ? `Active (${sweepTime} UTC)` : 'Disabled'}
                 </span>
               </div>
 

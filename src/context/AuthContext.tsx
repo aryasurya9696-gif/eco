@@ -26,7 +26,6 @@ const buildEmptyProfile = (id: string): Profile => ({
   core_offer: '',
   onboarding_completed: false,
   onboarding_step: 0,
-  email_digest: true,
   lookback_hours: 24,
   sweep_time_utc: '06:00',
   sweep_frequency: '24h',

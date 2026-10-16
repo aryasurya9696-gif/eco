@@ -11,8 +11,6 @@ export interface Profile {
   core_offer: string | null;
   onboarding_completed: boolean;
   onboarding_step: number;
-  email_digest?: boolean;
-  slack_webhook?: string | null;
   lookback_hours?: number;
   enabled_channels?: Platform[];
   min_intent_threshold?: number;

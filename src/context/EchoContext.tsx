@@ -12,7 +12,6 @@ import type { KeywordSuggestionResult } from '../lib/ai';
 import { generateAiOutreachDraft, generateAiKeywordsFromOffer } from '../lib/ai';
 import { invokeFunction } from '../lib/api';
 import { SUBSCRIPTION_PLANS } from '../lib/billing';
-import { validateWebhookUrl } from '../lib/constants';
 import { useAuth } from './AuthContext';
 import type { Keyword, MonitoredPost, Platform, LeadStatus } from '../types';
 
@@ -68,10 +67,6 @@ interface EchoContextType {
   setFeedRetentionDays: (days: number) => void;
   clearFeed: () => Promise<{ success: boolean; deleted?: number; error?: string }>;
   pruneFeed: () => Promise<{ success: boolean; deleted?: number; error?: string }>;
-  slackWebhook: string;
-  setSlackWebhook: (url: string) => void;
-  emailDigest: boolean;
-  setEmailDigest: (enabled: boolean) => void;
   lookbackHours: number;
   setLookbackHours: (hours: number) => void;
   sweepTime: string;
@@ -79,7 +74,6 @@ interface EchoContextType {
   sweepCadence: '24h' | '12h' | '6h';
   setSweepCadence: (cadence: '24h' | '12h' | '6h') => void;
   saveSettings: () => Promise<void>;
-  sendTestWebhook: () => Promise<{ success: boolean; error?: string }>;
   enabledChannels: Platform[];
   toggleChannel: (platform: Platform) => void;
   // Subscription
@@ -118,8 +112,6 @@ const channelLabel = (platform: Platform): string => {
   return platform.charAt(0).toUpperCase() + platform.slice(1);
 };
 
-/** Webhook validation lives in lib/constants so components can reuse it. */
-
 export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { user, profile } = useAuth();
 
@@ -145,8 +137,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [filterSearch, setFilterSearch] = useState<string>('');
 
   // Settings
-  const [slackWebhook, setSlackWebhook] = useState<string>('');
-  const [emailDigest, setEmailDigest] = useState<boolean>(true);
   const [lookbackHours, setLookbackHours] = useState<number>(24);
   const [sweepTime, setSweepTime] = useState<string>('06:00');
   const [sweepCadence, setSweepCadence] = useState<'24h' | '12h' | '6h'>('24h');
@@ -262,8 +252,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     // Server-persisted profile fields are authoritative in connected mode.
     if (profile) {
-      if (profile.slack_webhook) setSlackWebhook(profile.slack_webhook);
-      if (profile.email_digest !== undefined) setEmailDigest(profile.email_digest);
       if (profile.lookback_hours !== undefined && profile.lookback_hours !== null) {
         setLookbackHours(profile.lookback_hours);
       }
@@ -291,8 +279,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (saved && !isConfigured) {
       try {
         const parsed = JSON.parse(saved);
-        if (parsed.slackWebhook !== undefined) setSlackWebhook(parsed.slackWebhook);
-        if (parsed.emailDigest !== undefined) setEmailDigest(parsed.emailDigest);
         if (parsed.lookbackHours !== undefined) setLookbackHours(parsed.lookbackHours);
         if (parsed.sweepTime !== undefined) setSweepTime(parsed.sweepTime);
         if (parsed.sweepCadence !== undefined) setSweepCadence(parsed.sweepCadence);
@@ -617,8 +603,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     localStorage.setItem(
       `${LOCAL_STORAGE_SETTINGS_KEY}_${user.id}`,
       JSON.stringify({
-        slackWebhook,
-        emailDigest,
         lookbackHours,
         currentPlan: subscriptionPlan,
         sweepTime,
@@ -629,19 +613,9 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     );
 
     if (isConfigured && supabase) {
-      // Block obviously invalid webhook URLs client-side; the Postgres trigger
-      // is still the authority, but this avoids a round trip + generic toast.
-      const webhookError = validateWebhookUrl(slackWebhook);
-      if (webhookError) {
-        addToast(webhookError, 'error');
-        return;
-      }
-
       const { error } = await supabase
         .from('profiles')
         .update({
-          slack_webhook: slackWebhook || null,
-          email_digest: emailDigest,
           lookback_hours: lookbackHours,
           sweep_time_utc: sweepTime,
           sweep_frequency: sweepCadence,
@@ -661,8 +635,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     addToast('Preferences saved successfully.', 'success');
   }, [
     user,
-    slackWebhook,
-    emailDigest,
     lookbackHours,
     subscriptionPlan,
     sweepTime,
@@ -716,30 +688,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (deleted > 0) await loadPosts();
     return { success: true, deleted };
   }, [user, loadPosts]);
-
-  /** Sends a real request to the configured Slack/Discord webhook. */
-  const sendTestWebhook = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
-    if (!slackWebhook) {
-      return { success: false, error: 'Add a Slack or Discord webhook URL first.' };
-    }
-    try {
-      const res = await fetch(slackWebhook, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: 'Echo test: your lead alert webhook is connected.',
-          content: 'Echo test: your lead alert webhook is connected.',
-        }),
-      });
-      if (!res.ok) {
-        return { success: false, error: `Webhook returned ${res.status}` };
-      }
-      addToast('Test ping delivered to your webhook.', 'success');
-      return { success: true };
-    } catch (err) {
-      return { success: false, error: (err as Error)?.message || 'Network error' };
-    }
-  }, [slackWebhook, addToast]);
 
   // --- Exports --------------------------------------------------------------
 
@@ -851,10 +799,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setFeedRetentionDays,
       clearFeed,
       pruneFeed,
-      slackWebhook,
-      setSlackWebhook,
-      emailDigest,
-      setEmailDigest,
       lookbackHours,
       setLookbackHours,
       sweepTime,
@@ -862,7 +806,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       sweepCadence,
       setSweepCadence,
       saveSettings,
-      sendTestWebhook,
       enabledChannels,
       toggleChannel,
       subscriptionPlan,
@@ -900,13 +843,10 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       feedRetentionDays,
       clearFeed,
       pruneFeed,
-      slackWebhook,
-      emailDigest,
       lookbackHours,
       sweepTime,
       sweepCadence,
       saveSettings,
-      sendTestWebhook,
       enabledChannels,
       toggleChannel,
       subscriptionPlan,
