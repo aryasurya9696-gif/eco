@@ -1,9 +1,9 @@
 import React from 'react';
 import { useEcho } from '../../context/EchoContext';
-import { CreditCard, Check, Download, ShieldCheck } from 'lucide-react';
+import { CreditCard, Check, Download, ShieldCheck, Zap, Sparkles } from 'lucide-react';
 
 export const BillingTab: React.FC = () => {
-  const { currentPlan, setCurrentPlan, keywords, monthlyCreditsUsed, invoices, addToast } = useEcho();
+  const { currentPlan, setCurrentPlan, keywords, monthlyCreditsUsed, creditsBalance, setIsTopUpModalOpen, invoices, addToast } = useEcho();
 
   const plans = [
     {
@@ -134,6 +134,34 @@ export const BillingTab: React.FC = () => {
               Zero errors in current 30-day window.
             </p>
           </div>
+        </div>
+
+        {/* Lead Selling & Waterfall Credits Store Card */}
+        <div className="mt-6 pt-6 border-t border-[#eeeeea] flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-gradient-to-r from-emerald-50/50 to-white p-4 border border-emerald-200">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-full bg-emerald-100 border border-emerald-300 flex items-center justify-center flex-shrink-0 mt-0.5">
+              <Zap className="w-5 h-5 text-emerald-700" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-bold text-[#141414]">Verified Lead Credits Balance</h3>
+                <span className="px-2 py-0.5 text-[10px] font-mono bg-emerald-100 text-emerald-800 rounded-full font-semibold border border-emerald-300">
+                  {creditsBalance} Credits Available
+                </span>
+              </div>
+              <p className="text-xs text-[#5f5f5a] font-mono mt-0.5">
+                Each verified lead unlock costs 3 credits. 100% Hit Guarantee: misses and dead emails are automatically refunded.
+              </p>
+            </div>
+          </div>
+
+          <button
+            onClick={() => setIsTopUpModalOpen(true)}
+            className="inline-flex items-center justify-center gap-2 px-5 py-2.5 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer shadow-xs flex-shrink-0"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Top Up Lead Credits</span>
+          </button>
         </div>
       </div>
 

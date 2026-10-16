@@ -2,8 +2,10 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import { supabase, isConfigured } from '../lib/supabase';
 import { performSocialFetchSweep } from '../lib/socialfetch';
 import { generateAiOutreachDraft, generateAiKeywordsFromOffer } from '../lib/ai';
+import { executeWaterfallEnrichment } from '../lib/waterfall';
 import { useAuth } from './AuthContext';
-import type { Keyword, MonitoredPost, Platform, LeadStatus, InvoiceItem } from '../types';
+import type { Keyword, MonitoredPost, Platform, LeadStatus, InvoiceItem, LeadUnlock } from '../types';
+import { TopUpModal } from '../components/dashboard/TopUpModal';
 
 interface ToastMessage {
   id: string;
@@ -58,6 +60,14 @@ interface EchoContextType {
   saveSettings: () => Promise<void>;
   enabledChannels: Platform[];
   toggleChannel: (platform: Platform) => void;
+  // Lead Selling & Credit Unlocking Engine
+  creditsBalance: number;
+  unlockedLeads: Record<string, LeadUnlock>;
+  isUnlockingLead: Record<string, boolean>;
+  unlockLead: (post: MonitoredPost) => Promise<{ success: boolean; data?: LeadUnlock; error?: string }>;
+  topUpCredits: (amount: number, packName: string) => Promise<void>;
+  isTopUpModalOpen: boolean;
+  setIsTopUpModalOpen: (open: boolean) => void;
   // Phase 4: Billing
   currentPlan: 'starter' | 'pro' | 'scale';
   setCurrentPlan: (plan: 'starter' | 'pro' | 'scale') => void;
@@ -70,6 +80,8 @@ const EchoContext = createContext<EchoContextType | undefined>(undefined);
 const LOCAL_STORAGE_KEYWORDS_KEY = 'echo_mock_keywords';
 const LOCAL_STORAGE_POSTS_KEY = 'echo_mock_posts';
 const LOCAL_STORAGE_SETTINGS_KEY = 'echo_mock_settings';
+const LOCAL_STORAGE_CREDITS_KEY = 'echo_credits_balance';
+const LOCAL_STORAGE_UNLOCKS_KEY = 'echo_lead_unlocks';
 
 export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { user, profile } = useAuth();
@@ -79,6 +91,12 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [isLoadingPosts, setIsLoadingPosts] = useState<boolean>(true);
   const [isSweeping, setIsSweeping] = useState<boolean>(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+
+  // Lead Selling & Credits Engine
+  const [creditsBalance, setCreditsBalance] = useState<number>(25);
+  const [unlockedLeads, setUnlockedLeads] = useState<Record<string, LeadUnlock>>({});
+  const [isUnlockingLead, setIsUnlockingLead] = useState<Record<string, boolean>>({});
+  const [isTopUpModalOpen, setIsTopUpModalOpen] = useState<boolean>(false);
 
   // Filtering
   const [filterKeyword, setFilterKeyword] = useState<string>('all');
@@ -166,6 +184,9 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (profile.enabled_channels && Array.isArray(profile.enabled_channels) && profile.enabled_channels.length > 0) {
         setEnabledChannels(profile.enabled_channels);
       }
+      if (profile.credits_balance !== undefined && profile.credits_balance !== null) {
+        setCreditsBalance(profile.credits_balance);
+      }
     }
 
     // Overlay any client-side cached settings
@@ -185,6 +206,14 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       } catch (err) {
         console.error('Error loading settings:', err);
+      }
+    }
+
+    const savedCredits = localStorage.getItem(`${LOCAL_STORAGE_CREDITS_KEY}_${user.id}`);
+    if (savedCredits) {
+      const parsedNum = parseInt(savedCredits, 10);
+      if (!isNaN(parsedNum)) {
+        setCreditsBalance(parsedNum);
       }
     }
   };
@@ -270,17 +299,52 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
           .eq('user_id', user.id)
           .order('posted_at', { ascending: false });
 
+        // Load unlocked leads for current user
+        const { data: unlocks } = await supabase
+          .from('lead_unlocks')
+          .select('*')
+          .eq('user_id', user.id);
+
+        const unlockMap: Record<string, LeadUnlock> = {};
+        if (unlocks) {
+          unlocks.forEach((u) => {
+            unlockMap[u.post_id] = u as LeadUnlock;
+          });
+          setUnlockedLeads(unlockMap);
+        }
+
         if (!error && data) {
-          setPosts(data as MonitoredPost[]);
+          const merged = (data as MonitoredPost[]).map((p) => ({
+            ...p,
+            is_unlocked: !!unlockMap[p.id],
+            unlock_data: unlockMap[p.id],
+          }));
+          setPosts(merged);
         }
       } catch (err) {
         console.error('Error loading Supabase monitored posts:', err);
       }
     } else {
+      const savedUnlocks = localStorage.getItem(`${LOCAL_STORAGE_UNLOCKS_KEY}_${user.id}`);
+      let unlockMap: Record<string, LeadUnlock> = {};
+      if (savedUnlocks) {
+        try {
+          unlockMap = JSON.parse(savedUnlocks);
+          setUnlockedLeads(unlockMap);
+        } catch {}
+      }
+
       const saved = localStorage.getItem(`${LOCAL_STORAGE_POSTS_KEY}_${user.id}`);
       if (saved) {
         try {
-          setPosts(JSON.parse(saved));
+          const parsed: MonitoredPost[] = JSON.parse(saved);
+          setPosts(
+            parsed.map((p) => ({
+              ...p,
+              is_unlocked: !!unlockMap[p.id],
+              unlock_data: unlockMap[p.id],
+            }))
+          );
         } catch {
           setPosts([]);
         }
@@ -570,7 +634,127 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return await generateAiKeywordsFromOffer(offerText, website || profile?.website || undefined);
   };
 
-  // Phase 3: Export features
+  // Lead Selling & Credit Waterfall Unlocking Engine
+  const unlockLead = async (
+    post: MonitoredPost
+  ): Promise<{ success: boolean; data?: LeadUnlock; error?: string }> => {
+    if (!user) {
+      addToast('Please log in to unlock leads.', 'error');
+      return { success: false, error: 'unauthenticated' };
+    }
+
+    if (unlockedLeads[post.id]) {
+      return { success: true, data: unlockedLeads[post.id] };
+    }
+
+    if (creditsBalance < 3) {
+      addToast('Insufficient credits. 3 credits required to unlock verified contact.', 'error');
+      setIsTopUpModalOpen(true);
+      return { success: false, error: 'insufficient_credits' };
+    }
+
+    setIsUnlockingLead((prev) => ({ ...prev, [post.id]: true }));
+
+    try {
+      const enriched = await executeWaterfallEnrichment(post, user.id);
+      const newCredits = Math.max(0, creditsBalance - 3);
+      setCreditsBalance(newCredits);
+
+      const unlockRecord: LeadUnlock = {
+        id: `unlock-${Date.now()}`,
+        user_id: user.id,
+        post_id: post.id,
+        credits_spent: 3,
+        verified_email: enriched.verified_email,
+        email_status: enriched.email_status,
+        enrichment_provider: enriched.enrichment_provider,
+        contact_name: enriched.contact_name,
+        company_name: enriched.company_name,
+        company_domain: enriched.company_domain,
+        linkedin_url: enriched.linkedin_url,
+        unlocked_at: new Date().toISOString(),
+      };
+
+      const updatedMap = { ...unlockedLeads, [post.id]: unlockRecord };
+      setUnlockedLeads(updatedMap);
+
+      // Update post in memory with unlocked data
+      setPosts((prev) =>
+        prev.map((p) =>
+          p.id === post.id
+            ? { ...p, is_unlocked: true, unlock_data: unlockRecord }
+            : p
+        )
+      );
+
+      // Persist to Supabase if configured
+      if (isConfigured && supabase) {
+        try {
+          await supabase.from('lead_unlocks').upsert({
+            user_id: user.id,
+            post_id: post.id,
+            credits_spent: 3,
+            verified_email: enriched.verified_email,
+            email_status: enriched.email_status,
+            enrichment_provider: enriched.enrichment_provider,
+            contact_name: enriched.contact_name,
+            company_name: enriched.company_name,
+            company_domain: enriched.company_domain,
+            linkedin_url: enriched.linkedin_url,
+          }, { onConflict: 'user_id,post_id' });
+
+          await supabase.from('credit_transactions').insert({
+            user_id: user.id,
+            amount: -3,
+            type: 'lead_unlock',
+            description: `Unlocked ${enriched.contact_name} (${enriched.company_name})`,
+          });
+
+          await supabase.from('profiles').update({ credits_balance: newCredits }).eq('id', user.id);
+        } catch (dbErr) {
+          console.warn('DB unlock persist warning:', dbErr);
+        }
+      }
+
+      localStorage.setItem(`${LOCAL_STORAGE_CREDITS_KEY}_${user.id}`, String(newCredits));
+      localStorage.setItem(`${LOCAL_STORAGE_UNLOCKS_KEY}_${user.id}`, JSON.stringify(updatedMap));
+
+      addToast(
+        `Lead unlocked! Verified email found via ${enriched.enrichment_provider} (3 credits).`,
+        'success'
+      );
+      return { success: true, data: unlockRecord };
+    } catch (err: any) {
+      addToast(`Failed to enrich lead: ${err.message || 'Unknown error'}`, 'error');
+      return { success: false, error: err.message };
+    } finally {
+      setIsUnlockingLead((prev) => ({ ...prev, [post.id]: false }));
+    }
+  };
+
+  const topUpCredits = async (amount: number, packName: string): Promise<void> => {
+    if (!user) return;
+    const newBalance = creditsBalance + amount;
+    setCreditsBalance(newBalance);
+
+    if (isConfigured && supabase) {
+      try {
+        await supabase.from('profiles').update({ credits_balance: newBalance }).eq('id', user.id);
+        await supabase.from('credit_transactions').insert({
+          user_id: user.id,
+          amount,
+          type: 'topup',
+          description: `Purchased ${packName} (${amount} Credits)`,
+        });
+      } catch (err) {
+        console.warn('DB topup persist warning:', err);
+      }
+    }
+
+    localStorage.setItem(`${LOCAL_STORAGE_CREDITS_KEY}_${user.id}`, String(newBalance));
+  };
+
+  // Phase 3: Export features with Unlocked Contact Columns
   const exportPostsToCsv = (customPosts?: MonitoredPost[]) => {
     const targetPosts = customPosts && customPosts.length > 0 ? customPosts : posts;
     if (!targetPosts || targetPosts.length === 0) {
@@ -580,8 +764,13 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const headers = [
       'Platform',
-      'Author Name',
-      'Author Handle',
+      'Author / Decision Maker',
+      'Verified Work Email',
+      'Email Status',
+      'Company Name',
+      'Company Domain',
+      'LinkedIn Profile',
+      'Enrichment Provider',
       'Matched Keyword',
       'Intent Score',
       'Status',
@@ -591,18 +780,28 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       'Content / Body',
     ];
 
-    const rows = targetPosts.map((p) => [
-      `"${(p.platform || '').replace(/"/g, '""')}"`,
-      `"${(p.author_name || '').replace(/"/g, '""')}"`,
-      `"${(p.author_handle || '').replace(/"/g, '""')}"`,
-      `"${(p.matched_keyword || '').replace(/"/g, '""')}"`,
-      p.intent_score || 85,
-      `"${p.status || 'new'}"`,
-      `"${(p.channel_source || '').replace(/"/g, '""')}"`,
-      `"${p.posted_at || ''}"`,
-      `"${(p.post_url || '').replace(/"/g, '""')}"`,
-      `"${(p.body || '').replace(/"/g, '""').replace(/\r?\n/g, ' ')}"`,
-    ]);
+    const rows = targetPosts.map((p) => {
+      const unlock = p.unlock_data || unlockedLeads[p.id];
+      const isUnlocked = p.is_unlocked || !!unlock;
+
+      return [
+        `"${(p.platform || '').replace(/"/g, '""')}"`,
+        `"${(isUnlocked ? (unlock?.contact_name || p.author_name || '') : 'Locked (Unlock in Echo)').replace(/"/g, '""')}"`,
+        `"${(isUnlocked ? (unlock?.verified_email || '') : 'Locked (Unlock in Echo)').replace(/"/g, '""')}"`,
+        `"${(isUnlocked ? (unlock?.email_status || 'verified') : 'locked').replace(/"/g, '""')}"`,
+        `"${(isUnlocked ? (unlock?.company_name || '') : 'Locked').replace(/"/g, '""')}"`,
+        `"${(isUnlocked ? (unlock?.company_domain || '') : 'Locked').replace(/"/g, '""')}"`,
+        `"${(isUnlocked ? (unlock?.linkedin_url || '') : 'Locked').replace(/"/g, '""')}"`,
+        `"${(isUnlocked ? (unlock?.enrichment_provider || 'QuickEnrich') : 'N/A').replace(/"/g, '""')}"`,
+        `"${(p.matched_keyword || '').replace(/"/g, '""')}"`,
+        p.intent_score || 85,
+        `"${p.status || 'new'}"`,
+        `"${(p.channel_source || '').replace(/"/g, '""')}"`,
+        `"${p.posted_at || ''}"`,
+        `"${(p.post_url || '').replace(/"/g, '""')}"`,
+        `"${(p.body || '').replace(/"/g, '""').replace(/\r?\n/g, ' ')}"`,
+      ];
+    });
 
     // Prepend UTF-8 BOM (\uFEFF) for full Excel and Sheets compatibility
     const csvString = '\uFEFF' + [headers.join(','), ...rows.map((e) => e.join(','))].join('\r\n');
@@ -689,6 +888,13 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setMinIntentThreshold,
         enabledChannels,
         toggleChannel,
+        creditsBalance,
+        unlockedLeads,
+        isUnlockingLead,
+        unlockLead,
+        topUpCredits,
+        isTopUpModalOpen,
+        setIsTopUpModalOpen,
         currentPlan,
         setCurrentPlan,
         monthlyCreditsUsed,
@@ -696,6 +902,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }}
     >
       {children}
+      <TopUpModal isOpen={isTopUpModalOpen} onClose={() => setIsTopUpModalOpen(false)} />
     </EchoContext.Provider>
   );
 };

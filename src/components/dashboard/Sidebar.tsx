@@ -10,7 +10,8 @@ import {
   CreditCard, 
   LogOut,
   PanelLeftClose,
-  PanelLeftOpen
+  PanelLeftOpen,
+  Zap
 } from 'lucide-react';
 
 interface NavItem {
@@ -37,7 +38,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleCollapse,
 }) => {
   const { user, profile, signOut } = useAuth();
-  const { keywords, posts, sweepTime, sweepCadence, lookbackHours, enabledChannels } = useEcho();
+  const { keywords, posts, sweepTime, sweepCadence, lookbackHours, enabledChannels, creditsBalance, setIsTopUpModalOpen } = useEcho();
 
   // Compute user initials for avatar
   const getInitials = () => {
@@ -221,6 +222,36 @@ export const Sidebar: React.FC<SidebarProps> = ({
           ))}
         </div>
       </div>
+
+      {/* Pinned Credits Balance Card */}
+      {!isCollapsed ? (
+        <div className="mx-3 mb-2 p-3 bg-[#f6f6f4] border border-[#e3e3de] space-y-2">
+          <div className="flex items-center justify-between text-xs font-mono">
+            <span className="text-[#5f5f5a] flex items-center gap-1.5 font-medium">
+              <Zap className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Lead Credits</span>
+            </span>
+            <span className="font-bold text-[#141414] bg-white px-2 py-0.5 border border-[#deded8]">{creditsBalance}</span>
+          </div>
+          <button
+            onClick={() => setIsTopUpModalOpen(true)}
+            className="w-full py-1.5 bg-[#141414] hover:bg-black text-white text-[11px] font-mono transition-colors cursor-pointer flex items-center justify-center gap-1.5 shadow-2xs"
+          >
+            <span>Top Up Credits</span>
+            <span className="text-emerald-400 font-bold">+</span>
+          </button>
+        </div>
+      ) : (
+        <div className="flex justify-center mb-2">
+          <button
+            onClick={() => setIsTopUpModalOpen(true)}
+            title={`Lead Credits: ${creditsBalance}. Click to top up.`}
+            className="p-2 bg-[#f6f6f4] hover:bg-[#e3e3de] border border-[#deded8] text-[#141414] transition-colors cursor-pointer"
+          >
+            <Zap className="w-4 h-4 text-emerald-600" />
+          </button>
+        </div>
+      )}
 
       {/* Bottom User Account Card & Logout */}
       <div

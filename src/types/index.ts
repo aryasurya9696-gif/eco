@@ -15,6 +15,8 @@ export interface Profile {
   slack_webhook?: string | null;
   lookback_hours?: number;
   enabled_channels?: Platform[];
+  credits_balance?: number;
+  is_admin?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -26,6 +28,30 @@ export interface Keyword {
   is_active: boolean;
   created_at: string;
   mention_count?: number;
+}
+
+export interface LeadUnlock {
+  id: string;
+  user_id: string;
+  post_id: string;
+  credits_spent: number;
+  verified_email?: string | null;
+  email_status?: 'verified' | 'catch_all' | 'not_found';
+  enrichment_provider?: string | null;
+  contact_name?: string | null;
+  company_name?: string | null;
+  company_domain?: string | null;
+  linkedin_url?: string | null;
+  unlocked_at: string;
+}
+
+export interface CreditTransaction {
+  id: string;
+  user_id: string;
+  amount: number;
+  type: 'signup_bonus' | 'topup' | 'lead_unlock' | 'refund';
+  description: string;
+  created_at: string;
 }
 
 export interface MonitoredPost {
@@ -53,6 +79,8 @@ export interface MonitoredPost {
     reposts?: number | null;
   } | null;
   raw?: any;
+  is_unlocked?: boolean;
+  unlock_data?: LeadUnlock;
   created_at: string;
 }
 
