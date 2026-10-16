@@ -113,8 +113,19 @@ export const FeedTab: React.FC = () => {
     setTimeout(() => setCopiedDraft(false), 2000);
   };
 
+  // Reset platform filter if user disables that channel in settings
+  React.useEffect(() => {
+    if (filterPlatform !== 'all' && !enabledChannels.includes(filterPlatform as any)) {
+      setFilterPlatform('all');
+    }
+  }, [enabledChannels, filterPlatform]);
+
   // Filter posts
   const filteredPosts = posts.filter((post) => {
+    // 1. Hide posts from channels that the user turned OFF in Settings
+    if (enabledChannels && enabledChannels.length > 0 && !enabledChannels.includes(post.platform)) {
+      return false;
+    }
     if (filterKeyword !== 'all' && post.matched_keyword.toLowerCase() !== filterKeyword.toLowerCase()) {
       return false;
     }
@@ -147,34 +158,39 @@ export const FeedTab: React.FC = () => {
         {/* Row 1: Source toggle, status filter, keyword selector */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-3">
-            {/* Platform Toggle */}
+            {/* Platform Toggle: Only show channels active in user settings */}
             <div className="inline-flex flex-wrap border border-[#e3e3de] bg-[#f6f6f4] p-0.5 text-xs font-mono">
-              {(['all', 'twitter', 'linkedin', 'reddit', 'facebook', 'google'] as const).map((p) => (
-                <button
-                  key={p}
-                  onClick={() => {
-                    setFilterPlatform(p);
-                    setCurrentPage(1);
-                  }}
-                  className={`px-2.5 sm:px-3 py-1.5 transition-colors cursor-pointer ${
-                    filterPlatform === p
-                      ? 'bg-[#141414] text-white font-medium shadow-xs'
-                      : 'text-[#4a4a47] hover:text-[#141414]'
-                  }`}
-                >
-                  {p === 'all'
-                    ? 'All Sources'
-                    : p === 'twitter'
-                    ? 'X'
-                    : p === 'linkedin'
-                    ? 'LinkedIn'
-                    : p === 'reddit'
-                    ? 'Reddit'
-                    : p === 'facebook'
-                    ? 'Facebook'
-                    : 'Google'}
-                </button>
-              ))}
+              <button
+                onClick={() => {
+                  setFilterPlatform('all');
+                  setCurrentPage(1);
+                }}
+                className={`px-2.5 sm:px-3 py-1.5 transition-colors cursor-pointer ${
+                  filterPlatform === 'all'
+                    ? 'bg-[#141414] text-white font-medium shadow-xs'
+                    : 'text-[#4a4a47] hover:text-[#141414]'
+                }`}
+              >
+                All Active ({enabledChannels.length})
+              </button>
+              {(['twitter', 'reddit', 'google'] as const)
+                .filter((p) => enabledChannels.includes(p))
+                .map((p) => (
+                  <button
+                    key={p}
+                    onClick={() => {
+                      setFilterPlatform(p);
+                      setCurrentPage(1);
+                    }}
+                    className={`px-2.5 sm:px-3 py-1.5 transition-colors cursor-pointer ${
+                      filterPlatform === p
+                        ? 'bg-[#141414] text-white font-medium shadow-xs'
+                        : 'text-[#4a4a47] hover:text-[#141414]'
+                    }`}
+                  >
+                    {p === 'twitter' ? 'X' : p === 'reddit' ? 'Reddit' : 'Web'}
+                  </button>
+                ))}
             </div>
 
             {/* Status Filter */}
