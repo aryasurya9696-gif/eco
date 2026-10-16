@@ -21,14 +21,17 @@ export const KeywordsTab: React.FC = () => {
     }
   };
 
-  const handleGenerateAiKeywords = () => {
+  const handleGenerateAiKeywords = async () => {
     setIsGenerating(true);
-    setTimeout(() => {
-      const generated = suggestKeywordsFromOffer(profile?.core_offer || profile?.website || '');
+    try {
+      const generated = await suggestKeywordsFromOffer(profile?.core_offer || '', profile?.website || '');
       setAiSuggestions(generated);
+      addToast('AI analyzed your core offer and generated keyword suggestions.', 'success');
+    } catch (err: any) {
+      addToast(`AI generation error: ${err?.message || 'Failed to suggest keywords'}`, 'error');
+    } finally {
       setIsGenerating(false);
-      addToast('AI analyzed your core offer and generated keyword ideas.', 'success');
-    }, 600);
+    }
   };
 
   return (

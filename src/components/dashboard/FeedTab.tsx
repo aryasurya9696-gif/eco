@@ -52,6 +52,7 @@ export const FeedTab: React.FC = () => {
   const [aiDraftModalPost, setAiDraftModalPost] = useState<MonitoredPost | null>(null);
   const [draftTone, setDraftTone] = useState<'professional' | 'casual' | 'consultative' | 'direct'>('consultative');
   const [draftText, setDraftText] = useState<string>('');
+  const [isGeneratingDraft, setIsGeneratingDraft] = useState<boolean>(false);
   const [copiedDraft, setCopiedDraft] = useState<boolean>(false);
 
   const [inspectModalPost, setInspectModalPost] = useState<MonitoredPost | null>(null);
@@ -74,17 +75,33 @@ export const FeedTab: React.FC = () => {
     return 'just now';
   };
 
-  const handleOpenAiDraft = (post: MonitoredPost) => {
+  const handleOpenAiDraft = async (post: MonitoredPost) => {
     setAiDraftModalPost(post);
     setCopiedDraft(false);
-    const text = generateAiDraft(post, draftTone);
-    setDraftText(text);
+    setIsGeneratingDraft(true);
+    setDraftText('AI is crafting a personalized, high-converting outreach reply...');
+    try {
+      const text = await generateAiDraft(post, draftTone);
+      setDraftText(text);
+    } catch {
+      setDraftText('');
+    } finally {
+      setIsGeneratingDraft(false);
+    }
   };
 
-  const handleChangeTone = (tone: 'professional' | 'casual' | 'consultative' | 'direct') => {
+  const handleChangeTone = async (tone: 'professional' | 'casual' | 'consultative' | 'direct') => {
     setDraftTone(tone);
     if (aiDraftModalPost) {
-      setDraftText(generateAiDraft(aiDraftModalPost, tone));
+      setIsGeneratingDraft(true);
+      try {
+        const text = await generateAiDraft(aiDraftModalPost, tone);
+        setDraftText(text);
+      } catch {
+        // preserve
+      } finally {
+        setIsGeneratingDraft(false);
+      }
     }
   };
 
@@ -573,14 +590,25 @@ export const FeedTab: React.FC = () => {
 
             {/* Editable Response Area */}
             <div className="space-y-1.5">
-              <label className="text-[11px] font-mono uppercase text-[#4a4a47] block">
-                Generated Outreach Draft
-              </label>
+              <div className="flex items-center justify-between">
+                <label className="text-[11px] font-mono uppercase text-[#4a4a47] block">
+                  Generated Outreach Draft
+                </label>
+                {isGeneratingDraft && (
+                  <span className="inline-flex items-center gap-1.5 text-[10px] font-mono text-emerald-700 bg-emerald-50 px-2 py-0.5 border border-emerald-200">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    GPT-4o Generating...
+                  </span>
+                )}
+              </div>
               <textarea
                 rows={4}
                 value={draftText}
+                disabled={isGeneratingDraft}
                 onChange={(e) => setDraftText(e.target.value)}
-                className="w-full p-3 bg-white border border-[#e3e3de] text-xs leading-relaxed text-[#141414] focus:outline-none focus:border-[#141414]"
+                className={`w-full p-3 bg-white border border-[#e3e3de] text-xs leading-relaxed text-[#141414] focus:outline-none focus:border-[#141414] transition-opacity ${
+                  isGeneratingDraft ? 'opacity-60 animate-pulse' : 'opacity-100'
+                }`}
               />
             </div>
 

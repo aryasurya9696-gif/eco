@@ -20,6 +20,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
   const [website, setWebsite] = useState<string>(profile?.website || '');
   const [coreOffer, setCoreOffer] = useState<string>(profile?.core_offer || '');
   const [keywords, setKeywords] = useState<string[]>([]);
+  const [aiSuggestions, setAiSuggestions] = useState<string[]>([]);
   const [isFinishing, setIsFinishing] = useState<boolean>(false);
   const [isSuccess, setIsSuccess] = useState<boolean>(false);
 
@@ -32,6 +33,15 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
     if (profile?.website) setWebsite(profile.website);
     if (profile?.core_offer) setCoreOffer(profile.core_offer);
   }, [profile]);
+
+  // Auto-generate AI keyword suggestions on step 4 from coreOffer
+  useEffect(() => {
+    if (step === 4 && coreOffer.trim() && aiSuggestions.length === 0) {
+      suggestKeywordsFromOffer(coreOffer, website).then((sugs) => {
+        if (sugs && sugs.length > 0) setAiSuggestions(sugs);
+      }).catch(() => {});
+    }
+  }, [step, coreOffer, website]);
 
   if (!isOpen) return null;
 
@@ -300,7 +310,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
                       max={10}
                       suggestions={[
                         fullName ? fullName.toLowerCase() : 'your company',
-                        ...suggestKeywordsFromOffer(coreOffer),
+                        ...aiSuggestions,
                       ]}
                     />
                   </div>

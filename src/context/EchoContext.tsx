@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { supabase, isConfigured } from '../lib/supabase';
 import { performSocialFetchSweep } from '../lib/socialfetch';
+import { generateAiOutreachDraft, generateAiKeywordsFromOffer } from '../lib/ai';
 import { useAuth } from './AuthContext';
 import type { Keyword, MonitoredPost, Platform, LeadStatus, InvoiceItem } from '../types';
 
@@ -33,8 +34,12 @@ interface EchoContextType {
   dismissToast: (id: string) => void;
   addToast: (message: string, type?: 'info' | 'success' | 'error') => void;
   // Phase 2: AI features
-  generateAiDraft: (post: MonitoredPost, tone: 'professional' | 'casual' | 'consultative' | 'direct') => string;
-  suggestKeywordsFromOffer: (offerText: string) => string[];
+  generateAiDraft: (
+    post: MonitoredPost,
+    tone: 'professional' | 'casual' | 'consultative' | 'direct',
+    customOffer?: string
+  ) => Promise<string>;
+  suggestKeywordsFromOffer: (offerText: string, website?: string) => Promise<string[]>;
   // Phase 3: Export & Integrations
   exportPostsToCsv: (customPosts?: MonitoredPost[]) => void;
   minIntentThreshold: number;
@@ -516,52 +521,23 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  // Phase 2: AI Outreach Draft Generator
-  const generateAiDraft = (
+  // Phase 2: AI Outreach Draft Generator (OpenAI GPT-4o-mini powered)
+  const generateAiDraft = async (
     post: MonitoredPost,
-    tone: 'professional' | 'casual' | 'consultative' | 'direct'
-  ): string => {
-    const author = post.author_name ? post.author_name.split(' ')[0] : 'there';
-    const keyword = post.matched_keyword;
-
-    switch (tone) {
-      case 'casual':
-        return `Hey ${author}, saw your post regarding ${keyword}. We actually tackled this exact problem recently. Would love to share our benchmark notes if you're open to a quick comparison!`;
-      case 'consultative':
-        return `Hi ${author}, your observation about ${keyword} is spot-on. Many teams struggle with this transition. We put together a brief workflow analysis on how to optimize this without bloatware — happy to share the breakdown if helpful!`;
-      case 'direct':
-        return `Hi ${author}, noticed your requirement for ${keyword}. Echo monitors these exact intent signals automatically. Are you available for a 5-minute walkthrough this Thursday at 2pm?`;
-      case 'professional':
-      default:
-        return `Hello ${author}, I came across your post about ${keyword}. We specialize in solving this challenge with streamlined automation. I would welcome the opportunity to connect and exchange thoughts on your current architecture.`;
-    }
+    tone: 'professional' | 'casual' | 'consultative' | 'direct',
+    customOffer?: string
+  ): Promise<string> => {
+    return await generateAiOutreachDraft(
+      post,
+      tone,
+      customOffer || profile?.core_offer || undefined,
+      profile?.full_name || undefined
+    );
   };
 
-  // Phase 2: AI Keyword Suggestions from user's Core Offer
-  const suggestKeywordsFromOffer = (offerText: string): string[] => {
-    const clean = offerText.toLowerCase();
-    const defaults = [
-      'ai agents',
-      'b2b lead gen',
-      'sales automation',
-      'outbound pipeline',
-      'crm workflow',
-      'intent data',
-      'social listening',
-      'lead qualification',
-    ];
-
-    if (clean.includes('agent') || clean.includes('ai')) {
-      return ['autonomous ai agents', 'ai lead qualification', 'ai sales workflow', 'agentic outbound', 'crm ai enrichment'];
-    }
-    if (clean.includes('sales') || clean.includes('lead') || clean.includes('outbound')) {
-      return ['b2b lead gen', 'outbound pipeline', 'sales automation', 'buyer intent signal', 'cold outreach alternative'];
-    }
-    if (clean.includes('dev') || clean.includes('api') || clean.includes('code')) {
-      return ['developer api', 'backend workflow', 'serverless automation', 'automation webhook', 'social scraping api'];
-    }
-
-    return defaults;
+  // Phase 2: AI Keyword Suggestions from user's Core Offer (OpenAI GPT-4o-mini powered)
+  const suggestKeywordsFromOffer = async (offerText: string, website?: string): Promise<string[]> => {
+    return await generateAiKeywordsFromOffer(offerText, website || profile?.website || undefined);
   };
 
   // Phase 3: Export features
