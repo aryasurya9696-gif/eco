@@ -23,7 +23,13 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-const SWEEP_CRON_SECRET = Deno.env.get('SWEEP_CRON_SECRET') || '';
+
+/**
+ * Gate value for the cron caller. The edge secret wins; otherwise it is read
+ * from public.service_secrets alongside the provider token, so a pg_cron job
+ * can be wired up without first provisioning a Supabase edge secret.
+ */
+let SWEEP_CRON_SECRET = Deno.env.get('SWEEP_CRON_SECRET') || '';
 
 const TREG_BASE = 'https://treg.to';
 
@@ -37,7 +43,21 @@ type SweepSettings = {
   enabled_channels: Platform[] | null;
   lookback_hours: number | null;
   min_intent_threshold: number | null;
+  /** "HH:MM" in UTC. Null means the workspace never opted in. */
+  sweep_time_utc: string | null;
 };
+
+/**
+ * Parses the workspace's "HH:MM" sweep time into an hour of day.
+ * Returns null when unset or malformed, which the caller treats as "any hour".
+ */
+function sweepHourOf(sweepTime: string | null | undefined): number | null {
+  if (!sweepTime) return null;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(sweepTime.trim());
+  if (!m) return null;
+  const hour = Number(m[1]);
+  return hour >= 0 && hour <= 23 ? hour : null;
+}
 
 type PostRow = {
   user_id: string;
@@ -395,30 +415,33 @@ async function searchChannel(
 // ---------------------------------------------------------------------------
 
 Deno.serve(async (req) => {
-  // --- Gate: shared secret required ---------------------------------------
-  if (!SWEEP_CRON_SECRET) {
-    console.error('SWEEP_CRON_SECRET is not set — refusing to run.');
-    return json({ ok: false, error: 'sweep not configured' }, 503);
-  }
-
   const provided =
     req.headers.get('x-sweep-secret') ??
     new URL(req.url).searchParams.get('secret') ??
     '';
-  if (provided !== SWEEP_CRON_SECRET) {
-    return json({ ok: false, error: 'unauthorized' }, 401);
-  }
 
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
-  // Edge secret wins; fall back to the service-role-only secrets table.
-  if (!tregToken) {
-    const { data } = await supabase
+  // Edge secrets win; fall back to the service-role-only secrets table. This is
+  // resolved before the gate check below so a deployment that only has the
+  // table configured still authenticates its own cron caller.
+  if (!SWEEP_CRON_SECRET || !tregToken) {
+    const { data: secrets } = await supabase
       .from('service_secrets')
-      .select('value')
-      .eq('name', 'treg_token')
-      .maybeSingle();
-    tregToken = data?.value ?? '';
+      .select('name, value');
+    for (const s of secrets ?? []) {
+      if (s.name === 'sweep_cron_secret' && !SWEEP_CRON_SECRET) SWEEP_CRON_SECRET = s.value;
+      if (s.name === 'treg_token' && !tregToken) tregToken = s.value;
+    }
+  }
+
+  if (!SWEEP_CRON_SECRET) {
+    console.error('SWEEP_CRON_SECRET is not configured — refusing to run.');
+    return json({ ok: false, error: 'sweep not configured' }, 503);
+  }
+
+  if (provided !== SWEEP_CRON_SECRET) {
+    return json({ ok: false, error: 'unauthorized' }, 401);
   }
 
   if (!tregToken) {
@@ -435,6 +458,7 @@ Deno.serve(async (req) => {
 
   const errors: Array<Record<string, string>> = [];
   let usersProcessed = 0;
+  let usersSkipped = 0;
   let postsInserted = 0;
   let pruned = 0;
   let totalStale = 0;
@@ -474,7 +498,7 @@ Deno.serve(async (req) => {
 
   const { data: profiles } = await supabase
     .from('profiles')
-    .select('id, enabled_channels, lookback_hours, min_intent_threshold')
+    .select('id, enabled_channels, lookback_hours, min_intent_threshold, sweep_time_utc')
     .in('id', userIds);
 
   const settingsByUser = new Map<string, SweepSettings>();
@@ -483,16 +507,31 @@ Deno.serve(async (req) => {
       enabled_channels: p.enabled_channels,
       lookback_hours: p.lookback_hours,
       min_intent_threshold: p.min_intent_threshold,
+      sweep_time_utc: p.sweep_time_utc,
     });
   }
+
+  // The cron fires hourly and each workspace is swept in the hour it asked for,
+  // so "every day at 06:00 UTC" in Settings is actually true. Total treg spend
+  // is unchanged: each workspace still sweeps once per day.
+  const currentHourUtc = new Date().getUTCHours();
 
   for (const userId of userIds) {
     const userKeywords = byUser.get(userId) ?? [];
     if (userKeywords.length === 0) continue;
 
+    const settings = settingsByUser.get(userId);
+
+    // Respect the workspace's own sweep hour. Checked before the processed
+    // counter so the two numbers mean what they say.
+    const dueHour = sweepHourOf(settings?.sweep_time_utc);
+    if (dueHour !== null && dueHour !== currentHourUtc) {
+      usersSkipped++;
+      continue;
+    }
+
     usersProcessed++;
 
-    const settings = settingsByUser.get(userId);
     const ALL: Platform[] = ['twitter', 'reddit', 'google', 'news'];
     const channels: Platform[] = Array.isArray(settings?.enabled_channels) && settings.enabled_channels.length > 0
       ? settings.enabled_channels.filter((c): c is Platform => ALL.includes(c as Platform))
@@ -570,7 +609,9 @@ Deno.serve(async (req) => {
 
   return json({
     ok: true,
+    hourUtc: currentHourUtc,
     usersProcessed,
+    usersSkipped,
     postsInserted,
     droppedStale: totalStale,
     pruned,

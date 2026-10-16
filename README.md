@@ -76,6 +76,9 @@ supabase secrets set STRIPE_SECRET_KEY=sk_live_your_key
 supabase secrets set APP_ORIGIN=https://your-app.example
 supabase secrets set SWEEP_CRON_SECRET="$(openssl rand -hex 32)"
 ```
+`SWEEP_CRON_SECRET` and `TREG_TOKEN` may also live in `public.service_secrets`
+instead, which is what the scheduled-sweep setup in step 6 uses. The edge secret
+wins when both are present.
 
 ### 5. Deploy functions
 ```bash
@@ -89,22 +92,34 @@ Without `STRIPE_SECRET_KEY`, `billing` refuses every request, so plan changes
 are unavailable. It never falls back to granting access for free.
 
 ### 6. Schedule the sweep
-Run the function on a schedule, passing the secret:
-```
-POST <project-url>/functions/v1/daily-sweep
-Headers: x-sweep-secret: <SWEEP_CRON_SECRET>
-```
-Example with `pg_cron` + `pg_net`:
+Without this, **nothing sweeps automatically** — the Run sweep button is the
+only way to collect. `pg_cron` fires hourly and `pg_net` makes the call; each
+workspace is swept in the UTC hour it set in Settings, so "every day at 06:00
+UTC" is literally true while each account still sweeps once per day.
+
 ```sql
+-- One-time: generate the gate secret (32 random bytes, hex).
+insert into public.service_secrets (name, value)
+values ('sweep_cron_secret', encode(gen_random_bytes(32), 'hex'));
+
+-- Then schedule. The secret is read at fire time rather than baked into the
+-- command, so there is a single place to rotate it.
 select cron.schedule(
   'echo-daily-sweep',
-  '0 6 * * *',
+  '0 * * * *',
   $$ select net.http_post(
        url     := 'https://<project-ref>.supabase.co/functions/v1/daily-sweep',
-       headers := '{"Content-Type":"application","x-sweep-secret":"<SWEEP_CRON_SECRET>"}'::jsonb
+       headers := jsonb_build_object(
+         'Content-Type',  'application/json',
+         'x-sweep-secret', (select value from public.service_secrets
+                            where name = 'sweep_cron_secret')
+       ),
+       body    := '{}'::jsonb,
+       timeout_milliseconds := 180000
      ); $$
 );
 ```
+`supabase/migrations/20261023_scheduled_sweeps.sql` does all of this.
 
 ---
 
