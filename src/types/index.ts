@@ -1,4 +1,4 @@
-export type Platform = 'twitter' | 'linkedin' | 'reddit' | 'facebook' | 'google';
+export type Platform = 'twitter' | 'linkedin' | 'reddit' | 'google' | 'news';
 
 export type LeadStatus = 'new' | 'saved' | 'contacted' | 'dismissed';
 

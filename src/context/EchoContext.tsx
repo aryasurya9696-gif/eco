@@ -517,9 +517,12 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       setIsSweeping(false);
 
-      // Every SocialFetch request costs a credit, so surface the spend.
-      const spend = result.credits
-        ? ` (${result.credits} API credit${result.credits === 1 ? '' : 's'})`
+      // Cost is now split: treg bills USD per call, SocialFetch bills one
+      // credit each and is only reached when treg could not answer.
+      const spend = result.usd_spent
+        ? ` (~$${result.usd_spent.toFixed(4)})`
+        : result.sf_credits_spent
+        ? ` (${result.sf_credits_spent} SocialFetch credit${result.sf_credits_spent === 1 ? '' : 's'})`
         : '';
       const housekeeping = [
         result.dropped_stale ? `${result.dropped_stale} out-of-window result(s) dropped` : '',

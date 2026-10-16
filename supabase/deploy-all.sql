@@ -844,17 +844,29 @@ alter table public.profiles
 grant update (feed_retention_days) on public.profiles to authenticated;
 
 -- ---------------------------------------------------------------------------
--- 2. LinkedIn as a channel
+-- 2. Channels. `news` is served by a free treg endpoint; LinkedIn still comes
+--    from SocialFetch because treg has no keyword search for it.
 -- ---------------------------------------------------------------------------
 alter table public.profiles drop constraint if exists profiles_enabled_channels_supported;
 alter table public.profiles
   add constraint profiles_enabled_channels_supported
-  check (enabled_channels <@ array['twitter', 'reddit', 'google', 'linkedin']);
+  check (enabled_channels <@ array['twitter', 'reddit', 'google', 'linkedin', 'news']);
+
+alter table public.monitored_posts drop constraint if exists monitored_posts_platform_check;
+alter table public.monitored_posts
+  add constraint monitored_posts_platform_check
+  check (platform in ('twitter', 'linkedin', 'reddit', 'google', 'news'));
 
 -- ---------------------------------------------------------------------------
 -- 3. Vendor keys, service-role readable only. RLS on, zero policies: the
 --    browser has no SELECT path at all, which is the same trust boundary as
 --    an edge function secret. The edge functions still prefer Deno.env.
+--
+--    Insert your own values, never commit them:
+--      insert into public.service_secrets (name, value) values
+--        ('treg_token',            'treg_...'),
+--        ('socialfetch_api_key',  'sfk_...')
+--      on conflict (name) do update set value = excluded.value;
 -- ---------------------------------------------------------------------------
 create table if not exists public.service_secrets (
   name       text primary key,

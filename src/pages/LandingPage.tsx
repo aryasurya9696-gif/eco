@@ -18,7 +18,7 @@ interface LandingPageProps {
 interface DemoLead {
   id: string;
   keyword: string;
-  platform: 'twitter' | 'linkedin' | 'reddit' | 'facebook' | 'google';
+  platform: 'twitter' | 'linkedin' | 'reddit' | 'google' | 'news';
   channel_source?: string;
   author: string;
   handle: string;
@@ -62,11 +62,11 @@ const DEMO_LEADS: DemoLead[] = [
   {
     id: 'lead-4',
     keyword: 'ai agents',
-    platform: 'facebook',
-    channel_source: 'B2B SaaS Founders Group',
-    author: 'David Sterling',
-    handle: 'B2B SaaS Founders (42k)',
-    body: 'Anyone using AI agents for real-time buyer intent monitoring in Facebook groups and public discussions? Looking to replace manual prospecting for our SDR team. Ready to buy this month.',
+    platform: 'news',
+    channel_source: 'TechCrunch',
+    author: 'TechCrunch',
+    handle: 'TechCrunch',
+    body: 'Launchpad raises a $40M Series B to put autonomous sales agents in every revenue team; hiring 30 across engineering and GTM.',
     time: '6h ago',
     intent: 94,
   },
@@ -123,7 +123,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const faqs = [
     {
       q: 'How does the daily sweep work?',
-      a: 'Every morning at your configured schedule (e.g. 06:00 UTC), Echo sweeps public posts matching your keywords across X, LinkedIn, Reddit, Facebook B2B groups, and Google discussions. Matches are deduplicated and qualified straight into your feed.',
+      a: 'Every morning at your configured schedule (e.g. 06:00 UTC), Echo sweeps public posts matching your keywords across X, LinkedIn, Reddit, the open web and the press. Matches are deduplicated and qualified straight into your feed.',
     },
     {
       q: 'How does Echo prevent runaway API usage?',
@@ -153,7 +153,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </span>
           <span className="text-white font-medium">Multi-Platform Intelligence is live:</span>
           <span className="text-[#a0a09a]">
-            Now monitoring buyer intent across <strong className="text-white font-medium">X, LinkedIn, Reddit, Facebook & Google</strong>
+            Now monitoring buyer intent across <strong className="text-white font-medium">X, LinkedIn, Reddit, Web & News</strong>
           </span>
           <span className="inline-flex items-center gap-1 text-emerald-400 group-hover:text-emerald-300 font-medium ml-1 transition-transform group-hover:translate-x-0.5">
             <span>Explore live feed</span>
@@ -305,7 +305,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
             <div className="pt-2 space-y-2.5">
               {/* Platform selector */}
               <div className="inline-flex flex-wrap items-center justify-center border border-[#e3e3de] bg-white p-0.5 text-xs font-mono">
-                {(['all', 'twitter', 'linkedin', 'reddit', 'facebook', 'google'] as const).map((p) => (
+                {(['all', 'twitter', 'linkedin', 'reddit', 'google', 'news'] as const).map((p) => (
                   <button
                     key={p}
                     onClick={() => setSelectedPlatform(p)}
@@ -325,8 +325,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                         ? 'LinkedIn'
                         : p === 'reddit'
                         ? 'Reddit'
-                        : p === 'facebook'
-                        ? 'Facebook'
+                        : p === 'news'
+                        ? 'News'
                         : 'Google'}
                     </span>
                   </button>
@@ -394,8 +394,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                           <span className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-mono rounded-xs border font-medium ${
                             lead.platform === 'reddit'
                               ? 'bg-orange-50 text-[#ff4500] border-orange-200'
-                              : lead.platform === 'facebook'
-                              ? 'bg-blue-50 text-[#1877f2] border-blue-200'
+                              : lead.platform === 'news'
+                              ? 'bg-amber-50 text-[#b45309] border-amber-200'
                               : 'bg-indigo-50 text-[#4285f4] border-indigo-200'
                           }`}>
                             {lead.channel_source}
@@ -447,7 +447,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 <span className="text-xl font-mono font-bold text-[#8a8a86]">02</span>
                 <h3 className="text-sm font-bold text-[#141414]">Multi-channel daily sweep</h3>
                 <p className="text-xs text-[#4a4a47] font-mono leading-relaxed">
-                  Every morning at your scheduled time, Echo scans X, LinkedIn, Reddit, Facebook B2B groups, and Google discussions for buyer mentions.
+                  Every morning at your scheduled time, Echo scans X, LinkedIn, Reddit, the open web and the press for buyer mentions.
                 </p>
               </div>
 
@@ -852,9 +852,9 @@ export const LandingPage: React.FC<LandingPageProps> = ({
             <span>•</span>
             <span>Reddit</span>
             <span>•</span>
-            <span>Facebook</span>
+            <span>Web</span>
             <span>•</span>
-            <span>Google</span>
+            <span>News</span>
           </div>
         </div>
       </footer>

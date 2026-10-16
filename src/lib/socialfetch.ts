@@ -19,8 +19,12 @@ export interface SocialSearchResult {
   dropped_stale?: number;
   /** Mentions the retention pass removed after this sweep. */
   pruned?: number;
-  /** SocialFetch credits this sweep consumed — every request costs one. */
-  credits?: number;
+  /** Approximate treg spend for this sweep, in USD. */
+  usd_spent?: number;
+  /** SocialFetch credits consumed; only the fallback path spends these. */
+  sf_credits_spent?: number;
+  /** Which upstream actually answered for each channel. */
+  served_by?: Record<string, string>;
   errors?: string[];
 }
 
@@ -47,7 +51,9 @@ export async function performSocialFetchSweep(
     lookback_hours: res?.lookback_hours,
     dropped_stale: res?.dropped_stale,
     pruned: res?.pruned,
-    credits: res?.credits,
+    usd_spent: res?.usd_spent,
+    sf_credits_spent: res?.sf_credits_spent,
+    served_by: res?.served_by,
     errors: res?.errors,
   };
 }

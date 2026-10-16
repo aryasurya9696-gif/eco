@@ -268,15 +268,14 @@ export const SettingsTab: React.FC = () => {
                   id: 'linkedin' as const,
                   name: 'LinkedIn Network',
                   desc: 'B2B enterprise executive announcements and role changes.',
-                  supported: false,
-                  badge: 'Enterprise Roadmap',
+                  supported: true,
                 },
                 {
-                  id: 'facebook' as const,
-                  name: 'Facebook Groups',
-                  desc: 'Private entrepreneur, founder, and operator groups.',
-                  supported: false,
-                  badge: 'Community Bridge',
+                  id: 'news' as const,
+                  name: 'Press & News',
+                  desc: 'Product launches, funding rounds and hiring signals from the press.',
+                  supported: true,
+                  badge: 'Free',
                 },
               ].map((channel) => {
                 const isEnabled = enabledChannels.includes(channel.id);

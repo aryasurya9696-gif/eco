@@ -3,6 +3,9 @@
 // ----------------------------------------------------------------------------
 // Scheduled fan-out sweep across every user with active keywords.
 //
+// Uses the same treg-first / SocialFetch-fallback chains as `social-search`,
+// inlined rather than imported — see the note below.
+//
 // SECURITY: runs with the service role key and spends real money on API
 // credits, so it is NOT publicly invokable. Callers must present the
 // SWEEP_CRON_SECRET header (pg_net / dashboard schedule / your own cron).
@@ -12,8 +15,9 @@
 // directories and the relative import fails to resolve on deploy.
 //
 // Deploy:  supabase functions deploy daily-sweep --no-verify-jwt
-// Secrets: supabase secrets set SOCIALFETCH_API_KEY=sfk_...
-//          supabase secrets set SWEEP_CRON_SECRET=<long random string>
+// Secrets: supabase secrets set SWEEP_CRON_SECRET=<long random string>
+//          supabase secrets set TREG_TOKEN=treg_...
+//          supabase secrets set SOCIALFETCH_API_KEY=sfk_...
 // ============================================================================
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
@@ -22,19 +26,15 @@ const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 const SWEEP_CRON_SECRET = Deno.env.get('SWEEP_CRON_SECRET') || '';
 
-/**
- * Edge secret wins; otherwise the key is read from public.service_secrets over
- * the service role. That table has RLS on and no policies, so the browser can
- * never read it — the same trust boundary as an edge secret.
- */
-let SOCIALFETCH_API_KEY = Deno.env.get('SOCIALFETCH_API_KEY') || '';
+const TREG_BASE = 'https://treg.to';
+const SOCIALFETCH_BASE = 'https://api.socialfetch.dev';
 
-/** Hard cap so one busy day can never run away. */
+/** Hard caps so one busy day can never run away. */
 const MAX_PAGES_PER_KEYWORD = 2;
 const MAX_USERS_PER_RUN = 500;
 const MAX_KEYWORDS_PER_USER = 25;
 
-type Platform = 'twitter' | 'linkedin' | 'reddit' | 'google';
+type Platform = 'twitter' | 'reddit' | 'google' | 'linkedin' | 'news';
 
 type SweepSettings = {
   enabled_channels: Platform[] | null;
@@ -42,8 +42,33 @@ type SweepSettings = {
   min_intent_threshold: number | null;
 };
 
+type PostRow = {
+  user_id: string;
+  keyword_id: string;
+  matched_keyword: string;
+  platform: Platform;
+  channel_source: string;
+  post_url: string;
+  author_name: string | null;
+  author_handle: string | null;
+  author_avatar_url: string | null;
+  body: string | null;
+  posted_at: string | null;
+  intent_score: number;
+  status: 'new';
+  engagement: Record<string, number | null> | null;
+};
+
 // ---------------------------------------------------------------------------
-// Intent scoring (mirrors the social-search function)
+// Credentials — edge secrets first, then public.service_secrets (service-role
+// only; that table has RLS on and zero policies so the browser cannot read it)
+// ---------------------------------------------------------------------------
+
+let tregToken = Deno.env.get('TREG_TOKEN') || '';
+let socialFetchKey = Deno.env.get('SOCIALFETCH_API_KEY') || '';
+
+// ---------------------------------------------------------------------------
+// Intent scoring (mirrors social-search)
 // ---------------------------------------------------------------------------
 
 const HIGH_INTENT_PHRASES = [
@@ -75,27 +100,70 @@ function calculateIntentScore(text: string): number {
   return Math.max(0, Math.min(97, Math.round(score)));
 }
 
-function timeframeFor(lookbackHours: number): string {
+// ---------------------------------------------------------------------------
+// Dates
+// ---------------------------------------------------------------------------
+
+const MONTHS: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
+function parseWhen(value: unknown): string | null {
+  if (value == null) return null;
+
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || value <= 0) return null;
+    const ms = value > 1e12 ? value : value * 1000;
+    const d = new Date(ms);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const s = value.trim();
+
+  const rel = /^(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago$/i.exec(s);
+  if (rel) {
+    const ms: Record<string, number> = {
+      minute: 60e3, hour: 36e5, day: 864e5,
+      week: 6048e5, month: 2629746e3, year: 31556952e3,
+    };
+    return new Date(Date.now() - Number(rel[1]) * ms[rel[2].toLowerCase()]).toISOString();
+  }
+  if (/^today$/i.test(s)) return new Date().toISOString();
+  if (/^yesterday$/i.test(s)) return new Date(Date.now() - 864e5).toISOString();
+
+  const named = /^([a-z]{3,9})\.?\s+(\d{1,2})?,?\s*(\d{4})$/i.exec(s);
+  if (named) {
+    const mo = MONTHS[named[1].slice(0, 3).toLowerCase()];
+    if (mo !== undefined) {
+      return new Date(Date.UTC(Number(named[3]), mo, named[2] ? Number(named[2]) : 1)).toISOString();
+    }
+  }
+
+  const parsed = Date.parse(s);
+  return Number.isNaN(parsed) ? null : new Date(parsed).toISOString();
+}
+
+/**
+ * Google snippets open with a date and an em dash — "Aug 11, 2026 — Top SaaS
+ * analytics software". The endpoint returns no date field, so this is the only
+ * signal available.
+ */
+function dateFromSnippet(snippet: string | null | undefined): string | null {
+  if (!snippet) return null;
+  const m = /^\s*((?:[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})|(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})|(?:[A-Za-z]{3,9}\.?\s+\d{4}))\s*[—–\-|·]/.exec(snippet);
+  return m ? parseWhen(m[1]) : null;
+}
+
+function redditTimeframe(lookbackHours: number): string {
   if (lookbackHours <= 24) return 'day';
   if (lookbackHours <= 72) return 'week';
   if (lookbackHours <= 168) return 'month';
   return 'year';
 }
 
-// ---------------------------------------------------------------------------
-// Lookback window -> per-endpoint parameters
-// ---------------------------------------------------------------------------
-// Mirrors social-search. Each route spells its date filter differently and
-// silently ignores unknown params, so a wrong name is indistinguishable from
-// "no filter" and let a 2021 tweet into the feed.
-//
-//   twitter  : no date filter at all -> section=latest + a client-side cutoff
-//   reddit   : timeframe  = all | day | week | month | year
-//   web      : datePosted = last-hour | last-day | last-week | last-month | last-year
-//   linkedin : datePosted = same tokens as web
-
-/** /v1/web/search and /v1/linkedin/posts/search relative date tokens. */
-function datePostedFor(lookbackHours: number): string {
+function datePosted(lookbackHours: number): string {
   if (lookbackHours <= 1) return 'last-hour';
   if (lookbackHours <= 24) return 'last-day';
   if (lookbackHours <= 168) return 'last-week';
@@ -103,37 +171,86 @@ function datePostedFor(lookbackHours: number): string {
   return 'last-year';
 }
 
-/** Normalises the several timestamp spellings SocialFetch uses. */
-function parseWhen(value: unknown): string | null {
-  if (typeof value !== 'string' || !value.trim()) return null;
-  const ms = Date.parse(value);
-  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+function sinceDate(lookbackHours: number): string {
+  return new Date(Date.now() - lookbackHours * 3600 * 1000).toISOString().slice(0, 10);
 }
 
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
 
-async function socialFetchGet(
-  path: string,
-  params: Record<string, string | undefined>,
-): Promise<any> {
-  const url = new URL('https://api.socialfetch.dev' + path);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined) url.searchParams.set(k, v);
+let usdSpent = 0;
+let sfCreditsSpent = 0;
+
+async function tregCall(
+  endpointId: string,
+  opts: { method?: 'GET' | 'POST'; query?: Record<string, string | number | undefined>; body?: unknown; costUsd: number; timeoutMs?: number },
+): Promise<any | null> {
+  if (!tregToken) return null;
+
+  const url = new URL(`${TREG_BASE}/call/${endpointId}`);
+  for (const [k, v] of Object.entries(opts.query ?? {})) {
+    if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
   }
 
-  const res = await fetch(url.toString(), {
-    headers: { 'x-api-key': SOCIALFETCH_API_KEY, Accept: 'application/json' },
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`SocialFetch ${path} -> ${res.status}: ${text.slice(0, 200)}`);
+  const method = opts.method ?? 'GET';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 20000);
+
+  try {
+    const res = await fetch(url.toString(), {
+      method,
+      headers: {
+        'X-Treg-Token': tregToken,
+        Accept: 'application/json',
+        ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      signal: controller.signal,
+    });
+    usdSpent += opts.costUsd;
+
+    if (!res.ok) {
+      console.warn(`[treg] ${endpointId} -> ${res.status}`);
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    console.warn(`[treg] ${endpointId} threw:`, (err as Error)?.name);
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
-async function fetchPaged(
+async function socialFetchGet(
+  path: string,
+  params: Record<string, string | number | undefined>,
+): Promise<any | null> {
+  if (!socialFetchKey) return null;
+
+  const url = new URL(SOCIALFETCH_BASE + path);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+  }
+
+  try {
+    const res = await fetch(url.toString(), {
+      headers: { 'x-api-key': socialFetchKey, Accept: 'application/json' },
+    });
+    sfCreditsSpent += 1;
+    if (!res.ok) {
+      console.warn(`[socialfetch] ${path} -> ${res.status}`);
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    console.warn(`[socialfetch] ${path} threw:`, (err as Error)?.name);
+    return null;
+  }
+}
+
+async function socialFetchPaged(
   path: string,
   params: Record<string, string | number | undefined>,
   paginate: 'cursor' | 'page',
@@ -142,13 +259,15 @@ async function fetchPaged(
   let cursor: string | undefined;
   let pageNo = 1;
 
-  for (let page = 0; page < MAX_PAGES_PER_KEYWORD; page++) {
+  for (let i = 0; i < MAX_PAGES_PER_KEYWORD; i++) {
     const query: Record<string, string | number | undefined> = { ...params };
     if (paginate === 'page') query.page = pageNo;
     else if (cursor) query.cursor = cursor;
 
     const body = await socialFetchGet(path, query);
-    const data = body?.data ?? {};
+    if (!body) break;
+
+    const data = body.data ?? {};
     const items = data.tweets ?? data.posts ?? data.results ?? [];
     if (!Array.isArray(items) || items.length === 0) break;
 
@@ -156,7 +275,6 @@ async function fetchPaged(
 
     const pg = data.page ?? {};
     if (!pg.hasMore) break;
-
     if (paginate === 'page') {
       const next = typeof pg.nextPage === 'number' ? pg.nextPage : pageNo + 1;
       if (next <= pageNo) break;
@@ -173,145 +291,278 @@ async function fetchPaged(
 // Mappers
 // ---------------------------------------------------------------------------
 
-type PostRow = {
-  user_id: string;
-  keyword_id: string;
-  matched_keyword: string;
-  platform: Platform;
-  channel_source: string;
-  post_url: string;
-  author_name: string | null;
-  author_handle: string | null;
-  author_avatar_url: string | null;
-  body: string | null;
-  posted_at: string | null;
-  intent_score: number;
-  status: 'new';
-  engagement: Record<string, number | null> | null;
-};
-
-function mapTwitter(tweet: any, userId: string, kwId: string, kw: string): PostRow | null {
-  const url =
-    tweet?.url ?? tweet?.permalink ?? (tweet?.id ? `https://x.com/i/status/${tweet.id}` : null);
-  if (!url) return null;
-
-  const body = tweet?.text ?? null;
-  return {
-    user_id: userId,
-    keyword_id: kwId,
-    matched_keyword: kw,
-    platform: 'twitter',
-    channel_source: 'X / Twitter',
-    post_url: url,
-    author_name: tweet?.author?.displayName ?? tweet?.author?.name ?? null,
-    author_handle: tweet?.author?.handle ? `@${tweet.author.handle}` : null,
-    author_avatar_url: tweet?.author?.avatarUrl ?? null,
-    body,
-    posted_at: parseWhen(tweet?.createdAt),
-    intent_score: calculateIntentScore(body || ''),
-    status: 'new',
-    engagement: {
-      likes: tweet?.metrics?.likes ?? null,
-      retweets: tweet?.metrics?.retweets ?? null,
-      replies: tweet?.metrics?.replies ?? null,
-      views: tweet?.metrics?.views ?? null,
-      quotes: tweet?.metrics?.quotes ?? null,
-    },
-  };
+function row(input: Omit<PostRow, 'status'>): PostRow {
+  return { ...input, status: 'new' };
 }
 
-function mapLinkedIn(post: any, userId: string, kwId: string, kw: string): PostRow | null {
-  const url = post?.url ?? post?.permalink;
-  if (!url) return null;
-
-  const body = `${post?.title || ''} ${post?.text || ''}`.trim() || null;
-  const authorHandle = post?.author?.profileUrl
-    ? post.author.profileUrl.split('/in/')[1]
-    : null;
-
-  return {
-    user_id: userId,
-    keyword_id: kwId,
-    matched_keyword: kw,
-    platform: 'linkedin',
-    channel_source: 'LinkedIn',
-    post_url: url,
-    author_name: post?.author?.name ?? null,
-    author_handle: authorHandle ? `@${authorHandle}` : null,
-    author_avatar_url: post?.author?.avatarUrl ?? null,
-    body,
-    // The field is `publishedAt`. The old mapper looked for postedAt/createdAt,
-    // so every LinkedIn row landed with a NULL date.
-    posted_at: parseWhen(post?.publishedAt),
-    intent_score: calculateIntentScore(body || ''),
-    status: 'new',
+function mapTregTwitter(t: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const postUrl = t?.url ?? (t?.id ? `https://x.com/i/status/${t.id}` : null);
+  if (!postUrl) return null;
+  const handle = t?.authorUsername ? `@${String(t.authorUsername).replace(/^@/, '')}` : null;
+  return row({
+    user_id: userId, keyword_id: kwId, matched_keyword: kw, platform: 'twitter',
+    channel_source: 'X / Twitter', post_url: postUrl,
+    author_name: t?.authorName ?? null, author_handle: handle,
+    author_avatar_url: t?.authorImage ?? null, body: t?.text ?? null,
+    posted_at: parseWhen(t?.createdUtc ?? t?.createdAt),
+    intent_score: calculateIntentScore(t?.text || ''),
     engagement: {
-      likes: post?.metrics?.reactions ?? null,
-      comments: post?.metrics?.comments ?? null,
-      author_followers: post?.author?.followers ?? null,
+      likes: t?.likeCount ?? null, retweets: t?.retweetCount ?? null,
+      replies: t?.replyCount ?? null, quotes: t?.quoteCount ?? null,
+      views: t?.viewCount ?? null, author_followers: t?.authorFollowers ?? null,
     },
-  };
+  });
 }
 
-function mapReddit(post: any, userId: string, kwId: string, kw: string): PostRow | null {
-  const url = post?.permalink ?? post?.url ?? null;
-  if (!url) return null;
-
-  const body = `${post?.title || ''} ${post?.bodyText || ''}`.trim() || null;
-  return {
-    user_id: userId,
-    keyword_id: kwId,
-    matched_keyword: kw,
-    platform: 'reddit',
-    channel_source: post?.subreddit ? `r/${post.subreddit}` : 'r/reddit',
-    post_url: url,
-    author_name: post?.author ? `u/${post.author}` : 'u/anonymous',
-    author_handle: post?.author ? `@${post.author}` : null,
-    author_avatar_url: null,
-    body,
-    posted_at: parseWhen(post?.createdAt),
+function mapTregRedditSc(p: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const postUrl = p?.url ?? (p?.permalink ? `https://www.reddit.com${p.permalink}` : null);
+  if (!postUrl) return null;
+  const body = `${p?.title || ''} ${p?.selftext || ''}`.trim() || null;
+  return row({
+    user_id: userId, keyword_id: kwId, matched_keyword: kw, platform: 'reddit',
+    channel_source: p?.subreddit ? `r/${p.subreddit}` : 'r/reddit', post_url: postUrl,
+    author_name: p?.author ? `u/${p.author}` : 'u/anonymous',
+    author_handle: p?.author ? `@${p.author}` : null, author_avatar_url: null, body,
+    posted_at: parseWhen(p?.created_at_iso ?? p?.created_utc ?? p?.created),
     intent_score: calculateIntentScore(body || ''),
-    status: 'new',
     engagement: {
-      likes: post?.score ?? null,
-      comments: post?.commentCount ?? null,
-      upvotes: post?.upvotes ?? null,
-      upvote_ratio: post?.upvoteRatio ?? null,
-      subreddit_members: post?.subredditSubscriberCount ?? null,
+      likes: p?.score ?? p?.ups ?? null, comments: p?.num_comments ?? null,
+      upvotes: p?.ups ?? null, upvote_ratio: p?.upvote_ratio ?? null,
+      subreddit_members: p?.subreddit_subscribers ?? null,
     },
-  };
+  });
 }
 
-function mapWeb(result: any, userId: string, kwId: string, kw: string): PostRow | null {
-  const url = result?.url;
-  if (!url) return null;
+function mapTregRedditTikhub(p: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const d = p?.data ?? p;
+  const raw = d?.url ?? d?.permalink ?? d?.post_url ?? null;
+  if (!raw) return null;
+  const body = `${d?.title || ''} ${d?.selftext || ''}`.trim() || null;
+  return row({
+    user_id: userId, keyword_id: kwId, matched_keyword: kw, platform: 'reddit',
+    channel_source: d?.subreddit_name ?? d?.subreddit ?? 'r/reddit',
+    post_url: String(raw).startsWith('http') ? String(raw) : `https://www.reddit.com${raw}`,
+    author_name: d?.author ?? null,
+    author_handle: d?.author ? `@${d.author}` : null, author_avatar_url: null, body,
+    posted_at: parseWhen(d?.created_at ?? d?.created_utc ?? d?.post_time),
+    intent_score: calculateIntentScore(body || ''),
+    engagement: { likes: d?.upvote ?? d?.score ?? null, comments: d?.comment_count ?? null },
+  });
+}
 
+function mapTregWeb(r: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const postUrl = r?.url;
+  if (!postUrl) return null;
   let domain = 'Web';
   try {
-    domain = new URL(url).hostname.replace(/^www\./, '');
-  } catch {
-    /* keep default */
+    domain = new URL(postUrl).hostname.replace(/^www\./, '');
+  } catch { /* keep default */ }
+  const body = r?.snippet ? String(r.snippet).slice(0, 1200) : null;
+  return row({
+    user_id: userId, keyword_id: kwId, matched_keyword: kw, platform: 'google',
+    channel_source: domain, post_url: postUrl,
+    author_name: r?.title ?? domain, author_handle: `@${domain}`,
+    author_avatar_url: null, body,
+    posted_at: dateFromSnippet(r?.snippet),
+    intent_score: calculateIntentScore(body || ''),
+    engagement: { likes: null, comments: null },
+  });
+}
+
+function mapTregNews(r: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const postUrl = r?.url;
+  if (!postUrl) return null;
+  let domain = r?.site_name ?? 'News';
+  try {
+    domain = new URL(postUrl).hostname.replace(/^www\./, '') || domain;
+  } catch { /* keep default */ }
+  const body = r?.title ? `${r.title}${r.snippet ? ` — ${r.snippet}` : ''}`.slice(0, 1200) : null;
+  return row({
+    user_id: userId, keyword_id: kwId, matched_keyword: kw, platform: 'news',
+    channel_source: r?.publisher ?? domain, post_url: postUrl,
+    author_name: r?.publisher ?? domain, author_handle: `@${domain}`,
+    author_avatar_url: null, body,
+    posted_at: parseWhen(r?.date),
+    intent_score: calculateIntentScore(body || ''),
+    engagement: { likes: null, comments: null },
+  });
+}
+
+function mapSfTwitter(t: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const postUrl = t?.url ?? (t?.id ? `https://x.com/i/status/${t.id}` : null);
+  if (!postUrl) return null;
+  const body = t?.text ?? null;
+  return row({
+    user_id: userId, keyword_id: kwId, matched_keyword: kw, platform: 'twitter',
+    channel_source: 'X / Twitter', post_url: postUrl,
+    author_name: t?.author?.displayName ?? null,
+    author_handle: t?.author?.handle ? `@${t.author.handle}` : null,
+    author_avatar_url: t?.author?.avatarUrl ?? null, body,
+    posted_at: parseWhen(t?.createdAt),
+    intent_score: calculateIntentScore(body || ''),
+    engagement: {
+      likes: t?.metrics?.likes ?? null, retweets: t?.metrics?.retweets ?? null,
+      replies: t?.metrics?.replies ?? null, views: t?.metrics?.views ?? null,
+    },
+  });
+}
+
+function mapSfReddit(p: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const postUrl = p?.permalink ?? p?.url ?? null;
+  if (!postUrl) return null;
+  const body = `${p?.title || ''} ${p?.bodyText || ''}`.trim() || null;
+  return row({
+    user_id: userId, keyword_id: kwId, matched_keyword: kw, platform: 'reddit',
+    channel_source: p?.subredditPrefixedName ?? (p?.subreddit ? `r/${p.subreddit}` : 'r/reddit'),
+    post_url: postUrl,
+    author_name: p?.author ? `u/${p.author}` : 'u/anonymous',
+    author_handle: p?.author ? `@${p.author}` : null, author_avatar_url: null, body,
+    posted_at: parseWhen(p?.createdAt),
+    intent_score: calculateIntentScore(body || ''),
+    engagement: { likes: p?.score ?? null, comments: p?.commentCount ?? null },
+  });
+}
+
+function mapSfWeb(r: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const postUrl = r?.url;
+  if (!postUrl) return null;
+  let domain = 'Web';
+  try {
+    domain = new URL(postUrl).hostname.replace(/^www\./, '');
+  } catch { /* keep default */ }
+  const body = `${r?.title ?? ''} — ${r?.content ?? ''}`.trim() || null;
+  return row({
+    user_id: userId, keyword_id: kwId, matched_keyword: kw, platform: 'google',
+    channel_source: domain, post_url: postUrl,
+    author_name: r?.title ?? domain, author_handle: `@${domain}`,
+    author_avatar_url: null, body,
+    posted_at: parseWhen(r?.publishedAt ?? r?.date),
+    intent_score: calculateIntentScore(body || ''),
+    engagement: { likes: null, comments: null },
+  });
+}
+
+function mapSfLinkedIn(p: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const postUrl = p?.url ?? p?.permalink;
+  if (!postUrl) return null;
+  const handle = p?.author?.profileUrl ? p.author.profileUrl.split('/in/')[1] : null;
+  const body = `${p?.title ?? ''} ${p?.text ?? ''}`.trim() || null;
+  return row({
+    user_id: userId, keyword_id: kwId, matched_keyword: kw, platform: 'linkedin',
+    channel_source: 'LinkedIn', post_url: postUrl,
+    author_name: p?.author?.name ?? null,
+    author_handle: handle ? `@${handle}` : null,
+    author_avatar_url: p?.author?.avatarUrl ?? null, body,
+    posted_at: parseWhen(p?.publishedAt),
+    intent_score: calculateIntentScore(body || ''),
+    engagement: {
+      likes: p?.metrics?.reactions ?? null, comments: p?.metrics?.comments ?? null,
+      author_followers: p?.author?.followers ?? null,
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Per-channel provider chains
+// ---------------------------------------------------------------------------
+
+/**
+ * Providers are tried in order and the first one that returns rows wins, so a
+ * fallback only costs money once the cheaper option has actually failed. This
+ * is not hypothetical: treg answers 503 provider_capacity_unavailable when the
+ * vendor it prefers is busy.
+ */
+async function searchChannel(
+  platform: Platform, kwRow: { id: string; keyword: string },
+  userId: string, lookbackHours: number,
+): Promise<PostRow[]> {
+  const kwId = kwRow.id;
+  const kw = kwRow.keyword;
+
+  if (platform === 'twitter') {
+    const t = await tregCall('anyapi.x.search.posts', {
+      method: 'POST',
+      // Latest, not the default: the default returns all-time top posts, which
+      // is what once put a 2021 tweet into the feed.
+      body: { query: kw, queryType: 'Latest', limit: 20 },
+      costUsd: 0.0004,
+    });
+    const items = t?.output?.data?.items ?? [];
+    if (items.length) {
+      return items.map((x: any) => mapTregTwitter(x, userId, kwId, kw)).filter((r): r is PostRow => !!r);
+    }
+    const sf = await socialFetchPaged('/v1/twitter/search', { query: kw, section: 'latest' }, 'cursor');
+    return sf.length
+      ? sf.map((x: any) => mapSfTwitter(x, userId, kwId, kw)).filter((r): r is PostRow => !!r)
+      : [];
   }
 
-  const body = `${result?.title || ''} — ${result?.content ?? ''}`.trim() || null;
-  return {
-    user_id: userId,
-    keyword_id: kwId,
-    matched_keyword: kw,
-    platform: 'google',
-    channel_source: domain,
-    post_url: url,
-    author_name: result?.title ?? domain,
-    author_handle: `@${domain}`,
-    author_avatar_url: null,
-    body,
-    // /v1/web/search returns only title/url/content — no date field exists, so
-    // this stays null rather than being stamped with `now()`.
-    posted_at: parseWhen(result?.publishedAt ?? result?.date),
-    intent_score: calculateIntentScore(body || ''),
-    status: 'new',
-    engagement: { likes: null, comments: null },
-  };
+  if (platform === 'reddit') {
+    const tk = await tregCall('tikhub.x.reddit-app-fetch-dynamic-search', {
+      query: {
+        query: kw, search_type: 'post',
+        // RELEVANCE, not NEW: sorted by newest, a site-wide search returns
+        // whatever matched the tokens rather than posts about the keyword.
+        sort: 'RELEVANCE', time_range: redditTimeframe(lookbackHours), need_format: 'true',
+      },
+      costUsd: 0.001,
+    });
+    const tkItems = tk?.data?.posts ?? tk?.posts ?? [];
+    if (Array.isArray(tkItems) && tkItems.length) {
+      return tkItems.map((x: any) => mapTregRedditTikhub(x, userId, kwId, kw)).filter((r): r is PostRow => !!r);
+    }
+
+    const sc = await tregCall('scrapecreators.reddit.search.posts', {
+      query: { query: kw, timeframe: redditTimeframe(lookbackHours), sort: 'relevance', limit: 25 },
+      costUsd: 0.00188,
+    });
+    const scItems = sc?.posts ?? [];
+    if (Array.isArray(scItems) && scItems.length) {
+      return scItems.map((x: any) => mapTregRedditSc(x, userId, kwId, kw)).filter((r): r is PostRow => !!r);
+    }
+
+    const sf = await socialFetchPaged(
+      '/v1/reddit/search',
+      { query: kw, timeframe: redditTimeframe(lookbackHours), sortBy: 'relevance' },
+      'cursor',
+    );
+    return sf.length
+      ? sf.map((x: any) => mapSfReddit(x, userId, kwId, kw)).filter((r): r is PostRow => !!r)
+      : [];
+  }
+
+  if (platform === 'google') {
+    const r = await tregCall('crawl4ai.web.search.rich', { query: { q: kw, rich: 1 }, costUsd: 0.00015, timeoutMs: 25000 });
+    const items = r?.results ?? [];
+    if (Array.isArray(items) && items.length) {
+      return items.map((x: any) => mapTregWeb(x, userId, kwId, kw)).filter((r2): r2 is PostRow => !!r2);
+    }
+    const sf = await socialFetchPaged('/v1/web/search', { query: kw, datePosted: datePosted(lookbackHours) }, 'page');
+    return sf.length
+      ? sf.map((x: any) => mapSfWeb(x, userId, kwId, kw)).filter((r2): r2 is PostRow => !!r2)
+      : [];
+  }
+
+  if (platform === 'linkedin') {
+    // treg has no keyword search for LinkedIn posts — only per-profile fetches.
+    const sf = await socialFetchPaged('/v1/linkedin/posts/search', { query: kw, datePosted: datePosted(lookbackHours) }, 'cursor');
+    return sf.length
+      ? sf.map((x: any) => mapSfLinkedIn(x, userId, kwId, kw)).filter((r2): r2 is PostRow => !!r2)
+      : [];
+  }
+
+  if (platform === 'news') {
+    const r = await tregCall('tinyfish.web.search.news', {
+      query: { query: kw, domain_type: 'news', after_date: sinceDate(lookbackHours) },
+      costUsd: 0,
+    });
+    const items = r?.results ?? [];
+    return Array.isArray(items) && items.length
+      ? items.map((x: any) => mapTregNews(x, userId, kwId, kw)).filter((r2): r2 is PostRow => !!r2)
+      : [];
+  }
+
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -335,25 +586,24 @@ Deno.serve(async (req) => {
 
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
-  if (!SOCIALFETCH_API_KEY) {
-    const { data: secretRow, error: secretError } = await supabase
-      .from('service_secrets')
-      .select('value')
-      .eq('name', 'socialfetch_api_key')
-      .maybeSingle();
-    if (secretError) {
-      return json({ ok: false, error: `secret lookup failed: ${secretError.message}` }, 503);
+  // Edge secrets win; fall back to the service-role-only secrets table.
+  if (!tregToken || !socialFetchKey) {
+    const { data: secrets } = await supabase.from('service_secrets').select('name, value');
+    for (const s of secrets ?? []) {
+      if (s.name === 'treg_token' && !tregToken) tregToken = s.value;
+      if (s.name === 'socialfetch_api_key' && !socialFetchKey) socialFetchKey = s.value;
     }
-    SOCIALFETCH_API_KEY = secretRow?.value ?? '';
   }
 
-  if (!SOCIALFETCH_API_KEY) {
-    return json({ ok: false, error: 'SOCIALFETCH_API_KEY not set' }, 503);
+  if (!tregToken && !socialFetchKey) {
+    return json({ ok: false, error: 'no search provider configured' }, 503);
   }
 
   // Captured before any network work so the retention pass at the end of each
   // user's sweep cannot delete the results that sweep just produced.
   const sweepStartedAt = new Date().toISOString();
+  usdSpent = 0;
+  sfCreditsSpent = 0;
 
   const { data: runRow } = await supabase.from('sweep_runs').insert({}).select().single();
   const runId = runRow?.id;
@@ -362,6 +612,7 @@ Deno.serve(async (req) => {
   let usersProcessed = 0;
   let postsInserted = 0;
   let pruned = 0;
+  let totalStale = 0;
 
   const { data: keywords, error: keywordsError } = await supabase
     .from('keywords')
@@ -388,18 +639,14 @@ Deno.serve(async (req) => {
     byUser.set(kw.user_id, list);
   }
 
-  // Cap the number of users processed in one run.
   const userIds = [...byUser.keys()].slice(0, MAX_USERS_PER_RUN);
   if (userIds.length < byUser.size) {
     errors.push({
       stage: 'cap',
-      message: `Run capped at ${MAX_USERS_PER_RUN} users; ${
-        byUser.size - MAX_USERS_PER_RUN
-      } deferred to the next run.`,
+      message: `Run capped at ${MAX_USERS_PER_RUN} users; ${byUser.size - MAX_USERS_PER_RUN} deferred.`,
     });
   }
 
-  // Load every sweep user's settings in one round trip.
   const { data: profiles } = await supabase
     .from('profiles')
     .select('id, enabled_channels, lookback_hours, min_intent_threshold')
@@ -414,8 +661,6 @@ Deno.serve(async (req) => {
     });
   }
 
-  let totalStale = 0;
-
   for (const userId of userIds) {
     const userKeywords = byUser.get(userId) ?? [];
     if (userKeywords.length === 0) continue;
@@ -423,14 +668,12 @@ Deno.serve(async (req) => {
     usersProcessed++;
 
     const settings = settingsByUser.get(userId);
-    const channels: Platform[] =
-      Array.isArray(settings?.enabled_channels) && settings.enabled_channels.length > 0
-        ? settings.enabled_channels
-        : ['twitter', 'reddit', 'google'];
+    const ALL: Platform[] = ['twitter', 'reddit', 'google', 'linkedin', 'news'];
+    const channels: Platform[] = Array.isArray(settings?.enabled_channels) && settings.enabled_channels.length > 0
+      ? settings.enabled_channels.filter((c): c is Platform => ALL.includes(c as Platform))
+      : ['twitter', 'reddit', 'google'];
     const lookbackHours = Number(settings?.lookback_hours) || 24;
     const minIntent = Number(settings?.min_intent_threshold) || 0;
-    const timeframe = timeframeFor(lookbackHours);
-    const datePosted = datePostedFor(lookbackHours);
     const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
     let droppedStale = 0;
 
@@ -438,77 +681,23 @@ Deno.serve(async (req) => {
     const seenUrls = new Set<string>();
 
     for (const kw of userKeywords) {
-      const tasks: Array<Promise<PostRow[]>> = [];
+      const perChannel = await Promise.all(
+        channels.map((ch) => searchChannel(ch, kw, userId, lookbackHours)),
+      );
 
-      if (channels.includes('twitter')) {
-        // This route has no date filter; section=latest plus the cutoff below
-        // is the only way to keep all-time top results out of the feed.
-        tasks.push(
-          fetchPaged('/v1/twitter/search', { query: kw.keyword, section: 'latest' }, 'cursor')
-            .then((items) =>
-              items.map((t) => mapTwitter(t, userId, kw.id, kw.keyword)).filter((r): r is PostRow => !!r),
-            )
-            .catch((e) => {
-              errors.push({ user: userId, kw: kw.keyword, platform: 'twitter', message: String(e) });
-              return [];
-            }),
-        );
-      }
-
-      if (channels.includes('linkedin')) {
-        tasks.push(
-          fetchPaged('/v1/linkedin/posts/search', { query: kw.keyword, datePosted }, 'cursor')
-            .then((items) =>
-              items.map((p) => mapLinkedIn(p, userId, kw.id, kw.keyword)).filter((r): r is PostRow => !!r),
-            )
-            .catch((e) => {
-              errors.push({ user: userId, kw: kw.keyword, platform: 'linkedin', message: String(e) });
-              return [];
-            }),
-        );
-      }
-
-      if (channels.includes('reddit')) {
-        tasks.push(
-          fetchPaged('/v1/reddit/search', { query: kw.keyword, timeframe, sortBy: 'new' }, 'cursor')
-            .then((items) =>
-              items.map((p) => mapReddit(p, userId, kw.id, kw.keyword)).filter((r): r is PostRow => !!r),
-            )
-            .catch((e) => {
-              errors.push({ user: userId, kw: kw.keyword, platform: 'reddit', message: String(e) });
-              return [];
-            }),
-        );
-      }
-
-      if (channels.includes('google')) {
-        // Paginated by page number, not a cursor.
-        tasks.push(
-          fetchPaged('/v1/web/search', { query: kw.keyword, datePosted }, 'page')
-            .then((items) =>
-              items.map((r) => mapWeb(r, userId, kw.id, kw.keyword)).filter((r): r is PostRow => !!r),
-            )
-            .catch((e) => {
-              errors.push({ user: userId, kw: kw.keyword, platform: 'google', message: String(e) });
-              return [];
-            }),
-        );
-      }
-
-      const settled = await Promise.all(tasks);
-
-      for (const row of settled.flat()) {
-        // Exact cutoff: the API windows are coarse, so drop anything outside
-        // the real lookback. Rows with no date at all cannot be judged.
-        if (row.posted_at && Date.parse(row.posted_at) < cutoffMs) {
+      for (const r of perChannel.flat()) {
+        // Exact cutoff: the upstreams only accept coarse windows, so drop
+        // anything outside the real lookback. Rows with no date cannot be
+        // judged and are kept.
+        if (r.posted_at && Date.parse(r.posted_at) < cutoffMs) {
           droppedStale++;
           continue;
         }
-        if (row.intent_score < minIntent) continue;
-        const key = row.post_url.trim().toLowerCase();
+        if (r.intent_score < minIntent) continue;
+        const key = r.post_url.trim().toLowerCase();
         if (seenUrls.has(key)) continue;
         seenUrls.add(key);
-        rowsToUpsert.push(row);
+        rowsToUpsert.push(r);
       }
     }
 
@@ -537,8 +726,9 @@ Deno.serve(async (req) => {
       }
     } catch (pruneErr) {
       errors.push({ user: userId, kw: '*', platform: 'prune', message: String(pruneErr) });
-    totalStale += droppedStale;
     }
+
+    totalStale += droppedStale;
   }
 
   if (runId) {
@@ -559,6 +749,8 @@ Deno.serve(async (req) => {
     postsInserted,
     droppedStale: totalStale,
     pruned,
+    usdSpent: Number(usdSpent.toFixed(6)),
+    sfCreditsSpent,
     errorCount: errors.length,
   });
 });

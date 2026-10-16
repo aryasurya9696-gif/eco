@@ -85,7 +85,7 @@ const platformName = (p: MonitoredPost['platform']): string => {
   if (p === 'reddit') return 'Reddit';
   if (p === 'google') return 'Web';
   if (p === 'linkedin') return 'LinkedIn';
-  return 'Facebook';
+  return 'News';
 };
 
 /** Small muted action button shared by the card footer. */

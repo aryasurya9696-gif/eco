@@ -27,8 +27,12 @@ export function validateWebhookUrl(value: string): string | null {
 /**
  * Platforms the sweep functions actually implement.
  * Must stay in sync with profiles_enabled_channels_supported in Postgres.
+ * `news` is served by a free treg endpoint; LinkedIn still comes from
+ * SocialFetch because treg has no keyword search for it.
  */
-export const SUPPORTED_PLATFORMS = ['twitter', 'reddit', 'google', 'linkedin'] as const;
+export const SUPPORTED_PLATFORMS = [
+  'twitter', 'reddit', 'google', 'linkedin', 'news',
+] as const;
 
 /**
  * Feed retention options in days. 0 = keep everything.
