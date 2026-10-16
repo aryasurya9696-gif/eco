@@ -21,9 +21,12 @@ function groupByDay(
   };
 
   const buckets = new Map<string, MonitoredPost[]>();
+  const UNKNOWN = 'unknown';
   for (const post of posts) {
+    // /v1/web/search returns no date at all. Filing those under "Today"
+    // implied they were just found, so they get their own bucket instead.
     const ts = post.posted_at ? new Date(post.posted_at).getTime() : NaN;
-    const key = dayKey(Number.isNaN(ts) ? now : ts);
+    const key = Number.isNaN(ts) ? UNKNOWN : dayKey(ts);
     const list = buckets.get(key) ?? [];
     list.push(post);
     buckets.set(key, list);
@@ -35,10 +38,17 @@ function groupByDay(
   const yesterday = dayKey(yesterdayDate.getTime());
 
   return [...buckets.entries()]
-    .sort((a, b) => (a[0] < b[0] ? 1 : -1))
+    // The unknown bucket always sorts last regardless of key ordering.
+    .sort((a, b) => {
+      if (a[0] === UNKNOWN) return 1;
+      if (b[0] === UNKNOWN) return -1;
+      return a[0] < b[0] ? 1 : -1;
+    })
     .map(([key, list]) => {
       let label: string;
-      if (key === today) {
+      if (key === UNKNOWN) {
+        label = 'Date unknown';
+      } else if (key === today) {
         label = 'Today';
       } else if (key === yesterday) {
         label = 'Yesterday';

@@ -24,8 +24,11 @@ export function validateWebhookUrl(value: string): string | null {
   return null;
 }
 
-/** Platforms the sweep functions actually implement. */
-export const SUPPORTED_PLATFORMS = ['twitter', 'reddit', 'google'] as const;
+/**
+ * Platforms the sweep functions actually implement.
+ * Must stay in sync with profiles_enabled_channels_supported in Postgres.
+ */
+export const SUPPORTED_PLATFORMS = ['twitter', 'reddit', 'google', 'linkedin'] as const;
 
 /**
  * Feed retention options in days. 0 = keep everything.

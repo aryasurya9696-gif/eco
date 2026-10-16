@@ -826,5 +826,147 @@ alter table public.profiles
   add constraint profiles_min_intent_threshold_range
   check (min_intent_threshold between 0 and 100);
 
+-- ===========================================================================
+-- SECTION 7 — Feed retention + SocialFetch integration
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- 1. Retention setting. 0 = keep everything.
+-- ---------------------------------------------------------------------------
+alter table public.profiles
+  add column if not exists feed_retention_days integer not null default 30;
+
+alter table public.profiles drop constraint if exists profiles_feed_retention_range;
+alter table public.profiles
+  add constraint profiles_feed_retention_range
+  check (feed_retention_days between 0 and 365);
+
+grant update (feed_retention_days) on public.profiles to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 2. LinkedIn as a channel
+-- ---------------------------------------------------------------------------
+alter table public.profiles drop constraint if exists profiles_enabled_channels_supported;
+alter table public.profiles
+  add constraint profiles_enabled_channels_supported
+  check (enabled_channels <@ array['twitter', 'reddit', 'google', 'linkedin']);
+
+-- ---------------------------------------------------------------------------
+-- 3. Vendor keys, service-role readable only. RLS on, zero policies: the
+--    browser has no SELECT path at all, which is the same trust boundary as
+--    an edge function secret. The edge functions still prefer Deno.env.
+-- ---------------------------------------------------------------------------
+create table if not exists public.service_secrets (
+  name       text primary key,
+  value      text        not null,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.service_secrets enable row level security;
+revoke all on table public.service_secrets from anon, authenticated;
+revoke all on table public.service_secrets from public;
+grant select on table public.service_secrets to service_role;
+
+-- ---------------------------------------------------------------------------
+-- 4. Feed indexes. nulls last keeps undated web-search rows at the bottom.
+-- ---------------------------------------------------------------------------
+create index if not exists monitored_posts_user_posted_at_idx
+  on public.monitored_posts (user_id, posted_at desc nulls last, created_at desc);
+
+create index if not exists monitored_posts_user_created_at_idx
+  on public.monitored_posts (user_id, created_at);
+
+-- ---------------------------------------------------------------------------
+-- 5. prune_feed / clear_feed
+--    prune_feed removes a row only when it is BOTH older than the retention
+--    window AND not written by the sweep in flight. Folding p_keep_after into
+--    the cutoff made the window meaningless and wiped the feed on every sweep.
+-- ---------------------------------------------------------------------------
+create or replace function public.prune_feed(
+  p_user_id uuid default null,
+  p_keep_after timestamptz default null
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid uuid;
+  v_days int;
+  v_cutoff timestamptz;
+  v_deleted int;
+begin
+  v_uid := coalesce(p_user_id, auth.uid());
+  if v_uid is null then
+    return jsonb_build_object('success', false, 'error', 'unauthenticated');
+  end if;
+
+  if coalesce(auth.role(), '') <> 'service_role'
+     and session_user <> 'postgres'
+     and auth.uid() is distinct from v_uid then
+    return jsonb_build_object('success', false, 'error', 'unauthorized');
+  end if;
+
+  select feed_retention_days into v_days from public.profiles where id = v_uid;
+  if v_days is null then
+    return jsonb_build_object('success', false, 'error', 'profile_not_found');
+  end if;
+
+  if v_days = 0 then
+    return jsonb_build_object('success', true, 'deleted', 0, 'retention_days', 0);
+  end if;
+
+  v_cutoff := now() - make_interval(days => v_days);
+
+  with gone as (
+    delete from public.monitored_posts
+    where user_id = v_uid
+      and coalesce(posted_at, created_at) < v_cutoff
+      and (p_keep_after is null or created_at < p_keep_after)
+    returning 1
+  )
+  select count(*) into v_deleted from gone;
+
+  return jsonb_build_object('success', true, 'deleted', v_deleted,
+                             'retention_days', v_days, 'cutoff', v_cutoff);
+end;
+$$;
+
+revoke execute on function public.prune_feed(uuid, timestamptz) from public, anon;
+grant  execute on function public.prune_feed(uuid, timestamptz) to authenticated, service_role;
+
+create or replace function public.clear_feed(p_user_id uuid default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid uuid;
+  v_deleted int;
+begin
+  v_uid := coalesce(p_user_id, auth.uid());
+  if v_uid is null then
+    return jsonb_build_object('success', false, 'error', 'unauthenticated');
+  end if;
+
+  if coalesce(auth.role(), '') <> 'service_role'
+     and session_user <> 'postgres'
+     and auth.uid() is distinct from v_uid then
+    return jsonb_build_object('success', false, 'error', 'unauthorized');
+  end if;
+
+  with gone as (
+    delete from public.monitored_posts where user_id = v_uid returning 1
+  )
+  select count(*) into v_deleted from gone;
+
+  return jsonb_build_object('success', true, 'deleted', v_deleted);
+end;
+$$;
+
+revoke execute on function public.clear_feed(uuid) from public, anon;
+grant  execute on function public.clear_feed(uuid) to authenticated, service_role;
+
 
 

@@ -15,6 +15,12 @@ export interface SocialSearchResult {
   scanned: number;
   channels: Platform[];
   lookback_hours?: number;
+  /** Results dropped because they fell outside the real lookback window. */
+  dropped_stale?: number;
+  /** Mentions the retention pass removed after this sweep. */
+  pruned?: number;
+  /** SocialFetch credits this sweep consumed — every request costs one. */
+  credits?: number;
   errors?: string[];
 }
 
@@ -38,6 +44,10 @@ export async function performSocialFetchSweep(
     posts: Array.isArray(res?.posts) ? res.posts : [],
     scanned: res?.scanned ?? 0,
     channels: res?.channels ?? [],
+    lookback_hours: res?.lookback_hours,
+    dropped_stale: res?.dropped_stale,
+    pruned: res?.pruned,
+    credits: res?.credits,
     errors: res?.errors,
   };
 }

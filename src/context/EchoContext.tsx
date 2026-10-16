@@ -229,7 +229,10 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
           .from('monitored_posts')
           .select('*')
           .eq('user_id', user.id)
-          .order('posted_at', { ascending: false });
+          // nullsFirst:false keeps web-search rows (no date) at the bottom
+          // instead of letting Postgres float them to the top of the feed.
+          .order('posted_at', { ascending: false, nullsFirst: false })
+          .order('created_at', { ascending: false });
 
         if (!error && data) setPosts(data as MonitoredPost[]);
       } catch (err) {
@@ -514,14 +517,31 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       setIsSweeping(false);
 
+      // Every SocialFetch request costs a credit, so surface the spend.
+      const spend = result.credits
+        ? ` (${result.credits} API credit${result.credits === 1 ? '' : 's'})`
+        : '';
+      const housekeeping = [
+        result.dropped_stale ? `${result.dropped_stale} out-of-window result(s) dropped` : '',
+        result.pruned ? `${result.pruned} expired mention(s) cleaned up` : '',
+      ]
+        .filter(Boolean)
+        .join(', ');
+
       if (result.posts.length > 0) {
-        addToast(`Sweep complete — ${result.posts.length} new mention(s) found.`, 'success');
+        addToast(
+          `Sweep complete — ${result.posts.length} new mention(s) found${spend}.`,
+          'success',
+        );
       } else {
         addToast(
-          `Sweep finished. No new mentions above your ${minIntentThreshold}% intent threshold.`,
+          `Sweep finished. Nothing new above your ${minIntentThreshold}% intent threshold${spend}.`,
           'info',
         );
       }
+
+      if (housekeeping) addToast(housekeeping, 'info');
+      for (const e of result.errors?.slice(0, 3) ?? []) addToast(e, 'error');
     } catch (err) {
       setIsSweeping(false);
       addToast(`Sweep failed: ${(err as Error)?.message || 'Unknown error'}`, 'error');

@@ -188,7 +188,11 @@ export const FeedCard: React.FC<FeedCardProps> = ({
               matched <span className="text-[#5f5f5a]">“{post.matched_keyword}”</span>
             </span>
             <Dot />
-            <span>{relativeTime(post.posted_at, now)}</span>
+            {/* Web-search results carry no date at all, so say so rather than
+                implying "today" via a stamped created_at. */}
+            <span className={post.posted_at ? undefined : 'text-[#a8a8a2]'}>
+              {post.posted_at ? relativeTime(post.posted_at, now) : 'date unknown'}
+            </span>
           </div>
         </div>
 

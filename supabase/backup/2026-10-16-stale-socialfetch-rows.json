@@ -1,0 +1,171 @@
+{
+  "_note": "Snapshot of monitored_posts rows removed on 2026-10-16 while fixing the SocialFetch integration. Two defects made these rows unusable: (1) /v1/twitter/search was called with a `timeframe` param the route does not accept, so it silently answered with all-time `section=top` results dating back to 2021; (2) /v1/web/search returns no date field at all, so the mapper stamped `now()` onto every web row and made 2021-era product pages look like they were found today. Restore with the ids below if ever needed.",
+  "removed_count": 14,
+  "reason": "socialfetch-integration-fix",
+  "rows": [
+    {
+      "id": "54a007c2-771f-4a31-a38f-891259a66a6b",
+      "platform": "twitter",
+      "matched_keyword": "tempmail",
+      "channel_source": "X / Twitter Feed",
+      "post_url": "https://x.com/knjlovs/status/1396887755448360963",
+      "author_name": "!",
+      "author_handle": "@knjlovs",
+      "body": "as u can see, it takes less than 2 minutes to make one wf account with this method. DOWNLOAD TEMPMAIL AND GET INTO IT !",
+      "posted_at": "2021-05-24T17:56:08+00:00",
+      "intent_score": 33,
+      "engagement": { "likes": 18, "replies": 1, "retweets": 17 }
+    },
+    {
+      "id": "e1e22890-e3a5-40fb-ba93-3459e32dc9b1",
+      "platform": "twitter",
+      "matched_keyword": "tempmail",
+      "channel_source": "X / Twitter Feed",
+      "post_url": "https://x.com/cisnys/status/1454487631136313345",
+      "author_name": "sae",
+      "author_handle": "@cisnys",
+      "body": "TUTORIAL HOW TO MAKE TWITCH ACC USING TEMPMAIL!! NO NEED TO USE NUMBER CARATS SPREAD THIS",
+      "posted_at": "2021-10-30T16:37:28+00:00",
+      "intent_score": 30,
+      "engagement": { "likes": 75, "replies": 1, "retweets": 87 }
+    },
+    {
+      "id": "98bf621c-ef79-4be8-b826-3c6f45395433",
+      "platform": "twitter",
+      "matched_keyword": "tempmail",
+      "channel_source": "X / Twitter Feed",
+      "post_url": "https://x.com/ManuelBot59/status/1650262696695144454",
+      "author_name": "Manuel Travazano",
+      "author_handle": "@ManuelBot59",
+      "body": "Mantén en secreto tres servicios de correo temporales... Tempmail, Gmailnator, Smailpro",
+      "posted_at": "2023-04-23T22:17:41+00:00",
+      "intent_score": 30,
+      "engagement": { "likes": 46, "replies": 2, "retweets": 24 }
+    },
+    {
+      "id": "8deb5d0c-10e1-453d-8944-611ac63833ba",
+      "platform": "twitter",
+      "matched_keyword": "tempmail",
+      "channel_source": "X / Twitter Feed",
+      "post_url": "https://x.com/TONEweb3/status/1741769480047300724",
+      "author_name": "TONE",
+      "author_handle": "@TONEweb3",
+      "body": "Temporary disposable email. What is this? Also called tempmail, 10minutemail, throwaway email, fake mail, or trash mail.",
+      "posted_at": "2024-01-01T10:32:59+00:00",
+      "intent_score": 30,
+      "engagement": { "likes": 41, "replies": 25, "retweets": 1 }
+    },
+    {
+      "id": "941f76c4-64ee-4344-8a45-f76705c928a2",
+      "platform": "google",
+      "matched_keyword": "tempmail",
+      "channel_source": "tempmail.lol",
+      "post_url": "https://tempmail.lol/en/",
+      "author_name": "TempMail - Free Temporary Email",
+      "author_handle": "@tempmail.lol",
+      "posted_at_fake": "2026-10-16T11:27:59.98+00:00",
+      "intent_score": 30
+    },
+    {
+      "id": "2729dcc5-abb1-4206-a298-e7a16ac7e609",
+      "platform": "google",
+      "matched_keyword": "tempmail",
+      "channel_source": "play.google.com",
+      "post_url": "https://play.google.com/store/apps/details?id=com.unfolddroid.tempmail&hl=en_US",
+      "author_name": "Temp Mail - Apps on Google Play",
+      "author_handle": "@play.google.com",
+      "posted_at_fake": "2026-10-16T11:27:59.98+00:00",
+      "intent_score": 33
+    },
+    {
+      "id": "5d4ec98a-f27c-461f-b12f-252009e8d55e",
+      "platform": "google",
+      "matched_keyword": "tempmail",
+      "channel_source": "tmaily.com",
+      "post_url": "https://tmaily.com/",
+      "author_name": "TMaily: Temp Mail",
+      "author_handle": "@tmaily.com",
+      "posted_at_fake": "2026-10-16T11:27:59.98+00:00",
+      "intent_score": 30
+    },
+    {
+      "id": "cb4a4b31-c6a7-4d6a-8c6e-d155f165732b",
+      "platform": "google",
+      "matched_keyword": "tempmail",
+      "channel_source": "temp-mail.app",
+      "post_url": "https://temp-mail.app/",
+      "author_name": "Temp Mail - Free Disposable Temporary Email",
+      "author_handle": "@temp-mail.app",
+      "posted_at_fake": "2026-10-16T11:27:59.98+00:00",
+      "intent_score": 30
+    },
+    {
+      "id": "06b91783-8b4e-45a4-98af-91e078c97045",
+      "platform": "google",
+      "matched_keyword": "tempmail",
+      "channel_source": "tempmail.plus",
+      "post_url": "https://tempmail.plus/en/",
+      "author_name": "TempMail.Plus: Disposable Temporary Email",
+      "author_handle": "@tempmail.plus",
+      "posted_at_fake": "2026-10-16T11:27:59.98+00:00",
+      "intent_score": 30
+    },
+    {
+      "id": "628ea953-a758-427d-9acd-fd85b68f933e",
+      "platform": "google",
+      "matched_keyword": "tempmail",
+      "channel_source": "apps.apple.com",
+      "post_url": "https://apps.apple.com/us/app/temp-mail-temporary-emails/id6746118540",
+      "author_name": "Temp Mail - Temporary Emails - App Store - Apple",
+      "author_handle": "@apps.apple.com",
+      "posted_at_fake": "2026-10-16T11:27:59.98+00:00",
+      "intent_score": 30
+    },
+    {
+      "id": "31c2a039-6b23-4979-9a11-5657e37cd8fd",
+      "platform": "google",
+      "matched_keyword": "tempmail",
+      "channel_source": "temp-mail.org",
+      "post_url": "https://temp-mail.org/en/",
+      "author_name": "Temp Mail - Disposable Temporary Email",
+      "author_handle": "@temp-mail.org",
+      "posted_at_fake": "2026-10-16T11:27:59.98+00:00",
+      "intent_score": 30
+    },
+    {
+      "id": "db2b4ea4-e3d0-471b-93a5-edc29a3bf2e4",
+      "platform": "google",
+      "matched_keyword": "tempmail",
+      "channel_source": "temp-mail.io",
+      "post_url": "https://temp-mail.io/en",
+      "author_name": "Temp-Mail.io",
+      "author_handle": "@temp-mail.io",
+      "body_prefix": "Aug 3, 2026 ... Temp mail is a temporary email address that is valid for a limited time.",
+      "posted_at_fake": "2026-10-16T11:27:59.98+00:00",
+      "intent_score": 30
+    },
+    {
+      "id": "ba927c3e-9c2f-4ed7-9079-16d73c7f903d",
+      "platform": "google",
+      "matched_keyword": "tempmail",
+      "channel_source": "tempail.com",
+      "post_url": "https://tempail.com/",
+      "author_name": "Temp Mail - Free Temporary Email",
+      "author_handle": "@tempail.com",
+      "posted_at_fake": "2026-10-16T11:27:59.98+00:00",
+      "intent_score": 30
+    },
+    {
+      "id": "f48545f1-b668-4392-b924-7e2ba76ed66a",
+      "platform": "google",
+      "matched_keyword": "tempmail",
+      "channel_source": "reddit.com",
+      "post_url": "https://www.reddit.com/r/emailprivacy/comments/1rghs5d/what_is_the_best_temp_mail_service_you_guys_use/",
+      "author_name": "What is the best temp mail service you guys use in 2026? - Reddit",
+      "author_handle": "@reddit.com",
+      "body_prefix": "Feb 27, 2026 ... I use Trashmail.com -- simple and it just works.",
+      "posted_at_fake": "2026-10-16T11:27:59.981+00:00",
+      "intent_score": 30
+    }
+  ]
+}
