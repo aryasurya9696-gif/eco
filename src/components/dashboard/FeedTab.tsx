@@ -2,13 +2,13 @@ import React, { useState } from 'react';
 import { useEcho } from '../../context/EchoContext';
 import type { MonitoredPost } from '../../types';
 import { PlatformBadge } from '../common/PlatformBadge';
-import { 
-  ExternalLink, 
-  Search, 
-  Heart, 
-  MessageSquare, 
-  Repeat, 
-  Clock, 
+import {
+  ExternalLink,
+  Search,
+  Heart,
+  MessageSquare,
+  Repeat,
+  Clock,
   Sparkles,
   ChevronLeft,
   ChevronRight,
@@ -18,10 +18,7 @@ import {
   Copy,
   Check,
   Code,
-  X,
-  Lock,
-  CheckCircle2,
-  Zap
+  X
 } from 'lucide-react';
 
 export const FeedTab: React.FC = () => {
@@ -45,17 +42,21 @@ export const FeedTab: React.FC = () => {
     exportPostsToCsv,
     exportPostsToJson,
     enabledChannels,
-    creditsBalance,
-    unlockedLeads,
-    isUnlockingLead,
-    unlockLead,
-    setIsTopUpModalOpen,
+    minIntentThreshold,
     addToast,
   } = useEcho();
 
   const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>({});
   const [currentPage, setCurrentPage] = useState<number>(1);
   const itemsPerPage = 20;
+
+  // A single ticking clock keeps relative timestamps stable between renders
+  // instead of calling Date.now() during render.
+  const [now, setNow] = useState<number>(() => Date.now());
+  React.useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 60000);
+    return () => clearInterval(id);
+  }, []);
 
   // Modals
   const [aiDraftModalPost, setAiDraftModalPost] = useState<MonitoredPost | null>(null);
@@ -72,7 +73,8 @@ export const FeedTab: React.FC = () => {
 
   const getRelativeTime = (isoDate: string | null) => {
     if (!isoDate) return 'Recently';
-    const diffMs = Date.now() - new Date(isoDate).getTime();
+    const diffMs = now - new Date(isoDate).getTime();
+    if (diffMs < 0) return 'just now';
     const diffSec = Math.floor(diffMs / 1000);
     const diffMin = Math.floor(diffSec / 60);
     const diffHours = Math.floor(diffMin / 60);
@@ -123,15 +125,19 @@ export const FeedTab: React.FC = () => {
 
   // Reset platform filter if user disables that channel in settings
   React.useEffect(() => {
-    if (filterPlatform !== 'all' && !enabledChannels.includes(filterPlatform as any)) {
+    if (filterPlatform !== 'all' && !enabledChannels.includes(filterPlatform)) {
       setFilterPlatform('all');
     }
-  }, [enabledChannels, filterPlatform]);
+  }, [enabledChannels, filterPlatform, setFilterPlatform]);
 
   // Filter posts
   const filteredPosts = posts.filter((post) => {
     // 1. Hide posts from channels that the user turned OFF in Settings
-    if (enabledChannels && enabledChannels.length > 0 && !enabledChannels.includes(post.platform)) {
+    if (enabledChannels.length > 0 && !enabledChannels.includes(post.platform)) {
+      return false;
+    }
+    // 2. Honour the workspace intent threshold (also applied server-side)
+    if (minIntentThreshold > 0 && (post.intent_score ?? 0) < minIntentThreshold) {
       return false;
     }
     if (filterKeyword !== 'all' && post.matched_keyword.toLowerCase() !== filterKeyword.toLowerCase()) {
@@ -244,21 +250,8 @@ export const FeedTab: React.FC = () => {
             </div>
           </div>
 
-          {/* Right Export & Credits Controls */}
+          {/* Right Export Controls */}
           <div className="flex items-center gap-2 flex-wrap">
-            {/* Live Credits Meter */}
-            <div className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#ffffff] border border-[#e3e3de] text-xs font-mono shadow-2xs">
-              <Zap className="w-3.5 h-3.5 text-emerald-600" />
-              <span className="font-semibold text-[#141414]">{creditsBalance} Credits</span>
-              <button 
-                onClick={() => setIsTopUpModalOpen(true)}
-                className="ml-1 text-[11px] text-emerald-700 hover:text-emerald-900 font-bold underline cursor-pointer"
-                title="Purchase additional lead credits"
-              >
-                + Top Up
-              </button>
-            </div>
-
             <button
               onClick={() => exportPostsToCsv(filteredPosts)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#ffffff] hover:bg-[#f6f6f4] border border-[#e3e3de] text-xs font-mono text-[#141414] transition-colors cursor-pointer"
@@ -348,16 +341,12 @@ export const FeedTab: React.FC = () => {
         <div className="space-y-4">
           {paginatedPosts.map((post) => {
             const isExpanded = expandedCards[post.id] || false;
-            const intent = post.intent_score || 85;
-            const unlockData = post.unlock_data || unlockedLeads[post.id];
-            const isUnlocked = post.is_unlocked || !!unlockData;
+            const intent = post.intent_score ?? 0;
 
             return (
               <article
                 key={post.id}
-                className={`bg-[#ffffff] border transition-all group p-5 sm:p-6 ${
-                  isUnlocked ? 'border-emerald-300 ring-1 ring-emerald-100' : 'border-[#e3e3de] hover:border-[#141414]'
-                }`}
+                className="bg-[#ffffff] border border-[#e3e3de] hover:border-[#141414] transition-all group p-5 sm:p-6"
               >
                 {/* Header row */}
                 <div className="flex items-start justify-between gap-4 mb-3">
@@ -368,23 +357,9 @@ export const FeedTab: React.FC = () => {
 
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
-                        {isUnlocked && unlockData ? (
-                          <span className="text-xs font-bold text-[#141414] truncate flex items-center gap-1.5">
-                            <span>{unlockData.contact_name}</span>
-                            <span className="text-[10px] text-emerald-800 bg-emerald-50 border border-emerald-300 px-1.5 py-0.2 rounded-xs flex items-center gap-1 font-mono font-medium">
-                              <Check className="w-2.5 h-2.5" />
-                              <span>Unlocked</span>
-                            </span>
-                          </span>
-                        ) : (
-                          <span className="text-xs font-semibold text-[#141414] truncate flex items-center gap-1.5">
-                            <span>{post.author_name || 'Prospect'}</span>
-                            <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.2 rounded-xs flex items-center gap-1 font-mono">
-                              <Lock className="w-2.5 h-2.5" />
-                              <span>Contact Locked</span>
-                            </span>
-                          </span>
-                        )}
+                        <span className="text-xs font-semibold text-[#141414] truncate">
+                          {post.author_name || 'Prospect'}
+                        </span>
 
                         {post.author_handle && (
                           <span className="text-[11px] text-[#8a8a86] font-mono truncate">
@@ -469,107 +444,7 @@ export const FeedTab: React.FC = () => {
                   )}
                 </div>
 
-                {/* Cascade Lead Contact Enrichment Strip */}
-                {isUnlocked && unlockData ? (
-                  <div className="mt-3.5 ml-8 p-3.5 bg-emerald-50/70 border border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-in fade-in duration-300">
-                    <div className="flex items-start gap-3 min-w-0">
-                      <div className="w-8 h-8 rounded-full bg-emerald-100 border border-emerald-300 flex items-center justify-center flex-shrink-0 mt-0.5">
-                        <CheckCircle2 className="w-4 h-4 text-emerald-700" />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-xs font-bold text-[#141414]">
-                            {unlockData.contact_name}
-                          </span>
-                          <span className="text-[11px] font-mono text-[#5f5f5a]">
-                            ({unlockData.company_name})
-                          </span>
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-white text-emerald-800 text-[10px] font-mono font-semibold rounded-full border border-emerald-300 shadow-2xs">
-                            <Check className="w-2.5 h-2.5" />
-                            Verified via {unlockData.enrichment_provider || 'QuickEnrich'}
-                          </span>
-                        </div>
-
-                        <div className="mt-1.5 flex flex-wrap items-center gap-3 text-xs font-mono">
-                          <span className="text-[#141414] font-semibold bg-white px-2 py-0.5 border border-emerald-200 select-all">
-                            ✉️ {unlockData.verified_email}
-                          </span>
-                          {unlockData.company_domain && (
-                            <a
-                              href={`https://${unlockData.company_domain}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-[#4a4a47] hover:text-[#141414] underline text-[11px]"
-                            >
-                              🌐 {unlockData.company_domain}
-                            </a>
-                          )}
-                          {unlockData.linkedin_url && (
-                            <a
-                              href={unlockData.linkedin_url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-blue-700 hover:text-blue-900 font-semibold underline text-[11px]"
-                            >
-                              LinkedIn Profile ↗
-                            </a>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2 flex-shrink-0">
-                      <button
-                        onClick={() => {
-                          navigator.clipboard.writeText(unlockData.verified_email || '');
-                          addToast('Verified email copied to clipboard!', 'success');
-                        }}
-                        className="px-2.5 py-1.5 bg-white hover:bg-emerald-100 border border-emerald-300 text-emerald-900 text-[11px] font-mono transition-colors cursor-pointer flex items-center gap-1.5 shadow-2xs"
-                        title="Copy verified email"
-                      >
-                        <Copy className="w-3 h-3" />
-                        <span>Copy Email</span>
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="mt-3.5 ml-8 p-3.5 bg-gradient-to-r from-[#fafaf8] to-[#f4f4f0] border border-[#deded8] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                    <div className="flex items-center gap-3 min-w-0">
-                      <div className="w-8 h-8 rounded-full bg-amber-50 border border-amber-200 flex items-center justify-center flex-shrink-0">
-                        <Lock className="w-3.5 h-3.5 text-amber-700" />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="text-xs font-semibold text-[#141414] flex items-center gap-2">
-                          <span>Verified Work Email & Decision Maker Identity</span>
-                          <span className="text-[10px] font-mono px-1.5 py-0.2 bg-amber-100 text-amber-900 rounded-sm font-medium">Cascade 5-Tier</span>
-                        </div>
-                        <p className="text-[11px] font-mono text-[#8a8a86] truncate">
-                          Deliverable SMTP-verified business email + Company domain + Direct LinkedIn profile
-                        </p>
-                      </div>
-                    </div>
-
-                    <button
-                      onClick={() => unlockLead(post)}
-                      disabled={isUnlockingLead[post.id]}
-                      className="inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-all cursor-pointer shadow-xs flex-shrink-0"
-                    >
-                      {isUnlockingLead[post.id] ? (
-                        <>
-                          <span className="w-3 h-3 border-2 border-white/20 border-t-white rounded-full animate-spin" />
-                          <span>Cascading Providers...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Zap className="w-3.5 h-3.5 text-emerald-400" />
-                          <span>Unlock Lead (3 Credits)</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                )}
-
-                {/* Footer with Phase 2 Action Buttons & Engagement */}
+                {/* Footer with Action Buttons & Engagement */}
                 <div className="mt-4 pt-3 border-t border-[#eeeeea] pl-8 flex flex-wrap items-center justify-between gap-4">
                   {/* Left: Engagement metrics */}
                   {post.engagement && (

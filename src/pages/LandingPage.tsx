@@ -93,6 +93,9 @@ const DEMO_LEADS: DemoLead[] = [
   },
 ];
 
+/** Resolved once at module load so the footer year is stable across renders. */
+const COPYRIGHT_YEAR = new Date().getFullYear();
+
 export const LandingPage: React.FC<LandingPageProps> = ({
   onNavigateAuth,
   onNavigateDashboard,
@@ -123,8 +126,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       a: 'Every morning at your configured schedule (e.g. 06:00 UTC), Echo sweeps public posts matching your keywords across X, LinkedIn, Reddit, Facebook B2B groups, and Google discussions. Matches are deduplicated and qualified straight into your feed.',
     },
     {
-      q: 'How does Echo prevent runaway API credit usage?',
-      a: 'Each sweep strictly caps pagination at 2 pages per keyword per platform. With 10 keywords, credit consumption remains strictly bounded and predictable.',
+      q: 'How does Echo prevent runaway API usage?',
+      a: 'Each sweep strictly caps pagination at 2 pages per keyword per platform, and disabled channels are skipped entirely. API consumption stays bounded and predictable.',
     },
     {
       q: 'Are historical duplicates prevented?',
@@ -436,7 +439,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 <span className="text-xl font-mono font-bold text-[#8a8a86]">01</span>
                 <h3 className="text-sm font-bold text-[#141414]">Set your keywords</h3>
                 <p className="text-xs text-[#4a4a47] font-mono leading-relaxed">
-                  Enter up to 10 keywords describing your buyer pain points, competitors, or category queries.
+                  Enter keywords describing your buyer pain points, competitors, or category queries — 5 on Starter, 10 on Pro, 25 on Scale.
                 </p>
               </div>
 
@@ -841,7 +844,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       <footer className="border-t border-[#e3e3de] bg-[#ffffff] py-6 px-6 text-xs font-mono text-[#8a8a86]">
         <div className="max-w-5xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
           <BrandLogo size="sm" />
-          <p>© {new Date().getFullYear()} Echo Social Intelligence. All rights reserved.</p>
+          <p>© {COPYRIGHT_YEAR} Echo Social Intelligence. All rights reserved.</p>
           <div className="flex items-center gap-3 text-[#4a4a47]">
             <span>X (Twitter)</span>
             <span>•</span>

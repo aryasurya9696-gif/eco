@@ -47,12 +47,13 @@ graph TD
 
 ### Phase 4: Billing, Plans & Workspace Preferences (Implemented)
 - **Subscription Tiers**:
-  - *Starter*: 5 keywords, 2 channels (X & LinkedIn), daily sweep, $29/month.
-  - *Pro* (Popular): 10 keywords, all 5 channels (X, IN, Reddit, FB, Google), AI outreach drafts, Slack alerts, $79/month.
-  - *Scale*: 25 keywords, all 5 channels, accelerated 12h sweep frequency, unlimited AI drafts, CRM sync, $199/month.
-- **Usage Meters**: Real-time tracking of active keywords (e.g. 4/10), monthly credits consumed (e.g. 240/1,000), and sweeps executed.
-- **Invoices & Billing History**: Downloadable PDF receipts and card management.
-- **Workspace Preferences**: Custom sweep time selector, lookback window selector (24h vs 48h vs 12h), active channel configuration, and API key overrides.
+  - *Starter*: 5 keywords, 2 channels (X & Web), daily 24h sweep, $29/month.
+  - *Pro* (Popular): 10 keywords, all 5 channels, AI outreach drafts, Slack alerts, $79/month.
+  - *Scale*: 25 keywords, all 5 channels, accelerated 6h sweep, unlimited exports, $199/month.
+- **Usage Meters**: Active keyword count against the plan limit (e.g. 4/10), mentions found this session, and the configured sweep cadence.
+- **Payment**: Stripe-hosted Checkout. A plan is activated server-side only after the `billing` edge function confirms `payment_status === 'paid'`. Card details never touch Echo.
+- **Workspace Preferences**: Custom sweep time, lookback window (24h/48h), active channel configuration, minimum intent threshold, and a Slack/Discord webhook.
+- **Retired**: the credit-based lead-unlocking system (per-lead credit packs, credit ledger, paywalled contact enrichment) was removed. Feed cards show the author and post directly with no paywall.
 
 ### Phase 5: CRM Sync & Enterprise (Roadmap)
 - Native two-way integrations with HubSpot, Salesforce, and Attio.

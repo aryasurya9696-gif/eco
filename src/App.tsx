@@ -5,6 +5,7 @@ import { LandingPage } from './pages/LandingPage';
 import { AuthPage } from './pages/AuthPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { ToastContainer } from './components/common/Toast';
+import { ErrorBoundary } from './components/common/ErrorBoundary';
 
 type Route = '/' | '/auth' | '/dashboard';
 
@@ -18,6 +19,11 @@ const MainRouter: React.FC = () => {
     if (window.location.pathname === '/dashboard') return '/dashboard';
     return '/';
   });
+
+  const navigate = (route: Route) => {
+    window.location.hash = route;
+    setCurrentRoute(route);
+  };
 
   // Sync hash routing
   useEffect(() => {
@@ -42,11 +48,6 @@ const MainRouter: React.FC = () => {
       navigate('/dashboard');
     }
   }, [user, currentRoute]);
-
-  const navigate = (route: Route) => {
-    window.location.hash = route;
-    setCurrentRoute(route);
-  };
 
   if (isLoading) {
     return (
@@ -109,11 +110,15 @@ const MainRouter: React.FC = () => {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <EchoProvider>
-        <MainRouter />
-        <ToastContainer />
-      </EchoProvider>
-    </AuthProvider>
+    <ErrorBoundary>
+      <AuthProvider>
+        <EchoProvider>
+          <ErrorBoundary>
+            <MainRouter />
+          </ErrorBoundary>
+          <ToastContainer />
+        </EchoProvider>
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }

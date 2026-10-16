@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useEcho } from '../../context/EchoContext';
+import { validateWebhookUrl, INTENT_THRESHOLD_OPTIONS } from '../../lib/constants';
 import {
   Save,
   Bell,
@@ -15,11 +16,16 @@ import {
   Radio,
 } from 'lucide-react';
 import { PlatformBadge } from '../common/PlatformBadge';
+import { getPlan } from '../../lib/billing';
+
+/** Single source of truth for webhook rules lives in lib/constants. */
+const validateWebhook = validateWebhookUrl;
 
 export const SettingsTab: React.FC = () => {
   const { user, profile, updateProfile } = useAuth();
   const {
     keywords,
+    keywordLimit,
     posts,
     slackWebhook,
     setSlackWebhook,
@@ -36,6 +42,8 @@ export const SettingsTab: React.FC = () => {
     enabledChannels,
     toggleChannel,
     saveSettings,
+    sendTestWebhook,
+    subscriptionPlan,
     addToast,
   } = useEcho();
 
@@ -43,26 +51,48 @@ export const SettingsTab: React.FC = () => {
   const [website, setWebsite] = useState<string>(profile?.website || '');
   const [coreOffer, setCoreOffer] = useState<string>(profile?.core_offer || '');
   const [isSaving, setIsSaving] = useState<boolean>(false);
+  const [isSendingTest, setIsSendingTest] = useState<boolean>(false);
+  const [webhookError, setWebhookError] = useState<string | null>(null);
+
+  const planDetails = getPlan(subscriptionPlan);
+
+  const handleWebhookChange = (value: string) => {
+    setSlackWebhook(value);
+    if (webhookError) setWebhookError(validateWebhook(value));
+  };
+
+  const handleWebhookBlur = () => setWebhookError(validateWebhook(slackWebhook));
 
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSaving(true);
-    await updateProfile({
+    const result = await updateProfile({
       full_name: fullName,
       website: website,
       core_offer: coreOffer,
     });
     await saveSettings();
     setIsSaving(false);
-    addToast('Workspace settings saved successfully.', 'success');
+    if (result.error) {
+      addToast(`Could not save: ${result.error}`, 'error');
+    }
   };
 
-  const handleTestSlack = () => {
-    if (!slackWebhook) {
-      addToast('Please enter a valid Slack or Discord webhook URL first.', 'error');
+  const handleTestSlack = async () => {
+    if (isSendingTest) return;
+
+    const invalid = validateWebhook(slackWebhook);
+    if (invalid) {
+      setWebhookError(invalid);
       return;
     }
-    addToast('Test payload dispatched to your webhook endpoint.', 'success');
+
+    setIsSendingTest(true);
+    const result = await sendTestWebhook();
+    setIsSendingTest(false);
+    if (!result.success) {
+      addToast(result.error || 'Could not reach the webhook.', 'error');
+    }
   };
 
   return (
@@ -294,15 +324,11 @@ export const SettingsTab: React.FC = () => {
 
                     <div className="pt-3 mt-2 border-t border-[#f6f6f4] flex items-center justify-between text-[10px] font-mono">
                       <span className="text-[#8a8a86]">
-                        {channel.supported
-                          ? isEnabled
-                            ? '● Scanning every sweep'
-                            : '○ Skipped during sweep'
-                          : 'Coming in v2 release'}
+                        {isEnabled ? '● Scanning every sweep' : '○ Skipped during sweep'}
                       </span>
                       {channel.supported && (
                         <span className={isEnabled ? 'text-emerald-700 font-semibold' : 'text-[#8a8a86]'}>
-                          {isEnabled ? '0 Credits Saved' : 'Credits Preserved'}
+                          {isEnabled ? 'API calls per sweep' : 'No API cost'}
                         </span>
                       )}
                     </div>
@@ -372,20 +398,31 @@ export const SettingsTab: React.FC = () => {
                   </label>
                   <button
                     type="button"
-                    onClick={handleTestSlack}
-                    className="text-[11px] font-mono text-[#141414] hover:underline cursor-pointer font-medium"
+                    onClick={() => void handleTestSlack()}
+                    disabled={isSendingTest || !slackWebhook}
+                    className="text-[11px] font-mono text-[#141414] hover:underline cursor-pointer font-medium disabled:opacity-40 disabled:cursor-not-allowed"
                   >
-                    Send Test Ping →
+                    {isSendingTest ? 'Sending…' : 'Send Test Ping →'}
                   </button>
                 </div>
 
                 <input
                   type="url"
                   value={slackWebhook}
-                  onChange={(e) => setSlackWebhook(e.target.value)}
+                  onChange={(e) => handleWebhookChange(e.target.value)}
+                  onBlur={handleWebhookBlur}
+                  aria-invalid={Boolean(webhookError)}
                   placeholder="https://hooks.slack.com/services/... or https://discord.com/api/webhooks/..."
-                  className="w-full px-3.5 py-2.5 bg-white border border-[#deded8] hover:border-[#b5b5b0] focus:border-[#141414] focus:ring-1 focus:ring-[#141414] text-xs font-mono text-[#141414] transition-colors outline-none"
+                  className={`w-full px-3.5 py-2.5 bg-white border hover:border-[#b5b5b0] focus:ring-1 focus:ring-[#141414] text-xs font-mono text-[#141414] transition-colors outline-none ${
+                    webhookError
+                      ? 'border-red-400 focus:border-red-500 focus:ring-red-200'
+                      : 'border-[#deded8] focus:border-[#141414]'
+                  }`}
                 />
+
+                {webhookError && (
+                  <p className="text-[11px] font-mono text-red-600">{webhookError}</p>
+                )}
 
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] font-mono text-[#8a8a86]">
                   <span>Triggers in real-time when new matching leads are parsed.</span>
@@ -402,12 +439,12 @@ export const SettingsTab: React.FC = () => {
                     Minimum Intent Alert Threshold
                   </span>
                   <span className="text-xs font-mono text-emerald-700 font-semibold bg-emerald-50 px-2 py-0.5 border border-emerald-200">
-                    {minIntentThreshold}%+ Score
+                    {minIntentThreshold === 0 ? 'No filtering' : `${minIntentThreshold}%+ Score`}
                   </span>
                 </div>
 
                 <div className="grid grid-cols-3 gap-2">
-                  {[80, 90, 95].map((threshold) => (
+                  {INTENT_THRESHOLD_OPTIONS.map((threshold) => (
                     <button
                       key={threshold}
                       type="button"
@@ -418,7 +455,9 @@ export const SettingsTab: React.FC = () => {
                           : 'bg-white text-[#4a4a47] border-[#deded8] hover:bg-[#f6f6f4]'
                       }`}
                     >
-                      {threshold}% {threshold === 90 ? '(Recommended)' : ''}
+                      {threshold === 0
+                        ? 'All mentions'
+                        : `${threshold}%${threshold === 75 ? ' (Recommended)' : ''}`}
                     </button>
                   ))}
                 </div>
@@ -624,7 +663,9 @@ export const SettingsTab: React.FC = () => {
             <div className="space-y-3 text-xs font-mono">
               <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">
                 <span className="text-[#8a8a86]">Account Plan:</span>
-                <span className="font-bold text-[#141414]">Pro Tier ($79/mo)</span>
+                <span className="font-bold text-[#141414]">
+                  {planDetails.name} (${planDetails.monthlyPrice}/mo)
+                </span>
               </div>
 
               <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">
@@ -636,7 +677,9 @@ export const SettingsTab: React.FC = () => {
 
               <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">
                 <span className="text-[#8a8a86]">Tracked Keywords:</span>
-                <span className="font-semibold text-[#141414]">{keywords.length} / 10 active</span>
+                <span className="font-semibold text-[#141414]">
+                  {keywords.length} / {keywordLimit} active
+                </span>
               </div>
 
               <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">

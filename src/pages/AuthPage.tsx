@@ -26,6 +26,10 @@ export const AuthPage: React.FC<AuthPageProps> = ({
       setError('Please provide both email and password.');
       return;
     }
+    if (mode === 'signup' && password.length < 8) {
+      setError('Password must be at least 8 characters.');
+      return;
+    }
 
     setError(null);
     setInfoMessage(null);

@@ -5,7 +5,7 @@ import { PillInput } from '../common/PillInput';
 import { ShieldCheck, Zap, Sparkles, Plus } from 'lucide-react';
 
 export const KeywordsTab: React.FC = () => {
-  const { keywords, addKeyword, removeKeyword, suggestKeywordsFromOffer, addToast, sweepTime, lookbackHours, enabledChannels } = useEcho();
+  const { keywords, keywordLimit, addKeyword, removeKeyword, suggestKeywordsFromOffer, addToast, sweepTime, lookbackHours, enabledChannels } = useEcho();
   const { profile } = useAuth();
   const [aiSuggestions, setAiSuggestions] = useState<string[]>([]);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
@@ -51,7 +51,7 @@ export const KeywordsTab: React.FC = () => {
           <div className="flex items-center gap-3">
             <button
               onClick={handleGenerateAiKeywords}
-              disabled={isGenerating || keywords.length >= 10}
+              disabled={isGenerating || keywords.length >= keywordLimit}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#f6f6f4] hover:bg-[#ecece7] border border-[#e3e3de] text-xs font-mono text-[#141414] transition-colors cursor-pointer disabled:opacity-40"
             >
               <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
@@ -60,13 +60,13 @@ export const KeywordsTab: React.FC = () => {
 
             <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-[#f6f6f4] border border-[#e3e3de] text-xs font-mono text-[#141414]">
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span>Active: {keywords.length} / 10 limit</span>
+              <span>Active: {keywords.length} / {keywordLimit} limit</span>
             </div>
           </div>
         </div>
 
         {/* AI Suggested Keywords Banner if triggered */}
-        {aiSuggestions.length > 0 && keywords.length < 10 && (
+        {aiSuggestions.length > 0 && keywords.length < keywordLimit && (
           <div className="mt-4 p-4 bg-[#fbfbfa] border border-[#e3e3de] space-y-2 animate-in fade-in duration-200">
             <span className="text-[11px] font-mono text-[#141414] font-semibold flex items-center gap-1.5">
               <Sparkles className="w-3 h-3 text-emerald-600" />
@@ -98,7 +98,7 @@ export const KeywordsTab: React.FC = () => {
             keywords={keywords.map((k) => k.keyword)}
             onAdd={handleAdd}
             onRemove={handleRemove}
-            max={10}
+            max={keywordLimit}
             placeholder="Type keyword and press Enter or comma..."
             showSuggestions={true}
           />

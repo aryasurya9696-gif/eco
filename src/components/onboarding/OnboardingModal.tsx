@@ -41,7 +41,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
         if (sugs && sugs.length > 0) setAiSuggestions(sugs);
       }).catch(() => {});
     }
-  }, [step, coreOffer, website]);
+  }, [step, coreOffer, website, suggestKeywordsFromOffer, aiSuggestions.length]);
 
   if (!isOpen) return null;
 

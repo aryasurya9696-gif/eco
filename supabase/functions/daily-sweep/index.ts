@@ -1,263 +1,469 @@
+// ============================================================================
 // Supabase Edge Function: daily-sweep
+// ----------------------------------------------------------------------------
+// Scheduled fan-out sweep across every user with active keywords.
 //
-// Deploy path: supabase/functions/daily-sweep/index.ts
-// Deploy with: supabase functions deploy daily-sweep --no-verify-jwt
+// SECURITY: runs with the service role key and spends real money on API
+// credits, so it is NOT publicly invokable. Callers must present the
+// SWEEP_CRON_SECRET header (pg_net / dashboard schedule / your own cron).
 //
-// Invoked once/day by pg_cron+pg_net or a Dashboard schedule (see PRD.md §11).
-// Uses the service role key to read every active keyword across every user
-// and bypass RLS when writing matched posts back into monitored_posts.
+// NOTE: this file is intentionally SELF-CONTAINED. Do not split shared helpers
+// into an underscore-prefixed folder — Supabase's bundler skips `_`-prefixed
+// directories and the relative import fails to resolve on deploy.
+//
+// Deploy:  supabase functions deploy daily-sweep --no-verify-jwt
+// Secrets: supabase secrets set SOCIALFETCH_API_KEY=sfk_...
+//          supabase secrets set SWEEP_CRON_SECRET=<long random string>
+// ============================================================================
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const SOCIALFETCH_API_KEY = Deno.env.get("SOCIALFETCH_API_KEY")!;
-const SOCIALFETCH_BASE = "https://api.socialfetch.dev";
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+const SOCIALFETCH_API_KEY = Deno.env.get('SOCIALFETCH_API_KEY') || '';
+const SWEEP_CRON_SECRET = Deno.env.get('SWEEP_CRON_SECRET') || '';
 
-// Cap pagination so a single busy keyword can't blow the day's credit budget.
-const MAX_PAGES_PER_KEYWORD_PER_PLATFORM = 2;
+/** Hard cap so one busy day can never run away. */
+const MAX_PAGES_PER_KEYWORD = 2;
+const MAX_USERS_PER_RUN = 500;
+const MAX_KEYWORDS_PER_USER = 25;
 
-type Keyword = {
-  id: string;
-  user_id: string;
-  keyword: string;
+type Platform = 'twitter' | 'linkedin' | 'reddit' | 'google';
+
+type SweepSettings = {
+  enabled_channels: Platform[] | null;
+  lookback_hours: number | null;
+  min_intent_threshold: number | null;
 };
 
-type MonitoredPostRow = {
-  user_id: string;
-  keyword_id: string;
-  matched_keyword: string;
-  platform: "twitter" | "linkedin";
-  post_url: string;
-  author_name: string | null;
-  author_handle: string | null;
-  author_avatar_url: string | null;
-  body: string | null;
-  posted_at: string | null;
-  engagement: Record<string, unknown> | null;
-  raw: unknown;
-};
+// ---------------------------------------------------------------------------
+// Intent scoring (mirrors the social-search function)
+// ---------------------------------------------------------------------------
+
+const HIGH_INTENT_PHRASES = [
+  'looking for', 'recommend', 'recommendation', 'alternative to', 'switching from',
+  'anyone using', 'best tool for', 'best software for', 'pricing', 'how much does',
+  'budget', 'quote', 'need software', 'any suggestions', 'help choosing', 'rfp',
+  'demo', 'trial', 'contract', 'enterprise plan', 'migration',
+];
+
+const MEDIUM_INTENT_PHRASES = [
+  'tool', 'software', 'automation', 'platform', 'integration', 'workflow',
+  'alternative', 'vs', 'versus',
+];
+
+const NEGATIVE_PHRASES = [
+  'hiring', 'job opening', 'we are looking for candidates', 'free template',
+  'looking to buy followers', 'crypto giveaway',
+];
+
+function calculateIntentScore(text: string): number {
+  if (!text) return 30;
+  const lower = text.toLowerCase();
+
+  let score = 30;
+  for (const p of HIGH_INTENT_PHRASES) if (lower.includes(p)) score += 9;
+  for (const p of MEDIUM_INTENT_PHRASES) if (lower.includes(p)) score += 3;
+  for (const p of NEGATIVE_PHRASES) if (lower.includes(p)) score -= 40;
+
+  return Math.max(0, Math.min(97, Math.round(score)));
+}
+
+function timeframeFor(lookbackHours: number): string {
+  if (lookbackHours <= 24) return 'day';
+  if (lookbackHours <= 72) return 'week';
+  if (lookbackHours <= 168) return 'month';
+  return 'year';
+}
+
+// ---------------------------------------------------------------------------
+// Transport
+// ---------------------------------------------------------------------------
+
+async function socialFetchGet(
+  path: string,
+  params: Record<string, string | undefined>,
+): Promise<any> {
+  const url = new URL('https://api.socialfetch.dev' + path);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined) url.searchParams.set(k, v);
+  }
+
+  const res = await fetch(url.toString(), {
+    headers: { 'x-api-key': SOCIALFETCH_API_KEY, Accept: 'application/json' },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`SocialFetch ${path} -> ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+async function fetchPaged(
+  path: string,
+  params: Record<string, string | undefined>,
+): Promise<any[]> {
+  const results: any[] = [];
+  let cursor: string | undefined;
+
+  for (let page = 0; page < MAX_PAGES_PER_KEYWORD; page++) {
+    const body = await socialFetchGet(path, { ...params, cursor });
+    const items = body?.data?.tweets ?? body?.data?.posts ?? body?.data?.results ?? [];
+    if (!Array.isArray(items) || items.length === 0) break;
+
+    results.push(...items);
+
+    cursor = body?.data?.page?.nextCursor;
+    if (!body?.data?.page?.hasMore || !cursor) break;
+  }
+  return results;
+}
 
 function yesterdayUtcDate(): string {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() - 1);
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+  return d.toISOString().slice(0, 10);
 }
 
 function todayUtcDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-async function socialFetchGet(
-  path: string,
-  params: Record<string, string | undefined>,
-): Promise<any> {
-  const url = new URL(SOCIALFETCH_BASE + path);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined) url.searchParams.set(k, v);
-  }
-  const res = await fetch(url.toString(), {
-    headers: { "x-api-key": SOCIALFETCH_API_KEY },
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Social Fetch ${path} failed: ${res.status} ${text}`);
-  }
-  return res.json();
-}
+// ---------------------------------------------------------------------------
+// Mappers
+// ---------------------------------------------------------------------------
 
-// ---- X (Twitter) search -----------------------------------------------
+type PostRow = {
+  user_id: string;
+  keyword_id: string;
+  matched_keyword: string;
+  platform: Platform;
+  channel_source: string;
+  post_url: string;
+  author_name: string | null;
+  author_handle: string | null;
+  author_avatar_url: string | null;
+  body: string | null;
+  posted_at: string | null;
+  intent_score: number;
+  status: 'new';
+  engagement: Record<string, number | null> | null;
+};
 
-async function searchTwitter(keyword: string): Promise<any[]> {
-  const results: any[] = [];
-  let cursor: string | undefined;
-  const startDate = yesterdayUtcDate();
-  const endDate = todayUtcDate();
-
-  for (let page = 0; page < MAX_PAGES_PER_KEYWORD_PER_PLATFORM; page++) {
-    const json = await socialFetchGet("/v1/twitter/search", {
-      query: keyword,
-      startDate,
-      endDate,
-      cursor,
-    });
-    const tweets = json?.data?.tweets ?? json?.data?.results ?? [];
-    results.push(...tweets);
-    const hasMore = json?.data?.page?.hasMore;
-    cursor = json?.data?.page?.nextCursor;
-    if (!hasMore || !cursor) break;
-  }
-  return results;
-}
-
-function mapTwitterResult(
-  tweet: any,
-  userId: string,
-  keywordId: string,
-  matchedKeyword: string,
-): MonitoredPostRow | null {
-  const url = tweet?.url ?? tweet?.permalink;
+function mapTwitter(tweet: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const url =
+    tweet?.url ?? tweet?.permalink ?? (tweet?.id ? `https://x.com/i/status/${tweet.id}` : null);
   if (!url) return null;
+
+  const body = tweet?.text ?? null;
   return {
     user_id: userId,
-    keyword_id: keywordId,
-    matched_keyword: matchedKeyword,
-    platform: "twitter",
+    keyword_id: kwId,
+    matched_keyword: kw,
+    platform: 'twitter',
+    channel_source: 'X / Twitter',
     post_url: url,
-    author_name: tweet?.author?.name ?? tweet?.author?.displayName ?? null,
-    author_handle: tweet?.author?.handle ?? tweet?.author?.username ?? null,
-    author_avatar_url: tweet?.author?.avatarUrl ?? tweet?.author?.profileImageUrl ?? null,
-    body: tweet?.text ?? tweet?.body ?? null,
-    posted_at: tweet?.createdAt ?? tweet?.postedAt ?? null,
+    author_name: tweet?.author?.displayName ?? tweet?.author?.name ?? null,
+    author_handle: tweet?.author?.handle ? `@${tweet.author.handle}` : null,
+    author_avatar_url: tweet?.author?.avatarUrl ?? null,
+    body,
+    posted_at: tweet?.createdAt ?? null,
+    intent_score: calculateIntentScore(body || ''),
+    status: 'new',
     engagement: {
-      likes: tweet?.likeCount ?? null,
-      retweets: tweet?.retweetCount ?? null,
-      replies: tweet?.replyCount ?? null,
+      likes: tweet?.metrics?.likes ?? null,
+      retweets: tweet?.metrics?.retweets ?? null,
+      replies: tweet?.metrics?.replies ?? null,
     },
-    raw: tweet,
   };
 }
 
-// ---- LinkedIn post search -----------------------------------------------
-
-async function searchLinkedIn(keyword: string): Promise<any[]> {
-  const results: any[] = [];
-  let cursor: string | undefined;
-
-  for (let page = 0; page < MAX_PAGES_PER_KEYWORD_PER_PLATFORM; page++) {
-    const json = await socialFetchGet("/v1/linkedin/posts/search", {
-      query: keyword,
-      datePosted: "last-day",
-      cursor,
-    });
-    const posts = json?.data?.posts ?? json?.data?.results ?? [];
-    results.push(...posts);
-    const hasMore = json?.data?.page?.hasMore;
-    cursor = json?.data?.page?.nextCursor;
-    if (!hasMore || !cursor) break;
-  }
-  return results;
-}
-
-function mapLinkedInResult(
-  post: any,
-  userId: string,
-  keywordId: string,
-  matchedKeyword: string,
-): MonitoredPostRow | null {
+function mapLinkedIn(post: any, userId: string, kwId: string, kw: string): PostRow | null {
   const url = post?.url ?? post?.permalink;
   if (!url) return null;
+
+  const body = post?.text ?? post?.body ?? post?.commentary ?? null;
   return {
     user_id: userId,
-    keyword_id: keywordId,
-    matched_keyword: matchedKeyword,
-    platform: "linkedin",
+    keyword_id: kwId,
+    matched_keyword: kw,
+    platform: 'linkedin',
+    channel_source: 'LinkedIn',
     post_url: url,
     author_name: post?.author?.name ?? null,
-    author_handle: post?.author?.headline ?? post?.author?.vanityName ?? null,
+    author_handle: post?.author?.vanityName ? `@${post.author.vanityName}` : null,
     author_avatar_url: post?.author?.avatarUrl ?? post?.author?.profilePictureUrl ?? null,
-    body: post?.text ?? post?.body ?? post?.commentary ?? null,
+    body,
     posted_at: post?.postedAt ?? post?.createdAt ?? null,
+    intent_score: calculateIntentScore(body || ''),
+    status: 'new',
     engagement: {
       likes: post?.likeCount ?? post?.reactionCount ?? null,
       comments: post?.commentCount ?? null,
       reposts: post?.repostCount ?? null,
     },
-    raw: post,
   };
 }
 
-// ---- Main handler -----------------------------------------------------
+function mapReddit(post: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const url = post?.permalink ?? post?.url ?? null;
+  if (!url) return null;
 
-Deno.serve(async () => {
+  const body = `${post?.title || ''} ${post?.bodyText || ''}`.trim() || null;
+  return {
+    user_id: userId,
+    keyword_id: kwId,
+    matched_keyword: kw,
+    platform: 'reddit',
+    channel_source: post?.subreddit ? `r/${post.subreddit}` : 'r/reddit',
+    post_url: url,
+    author_name: post?.author ? `u/${post.author}` : 'u/anonymous',
+    author_handle: post?.author ? `@${post.author}` : null,
+    author_avatar_url: null,
+    body,
+    posted_at: post?.createdAt ?? null,
+    intent_score: calculateIntentScore(body || ''),
+    status: 'new',
+    engagement: { likes: post?.score ?? null, comments: post?.commentCount ?? null },
+  };
+}
+
+function mapWeb(result: any, userId: string, kwId: string, kw: string): PostRow | null {
+  const url = result?.url;
+  if (!url) return null;
+
+  let domain = 'Web';
+  try {
+    domain = new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    /* keep default */
+  }
+
+  const body = `${result?.title || ''} — ${result?.content ?? ''}`.trim() || null;
+  return {
+    user_id: userId,
+    keyword_id: kwId,
+    matched_keyword: kw,
+    platform: 'google',
+    channel_source: domain,
+    post_url: url,
+    author_name: result?.title ?? 'Discussion Participant',
+    author_handle: `@${domain}`,
+    author_avatar_url: null,
+    body,
+    posted_at: result?.publishedAt ?? result?.date ?? null,
+    intent_score: calculateIntentScore(body || ''),
+    status: 'new',
+    engagement: { likes: null, comments: null },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
+
+Deno.serve(async (req) => {
+  // --- Gate: shared secret required ---------------------------------------
+  if (!SWEEP_CRON_SECRET) {
+    console.error('SWEEP_CRON_SECRET is not set — refusing to run.');
+    return json({ ok: false, error: 'sweep not configured' }, 503);
+  }
+
+  const provided =
+    req.headers.get('x-sweep-secret') ??
+    new URL(req.url).searchParams.get('secret') ??
+    '';
+  if (provided !== SWEEP_CRON_SECRET) {
+    return json({ ok: false, error: 'unauthorized' }, 401);
+  }
+
+  if (!SOCIALFETCH_API_KEY) {
+    return json({ ok: false, error: 'SOCIALFETCH_API_KEY not set' }, 503);
+  }
+
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
-  const { data: runRow, error: runInsertError } = await supabase
-    .from("sweep_runs")
-    .insert({})
-    .select()
-    .single();
-  if (runInsertError) {
-    console.error("Failed to create sweep_runs row", runInsertError);
-  }
+  const { data: runRow } = await supabase.from('sweep_runs').insert({}).select().single();
   const runId = runRow?.id;
 
-  const errors: Array<{ userId: string; keyword: string; platform: string; message: string }> = [];
+  const errors: Array<Record<string, string>> = [];
   let usersProcessed = 0;
   let postsInserted = 0;
 
   const { data: keywords, error: keywordsError } = await supabase
-    .from("keywords")
-    .select("id, user_id, keyword")
-    .eq("is_active", true);
+    .from('keywords')
+    .select('id, user_id, keyword')
+    .eq('is_active', true);
 
   if (keywordsError) {
-    console.error("Failed to load keywords", keywordsError);
-    return new Response(JSON.stringify({ ok: false, error: keywordsError.message }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
+    if (runId) {
+      await supabase
+        .from('sweep_runs')
+        .update({
+          finished_at: new Date().toISOString(),
+          errors: [{ stage: 'keywords', message: keywordsError.message }],
+        })
+        .eq('id', runId);
+    }
+    return json({ ok: false, error: keywordsError.message }, 500);
   }
 
-  const byUser = new Map<string, Keyword[]>();
-  for (const kw of (keywords ?? []) as Keyword[]) {
+  const byUser = new Map<string, Array<{ id: string; keyword: string }>>();
+  for (const kw of keywords ?? []) {
     const list = byUser.get(kw.user_id) ?? [];
-    list.push(kw);
+    if (list.length < MAX_KEYWORDS_PER_USER) list.push(kw);
     byUser.set(kw.user_id, list);
   }
 
-  for (const [userId, userKeywords] of byUser.entries()) {
+  // Cap the number of users processed in one run.
+  const userIds = [...byUser.keys()].slice(0, MAX_USERS_PER_RUN);
+  if (userIds.length < byUser.size) {
+    errors.push({
+      stage: 'cap',
+      message: `Run capped at ${MAX_USERS_PER_RUN} users; ${
+        byUser.size - MAX_USERS_PER_RUN
+      } deferred to the next run.`,
+    });
+  }
+
+  // Load every sweep user's settings in one round trip.
+  const { data: profiles } = await supabase
+    .from('profiles')
+    .select('id, enabled_channels, lookback_hours, min_intent_threshold')
+    .in('id', userIds);
+
+  const settingsByUser = new Map<string, SweepSettings>();
+  for (const p of profiles ?? []) {
+    settingsByUser.set(p.id, {
+      enabled_channels: p.enabled_channels,
+      lookback_hours: p.lookback_hours,
+      min_intent_threshold: p.min_intent_threshold,
+    });
+  }
+
+  const startDate = yesterdayUtcDate();
+  const endDate = todayUtcDate();
+
+  for (const userId of userIds) {
+    const userKeywords = byUser.get(userId) ?? [];
+    if (userKeywords.length === 0) continue;
+
     usersProcessed++;
-    const rowsToUpsert: MonitoredPostRow[] = [];
+
+    const settings = settingsByUser.get(userId);
+    const channels: Platform[] =
+      Array.isArray(settings?.enabled_channels) && settings.enabled_channels.length > 0
+        ? settings.enabled_channels
+        : ['twitter', 'reddit', 'google'];
+    const lookbackHours = Number(settings?.lookback_hours) || 24;
+    const minIntent = Number(settings?.min_intent_threshold) || 0;
+    const timeframe = timeframeFor(lookbackHours);
+
+    const rowsToUpsert: PostRow[] = [];
+    const seenUrls = new Set<string>();
 
     for (const kw of userKeywords) {
-      try {
-        const tweets = await searchTwitter(kw.keyword);
-        for (const t of tweets) {
-          const row = mapTwitterResult(t, userId, kw.id, kw.keyword);
-          if (row) rowsToUpsert.push(row);
-        }
-      } catch (e) {
-        errors.push({ userId, keyword: kw.keyword, platform: "twitter", message: String(e) });
+      const tasks: Array<Promise<PostRow[]>> = [];
+
+      if (channels.includes('twitter')) {
+        tasks.push(
+          fetchPaged('/v1/twitter/search', { query: kw.keyword, timeframe })
+            .then((items) =>
+              items.map((t) => mapTwitter(t, userId, kw.id, kw.keyword)).filter((r): r is PostRow => !!r),
+            )
+            .catch((e) => {
+              errors.push({ user: userId, kw: kw.keyword, platform: 'twitter', message: String(e) });
+              return [];
+            }),
+        );
       }
 
-      try {
-        const posts = await searchLinkedIn(kw.keyword);
-        for (const p of posts) {
-          const row = mapLinkedInResult(p, userId, kw.id, kw.keyword);
-          if (row) rowsToUpsert.push(row);
-        }
-      } catch (e) {
-        errors.push({ userId, keyword: kw.keyword, platform: "linkedin", message: String(e) });
+      if (channels.includes('linkedin')) {
+        tasks.push(
+          fetchPaged('/v1/linkedin/posts/search', {
+            query: kw.keyword,
+            timeframe,
+            startDate,
+            endDate,
+          })
+            .then((items) =>
+              items.map((p) => mapLinkedIn(p, userId, kw.id, kw.keyword)).filter((r): r is PostRow => !!r),
+            )
+            .catch((e) => {
+              errors.push({ user: userId, kw: kw.keyword, platform: 'linkedin', message: String(e) });
+              return [];
+            }),
+        );
+      }
+
+      if (channels.includes('reddit')) {
+        tasks.push(
+          fetchPaged('/v1/reddit/search', { query: kw.keyword, timeframe, sortBy: 'new' })
+            .then((items) =>
+              items.map((p) => mapReddit(p, userId, kw.id, kw.keyword)).filter((r): r is PostRow => !!r),
+            )
+            .catch((e) => {
+              errors.push({ user: userId, kw: kw.keyword, platform: 'reddit', message: String(e) });
+              return [];
+            }),
+        );
+      }
+
+      if (channels.includes('google')) {
+        tasks.push(
+          fetchPaged('/v1/web/search', { query: kw.keyword, timeframe })
+            .then((items) =>
+              items.map((r) => mapWeb(r, userId, kw.id, kw.keyword)).filter((r): r is PostRow => !!r),
+            )
+            .catch((e) => {
+              errors.push({ user: userId, kw: kw.keyword, platform: 'google', message: String(e) });
+              return [];
+            }),
+        );
+      }
+
+      const settled = await Promise.all(tasks);
+
+      for (const row of settled.flat()) {
+        if (row.intent_score < minIntent) continue;
+        const key = row.post_url.trim().toLowerCase();
+        if (seenUrls.has(key)) continue;
+        seenUrls.add(key);
+        rowsToUpsert.push(row);
       }
     }
 
     if (rowsToUpsert.length > 0) {
-      const { error: upsertError, count } = await supabase
-        .from("monitored_posts")
-        .upsert(rowsToUpsert, { onConflict: "user_id,post_url", ignoreDuplicates: true, count: "exact" });
+      const { error: upsertError } = await supabase
+        .from('monitored_posts')
+        .upsert(rowsToUpsert, { onConflict: 'user_id,post_url', ignoreDuplicates: true });
+
       if (upsertError) {
-        errors.push({ userId, keyword: "*", platform: "*", message: upsertError.message });
+        errors.push({ user: userId, kw: '*', platform: '*', message: upsertError.message });
       } else {
-        postsInserted += count ?? rowsToUpsert.length;
+        postsInserted += rowsToUpsert.length;
       }
     }
   }
 
   if (runId) {
     await supabase
-      .from("sweep_runs")
+      .from('sweep_runs')
       .update({
         finished_at: new Date().toISOString(),
         users_processed: usersProcessed,
         posts_inserted: postsInserted,
         errors,
       })
-      .eq("id", runId);
+      .eq('id', runId);
   }
 
-  return new Response(
-    JSON.stringify({ ok: true, usersProcessed, postsInserted, errorCount: errors.length }),
-    { headers: { "Content-Type": "application/json" } },
-  );
+  return json({ ok: true, usersProcessed, postsInserted, errorCount: errors.length });
 });
+
+function json(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}

@@ -1,0 +1,35 @@
+/**
+ * Echo — shared runtime constants
+ * ----------------------------------------------------------------------------
+ * Kept in its own module (not in a component file) so both components and
+ * contexts can import them without tripping the `only-export-components`
+ * fast-refresh lint.
+ */
+
+/**
+ * Webhook URL allow-list. MUST stay in sync with the
+ * guard_profile_webhook() trigger in
+ * supabase/migrations/20261017_security_hardening.sql
+ */
+export const WEBHOOK_PATTERN =
+  /^https:\/\/[a-zA-Z0-9.-]*\.(hooks\.slack\.com|slack\.com|discord\.com|discordapp\.com)\//;
+
+/** Returns an error message, or null when the URL is acceptable. */
+export function validateWebhookUrl(value: string): string | null {
+  const url = value.trim();
+  if (!url) return null;
+  if (!WEBHOOK_PATTERN.test(url)) {
+    return 'Webhook must be an https Slack (hooks.slack.com) or Discord (discord.com) URL.';
+  }
+  return null;
+}
+
+/** Platforms the sweep functions actually implement. */
+export const SUPPORTED_PLATFORMS = ['twitter', 'reddit', 'google'] as const;
+
+/** Score bounds produced by the intent algorithm in the edge functions. */
+export const INTENT_SCORE_MIN = 0;
+export const INTENT_SCORE_MAX = 97;
+
+/** Thresholds offered in Settings. 0 = show everything. */
+export const INTENT_THRESHOLD_OPTIONS = [0, 60, 75, 85] as const;

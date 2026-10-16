@@ -1,102 +1,190 @@
-# Echo — Supabase Setup & Deployment Guide
+# Echo — Supabase Backend
 
-This directory contains the database migration and the Edge Function for **Echo**, the automated keyword lead monitor for X and LinkedIn.
-
----
-
-## 1. Prerequisites
-
-- [Supabase CLI](https://supabase.com/docs/guides/cli) installed (`npm install -g supabase` or `scoop bucket add supabase https://github.com/supabase/scoop-bucket.git && scoop install supabase`)
-- A Supabase Project created at [supabase.com](https://supabase.com)
-- A SocialFetch API key from [socialfetch.dev](https://socialfetch.dev)
+Everything under `supabase/` is deployed to the project `fteoyqhogzuapfdledeg`.
 
 ---
 
-## 2. Apply Database Schema
+## 📁 Layout
 
-### Option A: Via Supabase Dashboard (Fastest)
-1. Navigate to your Supabase project dashboard -> **SQL Editor**.
-2. Open `supabase/migrations/20250101000000_echo_schema.sql` and paste the contents into the query editor.
-3. Click **Run**.
-
-### Option B: Via Supabase CLI
-```bash
-supabase link --project-ref <YOUR_PROJECT_REF>
-supabase db push
+```
+supabase/
+├── deploy-all.sql              <- paste this once into the SQL Editor
+├── migrations/                 <- numbered, run in order
+├── backup/                     <- data snapshots taken before destructive changes
+└── functions/
+    ├── ai/                     OpenAI proxy  (keyword suggestions, outreach drafts)
+    ├── social-search/          SocialFetch proxy (live sweep)
+    ├── billing/                Stripe Checkout for plan changes
+    └── daily-sweep/            scheduled fan-out sweep
 ```
 
----
-
-## 3. Disable Email Confirmations (Required for Instant Signup)
-
-As per the PRD spec, enable immediate sign-in without email verification:
-1. Go to Supabase Dashboard -> **Authentication** -> **Providers**.
-2. Select **Email**.
-3. Toggle **"Confirm email"** to **OFF**.
-4. Click **Save**.
+> Each function is **self-contained on purpose**. Supabase's bundler skips
+> underscore-prefixed directories, so a shared `_shared/` module fails to
+> resolve on deploy. If you add a helper, inline it or use a normal directory.
 
 ---
 
-## 4. Set Edge Function Secrets
+## 1. Apply the schema
 
-Set the SocialFetch API key in Supabase secrets so the Edge Function can authenticate:
+Dashboard → SQL Editor → paste [`deploy-all.sql`](deploy-all.sql) → Run.
+
+Idempotent: safe to run more than once.
+
+<details>
+<summary>Or run the numbered migrations individually</summary>
+
+| Order | File | Purpose |
+|---|---|---|
+| 1 | `20250101000000_echo_schema.sql` | `profiles`, `keywords`, `monitored_posts`, `sweep_runs` + RLS + triggers |
+| 2 | `20250102000000_add_enabled_channels.sql` | `profiles.enabled_channels` |
+| 3 | `20261017_security_hardening.sql` | Plan-aware keyword limit, `min_intent_threshold`, server-column guard, `apply_subscription_plan` |
+| 4 | `20261018_remove_credits_system.sql` | Drops the retired credit system |
+| 5 | `20261019_security_lint_cleanup.sql` | Advisor-driven fixes: RPC revokes, `(select auth.uid())` policies, FK index |
+| 6 | `20261020_backfill_and_constraints.sql` | Re-scores existing posts; adds `CHECK` constraints |
+| — | `20261016_lead_selling_credits.sql` | ⚠️ Legacy upgrade path only. Skip on a fresh install. |
+
+</details>
+
+> **Backup before migration 4** — it permanently drops `lead_unlocks` and
+> `credit_transactions`.
+
+---
+
+## 2. Set secrets
+
+None of the API keys belong in `.env` or the frontend bundle. Set them here:
 
 ```bash
-supabase secrets set SOCIALFETCH_API_KEY=sfk_your_socialfetch_key_here
+supabase secrets set SOCIALFETCH_API_KEY=sfk_...
+supabase secrets set OPENAI_API_KEY=sk-...
+supabase secrets set STRIPE_SECRET_KEY=sk_live_...
+supabase secrets set APP_ORIGIN=https://your-app.example
+supabase secrets set SWEEP_CRON_SECRET="$(openssl rand -hex 32)"
 ```
 
-*(Note: `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are automatically injected by Supabase into Edge Functions).*
+| Secret | Used by | Without it |
+|---|---|---|
+| `SOCIALFETCH_API_KEY` | `social-search`, `daily-sweep` | both return 503 |
+| `OPENAI_API_KEY` | `ai` | returns 503, client falls back to templates |
+| `STRIPE_SECRET_KEY` | `billing` | plan changes disabled (503) |
+| `APP_ORIGIN` | `billing` | redirect URLs broken |
+| `SWEEP_CRON_SECRET` | `daily-sweep` | sweep refuses to run at all |
+
+Optional: `ALLOWED_ORIGIN` (CORS origin, defaults `*`), `OPENAI_MODEL`
+(defaults `gpt-4o-mini`).
+
+Also enable **Dashboard → Authentication → Providers → Email → Leaked password
+protection**. It is the one remaining security advisory SQL cannot fix.
 
 ---
 
-## 5. Deploy the Daily Sweep Edge Function
-
-Deploy the function with `--no-verify-jwt` because it runs via cron / backend triggers using the service role:
+## 3. Deploy the functions
 
 ```bash
+supabase functions deploy social-search
+supabase functions deploy ai
+supabase functions deploy billing
 supabase functions deploy daily-sweep --no-verify-jwt
 ```
 
+| Function | JWT | Auth model |
+|---|---|---|
+| `ai` | required | User JWT, verified in code via `requireUserId()` |
+| `social-search` | required | Same |
+| `billing` | required | Same |
+| `daily-sweep` | disabled | `x-sweep-secret` header, compared to `SWEEP_CRON_SECRET` |
+
+`daily-sweep` runs with the service role key and spends real API credit, so it
+is deliberately not publicly invokable.
+
 ---
 
-## 6. Schedule Daily Sweep (06:00 UTC)
-
-### Option A: Supabase Dashboard Schedule (UI)
-1. Go to **Edge Functions** in your Supabase dashboard.
-2. Click on `daily-sweep`.
-3. Open the **Schedule** tab and set the cron expression:
-   `0 6 * * *` (06:00 UTC every day).
-
-### Option B: pg_cron + pg_net (SQL Editor)
-Run the following in your Supabase SQL editor (replace `<PROJECT_REF>` and `<SERVICE_ROLE_KEY>`):
+## 4. Schedule the sweep
 
 ```sql
-create extension if not exists pg_cron;
-create extension if not exists pg_net;
-
 select cron.schedule(
-  'daily-keyword-sweep',
+  'echo-daily-sweep',
   '0 6 * * *',
-  $$
-  select net.http_post(
-    url := 'https://<PROJECT_REF>.supabase.co/functions/v1/daily-sweep',
-    headers := jsonb_build_object(
-      'Authorization', 'Bearer ' || '<SERVICE_ROLE_KEY>',
-      'Content-Type', 'application/json'
-    ),
-    body := '{}'::jsonb
-  );
-  $$
+  $$ select net.http_post(
+       url     := 'https://fteoyqhogzuapfdledeg.supabase.co/functions/v1/daily-sweep',
+       headers := '{"Content-Type":"application","x-sweep-secret":"<SWEEP_CRON_SECRET>"}'::jsonb
+     ); $$
 );
 ```
 
+Manual trigger for testing:
+
+```bash
+curl -X POST \
+  https://fteoyqhogzuapfdledeg.supabase.co/functions/v1/daily-sweep \
+  -H "x-sweep-secret: $SWEEP_CRON_SECRET"
+```
+
+The function reads each user's `enabled_channels`, `lookback_hours` and
+`min_intent_threshold`, so per-workspace settings are respected. Results land in
+`monitored_posts`; the run is logged in `sweep_runs`.
+
 ---
 
-## 7. Frontend Environment Variables
+## 🔐 Security model
 
-Create `.env` in the root of the project with:
+| Concern | Protection |
+|---|---|
+| Vendor API keys | Edge Function secrets only — never `.env`, never the bundle |
+| Plan changes | `apply_subscription_plan` is `SECURITY DEFINER`, service-role only; clients cannot change their own plan |
+| Keyword limits | `enforce_keyword_limit` trigger derives the cap from `subscription_plan` |
+| `subscription_*` / `is_admin` | Blocked from client writes by a column `REVOKE` **and** a `BEFORE UPDATE` trigger |
+| Trigger functions | `EXECUTE` revoked from `anon`/`authenticated` so they are not RPCs |
+| RLS policies | All use `(select auth.uid())` for per-query initialisation |
+| `sweep_runs` | Explicit deny-by-default policy; service role only |
+| Webhook URLs | Allow-listed to Slack/Discord hosts by trigger + client validation |
+| Channels | `CHECK` restricts `enabled_channels` to twitter/reddit/google |
+| Intent threshold | `CHECK` restricts to 0–100 |
+| API budgets | Per-function rate limits + 2-page pagination cap + 500-user run cap |
 
-```env
-VITE_SUPABASE_URL=https://<your-project-ref>.supabase.co
-VITE_SUPABASE_ANON_KEY=eyJhbGciOi...<your-anon-key>
+### Intent scoring
+
+Both `social-search` and `daily-sweep` score identically:
+
 ```
+score = 30
+      + 9 per high-intent phrase  (looking for, recommend, pricing, budget, demo, …)
+      + 3 per supporting phrase    (tool, software, automation, workflow, …)
+      - 40 per disqualifying phrase (hiring, job opening, free template, …)
+clamped to 0..97
+```
+
+Levels: `high >= 85`, `medium >= 60`, `low < 60`.
+
+**Keep this in sync in three places:** the `social-search` function, the
+`daily-sweep` function, and `20261020_backfill_and_constraints.sql` (the
+backfill query).
+
+---
+
+## 🗄 Schema
+
+| Table | Notes |
+|---|---|
+| `profiles` | One row per user; plan, sweep settings, intent threshold |
+| `keywords` | 5/10/25 active depending on plan, enforced by trigger |
+| `monitored_posts` | Unique on `(user_id, post_url)`; written by edge functions |
+| `sweep_runs` | Cron audit log, service-role only |
+
+Client write access to `profiles` is limited to these columns:
+`full_name`, `website`, `core_offer`, `onboarding_completed`, `onboarding_step`,
+`email_digest`, `slack_webhook`, `lookback_hours`, `sweep_time_utc`,
+`sweep_frequency`, `enabled_channels`, `min_intent_threshold`.
+
+---
+
+## 🔁 Client ↔ server constants
+
+Keep these pairs in sync when changing a value:
+
+| Client | Server |
+|---|---|
+| `src/lib/billing.ts` → `keywordLimit` | `plan_keyword_limit()` |
+| `src/lib/constants.ts` → `WEBHOOK_PATTERN` | `guard_profile_webhook()` |
+| `src/lib/constants.ts` → `SUPPORTED_PLATFORMS` | `profiles_enabled_channels_supported` |
+| `src/lib/constants.ts` → `INTENT_THRESHOLD_OPTIONS` | `profiles_min_intent_threshold_range` |

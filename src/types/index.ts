@@ -15,8 +15,14 @@ export interface Profile {
   slack_webhook?: string | null;
   lookback_hours?: number;
   enabled_channels?: Platform[];
-  credits_balance?: number;
+  min_intent_threshold?: number;
   is_admin?: boolean;
+  sweep_time_utc?: string;
+  sweep_frequency?: string;
+  subscription_plan?: 'starter' | 'pro' | 'scale';
+  subscription_interval?: 'month' | 'year';
+  subscription_status?: 'active' | 'past_due' | 'canceled';
+  subscription_renews_at?: string;
   created_at: string;
   updated_at: string;
 }
@@ -28,30 +34,6 @@ export interface Keyword {
   is_active: boolean;
   created_at: string;
   mention_count?: number;
-}
-
-export interface LeadUnlock {
-  id: string;
-  user_id: string;
-  post_id: string;
-  credits_spent: number;
-  verified_email?: string | null;
-  email_status?: 'verified' | 'catch_all' | 'not_found';
-  enrichment_provider?: string | null;
-  contact_name?: string | null;
-  company_name?: string | null;
-  company_domain?: string | null;
-  linkedin_url?: string | null;
-  unlocked_at: string;
-}
-
-export interface CreditTransaction {
-  id: string;
-  user_id: string;
-  amount: number;
-  type: 'signup_bonus' | 'topup' | 'lead_unlock' | 'refund';
-  description: string;
-  created_at: string;
 }
 
 export interface MonitoredPost {
@@ -79,8 +61,6 @@ export interface MonitoredPost {
     reposts?: number | null;
   } | null;
   raw?: any;
-  is_unlocked?: boolean;
-  unlock_data?: LeadUnlock;
   created_at: string;
 }
 
@@ -94,25 +74,5 @@ export interface SweepRun {
 }
 
 export type DashboardTab = 'feed' | 'keywords' | 'settings' | 'billing';
-
-export interface PlanDetails {
-  id: 'starter' | 'pro' | 'scale';
-  name: string;
-  price: number;
-  interval: 'month';
-  keyword_limit: number;
-  sweep_cadence: string;
-  ai_drafts_enabled: boolean;
-  slack_alerts: boolean;
-  credits_included: number;
-}
-
-export interface InvoiceItem {
-  id: string;
-  date: string;
-  amount: number;
-  status: 'paid' | 'pending';
-  download_url: string;
-}
 
 export const APP_NAME = 'Echo';
