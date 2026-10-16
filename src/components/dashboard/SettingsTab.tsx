@@ -1,7 +1,11 @@
 import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useEcho } from '../../context/EchoContext';
-import { validateWebhookUrl, INTENT_THRESHOLD_OPTIONS } from '../../lib/constants';
+import {
+  validateWebhookUrl,
+  INTENT_THRESHOLD_OPTIONS,
+  RETENTION_OPTIONS,
+} from '../../lib/constants';
 import {
   Save,
   Bell,
@@ -39,6 +43,9 @@ export const SettingsTab: React.FC = () => {
     setSweepCadence,
     minIntentThreshold,
     setMinIntentThreshold,
+    feedRetentionDays,
+    setFeedRetentionDays,
+    pruneFeed,
     enabledChannels,
     toggleChannel,
     saveSettings,
@@ -462,6 +469,65 @@ export const SettingsTab: React.FC = () => {
                   ))}
                 </div>
               </div>
+
+              {/* ── Feed retention ─────────────────────────────────────── */}
+              <div className="space-y-2 pt-2 border-t border-[#eeeeea]">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-[#141414] font-mono">
+                    Feed retention
+                  </span>
+                  <span className="text-xs font-mono text-[#8a8a86]">
+                    {feedRetentionDays === 0
+                      ? 'Keeping everything'
+                      : `Keeping last ${feedRetentionDays} day${feedRetentionDays === 1 ? '' : 's'}`}
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap gap-1.5">
+                  {RETENTION_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.days}
+                      type="button"
+                      onClick={() => setFeedRetentionDays(opt.days)}
+                      className={`px-2.5 py-1.5 text-[11px] font-mono border transition-all duration-150 cursor-pointer active:scale-[0.97] ${
+                        feedRetentionDays === opt.days
+                          ? 'bg-[#141414] text-white border-[#141414]'
+                          : 'bg-white text-[#4a4a47] border-[#e3e3de] hover:border-[#b5b5b0] hover:bg-[#f6f6f4]'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+
+                <p className="text-[11px] font-mono text-[#8a8a86] leading-relaxed">
+                  After every sweep, mentions older than this window are deleted automatically.
+                  Whatever that sweep just found is always kept.
+                </p>
+
+                {posts.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await saveSettings();
+                      const result = await pruneFeed();
+                      if (result.success) {
+                        addToast(
+                          result.deleted
+                            ? `Removed ${result.deleted} expired mention(s).`
+                            : 'Nothing expired yet.',
+                          'success',
+                        );
+                      } else {
+                        addToast(result.error || 'Could not prune the feed.', 'error');
+                      }
+                    }}
+                    className="mt-1 px-3 py-1.5 text-[11px] font-mono border border-[#e3e3de] bg-white text-[#4a4a47] hover:bg-[#f6f6f4] hover:border-[#b5b5b0] transition-all duration-150 cursor-pointer active:scale-[0.97]"
+                  >
+                    Apply now
+                  </button>
+                )}
+              </div>
             </div>
           </div>
 
@@ -477,7 +543,7 @@ export const SettingsTab: React.FC = () => {
                     Automated Sweep Schedule & Timing
                   </h3>
                   <p className="text-xs text-[#8a8a86] font-mono">
-                    Configure custom execution hours, cadence, and credit safety parameters.
+                    Configure custom execution hours, cadence and sweep scope.
                   </p>
                 </div>
               </div>

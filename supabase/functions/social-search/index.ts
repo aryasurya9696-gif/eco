@@ -299,7 +299,6 @@ Deno.serve(async (req) => {
   const userId = await requireUserId(req);
   if (!userId) return fail('Unauthorized', 401);
 
-  // 30 searches / hour / user — bounds worst-case API spend per session.
   if (!rateLimit('search:' + userId, 30, 60 * 60 * 1000)) {
     return fail('Search rate limit reached. Please try again in a few minutes.', 429);
   }
@@ -313,6 +312,10 @@ Deno.serve(async (req) => {
   const admin = createClient(supabaseUrl, serviceKey, {
     auth: { persistSession: false },
   });
+
+  // Captured BEFORE any search runs. prune_feed() uses this so the batch this
+  // sweep is about to write is never deleted by the retention pass.
+  const sweepStartedAt = new Date().toISOString();
 
   // --- Load authoritative user settings (service role bypasses RLS) --------
   // min_intent_threshold arrives with the 20261017 migration. Fall back to a
@@ -468,12 +471,43 @@ Deno.serve(async (req) => {
     }
   }
 
+  // --- Retention pass ------------------------------------------------------
+  // Runs after the upsert so this sweep's own results are already saved, and
+  // is passed sweepStartedAt so they are never treated as stale.
+  const pruned = await pruneOldMentions(admin, userId, sweepStartedAt);
+
   return json({
     ok: true,
     posts: collected,
     scanned: keywords.length,
     channels: enabledChannels,
     lookback_hours: lookbackHours,
+    pruned,
     errors: errors.length > 0 ? errors : undefined,
   });
 });
+
+/**
+ * Retention pass. Removes mentions older than the workspace's retention window,
+ * but never removes anything written by the sweep currently in flight.
+ */
+async function pruneOldMentions(
+  admin: ReturnType<typeof createClient>,
+  userId: string,
+  keepAfter: string,
+): Promise<number> {
+  try {
+    const { data, error } = await admin.rpc('prune_feed', {
+      p_user_id: userId,
+      p_keep_after: keepAfter,
+    });
+    if (error) {
+      console.warn('[social-search] prune failed:', error.message);
+      return 0;
+    }
+    return typeof data?.deleted === 'number' ? data.deleted : 0;
+  } catch (err) {
+    console.warn('[social-search] prune threw:', err);
+    return 0;
+  }
+}

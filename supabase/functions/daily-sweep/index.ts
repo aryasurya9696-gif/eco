@@ -283,12 +283,17 @@ Deno.serve(async (req) => {
 
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
+  // Captured before any network work so the retention pass at the end of each
+  // user's sweep cannot delete the results that sweep just produced.
+  const sweepStartedAt = new Date().toISOString();
+
   const { data: runRow } = await supabase.from('sweep_runs').insert({}).select().single();
   const runId = runRow?.id;
 
   const errors: Array<Record<string, string>> = [];
   let usersProcessed = 0;
   let postsInserted = 0;
+  let pruned = 0;
 
   const { data: keywords, error: keywordsError } = await supabase
     .from('keywords')
@@ -444,6 +449,21 @@ Deno.serve(async (req) => {
         postsInserted += rowsToUpsert.length;
       }
     }
+
+    // Retention pass for this user. sweepStartedAt keeps this sweep's results.
+    try {
+      const { data: prune, error: pruneError } = await supabase.rpc('prune_feed', {
+        p_user_id: userId,
+        p_keep_after: sweepStartedAt,
+      });
+      if (pruneError) {
+        errors.push({ user: userId, kw: '*', platform: 'prune', message: pruneError.message });
+      } else if (typeof prune?.deleted === 'number' && prune.deleted > 0) {
+        pruned += prune.deleted;
+      }
+    } catch (pruneErr) {
+      errors.push({ user: userId, kw: '*', platform: 'prune', message: String(pruneErr) });
+    }
   }
 
   if (runId) {
@@ -458,7 +478,7 @@ Deno.serve(async (req) => {
       .eq('id', runId);
   }
 
-  return json({ ok: true, usersProcessed, postsInserted, errorCount: errors.length });
+  return json({ ok: true, usersProcessed, postsInserted, pruned, errorCount: errors.length });
 });
 
 function json(body: unknown, status = 200) {

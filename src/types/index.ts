@@ -16,6 +16,8 @@ export interface Profile {
   lookback_hours?: number;
   enabled_channels?: Platform[];
   min_intent_threshold?: number;
+  /** 0 = keep forever; otherwise days of mentions to retain. */
+  feed_retention_days?: number;
   is_admin?: boolean;
   sweep_time_utc?: string;
   sweep_frequency?: string;

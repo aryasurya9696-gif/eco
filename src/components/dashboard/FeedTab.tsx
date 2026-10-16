@@ -1,25 +1,58 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useEcho } from '../../context/EchoContext';
 import type { MonitoredPost } from '../../types';
-import { PlatformBadge } from '../common/PlatformBadge';
-import {
-  ExternalLink,
-  Search,
-  Heart,
-  MessageSquare,
-  Repeat,
-  Clock,
-  Sparkles,
-  ChevronLeft,
-  ChevronRight,
-  Download,
-  Bookmark,
-  CheckCircle,
-  Copy,
-  Check,
-  Code,
-  X
-} from 'lucide-react';
+import { FeedCard } from './FeedCard';
+import { FeedSummary, FeedSkeleton } from './FeedSummary';
+import { Search, X, Sparkles, Clock, Trash2 } from 'lucide-react';
+
+/**
+ * Buckets posts by calendar day so the feed is scannable over time instead of
+ * being one flat list. Uses local midnight, matching what the user sees.
+ */
+function groupByDay(
+  posts: MonitoredPost[],
+  now: number,
+): Array<{ label: string; posts: MonitoredPost[] }> {
+  const dayKey = (t: number) => {
+    const d = new Date(t);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+      d.getDate(),
+    ).padStart(2, '0')}`;
+  };
+
+  const buckets = new Map<string, MonitoredPost[]>();
+  for (const post of posts) {
+    const ts = post.posted_at ? new Date(post.posted_at).getTime() : NaN;
+    const key = dayKey(Number.isNaN(ts) ? now : ts);
+    const list = buckets.get(key) ?? [];
+    list.push(post);
+    buckets.set(key, list);
+  }
+
+  const today = dayKey(now);
+  const yesterdayDate = new Date(now);
+  yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+  const yesterday = dayKey(yesterdayDate.getTime());
+
+  return [...buckets.entries()]
+    .sort((a, b) => (a[0] < b[0] ? 1 : -1))
+    .map(([key, list]) => {
+      let label: string;
+      if (key === today) {
+        label = 'Today';
+      } else if (key === yesterday) {
+        label = 'Yesterday';
+      } else {
+        const [y, m, d] = key.split('-').map(Number);
+        label = new Date(y, m - 1, d).toLocaleDateString(undefined, {
+          weekday: 'short',
+          day: 'numeric',
+          month: 'short',
+        });
+      }
+      return { label, posts: list };
+    });
+}
 
 export const FeedTab: React.FC = () => {
   const {
@@ -43,57 +76,45 @@ export const FeedTab: React.FC = () => {
     exportPostsToJson,
     enabledChannels,
     minIntentThreshold,
+    clearFeed,
+    feedRetentionDays,
     addToast,
   } = useEcho();
 
   const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>({});
   const [currentPage, setCurrentPage] = useState<number>(1);
+  const [showFilters, setShowFilters] = useState<boolean>(false);
+  const [confirmClear, setConfirmClear] = useState<boolean>(false);
+  const [isClearing, setIsClearing] = useState<boolean>(false);
   const itemsPerPage = 20;
 
   // A single ticking clock keeps relative timestamps stable between renders
   // instead of calling Date.now() during render.
   const [now, setNow] = useState<number>(() => Date.now());
-  React.useEffect(() => {
+  useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 60000);
     return () => clearInterval(id);
   }, []);
 
-  // Modals
+  // AI outreach modal
   const [aiDraftModalPost, setAiDraftModalPost] = useState<MonitoredPost | null>(null);
-  const [draftTone, setDraftTone] = useState<'professional' | 'casual' | 'consultative' | 'direct'>('consultative');
+  const [draftTone, setDraftTone] = useState<
+    'professional' | 'casual' | 'consultative' | 'direct'
+  >('consultative');
   const [draftText, setDraftText] = useState<string>('');
   const [isGeneratingDraft, setIsGeneratingDraft] = useState<boolean>(false);
   const [copiedDraft, setCopiedDraft] = useState<boolean>(false);
 
-  const [inspectModalPost, setInspectModalPost] = useState<MonitoredPost | null>(null);
-
-  const toggleExpand = (id: string) => {
+  const toggleExpand = (id: string) =>
     setExpandedCards((prev) => ({ ...prev, [id]: !prev[id] }));
-  };
-
-  const getRelativeTime = (isoDate: string | null) => {
-    if (!isoDate) return 'Recently';
-    const diffMs = now - new Date(isoDate).getTime();
-    if (diffMs < 0) return 'just now';
-    const diffSec = Math.floor(diffMs / 1000);
-    const diffMin = Math.floor(diffSec / 60);
-    const diffHours = Math.floor(diffMin / 60);
-    const diffDays = Math.floor(diffHours / 24);
-
-    if (diffDays > 0) return `${diffDays}d ago`;
-    if (diffHours > 0) return `${diffHours}h ago`;
-    if (diffMin > 0) return `${diffMin}m ago`;
-    return 'just now';
-  };
 
   const handleOpenAiDraft = async (post: MonitoredPost) => {
     setAiDraftModalPost(post);
     setCopiedDraft(false);
     setIsGeneratingDraft(true);
-    setDraftText('AI is crafting a personalized, high-converting outreach reply...');
+    setDraftText('AI is drafting a personalised reply...');
     try {
-      const text = await generateAiDraft(post, draftTone);
-      setDraftText(text);
+      setDraftText(await generateAiDraft(post, draftTone));
     } catch {
       setDraftText('');
     } finally {
@@ -101,105 +122,183 @@ export const FeedTab: React.FC = () => {
     }
   };
 
-  const handleChangeTone = async (tone: 'professional' | 'casual' | 'consultative' | 'direct') => {
+  const handleChangeTone = async (
+    tone: 'professional' | 'casual' | 'consultative' | 'direct',
+  ) => {
     setDraftTone(tone);
     if (aiDraftModalPost) {
       setIsGeneratingDraft(true);
       try {
-        const text = await generateAiDraft(aiDraftModalPost, tone);
-        setDraftText(text);
+        setDraftText(await generateAiDraft(aiDraftModalPost, tone));
       } catch {
-        // preserve
+        /* keep previous draft */
       } finally {
         setIsGeneratingDraft(false);
       }
     }
   };
 
-  const handleCopyDraft = () => {
-    navigator.clipboard.writeText(draftText);
-    setCopiedDraft(true);
-    addToast('Outreach response copied to clipboard.', 'success');
-    setTimeout(() => setCopiedDraft(false), 2000);
+  const handleCopyDraft = async () => {
+    try {
+      await navigator.clipboard.writeText(draftText);
+      addToast('Draft copied to clipboard.', 'success');
+      setCopiedDraft(true);
+      setTimeout(() => setCopiedDraft(false), 2000);
+    } catch {
+      addToast('Could not access the clipboard.', 'error');
+    }
   };
 
-  // Reset platform filter if user disables that channel in settings
-  React.useEffect(() => {
+  // Reset the platform filter if that channel was turned off in Settings.
+  useEffect(() => {
     if (filterPlatform !== 'all' && !enabledChannels.includes(filterPlatform)) {
       setFilterPlatform('all');
     }
   }, [enabledChannels, filterPlatform, setFilterPlatform]);
 
-  // Filter posts
-  const filteredPosts = posts.filter((post) => {
-    // 1. Hide posts from channels that the user turned OFF in Settings
-    if (enabledChannels.length > 0 && !enabledChannels.includes(post.platform)) {
-      return false;
-    }
-    // 2. Honour the workspace intent threshold (also applied server-side)
-    if (minIntentThreshold > 0 && (post.intent_score ?? 0) < minIntentThreshold) {
-      return false;
-    }
-    if (filterKeyword !== 'all' && post.matched_keyword.toLowerCase() !== filterKeyword.toLowerCase()) {
-      return false;
-    }
-    if (filterPlatform !== 'all' && post.platform !== filterPlatform) {
-      return false;
-    }
-    if (filterStatus !== 'all' && post.status !== filterStatus) {
-      return false;
-    }
-    if (filterSearch.trim()) {
-      const q = filterSearch.toLowerCase();
-      const matchBody = post.body?.toLowerCase().includes(q) ?? false;
-      const matchAuthor = post.author_name?.toLowerCase().includes(q) ?? false;
-      const matchHandle = post.author_handle?.toLowerCase().includes(q) ?? false;
-      if (!matchBody && !matchAuthor && !matchHandle) return false;
-    }
-    return true;
-  });
+  const filteredPosts = useMemo(
+    () =>
+      posts.filter((post) => {
+        // Hide posts from channels the user turned off.
+        if (enabledChannels.length > 0 && !enabledChannels.includes(post.platform)) {
+          return false;
+        }
+        // Workspace intent threshold (also applied server-side).
+        if (minIntentThreshold > 0 && (post.intent_score ?? 0) < minIntentThreshold) {
+          return false;
+        }
+        if (filterKeyword !== 'all' && post.matched_keyword.toLowerCase() !== filterKeyword.toLowerCase()) {
+          return false;
+        }
+        if (filterPlatform !== 'all' && post.platform !== filterPlatform) {
+          return false;
+        }
+        if (filterStatus !== 'all' && post.status !== filterStatus) {
+          return false;
+        }
+        if (filterSearch.trim()) {
+          const q = filterSearch.toLowerCase();
+          const matchBody = post.body?.toLowerCase().includes(q) ?? false;
+          const matchAuthor = post.author_name?.toLowerCase().includes(q) ?? false;
+          const matchHandle = post.author_handle?.toLowerCase().includes(q) ?? false;
+          if (!matchBody && !matchAuthor && !matchHandle) return false;
+        }
+        return true;
+      }),
+    [
+      posts,
+      enabledChannels,
+      minIntentThreshold,
+      filterKeyword,
+      filterPlatform,
+      filterStatus,
+      filterSearch,
+    ],
+  );
 
   const totalPages = Math.ceil(filteredPosts.length / itemsPerPage) || 1;
   const paginatedPosts = filteredPosts.slice(
     (currentPage - 1) * itemsPerPage,
-    currentPage * itemsPerPage
+    currentPage * itemsPerPage,
   );
+  const dayGroups = useMemo(() => groupByDay(paginatedPosts, now), [paginatedPosts, now]);
+
+  const activeFilterCount =
+    (filterPlatform !== 'all' ? 1 : 0) +
+    (filterStatus !== 'all' ? 1 : 0) +
+    (filterKeyword !== 'all' ? 1 : 0);
+
+  const resetFilters = () => {
+    setFilterKeyword('all');
+    setFilterPlatform('all');
+    setFilterStatus('all');
+    setFilterSearch('');
+  };
+
+  const handleClearFeed = async () => {
+    setIsClearing(true);
+    const result = await clearFeed();
+    setIsClearing(false);
+    setConfirmClear(false);
+
+    if (result.success) {
+      addToast(
+        `Cleared ${result.deleted ?? 0} mention${(result.deleted ?? 0) === 1 ? '' : 's'}.`,
+        'success',
+      );
+    } else {
+      addToast(result.error || 'Could not clear the feed.', 'error');
+    }
+  };
 
   return (
-    <div className="space-y-6">
-      {/* Top Filter & Actions Bar */}
-      <div className="bg-[#ffffff] border border-[#e3e3de] p-4 flex flex-col gap-4">
-        {/* Row 1: Source toggle, status filter, keyword selector */}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-3">
-            {/* Platform Toggle: Only show channels active in user settings */}
-            <div className="inline-flex flex-wrap border border-[#e3e3de] bg-[#f6f6f4] p-0.5 text-xs font-mono">
+    <div className="max-w-4xl space-y-4">
+      {/* ── Summary header ──────────────────────────────────────────────── */}
+      <FeedSummary
+        posts={posts}
+        filteredCount={filteredPosts.length}
+        minIntentThreshold={minIntentThreshold}
+        onToggleFilters={() => setShowFilters((v) => !v)}
+        activeFilterCount={activeFilterCount}
+        onExportCsv={() => exportPostsToCsv(filteredPosts)}
+        onExportJson={() => exportPostsToJson(filteredPosts)}
+        onClearFeed={() => setConfirmClear(true)}
+        isClearing={isClearing}
+      />
+
+      {/* ── Search + filters ────────────────────────────────────────────── */}
+      <div className="bg-white border border-[#e3e3de]">
+        <div className="flex items-center gap-2 p-3">
+          <div className="relative flex-1 min-w-0">
+            <Search className="w-3.5 h-3.5 text-[#8a8a86] absolute left-3 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              value={filterSearch}
+              onChange={(e) => {
+                setFilterSearch(e.target.value);
+                setCurrentPage(1);
+              }}
+              placeholder="Search mentions by text, author or handle..."
+              className="w-full pl-9 pr-3 py-2 bg-[#f6f6f4] border border-transparent text-xs text-[#141414] placeholder:text-[#9b9b96] focus:outline-none focus:bg-white focus:border-[#141414] transition-all duration-150"
+            />
+          </div>
+        </div>
+
+        {/* Collapsible filter row */}
+        {showFilters && (
+          <div className="px-3 pb-3 pt-1 border-t border-[#f4f4f0] flex flex-wrap items-center gap-2">
+            <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] mr-1">
+              Channel
+            </span>
+            <div className="inline-flex border border-[#e3e3de] bg-white">
               <button
+                type="button"
                 onClick={() => {
                   setFilterPlatform('all');
                   setCurrentPage(1);
                 }}
-                className={`px-2.5 sm:px-3 py-1.5 transition-colors cursor-pointer ${
+                className={`px-2.5 py-1 text-[11px] font-mono transition-colors cursor-pointer ${
                   filterPlatform === 'all'
-                    ? 'bg-[#141414] text-white font-medium shadow-xs'
-                    : 'text-[#4a4a47] hover:text-[#141414]'
+                    ? 'bg-[#141414] text-white'
+                    : 'text-[#4a4a47] hover:bg-[#f6f6f4]'
                 }`}
               >
-                All Active ({enabledChannels.length})
+                All
               </button>
               {(['twitter', 'reddit', 'google'] as const)
                 .filter((p) => enabledChannels.includes(p))
                 .map((p) => (
                   <button
                     key={p}
+                    type="button"
                     onClick={() => {
                       setFilterPlatform(p);
                       setCurrentPage(1);
                     }}
-                    className={`px-2.5 sm:px-3 py-1.5 transition-colors cursor-pointer ${
+                    className={`px-2.5 py-1 text-[11px] font-mono border-l border-[#e3e3de] transition-colors cursor-pointer ${
                       filterPlatform === p
-                        ? 'bg-[#141414] text-white font-medium shadow-xs'
-                        : 'text-[#4a4a47] hover:text-[#141414]'
+                        ? 'bg-[#141414] text-white'
+                        : 'text-[#4a4a47] hover:bg-[#f6f6f4]'
                     }`}
                   >
                     {p === 'twitter' ? 'X' : p === 'reddit' ? 'Reddit' : 'Web'}
@@ -207,19 +306,22 @@ export const FeedTab: React.FC = () => {
                 ))}
             </div>
 
-            {/* Status Filter */}
-            <div className="inline-flex border border-[#e3e3de] bg-[#ffffff] p-0.5 text-xs font-mono">
+            <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] ml-2 mr-1">
+              Status
+            </span>
+            <div className="inline-flex border border-[#e3e3de] bg-white">
               {(['all', 'new', 'saved', 'contacted'] as const).map((s) => (
                 <button
                   key={s}
+                  type="button"
                   onClick={() => {
                     setFilterStatus(s);
                     setCurrentPage(1);
                   }}
-                  className={`px-2.5 py-1.5 transition-colors cursor-pointer uppercase ${
+                  className={`px-2.5 py-1 text-[11px] font-mono border-l first:border-l-0 border-[#e3e3de] uppercase transition-colors cursor-pointer ${
                     filterStatus === s
-                      ? 'bg-[#141414] text-white font-medium'
-                      : 'text-[#8a8a86] hover:text-[#141414]'
+                      ? 'bg-[#141414] text-white'
+                      : 'text-[#4a4a47] hover:bg-[#f6f6f4]'
                   }`}
                 >
                   {s}
@@ -227,491 +329,305 @@ export const FeedTab: React.FC = () => {
               ))}
             </div>
 
-            {/* Keyword Selector */}
-            <div className="relative">
+            <div className="relative ml-2">
               <select
                 value={filterKeyword}
                 onChange={(e) => {
                   setFilterKeyword(e.target.value);
                   setCurrentPage(1);
                 }}
-                className="appearance-none bg-[#ffffff] border border-[#e3e3de] px-3 py-1.5 pr-8 text-xs font-mono text-[#141414] focus:outline-none focus:border-[#141414] cursor-pointer"
+                className="appearance-none bg-white border border-[#e3e3de] px-2.5 py-1 pr-7 text-[11px] font-mono text-[#141414] focus:outline-none focus:border-[#141414] cursor-pointer"
               >
-                <option value="all">All Keywords ({keywords.length})</option>
+                <option value="all">All keywords</option>
                 {keywords.map((kw) => (
                   <option key={kw.id} value={kw.keyword}>
                     {kw.keyword}
                   </option>
                 ))}
               </select>
-              <div className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-[#8a8a86] text-[10px]">
+              <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[#8a8a86] text-[9px]">
                 ▼
-              </div>
+              </span>
             </div>
+
+            {activeFilterCount > 0 && (
+              <button
+                type="button"
+                onClick={resetFilters}
+                className="ml-auto inline-flex items-center gap-1 text-[11px] font-mono text-[#4a4a47] hover:text-[#141414] underline cursor-pointer"
+              >
+                <X className="w-3 h-3" />
+                Clear filters
+              </button>
+            )}
           </div>
-
-          {/* Right Export Controls */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <button
-              onClick={() => exportPostsToCsv(filteredPosts)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#ffffff] hover:bg-[#f6f6f4] border border-[#e3e3de] text-xs font-mono text-[#141414] transition-colors cursor-pointer"
-              title="Export visible leads to CSV"
-            >
-              <Download className="w-3.5 h-3.5 text-[#8a8a86]" />
-              <span className="hidden sm:inline">Export CSV</span>
-            </button>
-
-            <button
-              onClick={() => exportPostsToJson(filteredPosts)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#ffffff] hover:bg-[#f6f6f4] border border-[#e3e3de] text-xs font-mono text-[#141414] transition-colors cursor-pointer"
-              title="Export visible leads to JSON"
-            >
-              <Code className="w-3.5 h-3.5 text-[#8a8a86]" />
-              <span className="hidden sm:inline">JSON</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Row 2: Search */}
-        <div className="relative w-full">
-          <Search className="w-3.5 h-3.5 text-[#8a8a86] absolute left-3 top-1/2 -translate-y-1/2" />
-          <input
-            type="text"
-            value={filterSearch}
-            onChange={(e) => {
-              setFilterSearch(e.target.value);
-              setCurrentPage(1);
-            }}
-            placeholder="Search leads by keywords, body text, or author handle..."
-            className="w-full pl-9 pr-3 py-2 bg-[#f6f6f4] border border-[#e3e3de] text-xs text-[#141414] placeholder:text-[#9b9b96] focus:outline-none focus:border-[#141414] transition-colors"
-          />
-        </div>
+        )}
       </div>
 
-      {/* Posts List */}
+      {/* ── Feed ─────────────────────────────────────────────────────────── */}
       {isLoadingPosts ? (
-        <div className="space-y-4">
-          {[1, 2, 3].map((n) => (
-            <div key={n} className="bg-white border border-[#e3e3de] p-6 animate-pulse space-y-4">
-              <div className="w-32 h-4 bg-[#eeeeea]" />
-              <div className="w-full h-12 bg-[#eeeeea]" />
-            </div>
-          ))}
-        </div>
+        <FeedSkeleton />
       ) : posts.length === 0 ? (
-        <div className="bg-[#ffffff] border border-[#e3e3de] p-12 text-center space-y-4 max-w-xl mx-auto my-8">
-          <div className="w-12 h-12 bg-[#f6f6f4] border border-[#e3e3de] flex items-center justify-center mx-auto text-[#141414]">
+        <div className="bg-white border border-[#e3e3de] p-12 text-center space-y-4 max-w-lg mx-auto">
+          <div className="w-11 h-11 bg-[#f6f6f4] border border-[#e3e3de] flex items-center justify-center mx-auto text-[#141414]">
             <Clock className="w-5 h-5 text-[#8a8a86]" />
           </div>
           <div className="space-y-2">
-            <h3 className="text-base font-semibold text-[#141414]">
-              First Daily Sweep Scheduled
-            </h3>
-            <p className="text-xs text-[#8a8a86] font-mono leading-relaxed max-w-md mx-auto">
-              Your first sweep runs at <span className="text-[#141414] font-semibold">{sweepTime} UTC</span>. Mentions will start showing up here once we've searched your active channels ({enabledChannels.map((c) => (c === 'twitter' ? 'X' : c === 'google' ? 'Web' : c.charAt(0).toUpperCase() + c.slice(1))).join(', ')}) for your keywords.
+            <h3 className="text-sm font-bold text-[#141414]">No mentions yet</h3>
+            <p className="text-xs text-[#8a8a86] font-mono leading-relaxed">
+              Your next automated sweep runs at{' '}
+              <span className="text-[#141414] font-semibold">{sweepTime} UTC</span>, or you can
+              run one now. It searches{' '}
+              {enabledChannels
+                .map((c) => (c === 'twitter' ? 'X' : c === 'google' ? 'Web' : c))
+                .join(', ')}{' '}
+              for your {keywords.length} keyword{keywords.length === 1 ? '' : 's'}.
             </p>
           </div>
           <button
+            type="button"
             onClick={runSweep}
             disabled={isSweeping}
-            className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#121212] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer shadow-xs"
+            className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer disabled:opacity-60"
           >
             <Sparkles className="w-3.5 h-3.5" />
-            <span>{isSweeping ? 'Scanning Social Channels...' : 'Run Sweep Now'}</span>
+            <span>{isSweeping ? 'Scanning...' : 'Run sweep now'}</span>
           </button>
         </div>
       ) : filteredPosts.length === 0 ? (
-        <div className="bg-[#ffffff] border border-[#e3e3de] p-12 text-center space-y-2 max-w-md mx-auto my-8">
-          <p className="text-sm font-medium text-[#141414]">
-            No mentions match these filters.
+        <div className="bg-white border border-[#e3e3de] p-12 text-center space-y-3 max-w-md mx-auto">
+          <p className="text-sm font-medium text-[#141414]">Nothing matches these filters</p>
+          <p className="text-xs text-[#8a8a86] font-mono leading-relaxed">
+            {minIntentThreshold > 0
+              ? `Your workspace threshold is ${minIntentThreshold}% intent. Lower it in Settings, or clear the filters here.`
+              : 'Try widening the channel, status or keyword filters.'}
           </p>
           <button
-            onClick={() => {
-              setFilterKeyword('all');
-              setFilterPlatform('all');
-              setFilterStatus('all');
-              setFilterSearch('');
-            }}
-            className="mt-3 text-xs font-mono text-[#141414] underline hover:no-underline cursor-pointer"
+            type="button"
+            onClick={resetFilters}
+            className="text-xs font-mono text-[#141414] underline hover:no-underline cursor-pointer"
           >
-            Reset all filters
+            Clear all filters
           </button>
         </div>
       ) : (
-        <div className="space-y-4">
-          {paginatedPosts.map((post) => {
-            const isExpanded = expandedCards[post.id] || false;
-            const intent = post.intent_score ?? 0;
+        <div className="space-y-6">
+          {dayGroups.map((group) => (
+            <section key={group.label}>
+              <div className="flex items-center gap-3 mb-2.5">
+                <h2 className="text-[11px] font-mono uppercase tracking-wider text-[#8a8a86] flex-shrink-0">
+                  {group.label}
+                </h2>
+                <div className="flex-1 h-px bg-[#e3e3de]" />
+                <span className="text-[11px] font-mono text-[#b5b5b0]">
+                  {group.posts.length}
+                </span>
+              </div>
 
-            return (
-              <article
-                key={post.id}
-                className="bg-[#ffffff] border border-[#e3e3de] hover:border-[#141414] transition-all group p-5 sm:p-6"
-              >
-                {/* Header row */}
-                <div className="flex items-start justify-between gap-4 mb-3">
-                  <div className="flex items-start gap-3 min-w-0">
-                    <div className="pt-0.5">
-                      <PlatformBadge platform={post.platform} size={22} />
-                    </div>
-
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-xs font-semibold text-[#141414] truncate">
-                          {post.author_name || 'Prospect'}
-                        </span>
-
-                        {post.author_handle && (
-                          <span className="text-[11px] text-[#8a8a86] font-mono truncate">
-                            {post.author_handle}
-                          </span>
-                        )}
-
-                        {/* Channel Source (Subreddit, FB Group, Forum) */}
-                        {post.channel_source && (
-                          <span
-                            className={`inline-flex items-center px-2 py-0.5 text-[10px] font-mono rounded-full border ${
-                              post.platform === 'reddit'
-                                ? 'bg-orange-50 text-orange-800 border-orange-200 font-semibold'
-                                : post.platform === 'facebook'
-                                ? 'bg-blue-50 text-blue-800 border-blue-200 font-semibold'
-                                : 'bg-indigo-50 text-indigo-800 border-indigo-200 font-semibold'
-                            }`}
-                          >
-                            {post.channel_source}
-                          </span>
-                        )}
-
-                        {/* Matched keyword pill */}
-                        <span className="inline-flex items-center px-2 py-0.5 bg-[#eeeeea] text-[#141414] text-[10px] font-mono rounded-full border border-[#deded8]">
-                          matched: {post.matched_keyword}
-                        </span>
-
-                        {/* Intent score badge */}
-                        <span
-                          className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-mono rounded-full border ${
-                            intent >= 90
-                              ? 'bg-emerald-50 text-emerald-800 border-emerald-200 font-medium'
-                              : 'bg-[#f6f6f4] text-[#4a4a47] border-[#e3e3de]'
-                          }`}
-                        >
-                          <Sparkles className="w-2.5 h-2.5" />
-                          <span>{intent}% Intent</span>
-                        </span>
-
-                        {/* Lead Status pill */}
-                        {post.status && post.status !== 'new' && (
-                          <span className="inline-flex items-center px-2 py-0.5 bg-[#141414] text-white text-[9px] font-mono uppercase tracking-wider rounded-none">
-                            {post.status}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Right side: Timestamp & Original Link */}
-                  <div className="flex items-center gap-3 flex-shrink-0">
-                    <span className="text-[11px] font-mono text-[#8a8a86]">
-                      {getRelativeTime(post.posted_at)}
-                    </span>
-                    <a
-                      href={post.post_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 text-[11px] font-mono text-[#4a4a47] hover:text-[#141414] transition-colors"
-                      title="Open original post in new tab"
-                    >
-                      <span>View original</span>
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
-                  </div>
-                </div>
-
-                {/* Post Body */}
-                <div className="mt-2 text-xs sm:text-sm text-[#262626] leading-relaxed pl-8">
-                  <p className={isExpanded ? '' : 'line-clamp-4'}>
-                    {post.body}
-                  </p>
-
-                  {post.body && post.body.length > 220 && (
-                    <button
-                      type="button"
-                      onClick={() => toggleExpand(post.id)}
-                      className="mt-1.5 text-xs font-mono text-[#8a8a86] hover:text-[#141414] transition-colors cursor-pointer"
-                    >
-                      {isExpanded ? 'Show less ↑' : 'Show more ↓'}
-                    </button>
-                  )}
-                </div>
-
-                {/* Footer with Action Buttons & Engagement */}
-                <div className="mt-4 pt-3 border-t border-[#eeeeea] pl-8 flex flex-wrap items-center justify-between gap-4">
-                  {/* Left: Engagement metrics */}
-                  {post.engagement && (
-                    <div className="flex items-center gap-5 text-[11px] font-mono text-[#8a8a86]">
-                      {post.engagement.likes !== null && post.engagement.likes !== undefined && (
-                        <span className="flex items-center gap-1.5">
-                          <Heart className="w-3 h-3 text-[#9b9b96]" />
-                          {post.engagement.likes}
-                        </span>
-                      )}
-                      {(post.engagement.retweets !== null || post.engagement.reposts !== null) && (
-                        <span className="flex items-center gap-1.5">
-                          <Repeat className="w-3 h-3 text-[#9b9b96]" />
-                          {post.engagement.retweets ?? post.engagement.reposts ?? 0}
-                        </span>
-                      )}
-                      {(post.engagement.replies !== null || post.engagement.comments !== null) && (
-                        <span className="flex items-center gap-1.5">
-                          <MessageSquare className="w-3 h-3 text-[#9b9b96]" />
-                          {post.engagement.replies ?? post.engagement.comments ?? 0}
-                        </span>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Right: Lead Pipeline Actions & AI Drafter */}
-                  <div className="flex items-center gap-2 ml-auto">
-                    {/* Status toggles */}
-                    <button
-                      onClick={() =>
-                        updatePostStatus(post.id, post.status === 'saved' ? 'new' : 'saved')
-                      }
-                      className={`inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-mono border transition-colors cursor-pointer ${
-                        post.status === 'saved'
-                          ? 'bg-[#141414] text-white border-[#141414]'
-                          : 'bg-[#ffffff] text-[#4a4a47] border-[#e3e3de] hover:bg-[#f6f6f4]'
-                      }`}
-                      title="Save lead for follow-up"
-                    >
-                      <Bookmark className="w-3 h-3" />
-                      <span>{post.status === 'saved' ? 'Saved' : 'Save'}</span>
-                    </button>
-
-                    <button
-                      onClick={() =>
-                        updatePostStatus(
-                          post.id,
-                          post.status === 'contacted' ? 'new' : 'contacted'
-                        )
-                      }
-                      className={`inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-mono border transition-colors cursor-pointer ${
-                        post.status === 'contacted'
-                          ? 'bg-emerald-700 text-white border-emerald-700'
-                          : 'bg-[#ffffff] text-[#4a4a47] border-[#e3e3de] hover:bg-[#f6f6f4]'
-                      }`}
-                      title="Mark as contacted"
-                    >
-                      <CheckCircle className="w-3 h-3" />
-                      <span>{post.status === 'contacted' ? 'Contacted' : 'Contact'}</span>
-                    </button>
-
-                    {/* Inspect raw data modal trigger */}
-                    <button
-                      onClick={() => setInspectModalPost(post)}
-                      className="p-1 text-[#8a8a86] hover:text-[#141414] border border-[#e3e3de] hover:bg-[#f6f6f4] transition-colors cursor-pointer"
-                      title="Inspect lead metadata"
-                    >
-                      <Code className="w-3 h-3" />
-                    </button>
-
-                    {/* Generate AI Outreach draft */}
-                    <button
-                      onClick={() => handleOpenAiDraft(post)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1 bg-[#141414] hover:bg-black text-white text-[11px] font-mono transition-colors cursor-pointer shadow-xs"
-                    >
-                      <Sparkles className="w-3 h-3 text-emerald-400" />
-                      <span>AI Outreach Draft</span>
-                    </button>
-                  </div>
-                </div>
-              </article>
-            );
-          })}
+              <div className="space-y-2.5">
+                {group.posts.map((post) => (
+                  <FeedCard
+                    key={post.id}
+                    post={post}
+                    now={now}
+                    isExpanded={expandedCards[post.id] || false}
+                    onToggleExpand={toggleExpand}
+                    onStatusChange={updatePostStatus}
+                    onOpenAiDraft={handleOpenAiDraft}
+                  />
+                ))}
+              </div>
+            </section>
+          ))}
         </div>
       )}
 
-      {/* Pagination Footer */}
+      {/* Pagination */}
       {filteredPosts.length > itemsPerPage && (
-        <div className="flex items-center justify-between bg-[#ffffff] border border-[#e3e3de] px-4 py-3 text-xs font-mono text-[#8a8a86]">
+        <div className="flex items-center justify-between bg-white border border-[#e3e3de] px-4 py-3 text-xs font-mono text-[#8a8a86]">
           <span>
-            Showing {(currentPage - 1) * itemsPerPage + 1}–
-            {Math.min(currentPage * itemsPerPage, filteredPosts.length)} of {filteredPosts.length} posts
+            {(currentPage - 1) * itemsPerPage + 1}–
+            {Math.min(currentPage * itemsPerPage, filteredPosts.length)} of{' '}
+            {filteredPosts.length}
           </span>
-
           <div className="flex items-center gap-2">
             <button
+              type="button"
               onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
               disabled={currentPage === 1}
-              className="p-1 border border-[#e3e3de] hover:bg-[#f6f6f4] disabled:opacity-30 disabled:cursor-not-allowed text-[#141414] cursor-pointer"
+              className="px-2 py-1 border border-[#e3e3de] hover:bg-[#f6f6f4] disabled:opacity-30 disabled:cursor-not-allowed text-[#141414] cursor-pointer"
             >
-              <ChevronLeft className="w-4 h-4" />
+              Prev
             </button>
-            <span className="px-2 text-[#141414]">
+            <span className="px-1 text-[#141414]">
               {currentPage} / {totalPages}
             </span>
             <button
+              type="button"
               onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
               disabled={currentPage === totalPages}
-              className="p-1 border border-[#e3e3de] hover:bg-[#f6f6f4] disabled:opacity-30 disabled:cursor-not-allowed text-[#141414] cursor-pointer"
+              className="px-2 py-1 border border-[#e3e3de] hover:bg-[#f6f6f4] disabled:opacity-30 disabled:cursor-not-allowed text-[#141414] cursor-pointer"
             >
-              <ChevronRight className="w-4 h-4" />
+              Next
             </button>
           </div>
         </div>
       )}
 
-      {/* PHASE 2: AI OUTREACH DRAFT MODAL */}
+      {/* ── Clear feed confirmation ──────────────────────────────────────── */}
+      {confirmClear && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div
+            className="fixed inset-0 bg-black/40 backdrop-blur-xs"
+            onClick={() => !isClearing && setConfirmClear(false)}
+          />
+          <div className="relative w-full max-w-sm bg-white border border-[#e3e3de] shadow-2xl z-10">
+            <div className="px-5 pt-5 pb-4">
+              <div className="flex items-start gap-3">
+                <div className="w-8 h-8 rounded-full bg-red-50 border border-red-200 flex items-center justify-center flex-shrink-0">
+                  <Trash2 className="w-4 h-4 text-red-600" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-sm font-bold text-[#141414]">Clear the whole feed?</h3>
+                  <p className="mt-1.5 text-xs text-[#4a4a47] leading-relaxed">
+                    This permanently deletes all{' '}
+                    <span className="font-semibold text-[#141414]">{posts.length}</span> stored
+                    mentions, including anything you saved. Your keywords and settings are
+                    untouched.
+                  </p>
+                  {feedRetentionDays > 0 && (
+                    <p className="mt-2 text-[11px] font-mono text-[#8a8a86]">
+                      Retention is set to {feedRetentionDays} days, so a future sweep will
+                      also prune automatically.
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-[#eeeeea] bg-[#fafaf9]">
+              <button
+                type="button"
+                onClick={() => setConfirmClear(false)}
+                disabled={isClearing}
+                className="px-3.5 py-1.5 text-[11px] font-mono border border-[#e3e3de] bg-white text-[#4a4a47] hover:bg-[#f6f6f4] transition-all duration-150 cursor-pointer disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleClearFeed()}
+                disabled={isClearing}
+                className="px-3.5 py-1.5 text-[11px] font-mono bg-red-600 hover:bg-red-700 text-white transition-all duration-150 cursor-pointer disabled:opacity-50 active:scale-[0.97]"
+              >
+                {isClearing ? 'Clearing...' : `Delete ${posts.length}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── AI outreach modal ─────────────────────────────────────────────── */}
       {aiDraftModalPost && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <div
             className="fixed inset-0 bg-black/40 backdrop-blur-xs"
             onClick={() => setAiDraftModalPost(null)}
           />
-          <div className="relative w-full max-w-lg bg-white border border-[#e3e3de] p-6 shadow-2xl z-10 space-y-4">
-            <div className="flex items-center justify-between border-b border-[#eeeeea] pb-3">
+          <div className="relative w-full max-w-lg bg-white border border-[#e3e3de] shadow-2xl z-10 space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-[#eeeeea] px-5 py-3">
               <div className="flex items-center gap-2">
                 <Sparkles className="w-4 h-4 text-[#141414]" />
-                <h3 className="text-sm font-bold text-[#141414]">
-                  AI Outreach Response Generator
-                </h3>
+                <h3 className="text-sm font-bold text-[#141414]">Outreach reply</h3>
               </div>
-              <button
-                onClick={() => setAiDraftModalPost(null)}
-                className="text-[#8a8a86] hover:text-[#141414] cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Target context */}
-            <div className="p-3 bg-[#f6f6f4] border border-[#e3e3de] text-xs space-y-1">
-              <span className="text-[10px] font-mono text-[#8a8a86] uppercase block">
-                Target Lead
-              </span>
-              <p className="font-semibold text-[#141414]">
-                {aiDraftModalPost.author_name} ({aiDraftModalPost.author_handle})
-              </p>
-              <p className="text-[11px] text-[#4a4a47] line-clamp-2">
-                "{aiDraftModalPost.body}"
-              </p>
-            </div>
-
-            {/* Tone selector */}
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-mono uppercase text-[#4a4a47] block">
-                Response Tone
-              </label>
-              <div className="grid grid-cols-4 gap-1.5 text-xs font-mono">
-                {(['consultative', 'direct', 'professional', 'casual'] as const).map((tone) => (
-                  <button
-                    key={tone}
-                    type="button"
-                    onClick={() => handleChangeTone(tone)}
-                    className={`py-1.5 text-center border capitalize transition-colors cursor-pointer ${
-                      draftTone === tone
-                        ? 'bg-[#141414] text-white border-[#141414]'
-                        : 'bg-white text-[#4a4a47] border-[#e3e3de] hover:bg-[#f6f6f4]'
-                    }`}
-                  >
-                    {tone}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Editable Response Area */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-mono uppercase text-[#4a4a47] block">
-                  Generated Outreach Draft
-                </label>
-                {isGeneratingDraft && (
-                  <span className="inline-flex items-center gap-1.5 text-[10px] font-mono text-emerald-700 bg-emerald-50 px-2 py-0.5 border border-emerald-200">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                    GPT-4o Generating...
-                  </span>
-                )}
-              </div>
-              <textarea
-                rows={4}
-                value={draftText}
-                disabled={isGeneratingDraft}
-                onChange={(e) => setDraftText(e.target.value)}
-                className={`w-full p-3 bg-white border border-[#e3e3de] text-xs leading-relaxed text-[#141414] focus:outline-none focus:border-[#141414] transition-opacity ${
-                  isGeneratingDraft ? 'opacity-60 animate-pulse' : 'opacity-100'
-                }`}
-              />
-            </div>
-
-            {/* Actions */}
-            <div className="flex items-center justify-between pt-2">
-              <a
-                href={aiDraftModalPost.post_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 text-xs font-mono text-[#4a4a47] hover:text-[#141414]"
-              >
-                <span>Open original post to reply</span>
-                <ExternalLink className="w-3.5 h-3.5" />
-              </a>
-
               <button
                 type="button"
-                onClick={handleCopyDraft}
-                className="inline-flex items-center gap-2 px-4 py-2 bg-[#121212] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer"
-              >
-                {copiedDraft ? (
-                  <>
-                    <Check className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Copied!</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Copy Response</span>
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* RAW JSON / INSPECTION MODAL */}
-      {inspectModalPost && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div
-            className="fixed inset-0 bg-black/40 backdrop-blur-xs"
-            onClick={() => setInspectModalPost(null)}
-          />
-          <div className="relative w-full max-w-2xl bg-white border border-[#e3e3de] p-6 shadow-2xl z-10 space-y-4 max-h-[80vh] flex flex-col">
-            <div className="flex items-center justify-between border-b border-[#eeeeea] pb-3 flex-shrink-0">
-              <div className="flex items-center gap-2">
-                <Code className="w-4 h-4 text-[#141414]" />
-                <h3 className="text-sm font-bold text-[#141414]">
-                  Lead Details & Metadata
-                </h3>
-              </div>
-              <button
-                onClick={() => setInspectModalPost(null)}
+                onClick={() => setAiDraftModalPost(null)}
                 className="text-[#8a8a86] hover:text-[#141414] cursor-pointer"
+                aria-label="Close"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto bg-[#141414] p-4 text-[#eeeeea] font-mono text-[11px] leading-relaxed">
-              <pre>{JSON.stringify(inspectModalPost, null, 2)}</pre>
-            </div>
+            <div className="px-5 space-y-4">
+              <div className="p-3 bg-[#f6f6f4] border border-[#eeeeea] text-xs space-y-1">
+                <span className="text-[10px] font-mono text-[#8a8a86] uppercase block">
+                  Replying to
+                </span>
+                <p className="font-semibold text-[#141414]">
+                  {aiDraftModalPost.author_name}
+                  {aiDraftModalPost.author_handle
+                    ? ` (${aiDraftModalPost.author_handle})`
+                    : ''}
+                </p>
+                <p className="text-[11px] text-[#4a4a47] line-clamp-3">
+                  {aiDraftModalPost.body}
+                </p>
+              </div>
 
-            <div className="flex justify-end pt-2 flex-shrink-0">
-              <button
-                onClick={() => setInspectModalPost(null)}
-                className="px-4 py-1.5 bg-[#f6f6f4] hover:bg-[#ecece7] border border-[#e3e3de] text-xs font-mono text-[#141414] cursor-pointer"
-              >
-                Close
-              </button>
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-mono uppercase text-[#4a4a47] block">
+                  Tone
+                </label>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-xs font-mono">
+                  {(['consultative', 'direct', 'professional', 'casual'] as const).map((tone) => (
+                    <button
+                      key={tone}
+                      type="button"
+                      onClick={() => void handleChangeTone(tone)}
+                      className={`py-1.5 text-center border capitalize transition-colors cursor-pointer ${
+                        draftTone === tone
+                          ? 'bg-[#141414] text-white border-[#141414]'
+                          : 'bg-white text-[#4a4a47] border-[#e3e3de] hover:bg-[#f6f6f4]'
+                      }`}
+                    >
+                      {tone}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-mono uppercase text-[#4a4a47] block">
+                    Draft
+                  </label>
+                  {isGeneratingDraft && (
+                    <span className="text-[10px] font-mono text-[#8a8a86]">
+                      generating...
+                    </span>
+                  )}
+                </div>
+                <textarea
+                  rows={5}
+                  value={draftText}
+                  disabled={isGeneratingDraft}
+                  onChange={(e) => setDraftText(e.target.value)}
+                  className={`w-full p-3 bg-white border border-[#e3e3de] text-xs leading-relaxed text-[#141414] focus:outline-none focus:border-[#141414] ${
+                    isGeneratingDraft ? 'opacity-50' : ''
+                  }`}
+                />
+              </div>
+
+              <div className="flex items-center justify-between">
+                <a
+                  href={aiDraftModalPost.post_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-[11px] font-mono text-[#4a4a47] hover:text-[#141414]"
+                >
+                  Open original
+                </a>
+                <button
+                  type="button"
+                  onClick={() => void handleCopyDraft()}
+                  disabled={!draftText}
+                  className="inline-flex items-center gap-2 px-4 py-2 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  {copiedDraft ? 'Copied' : 'Copy draft'}
+                </button>
+              </div>
             </div>
           </div>
         </div>

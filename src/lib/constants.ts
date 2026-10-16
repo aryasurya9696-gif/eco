@@ -27,6 +27,19 @@ export function validateWebhookUrl(value: string): string | null {
 /** Platforms the sweep functions actually implement. */
 export const SUPPORTED_PLATFORMS = ['twitter', 'reddit', 'google'] as const;
 
+/**
+ * Feed retention options in days. 0 = keep everything.
+ * Must stay in sync with profiles_feed_retention_range in Postgres.
+ */
+export const RETENTION_OPTIONS = [
+  { days: 0, label: 'Keep everything' },
+  { days: 7, label: '7 days' },
+  { days: 14, label: '14 days' },
+  { days: 30, label: '30 days' },
+  { days: 90, label: '90 days' },
+  { days: 365, label: '1 year' },
+] as const;
+
 /** Score bounds produced by the intent algorithm in the edge functions. */
 export const INTENT_SCORE_MIN = 0;
 export const INTENT_SCORE_MAX = 97;

@@ -60,6 +60,10 @@ interface EchoContextType {
   // Settings
   minIntentThreshold: number;
   setMinIntentThreshold: (threshold: number) => void;
+  feedRetentionDays: number;
+  setFeedRetentionDays: (days: number) => void;
+  clearFeed: () => Promise<{ success: boolean; deleted?: number; error?: string }>;
+  pruneFeed: () => Promise<{ success: boolean; deleted?: number; error?: string }>;
   slackWebhook: string;
   setSlackWebhook: (url: string) => void;
   emailDigest: boolean;
@@ -143,6 +147,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [sweepTime, setSweepTime] = useState<string>('06:00');
   const [sweepCadence, setSweepCadence] = useState<'24h' | '12h' | '6h'>('24h');
   const [minIntentThreshold, setMinIntentThreshold] = useState<number>(0);
+  const [feedRetentionDays, setFeedRetentionDays] = useState<number>(30);
   const [enabledChannels, setEnabledChannels] = useState<Platform[]>(['twitter', 'reddit', 'google']);
   const [mentionsFound, setMentionsFound] = useState<number>(0);
 
@@ -262,6 +267,9 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (profile.min_intent_threshold !== undefined && profile.min_intent_threshold !== null) {
         setMinIntentThreshold(profile.min_intent_threshold);
       }
+      if (profile.feed_retention_days !== undefined && profile.feed_retention_days !== null) {
+        setFeedRetentionDays(profile.feed_retention_days);
+      }
       if (Array.isArray(profile.enabled_channels) && profile.enabled_channels.length > 0) {
         setEnabledChannels(profile.enabled_channels);
       }
@@ -283,6 +291,9 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (parsed.sweepCadence !== undefined) setSweepCadence(parsed.sweepCadence);
         if (parsed.minIntentThreshold !== undefined) {
           setMinIntentThreshold(parsed.minIntentThreshold);
+        }
+        if (parsed.feedRetentionDays !== undefined) {
+          setFeedRetentionDays(parsed.feedRetentionDays);
         }
         if (parsed.currentPlan !== undefined) setSubscriptionPlan(parsed.currentPlan);
         if (Array.isArray(parsed.enabledChannels) && parsed.enabledChannels.length > 0) {
@@ -607,6 +618,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
           sweep_frequency: sweepCadence,
           enabled_channels: enabledChannels,
           min_intent_threshold: minIntentThreshold,
+          feed_retention_days: feedRetentionDays,
         })
         .eq('id', user.id);
 
@@ -627,9 +639,54 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     sweepTime,
     sweepCadence,
     minIntentThreshold,
+    feedRetentionDays,
     enabledChannels,
     addToast,
   ]);
+
+  // --- Feed cleanup -----------------------------------------------------
+
+  /**
+   * Deletes every mention in the workspace. Goes through the clear_feed() RPC
+   * so the count comes back from the database rather than the client.
+   */
+  const clearFeed = useCallback(async (): Promise<{ success: boolean; deleted?: number; error?: string }> => {
+    if (!user) return { success: false, error: 'not_authenticated' };
+
+    if (!isConfigured || !supabase) {
+      setPosts([]);
+      return { success: true, deleted: 0 };
+    }
+
+    const { data, error } = await supabase.rpc('clear_feed', { p_user_id: user.id });
+    if (error) return { success: false, error: error.message };
+    if (data?.success !== true) return { success: false, error: data?.error || 'clear_failed' };
+
+    const deleted = typeof data.deleted === 'number' ? data.deleted : 0;
+    setPosts([]);
+    return { success: true, deleted };
+  }, [user]);
+
+  /**
+   * Applies the retention window immediately, without waiting for a sweep.
+   * Never touches rows written after `keepAfter`.
+   */
+  const pruneFeed = useCallback(async (params: { keepAfter?: string } = {}): Promise<{ success: boolean; deleted?: number; error?: string }> => {
+    if (!user) return { success: false, error: 'not_authenticated' };
+
+    if (!isConfigured || !supabase) return { success: true, deleted: 0 };
+
+    const { data, error } = await supabase.rpc('prune_feed', {
+      p_user_id: user.id,
+      p_keep_after: params.keepAfter ?? null,
+    });
+    if (error) return { success: false, error: error.message };
+    if (data?.success !== true) return { success: false, error: data?.error || 'prune_failed' };
+
+    const deleted = typeof data.deleted === 'number' ? data.deleted : 0;
+    if (deleted > 0) await loadPosts();
+    return { success: true, deleted };
+  }, [user, loadPosts]);
 
   /** Sends a real request to the configured Slack/Discord webhook. */
   const sendTestWebhook = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
@@ -761,6 +818,10 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       exportPostsToJson,
       minIntentThreshold,
       setMinIntentThreshold,
+      feedRetentionDays,
+      setFeedRetentionDays,
+      clearFeed,
+      pruneFeed,
       slackWebhook,
       setSlackWebhook,
       emailDigest,
@@ -807,6 +868,9 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       exportPostsToCsv,
       exportPostsToJson,
       minIntentThreshold,
+      feedRetentionDays,
+      clearFeed,
+      pruneFeed,
       slackWebhook,
       emailDigest,
       lookbackHours,
