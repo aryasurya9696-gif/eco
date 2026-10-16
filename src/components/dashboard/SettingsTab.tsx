@@ -10,8 +10,11 @@ import {
   Building2,
   Globe,
   Sparkles,
-  Calendar
+  Calendar,
+  Share2,
+  Radio,
 } from 'lucide-react';
+import { PlatformBadge } from '../common/PlatformBadge';
 
 export const SettingsTab: React.FC = () => {
   const { user, profile, updateProfile } = useAuth();
@@ -30,6 +33,8 @@ export const SettingsTab: React.FC = () => {
     setSweepCadence,
     minIntentThreshold,
     setMinIntentThreshold,
+    enabledChannels,
+    toggleChannel,
     saveSettings,
     addToast,
   } = useEcho();
@@ -178,6 +183,138 @@ export const SettingsTab: React.FC = () => {
               </button>
             </div>
           </form>
+
+          {/* Monitored Channels & Platform Selectivity */}
+          <div className="bg-white border border-[#e3e3de] p-6 space-y-6">
+            <div className="flex items-start justify-between border-b border-[#eeeeea] pb-4">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-[#f6f6f4] border border-[#e3e3de]">
+                  <Share2 className="w-4 h-4 text-[#141414]" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-[#141414]">
+                    Monitored Channels & Platform Selectivity
+                  </h3>
+                  <p className="text-xs text-[#8a8a86] font-mono">
+                    Select exactly which channels Echo scans for your keywords. Disabled platforms are skipped to save API credits.
+                  </p>
+                </div>
+              </div>
+
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-emerald-50 border border-emerald-200 text-emerald-800 text-[10px] font-mono font-medium">
+                <Radio className="w-2.5 h-2.5 text-emerald-600 animate-pulse" />
+                <span>{enabledChannels.length} Active</span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+              {[
+                {
+                  id: 'twitter' as const,
+                  name: 'X (formerly Twitter)',
+                  desc: 'High-velocity buying discussions, tool questions & complaints.',
+                  supported: true,
+                },
+                {
+                  id: 'reddit' as const,
+                  name: 'Reddit Communities',
+                  desc: 'Deep technical queries, subreddit recommendations & peer reviews.',
+                  supported: true,
+                },
+                {
+                  id: 'google' as const,
+                  name: 'Web & Google Discussions',
+                  desc: 'Public developer forums, tech blogs, and indexed Q&A portals.',
+                  supported: true,
+                },
+                {
+                  id: 'linkedin' as const,
+                  name: 'LinkedIn Network',
+                  desc: 'B2B enterprise executive announcements and role changes.',
+                  supported: false,
+                  badge: 'Enterprise Roadmap',
+                },
+                {
+                  id: 'facebook' as const,
+                  name: 'Facebook Groups',
+                  desc: 'Private entrepreneur, founder, and operator groups.',
+                  supported: false,
+                  badge: 'Community Bridge',
+                },
+              ].map((channel) => {
+                const isEnabled = enabledChannels.includes(channel.id);
+                return (
+                  <div
+                    key={channel.id}
+                    className={`p-4 border transition-all flex flex-col justify-between ${
+                      !channel.supported
+                        ? 'bg-[#fbfbfa] border-[#eeeeea] opacity-75'
+                        : isEnabled
+                        ? 'bg-white border-[#141414] shadow-xs'
+                        : 'bg-[#fbfbfa] border-[#e3e3de]'
+                    }`}
+                  >
+                    <div>
+                      <div className="flex items-center justify-between pb-2">
+                        <div className="flex items-center gap-2">
+                          <PlatformBadge platform={channel.id} size={20} />
+                          <span className="text-xs font-bold text-[#141414]">
+                            {channel.name}
+                          </span>
+                        </div>
+
+                        {channel.supported ? (
+                          <button
+                            type="button"
+                            onClick={() => toggleChannel(channel.id)}
+                            className={`w-11 h-6 flex items-center p-0.5 border transition-colors cursor-pointer ${
+                              isEnabled
+                                ? 'bg-[#141414] border-[#141414] justify-end'
+                                : 'bg-white border-[#deded8] justify-start'
+                            }`}
+                            aria-label={`Toggle ${channel.name}`}
+                          >
+                            <span
+                              className={`w-4 h-4 block ${
+                                isEnabled ? 'bg-white' : 'bg-[#8a8a86]'
+                              }`}
+                            />
+                          </button>
+                        ) : (
+                          <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 bg-white border border-[#deded8] text-[#8a8a86]">
+                            {channel.badge}
+                          </span>
+                        )}
+                      </div>
+
+                      <p className="text-[11px] text-[#8a8a86] font-mono leading-relaxed mt-1">
+                        {channel.desc}
+                      </p>
+                    </div>
+
+                    <div className="pt-3 mt-2 border-t border-[#f6f6f4] flex items-center justify-between text-[10px] font-mono">
+                      <span className="text-[#8a8a86]">
+                        {channel.supported
+                          ? isEnabled
+                            ? '● Scanning every sweep'
+                            : '○ Skipped during sweep'
+                          : 'Coming in v2 release'}
+                      </span>
+                      {channel.supported && (
+                        <span className={isEnabled ? 'text-emerald-700 font-semibold' : 'text-[#8a8a86]'}>
+                          {isEnabled ? '0 Credits Saved' : 'Credits Preserved'}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="flex items-center justify-between pt-1 text-[11px] font-mono text-[#8a8a86]">
+              <span>Tip: Turning off channels you do not need cuts down your sweep runtime by up to 60%.</span>
+            </div>
+          </div>
 
           {/* Notifications & Webhooks */}
           <div className="bg-white border border-[#e3e3de] p-6 space-y-6">
@@ -492,7 +629,9 @@ export const SettingsTab: React.FC = () => {
 
               <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">
                 <span className="text-[#8a8a86]">Monitored Platforms:</span>
-                <span className="text-[#141414] font-medium">5 Channels (X, IN, Reddit, FB, Google)</span>
+                <span className="text-[#141414] font-medium">
+                  {enabledChannels.length} Active ({enabledChannels.map((c) => (c === 'twitter' ? 'X' : c === 'google' ? 'Web' : c.charAt(0).toUpperCase() + c.slice(1))).join(', ')})
+                </span>
               </div>
 
               <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">

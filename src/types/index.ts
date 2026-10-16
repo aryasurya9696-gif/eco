@@ -14,6 +14,7 @@ export interface Profile {
   email_digest?: boolean;
   slack_webhook?: string | null;
   lookback_hours?: number;
+  enabled_channels?: Platform[];
   created_at: string;
   updated_at: string;
 }

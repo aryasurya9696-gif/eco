@@ -41,6 +41,7 @@ export const FeedTab: React.FC = () => {
     generateAiDraft,
     exportPostsToCsv,
     exportPostsToJson,
+    enabledChannels,
     addToast,
   } = useEcho();
 
@@ -277,7 +278,7 @@ export const FeedTab: React.FC = () => {
               First Daily Sweep Scheduled
             </h3>
             <p className="text-xs text-[#8a8a86] font-mono leading-relaxed max-w-md mx-auto">
-              Your first sweep runs at <span className="text-[#141414] font-semibold">{sweepTime} UTC</span>. Mentions will start showing up here once we've searched connected channels (X, Reddit & Web) for your keywords.
+              Your first sweep runs at <span className="text-[#141414] font-semibold">{sweepTime} UTC</span>. Mentions will start showing up here once we've searched your active channels ({enabledChannels.map((c) => (c === 'twitter' ? 'X' : c === 'google' ? 'Web' : c.charAt(0).toUpperCase() + c.slice(1))).join(', ')}) for your keywords.
             </p>
           </div>
           <button

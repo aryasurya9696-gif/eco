@@ -56,6 +56,8 @@ interface EchoContextType {
   sweepCadence: '24h' | '12h' | '6h';
   setSweepCadence: (cadence: '24h' | '12h' | '6h') => void;
   saveSettings: () => Promise<void>;
+  enabledChannels: Platform[];
+  toggleChannel: (platform: Platform) => void;
   // Phase 4: Billing
   currentPlan: 'starter' | 'pro' | 'scale';
   setCurrentPlan: (plan: 'starter' | 'pro' | 'scale') => void;
@@ -91,6 +93,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [sweepTime, setSweepTime] = useState<string>('06:00');
   const [sweepCadence, setSweepCadence] = useState<'24h' | '12h' | '6h'>('24h');
   const [minIntentThreshold, setMinIntentThreshold] = useState<number>(85);
+  const [enabledChannels, setEnabledChannels] = useState<Platform[]>(['twitter', 'reddit', 'google']);
 
   // Billing
   const [currentPlan, setCurrentPlan] = useState<'starter' | 'pro' | 'scale'>('starter');
@@ -108,6 +111,22 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const dismissToast = (id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
+  };
+
+  const toggleChannel = (platform: Platform) => {
+    if (enabledChannels.includes(platform)) {
+      if (enabledChannels.length <= 1) {
+        addToast('At least one platform must remain active for monitoring.', 'error');
+        return;
+      }
+      const updated = enabledChannels.filter((p) => p !== platform);
+      setEnabledChannels(updated);
+      addToast(`Deactivated ${platform === 'twitter' ? 'X' : platform === 'google' ? 'Web' : platform} channel.`, 'info');
+    } else {
+      const updated = [...enabledChannels, platform];
+      setEnabledChannels(updated);
+      addToast(`Activated ${platform === 'twitter' ? 'X' : platform === 'google' ? 'Web' : platform} channel.`, 'success');
+    }
   };
 
   useEffect(() => {
@@ -144,6 +163,9 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if ((profile as any).sweep_frequency) {
         setSweepCadence((profile as any).sweep_frequency);
       }
+      if (profile.enabled_channels && Array.isArray(profile.enabled_channels) && profile.enabled_channels.length > 0) {
+        setEnabledChannels(profile.enabled_channels);
+      }
     }
 
     // Overlay any client-side cached settings
@@ -158,6 +180,9 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (parsed.sweepTime !== undefined) setSweepTime(parsed.sweepTime);
         if (parsed.sweepCadence !== undefined) setSweepCadence(parsed.sweepCadence);
         if (parsed.minIntentThreshold !== undefined) setMinIntentThreshold(parsed.minIntentThreshold);
+        if (parsed.enabledChannels && Array.isArray(parsed.enabledChannels) && parsed.enabledChannels.length > 0) {
+          setEnabledChannels(parsed.enabledChannels);
+        }
       } catch (err) {
         console.error('Error loading settings:', err);
       }
@@ -174,6 +199,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       sweepTime,
       sweepCadence,
       minIntentThreshold,
+      enabledChannels,
     };
     localStorage.setItem(`${LOCAL_STORAGE_SETTINGS_KEY}_${user.id}`, JSON.stringify(settings));
 
@@ -187,6 +213,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
             lookback_hours: lookbackHours,
             sweep_time_utc: sweepTime,
             sweep_frequency: sweepCadence,
+            enabled_channels: enabledChannels,
           })
           .eq('id', user.id);
       } catch (err) {
@@ -432,16 +459,19 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const runSweep = async () => {
     if (!user) return;
     setIsSweeping(true);
-    addToast('Scanning social networks across Twitter, Reddit & Web...', 'info');
+    const channelNames = enabledChannels
+      .map((c) => (c === 'twitter' ? 'X' : c === 'google' ? 'Web' : c.charAt(0).toUpperCase() + c.slice(1)))
+      .join(', ');
+    addToast(`Scanning social networks across ${channelNames}...`, 'info');
 
     try {
       const activeKeywords = keywords.filter((k) => k.is_active);
       const startedAt = new Date().toISOString();
 
-      // 1. Fetch live posts across channels via Social Fetch API
+      // 1. Fetch live posts across user-enabled channels via Social Fetch API
       let fetchedPosts: MonitoredPost[] = [];
-      if (activeKeywords.length > 0) {
-        fetchedPosts = await performSocialFetchSweep(activeKeywords, user.id);
+      if (activeKeywords.length > 0 && enabledChannels.length > 0) {
+        fetchedPosts = await performSocialFetchSweep(activeKeywords, user.id, enabledChannels);
       }
 
       // 2. If Supabase is connected, persist to monitored_posts and sweep_runs
@@ -657,6 +687,8 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         saveSettings,
         minIntentThreshold,
         setMinIntentThreshold,
+        enabledChannels,
+        toggleChannel,
         currentPlan,
         setCurrentPlan,
         monthlyCreditsUsed,

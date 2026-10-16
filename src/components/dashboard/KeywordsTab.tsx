@@ -5,7 +5,7 @@ import { PillInput } from '../common/PillInput';
 import { ShieldCheck, Zap, Sparkles, Plus } from 'lucide-react';
 
 export const KeywordsTab: React.FC = () => {
-  const { keywords, addKeyword, removeKeyword, suggestKeywordsFromOffer, addToast, sweepTime, lookbackHours } = useEcho();
+  const { keywords, addKeyword, removeKeyword, suggestKeywordsFromOffer, addToast, sweepTime, lookbackHours, enabledChannels } = useEcho();
   const { profile } = useAuth();
   const [aiSuggestions, setAiSuggestions] = useState<string[]>([]);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
@@ -44,7 +44,7 @@ export const KeywordsTab: React.FC = () => {
               Tracked Keywords
             </h2>
             <p className="text-xs text-[#8a8a86] font-mono mt-1">
-              Active keywords scanned daily across connected social channels and web communities for buyer-intent mentions.
+              Scanned daily across {enabledChannels.length} active channels ({enabledChannels.map((c) => (c === 'twitter' ? 'X' : c === 'google' ? 'Web' : c.charAt(0).toUpperCase() + c.slice(1))).join(', ')}) for buyer-intent mentions.
             </p>
           </div>
 

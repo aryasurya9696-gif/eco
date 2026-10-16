@@ -37,7 +37,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleCollapse,
 }) => {
   const { user, profile, signOut } = useAuth();
-  const { keywords, posts, sweepTime, sweepCadence, lookbackHours } = useEcho();
+  const { keywords, posts, sweepTime, sweepCadence, lookbackHours, enabledChannels } = useEcho();
 
   // Compute user initials for avatar
   const getInitials = () => {
@@ -141,8 +141,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <p className="text-[11px] text-[#8a8a86] font-mono">
               Next: <span className="text-[#141414] font-medium">{sweepTime} UTC</span>
             </p>
-            <p className="text-[10px] text-[#9b9b96] font-mono mt-0.5">
-              X, LinkedIn, Reddit, FB, Google ({lookbackHours}h)
+            <p className="text-[10px] text-[#9b9b96] font-mono mt-0.5 truncate">
+              {enabledChannels.map((c) => (c === 'twitter' ? 'X' : c === 'google' ? 'Web' : c.charAt(0).toUpperCase() + c.slice(1))).join(', ')} ({lookbackHours}h)
             </p>
           </div>
         ) : (

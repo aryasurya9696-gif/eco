@@ -315,29 +315,34 @@ export async function fetchWebPostsForKeyword(
  */
 export async function performSocialFetchSweep(
   keywords: Array<{ id: string; keyword: string }>,
-  userId: string
+  userId: string,
+  enabledChannels: Platform[] = ['twitter', 'reddit', 'google']
 ): Promise<MonitoredPost[]> {
   const allPosts: MonitoredPost[] = [];
   const seenUrls = new Set<string>();
 
   for (const kw of keywords) {
     try {
-      // Parallel fetch across supported platforms with Social Fetch
-      const [redditResults, twitterResults, webResults] = await Promise.allSettled([
-        fetchRedditPostsForKeyword(kw.keyword, userId, kw.id),
-        fetchTwitterPostsForKeyword(kw.keyword, userId, kw.id),
-        fetchWebPostsForKeyword(kw.keyword, userId, kw.id),
-      ]);
+      const fetchTasks: Promise<MonitoredPost[]>[] = [];
+
+      // Only trigger scrapers for channels enabled by the user
+      if (enabledChannels.includes('reddit')) {
+        fetchTasks.push(fetchRedditPostsForKeyword(kw.keyword, userId, kw.id));
+      }
+      if (enabledChannels.includes('twitter')) {
+        fetchTasks.push(fetchTwitterPostsForKeyword(kw.keyword, userId, kw.id));
+      }
+      if (enabledChannels.includes('google')) {
+        fetchTasks.push(fetchWebPostsForKeyword(kw.keyword, userId, kw.id));
+      }
+
+      const results = await Promise.allSettled(fetchTasks);
 
       const candidatePosts: MonitoredPost[] = [];
-      if (redditResults.status === 'fulfilled') {
-        candidatePosts.push(...redditResults.value);
-      }
-      if (twitterResults.status === 'fulfilled') {
-        candidatePosts.push(...twitterResults.value);
-      }
-      if (webResults.status === 'fulfilled') {
-        candidatePosts.push(...webResults.value);
+      for (const res of results) {
+        if (res.status === 'fulfilled' && Array.isArray(res.value)) {
+          candidatePosts.push(...res.value);
+        }
       }
 
       for (const post of candidatePosts) {
