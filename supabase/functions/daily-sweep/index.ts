@@ -35,7 +35,9 @@ const TREG_BASE = 'https://treg.to';
 
 /** Hard caps so one busy day can never run away. */
 const MAX_USERS_PER_RUN = 500;
-const MAX_KEYWORDS_PER_USER = 25;
+// Must equal public.plan_max_keywords(). A workspace cannot be given more
+// keywords than this, so anything higher would be dead headroom.
+const MAX_KEYWORDS_PER_USER = 40;
 
 type Platform = 'twitter' | 'reddit' | 'google' | 'news';
 
@@ -62,9 +64,9 @@ const PLAN_MIN_SWEEP_HOURS: Record<string, number> = {
 };
 
 const PLAN_MAX_CHANNELS: Record<string, number> = {
-  starter: 2,
-  pro: 5,
-  scale: 5,
+  starter: 3,
+  pro: 4,
+  scale: 4,
 };
 
 /** Interval length in hours for a stored cadence string. */
@@ -227,11 +229,93 @@ function sinceDate(lookbackHours: number): string {
 // Transport
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Rate card — USD per successful provider call.
+//
+// These are treg's own published prices, not estimates:
+//   GET https://treg.to/catalog/endpoints/<id>  ->  endpoint.cost.usd
+//
+// They matter twice over: they set the running total reported at the end of a
+// sweep, and they are what the plan limits in public.plan_keyword_limit() are
+// sized against. Guessing low here makes every margin figure a fiction, which
+// is how the twitter rate came to be recorded at less than half its real cost.
+//
+// Keep in step with supabase/migrations/20261024_billing_economics.sql.
+// ---------------------------------------------------------------------------
+const TREG_COST_USD = {
+  twitter: 0.00075,        // anyapi.x.search.posts                  observed 2026-09-11
+  reddit: 0.001,           // tikhub.x.reddit-app-fetch-dynamic-search rate card 2026-07-28
+  redditFallback: 0.00188, // scrapecreators.reddit.search.posts      rate card 2026-07-28
+  google: 0.00015,         // crawl4ai.web.search.rich               observed 2026-10-09
+  news: 0,                 // tinyfish.web.search.news               rate card 2026-09-23
+} as const;
+
+// Credits charged per successful call. These are the customer-facing prices and
+// live in public.billing_config under 'operation_pricing' so an admin can
+// retune them without a deploy; the values here are only the fallback used when
+// the config row is missing.
+//
+// The ratio between credits and cost is what sets the margin on each call. At
+// 20 credits per dollar one credit is $0.05, so a Reddit call at 2 credits
+// ($0.10) against a $0.00288 cost is a 97% margin.
+const DEFAULT_CREDITS_PER_OPERATION: Record<string, number> = {
+  sweep_call_twitter: 1,
+  sweep_call_reddit: 2,
+  sweep_call_google: 1,
+  sweep_call_news: 0,
+};
+
+let operationCredits: Record<string, number> = { ...DEFAULT_CREDITS_PER_OPERATION };
+
+/** Accumulators, reset per run. */
+let creditsCharged = 0;
+const perOperation = new Map<string, { calls: number; credits: number; costUsd: number }>();
+
+function tally(operation: string, costUsd: number) {
+  creditsCharged += operationCredits[operation] ?? 0;
+  const row = perOperation.get(operation) ?? { calls: 0, credits: 0, costUsd: 0 };
+  row.calls += 1;
+  row.credits += operationCredits[operation] ?? 0;
+  row.costUsd += costUsd;
+  perOperation.set(operation, row);
+}
+
+function resetCreditCounters() {
+  creditsCharged = 0;
+  perOperation.clear();
+}
+
+
+/**
+ * Refuse to start once the wallet cannot cover a plausible run. A dry account
+ * otherwise spends an hour of scheduled sweeps collecting 503s, and the failure
+ * looks like a provider outage rather than an empty balance.
+ */
+const MIN_TREG_BALANCE_USD = 0.50;
+
+async function tregBalanceUsd(): Promise<number | null> {
+  if (!tregToken) return null;
+  try {
+    const res = await fetch(`${TREG_BASE}/billing`, {
+      headers: { 'X-Treg-Token': tregToken, Accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return typeof body?.balance_usd === 'number' ? body.balance_usd : null;
+  } catch {
+    return null; // unknown balance is not a reason to stop working
+  }
+}
+
 let usdSpent = 0;
+/** usdSpent sampled before the current workspace starts, so its cost can be attributed. */
+let usdSpentBefore = 0;
+/** Provider calls actually issued, for the spend ledger. */
+let callsMade = 0;
 
 async function tregCall(
   endpointId: string,
-  opts: { method?: 'GET' | 'POST'; query?: Record<string, string | number | undefined>; body?: unknown; costUsd: number; timeoutMs?: number },
+  opts: { method?: 'GET' | 'POST'; query?: Record<string, string | number | undefined>; body?: unknown; costUsd: number; operation: string; timeoutMs?: number },
 ): Promise<any | null> {
   if (!tregToken) return null;
 
@@ -243,6 +327,7 @@ async function tregCall(
   const method = opts.method ?? 'GET';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 20000);
+  callsMade++;
 
   try {
     const res = await fetch(url.toString(), {
@@ -255,12 +340,17 @@ async function tregCall(
       body: opts.body ? JSON.stringify(opts.body) : undefined,
       signal: controller.signal,
     });
-    usdSpent += opts.costUsd;
 
     if (!res.ok) {
+      // treg meters per_success, so a call it declined to serve is free.
+      // Counting it would overstate cost, which is the safer direction but
+      // still wrong to report.
       console.warn(`[treg] ${endpointId} -> ${res.status}`);
       return null;
     }
+
+    usdSpent += opts.costUsd;
+    tally(opts.operation, opts.costUsd);
     return await res.json();
   } catch (err) {
     console.warn(`[treg] ${endpointId} threw:`, (err as Error)?.name);
@@ -395,7 +485,8 @@ async function searchChannel(
       // Latest, not the default: the default returns all-time top posts, which
       // is what once put a 2021 tweet into the feed.
       body: { query: kw, queryType: 'Latest', limit: 20 },
-      costUsd: 0.0004,
+      costUsd: TREG_COST_USD.twitter,
+      operation: 'sweep_call_twitter',
     });
     const items = t?.output?.data?.items ?? [];
     return items.length
@@ -411,7 +502,8 @@ async function searchChannel(
         // whatever matched the tokens rather than posts about the keyword.
         sort: 'RELEVANCE', time_range: redditTimeframe(lookbackHours), need_format: 'true',
       },
-      costUsd: 0.001,
+      costUsd: TREG_COST_USD.reddit,
+      operation: 'sweep_call_reddit',
     });
     const tkItems = tk?.data?.posts ?? tk?.posts ?? [];
     if (Array.isArray(tkItems) && tkItems.length) {
@@ -420,7 +512,8 @@ async function searchChannel(
 
     const sc = await tregCall('scrapecreators.reddit.search.posts', {
       query: { query: kw, timeframe: redditTimeframe(lookbackHours), sort: 'relevance', limit: 25 },
-      costUsd: 0.00188,
+      costUsd: TREG_COST_USD.redditFallback,
+      operation: 'sweep_call_reddit',
     });
     const scItems = sc?.posts ?? [];
     return Array.isArray(scItems) && scItems.length
@@ -429,7 +522,8 @@ async function searchChannel(
   }
 
   if (platform === 'google') {
-    const r = await tregCall('crawl4ai.web.search.rich', { query: { q: kw, rich: 1 }, costUsd: 0.00015, timeoutMs: 25000 });
+    const r = await tregCall('crawl4ai.web.search.rich', { query: { q: kw, rich: 1 }, costUsd: TREG_COST_USD.google,
+      operation: 'sweep_call_google', timeoutMs: 25000 });
     const items = r?.results ?? [];
     return Array.isArray(items) && items.length
       ? items.map((x: any) => mapWeb(x, userId, kwId, kw)).filter((r2): r2 is PostRow => !!r2)
@@ -439,7 +533,8 @@ async function searchChannel(
   if (platform === 'news') {
     const r = await tregCall('tinyfish.web.search.news', {
       query: { query: kw, domain_type: 'news', after_date: sinceDate(lookbackHours) },
-      costUsd: 0,
+      costUsd: TREG_COST_USD.news,
+      operation: 'sweep_call_news',
     });
     const items = r?.results ?? [];
     return Array.isArray(items) && items.length
@@ -488,10 +583,52 @@ Deno.serve(async (req) => {
     return json({ ok: false, error: 'search provider not configured' }, 503);
   }
 
+  // An empty treg wallet turns every scheduled sweep into a burst of 503s that
+  // reads like a provider outage. One clear refusal is cheaper to diagnose.
+  const balanceUsd = await tregBalanceUsd();
+  if (balanceUsd !== null && balanceUsd < MIN_TREG_BALANCE_USD) {
+    console.error(
+      `[sweep] treg balance $${balanceUsd.toFixed(4)} is below the $${MIN_TREG_BALANCE_USD} floor — skipping this run.`,
+    );
+    return json(
+      {
+        ok: false,
+        error: 'insufficient_provider_credit',
+        balanceUsd,
+        requiredUsd: MIN_TREG_BALANCE_USD,
+      },
+      503,
+    );
+  }
+
   // Captured before any network work so the retention pass at the end of each
   // user's sweep cannot delete the results that sweep just produced.
   const sweepStartedAt = new Date().toISOString();
   usdSpent = 0;
+  usdSpentBefore = 0;
+  callsMade = 0;
+  resetCreditCounters();
+
+  // Credit prices are admin-tunable, so read them rather than trusting the
+  // compiled-in defaults. A failure here is not fatal: the defaults are the
+  // published list prices.
+  try {
+    const { data: cfg } = await supabase
+      .from('billing_config')
+      .select('value')
+      .eq('key', 'operation_pricing')
+      .maybeSingle();
+    const configured: Record<string, number> = {};
+    for (const [key, entry] of Object.entries(cfg?.value ?? {})) {
+      const credits = Number((entry as any)?.credits);
+      if (Number.isFinite(credits)) configured[key] = credits;
+    }
+    if (Object.keys(configured).length > 0) {
+      operationCredits = { ...DEFAULT_CREDITS_PER_OPERATION, ...configured };
+    }
+  } catch {
+    // Keep the defaults.
+  }
 
   const { data: runRow } = await supabase.from('sweep_runs').insert({}).select().single();
   const runId = runRow?.id;
@@ -581,6 +718,12 @@ Deno.serve(async (req) => {
 
     usersProcessed++;
 
+    // Everything this workspace spends from here on is attributed to it, which
+    // is what makes the per-workspace margin figure real.
+    usdSpentBefore = usdSpent;
+    const callsBefore = callsMade;
+    resetCreditCounters();
+
     const ALL: Platform[] = ['twitter', 'reddit', 'google', 'news'];
     const requested: Platform[] = Array.isArray(settings?.enabled_channels) && settings.enabled_channels.length > 0
       ? settings.enabled_channels.filter((c): c is Platform => ALL.includes(c as Platform))
@@ -644,6 +787,43 @@ Deno.serve(async (req) => {
       errors.push({ user: userId, kw: '*', platform: 'prune', message: String(pruneErr) });
     }
 
+    // ---- settle the credit meter for this workspace -----------------------
+    // One call, carrying the per-channel breakdown in metadata, rather than one
+    // per provider call. Overdraft is allowed so a workspace keeps working while
+    // a top-up settles; the shortfall shows up as a negative balance and is
+    // visible on the billing page instead of silently producing an empty feed.
+    const userUsd = Number((usdSpent - usdSpentBefore).toFixed(6));
+    const userCalls = callsMade - callsBefore;
+    const breakdown = Object.fromEntries(perOperation);
+
+    if (userCalls > 0) {
+      try {
+        const { data: settled } = await supabase.rpc('spend_credits', {
+          p_user_id: userId,
+          p_credits: creditsCharged,
+          p_operation: 'sweep',
+          p_service_cost_usd: userUsd,
+          p_calls: userCalls,
+          p_provider: 'treg',
+          p_provider_ref: runId ?? null,
+          p_allow_overdraft: true,
+          p_idempotency_key: runId ? `sweep:${runId}:${userId}` : null,
+          p_metadata: { byOperation: breakdown, runId },
+        });
+
+        if (settled?.shortfall > 0) {
+          errors.push({
+            user: userId,
+            kw: '*',
+            platform: 'credits',
+            message: `Credit balance short by ${settled.shortfall} after this sweep.`,
+          });
+        }
+      } catch (spendErr) {
+        errors.push({ user: userId, kw: '*', platform: 'credits', message: String(spendErr) });
+      }
+    }
+
     totalStale += droppedStale;
   }
 
@@ -654,6 +834,7 @@ Deno.serve(async (req) => {
         finished_at: new Date().toISOString(),
         users_processed: usersProcessed,
         posts_inserted: postsInserted,
+        usd_spent: Number(usdSpent.toFixed(6)),
         errors,
       })
       .eq('id', runId);
@@ -668,6 +849,8 @@ Deno.serve(async (req) => {
     droppedStale: totalStale,
     pruned,
     usdSpent: Number(usdSpent.toFixed(6)),
+    callsMade,
+    balanceUsd,
     errorCount: errors.length,
   });
 });

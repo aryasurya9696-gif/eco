@@ -10,7 +10,8 @@ import {
   CreditCard,
   LogOut,
   PanelLeftClose,
-  PanelLeftOpen
+  PanelLeftOpen,
+  BarChart3,
 } from 'lucide-react';
 
 interface NavItem {
@@ -88,6 +89,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
       ],
     },
   ];
+
+  // The profit view reads aggregates across every workspace, so it is only ever
+  // offered to an admin. Hiding the link is convenience; the server refuses a
+  // non-admin regardless.
+  if (profile?.is_admin) {
+    navItems.push({
+      group: 'ADMIN',
+      items: [
+        {
+          id: 'admin' as DashboardTab,
+          label: 'Billing & profit',
+          icon: <BarChart3 className="w-4 h-4" />,
+        },
+      ],
+    });
+  }
 
   return (
     <aside

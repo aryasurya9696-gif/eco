@@ -216,8 +216,7 @@ export const SettingsTab: React.FC = () => {
 
   const planDetails = getPlan(subscriptionPlan);
   const planMaxChannels = planDetails.maxChannels;
-  const planMinSweepHours =
-    CADENCES.find((c) => c.id === planDetails.sweepCadence)?.hours ?? 24;
+  const planMinSweepHours = planDetails.sweepCadenceHours;
 
   const cadenceHours =
     CADENCES.find((c) => c.id === sweepCadence)?.hours ?? 24;
