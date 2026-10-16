@@ -37,8 +37,10 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
   // Auto-generate AI keyword suggestions on step 4 from coreOffer
   useEffect(() => {
     if (step === 4 && coreOffer.trim() && aiSuggestions.length === 0) {
-      suggestKeywordsFromOffer(coreOffer, website).then((sugs) => {
-        if (sugs && sugs.length > 0) setAiSuggestions(sugs);
+      suggestKeywordsFromOffer(coreOffer, website).then((result) => {
+        // The suggestion set is now structured; PillInput only needs phrases.
+        const phrases = result?.suggestions?.map((s) => s.phrase).filter(Boolean) ?? [];
+        if (phrases.length > 0) setAiSuggestions(phrases);
       }).catch(() => {});
     }
   }, [step, coreOffer, website, suggestKeywordsFromOffer, aiSuggestions.length]);

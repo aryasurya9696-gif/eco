@@ -8,6 +8,7 @@ import React, {
 } from 'react';
 import { supabase, isConfigured } from '../lib/supabase';
 import { invokeSearchSweep } from '../lib/sweep';
+import type { KeywordSuggestionResult } from '../lib/ai';
 import { generateAiOutreachDraft, generateAiKeywordsFromOffer } from '../lib/ai';
 import { invokeFunction } from '../lib/api';
 import { SUBSCRIPTION_PLANS } from '../lib/billing';
@@ -53,7 +54,10 @@ interface EchoContextType {
     tone: 'professional' | 'casual' | 'consultative' | 'direct',
     customOffer?: string
   ) => Promise<string>;
-  suggestKeywordsFromOffer: (offerText: string, website?: string) => Promise<string[]>;
+  suggestKeywordsFromOffer: (
+    offerText: string,
+    website?: string,
+  ) => Promise<KeywordSuggestionResult>;
   // Export
   exportPostsToCsv: (customPosts?: MonitoredPost[]) => void;
   exportPostsToJson: (customPosts?: MonitoredPost[]) => void;
@@ -564,9 +568,16 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   );
 
   const suggestKeywordsFromOffer = useCallback(
-    async (offerText: string, website?: string): Promise<string[]> =>
-      generateAiKeywordsFromOffer(offerText, website || profile?.website || undefined),
-    [profile],
+    async (offerText: string, website?: string): Promise<KeywordSuggestionResult> =>
+      generateAiKeywordsFromOffer(offerText, website || profile?.website || undefined, {
+        // Already-tracked keywords are filtered out server-side so the model
+        // spends its limited slots on genuinely new suggestions.
+        existingKeywords: keywords.map((k) => k.keyword),
+        channels: enabledChannels,
+        slots: Math.max(1, keywordLimit - keywords.length),
+        lookbackHours,
+      }),
+    [profile, keywords, enabledChannels, keywordLimit, lookbackHours],
   );
 
   // --- Subscription ---------------------------------------------------------
