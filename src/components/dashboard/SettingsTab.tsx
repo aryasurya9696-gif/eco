@@ -1,24 +1,180 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useEcho } from '../../context/EchoContext';
-import {
-  INTENT_THRESHOLD_OPTIONS,
-  RETENTION_OPTIONS,
-} from '../../lib/constants';
+import { INTENT_THRESHOLD_OPTIONS, RETENTION_OPTIONS } from '../../lib/constants';
 import {
   Save,
-  Filter,
-  Clock,
-  ShieldCheck,
   Building2,
   Globe,
-  Sparkles,
-  Calendar,
-  Share2,
   Radio,
+  Clock,
+  Inbox,
+  Sparkles,
 } from 'lucide-react';
 import { PlatformBadge } from '../common/PlatformBadge';
 import { getPlan } from '../../lib/billing';
+import type { Platform } from '../../types';
+
+const CORE_OFFER_MAX = 280;
+
+/** Sweep intervals, slowest first. Index order is the upgrade order. */
+const CADENCES = [
+  { id: '24h', label: 'Daily', hours: 24 },
+  { id: '12h', label: 'Twice a day', hours: 12 },
+  { id: '6h', label: 'Every 6 hours', hours: 6 },
+] as const;
+
+const CHANNELS: {
+  id: Platform;
+  name: string;
+  desc: string;
+  tag?: string;
+}[] = [
+  {
+    id: 'twitter',
+    name: 'X (Twitter)',
+    desc: 'Buying discussions, tool questions and public complaints.',
+  },
+  {
+    id: 'reddit',
+    name: 'Reddit',
+    desc: 'Technical queries, peer reviews and community recommendations.',
+  },
+  {
+    id: 'google',
+    name: 'Web discussions',
+    desc: 'Forums, Q&A portals and indexed community threads.',
+  },
+  {
+    id: 'news',
+    name: 'Press & news',
+    desc: 'Launches, funding rounds and hiring signals.',
+    tag: 'Free',
+  },
+];
+
+const LOOKBACKS = [
+  { hours: 24, label: 'Last 24 hours' },
+  { hours: 48, label: 'Last 48 hours' },
+] as const;
+
+/**
+ * Mirrors isSweepDue() in supabase/functions/daily-sweep. The cron wakes up
+ * every hour, so "when is my next sweep" is just the next hour-of-day that
+ * satisfies the same modulo rule the sweep itself uses.
+ */
+function isSweepDue(hour: number, sweepHour: number, cadenceHours: number): boolean {
+  if (cadenceHours >= 24) return hour === sweepHour;
+  return hour % cadenceHours === sweepHour % cadenceHours;
+}
+
+const relative = (target: Date, now: Date): string => {
+  const mins = Math.max(1, Math.round((target.getTime() - now.getTime()) / 60000));
+  if (mins < 60) return `in ${mins}m`;
+  const hrs = Math.round(mins / 60);
+  return hrs < 48 ? `in ${hrs}h` : `in ${Math.round(hrs / 24)}d`;
+};
+
+// ---------------------------------------------------------------------------
+// Primitives
+// ---------------------------------------------------------------------------
+
+const Section: React.FC<{
+  icon: React.ReactNode;
+  title: string;
+  description: string;
+  aside?: React.ReactNode;
+  children: React.ReactNode;
+}> = ({ icon, title, description, aside, children }) => (
+  <section className="bg-white border border-[#e3e3de]">
+    <header className="flex items-start justify-between gap-4 px-6 py-4 border-b border-[#eeeeea]">
+      <div className="flex items-start gap-3">
+        <span className="shrink-0 w-8 h-8 bg-[#f6f6f4] border border-[#e3e3de] flex items-center justify-center">
+          {icon}
+        </span>
+        <div>
+          <h3 className="text-sm font-bold text-[#141414]">{title}</h3>
+          <p className="text-[11px] text-[#8a8a86] font-mono mt-0.5 max-w-prose">
+            {description}
+          </p>
+        </div>
+      </div>
+      {aside}
+    </header>
+    <div className="p-6 space-y-5">{children}</div>
+  </section>
+);
+
+const Field: React.FC<{
+  label: string;
+  hint?: React.ReactNode;
+  aside?: React.ReactNode;
+  children: React.ReactNode;
+}> = ({ label, hint, aside, children }) => (
+  <div className="space-y-2">
+    <div className="flex items-baseline justify-between gap-3">
+      <span className="text-xs font-mono font-medium text-[#141414]">{label}</span>
+      {aside}
+    </div>
+    {children}
+    {hint && (
+      <p className="text-[11px] font-mono text-[#8a8a86] leading-relaxed">{hint}</p>
+    )}
+  </div>
+);
+
+/** Segmented control. Every option gets an equal column. */
+function Segmented<T extends string | number>({
+  options,
+  value,
+  onChange,
+  isAllowed,
+  format,
+}: {
+  options: readonly T[];
+  value: T;
+  onChange: (next: T) => void;
+  isAllowed?: (option: T) => boolean;
+  format?: (option: T) => string;
+}) {
+  return (
+    <div
+      className="grid gap-1.5"
+      style={{ gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))` }}
+    >
+      {options.map((option) => {
+        const selected = option === value;
+        const allowed = isAllowed ? isAllowed(option) : true;
+
+        return (
+          <button
+            key={String(option)}
+            type="button"
+            disabled={!allowed}
+            aria-pressed={selected}
+            onClick={() => onChange(option)}
+            title={allowed ? undefined : 'Not included in your plan'}
+            className={`px-3 py-2 text-[11px] font-mono border transition-colors duration-150 cursor-pointer active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-35 disabled:active:scale-100 ${
+              selected
+                ? 'bg-[#141414] text-white border-[#141414] font-medium'
+                : 'bg-white text-[#4a4a47] border-[#deded8] hover:bg-[#f6f6f4] hover:border-[#b5b5b0]'
+            }`}
+          >
+            {format ? format(option) : String(option)}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+const inputClass =
+  'w-full px-3.5 py-2.5 bg-white border border-[#deded8] hover:border-[#b5b5b0] focus:border-[#141414] focus:ring-1 focus:ring-[#141414] text-xs font-mono text-[#141414] transition-colors outline-none';
+
+const pillClass =
+  'text-[10px] font-mono px-2 py-0.5 border whitespace-nowrap font-medium';
+
+// ---------------------------------------------------------------------------
 
 export const SettingsTab: React.FC = () => {
   const { profile, updateProfile } = useAuth();
@@ -49,614 +205,396 @@ export const SettingsTab: React.FC = () => {
   const [coreOffer, setCoreOffer] = useState<string>(profile?.core_offer || '');
   const [isSaving, setIsSaving] = useState<boolean>(false);
 
+  // One ticking clock drives every relative timestamp on the page, so the
+  // "next sweep" countdown stays honest instead of freezing at first render.
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => clearInterval(id);
+  }, []);
+  const now = useMemo(() => new Date(nowMs), [nowMs]);
+
   const planDetails = getPlan(subscriptionPlan);
+  const planMaxChannels = planDetails.maxChannels;
+  const planMinSweepHours =
+    CADENCES.find((c) => c.id === planDetails.sweepCadence)?.hours ?? 24;
+
+  const cadenceHours =
+    CADENCES.find((c) => c.id === sweepCadence)?.hours ?? 24;
+  const effectiveSweepHours = Math.max(cadenceHours, planMinSweepHours);
+
+  const sweepHour = useMemo(() => {
+    const parsed = /^(\d{1,2}):/.exec(sweepTime);
+    const hour = parsed ? Number(parsed[1]) : 6;
+    return hour >= 0 && hour <= 23 ? hour : 6;
+  }, [sweepTime]);
+
+  const nextSweep = useMemo(() => {
+    const midnight = Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate(),
+    );
+    for (let offset = 0; offset <= 24; offset += 1) {
+      const candidate = new Date(midnight + (offset * 24 + sweepHour) * 3600_000);
+      if (candidate <= now) continue;
+      if (isSweepDue(candidate.getUTCHours(), sweepHour, effectiveSweepHours)) {
+        return candidate;
+      }
+    }
+    return null;
+  }, [now, sweepHour, effectiveSweepHours]);
 
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSaving(true);
     const result = await updateProfile({
       full_name: fullName,
-      website: website,
+      website,
       core_offer: coreOffer,
     });
     await saveSettings();
     setIsSaving(false);
     if (result.error) {
       addToast(`Could not save: ${result.error}`, 'error');
+    } else {
+      addToast('Settings saved.', 'success');
     }
   };
 
+  const channelLimitReached = enabledChannels.length >= planMaxChannels;
+
+  const handleToggleChannel = (id: Platform) => {
+    const active = enabledChannels.includes(id);
+    if (!active && channelLimitReached) {
+      addToast(
+        `The ${planDetails.name} plan covers ${planMaxChannels} channels. Remove one to add another.`,
+        'error',
+      );
+      return;
+    }
+    toggleChannel(id);
+  };
+
+  const handlePrune = async () => {
+    await saveSettings();
+    const result = await pruneFeed();
+    if (result.success) {
+      addToast(
+        result.deleted
+          ? `Removed ${result.deleted} expired mention${result.deleted === 1 ? '' : 's'}.`
+          : 'Nothing has expired yet.',
+        'success',
+      );
+    } else {
+      addToast(result.error || 'Could not apply retention.', 'error');
+    }
+  };
+
+  const nextSweepLabel = nextSweep
+    ? `${nextSweep.toLocaleString('en-US', {
+        weekday: 'short',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+        timeZone: 'UTC',
+      })} UTC · ${relative(nextSweep, now)}`
+    : 'Not scheduled';
+
   return (
-    <div className="max-w-6xl mx-auto space-y-6">
-      {/* Page Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-[#e3e3de]">
+    <form
+      onSubmit={handleSaveProfile}
+      className="max-w-4xl mx-auto space-y-5 pb-24"
+    >
+      {/* Header --------------------------------------------------------- */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-xl font-bold tracking-tight text-[#141414]">
-            Settings & Workspace Preferences
+            Workspace Settings
           </h2>
-          <p className="text-xs text-[#8a8a86] font-mono mt-0.5">
-            Configure buyer intent parameters, sweep schedule, and workspace identity.
+          <p className="text-[11px] text-[#8a8a86] font-mono mt-1">
+            Saved to your account and applied to the next sweep.
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={handleSaveProfile}
-            disabled={isSaving}
-            className="inline-flex items-center gap-2 px-4 py-2 bg-[#121212] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer disabled:opacity-50 shadow-xs"
-          >
-            <Save className="w-3.5 h-3.5" />
-            <span>{isSaving ? 'Saving...' : 'Save All Settings'}</span>
-          </button>
-        </div>
+        <button
+          type="submit"
+          disabled={isSaving}
+          className="inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-[#121212] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer disabled:opacity-50 shrink-0"
+        >
+          <Save className="w-3.5 h-3.5" />
+          <span>{isSaving ? 'Saving…' : 'Save changes'}</span>
+        </button>
       </div>
 
-      {/* Main 2-Column Responsive Layout */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
-        {/* Left Column: Core Forms (2 cols wide) */}
-        <div className="lg:col-span-2 space-y-6">
-          {/* Workspace & Business Context */}
-          <form onSubmit={handleSaveProfile} className="bg-white border border-[#e3e3de] p-6 space-y-6">
-            <div className="flex items-start justify-between border-b border-[#eeeeea] pb-4">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 bg-[#f6f6f4] border border-[#e3e3de]">
-                  <Building2 className="w-4 h-4 text-[#141414]" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-[#141414]">
-                    Workspace Profile & Value Proposition
-                  </h3>
-                  <p className="text-xs text-[#8a8a86] font-mono">
-                    Used by Echo to personalize lead detection and tailor AI outreach drafts.
-                  </p>
-                </div>
-              </div>
+      {/* At a glance ---------------------------------------------------- */}
+      <dl className="grid grid-cols-2 sm:grid-cols-4 border border-[#e3e3de] bg-white divide-x divide-y sm:divide-y-0 sm:divide-x divide-[#eeeeea]">
+        {[
+          { label: 'Plan', value: planDetails.name },
+          {
+            label: 'Keywords',
+            value: `${keywords.length}/${keywordLimit}`,
+          },
+          {
+            label: 'Mentions',
+            value: `${posts.length}`,
+          },
+          {
+            label: 'Next sweep',
+            value: nextSweepLabel,
+            wide: true,
+          },
+        ].map((stat) => (
+          <div key={stat.label} className="px-4 py-3 space-y-0.5">
+            <dt className="text-[10px] font-mono uppercase tracking-wide text-[#8a8a86]">
+              {stat.label}
+            </dt>
+            <dd
+              className={`text-xs font-mono text-[#141414] font-medium ${
+                stat.wide ? 'text-[11px]' : ''
+              }`}
+            >
+              {stat.value}
+            </dd>
+          </div>
+        ))}
+      </dl>
+
+      {/* Workspace ------------------------------------------------------ */}
+      <Section
+        icon={<Building2 className="w-4 h-4 text-[#141414]" />}
+        title="Workspace"
+        description="Your offer is the context every keyword score and AI draft is built from."
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <Field label="Name">
+            <input
+              type="text"
+              value={fullName}
+              onChange={(e) => setFullName(e.target.value)}
+              placeholder="e.g. Alex Rivera"
+              className={inputClass}
+            />
+          </Field>
+
+          <Field label="Website">
+            <div className="relative">
+              <Globe className="w-3.5 h-3.5 text-[#8a8a86] absolute left-3 top-3 pointer-events-none" />
+              <input
+                type="text"
+                value={website}
+                onChange={(e) => setWebsite(e.target.value)}
+                placeholder="acme.ai"
+                className={`${inputClass} pl-9`}
+              />
             </div>
+          </Field>
+        </div>
 
-            <div className="space-y-4">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="space-y-1.5">
-                  <label className="text-xs font-mono uppercase text-[#4a4a47] block font-medium">
-                    Company or Founder Name
-                  </label>
-                  <input
-                    type="text"
-                    value={fullName}
-                    onChange={(e) => setFullName(e.target.value)}
-                    placeholder="e.g. Alex Rivera"
-                    className="w-full px-3.5 py-2.5 bg-white border border-[#deded8] hover:border-[#b5b5b0] focus:border-[#141414] focus:ring-1 focus:ring-[#141414] text-xs font-mono text-[#141414] transition-colors outline-none"
-                  />
-                </div>
+        <Field
+          label="What you sell"
+          hint="One or two sentences. This is what tells a buying mention apart from noise."
+          aside={
+            <span className="text-[11px] font-mono text-[#8a8a86]">
+              {coreOffer.length}/{CORE_OFFER_MAX}
+            </span>
+          }
+        >
+          <textarea
+            rows={3}
+            maxLength={CORE_OFFER_MAX}
+            value={coreOffer}
+            onChange={(e) => setCoreOffer(e.target.value)}
+            placeholder="e.g. Autonomous AI lead qualification agents for B2B outbound teams"
+            className={`${inputClass} resize-none leading-relaxed`}
+          />
+        </Field>
 
-                <div className="space-y-1.5">
-                  <label className="text-xs font-mono uppercase text-[#4a4a47] block font-medium">
-                    Website URL
-                  </label>
-                  <div className="relative">
-                    <Globe className="w-3.5 h-3.5 text-[#8a8a86] absolute left-3 top-3 pointer-events-none" />
-                    <input
-                      type="text"
-                      value={website}
-                      onChange={(e) => setWebsite(e.target.value)}
-                      placeholder="acme.ai"
-                      className="w-full pl-9 pr-3.5 py-2.5 bg-white border border-[#deded8] hover:border-[#b5b5b0] focus:border-[#141414] focus:ring-1 focus:ring-[#141414] text-xs font-mono text-[#141414] transition-colors outline-none"
-                    />
-                  </div>
-                </div>
-              </div>
+        {coreOffer.trim().length === 0 && (
+          <p className="flex items-start gap-2 text-[11px] font-mono text-amber-800 bg-amber-50 border border-amber-200 px-3 py-2 leading-relaxed">
+            <Sparkles className="w-3.5 h-3.5 shrink-0 mt-px" />
+            <span>
+              Add your offer to unlock AI keyword suggestions and outreach drafts.
+            </span>
+          </p>
+        )}
+      </Section>
 
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-mono uppercase text-[#4a4a47] block font-medium">
-                    Core Offer & Product Description
-                  </label>
-                  <span className="text-[11px] font-mono text-[#8a8a86]">
-                    {coreOffer.length} / 280 characters
-                  </span>
-                </div>
-                <textarea
-                  rows={3}
-                  value={coreOffer}
-                  onChange={(e) => setCoreOffer(e.target.value)}
-                  placeholder="Explain what your product solves in 1–2 sentences (e.g. Autonomous AI lead qualification agents for B2B outbound teams)..."
-                  className="w-full px-3.5 py-2.5 bg-white border border-[#deded8] hover:border-[#b5b5b0] focus:border-[#141414] focus:ring-1 focus:ring-[#141414] text-xs font-mono text-[#141414] transition-colors outline-none resize-none leading-relaxed"
-                />
-                <p className="text-[11px] font-mono text-[#8a8a86]">
-                  Echo injects this context directly into the AI prompt to draft hyper-relevant replies.
-                </p>
-              </div>
-            </div>
+      {/* Channels ------------------------------------------------------- */}
+      <Section
+        icon={<Radio className="w-4 h-4 text-[#141414]" />}
+        title="Channels"
+        description="Every sweep searches exactly these sources. Fewer channels means faster sweeps and lower cost."
+        aside={
+          <span
+            className={`${pillClass} ${
+              channelLimitReached
+                ? 'border-[#141414] text-[#141414]'
+                : 'border-[#deded8] text-[#8a8a86]'
+            }`}
+          >
+            {enabledChannels.length}/{planMaxChannels} used
+          </span>
+        }
+      >
+        <ul className="divide-y divide-[#f6f6f4] border border-[#f0f0ec]">
+          {CHANNELS.map((channel) => {
+            const isEnabled = enabledChannels.includes(channel.id);
+            const atLimit = !isEnabled && channelLimitReached;
 
-            <div className="flex items-center justify-between pt-2 border-t border-[#eeeeea]">
-              <span className="text-[11px] font-mono text-emerald-700 bg-emerald-50 px-2.5 py-1 border border-emerald-200 inline-flex items-center gap-1.5">
-                <Sparkles className="w-3 h-3" />
-                <span>AI personalization active</span>
-              </span>
-
-              <button
-                type="submit"
-                disabled={isSaving}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#f6f6f4] hover:bg-[#ecece7] text-[#141414] border border-[#deded8] text-xs font-mono transition-colors cursor-pointer disabled:opacity-50"
+            return (
+              <li
+                key={channel.id}
+                className="flex items-center justify-between gap-4 px-4 py-3"
               >
-                <Save className="w-3 h-3 text-[#4a4a47]" />
-                <span>{isSaving ? 'Saving...' : 'Save Profile'}</span>
-              </button>
-            </div>
-          </form>
-
-          {/* Monitored Channels & Platform Selectivity */}
-          <div className="bg-white border border-[#e3e3de] p-6 space-y-6">
-            <div className="flex items-start justify-between border-b border-[#eeeeea] pb-4">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 bg-[#f6f6f4] border border-[#e3e3de]">
-                  <Share2 className="w-4 h-4 text-[#141414]" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-[#141414]">
-                    Monitored Channels & Platform Selectivity
-                  </h3>
-                  <p className="text-xs text-[#8a8a86] font-mono">
-                    Select exactly which channels Echo scans for your keywords. Disabled platforms are skipped to save API credits.
-                  </p>
-                </div>
-              </div>
-
-              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-emerald-50 border border-emerald-200 text-emerald-800 text-[10px] font-mono font-medium">
-                <Radio className="w-2.5 h-2.5 text-emerald-600 animate-pulse" />
-                <span>{enabledChannels.length} Active</span>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-              {[
-                {
-                  id: 'twitter' as const,
-                  name: 'X (formerly Twitter)',
-                  desc: 'High-velocity buying discussions, tool questions & complaints.',
-                  supported: true,
-                },
-                {
-                  id: 'reddit' as const,
-                  name: 'Reddit Communities',
-                  desc: 'Deep technical queries, subreddit recommendations & peer reviews.',
-                  supported: true,
-                },
-                {
-                  id: 'google' as const,
-                  name: 'Web & Google Discussions',
-                  desc: 'Public developer forums, tech blogs, and indexed Q&A portals.',
-                  supported: true,
-                },
-                {
-                  id: 'news' as const,
-                  name: 'Press & News',
-                  desc: 'Product launches, funding rounds and hiring signals from the press.',
-                  supported: true,
-                  badge: 'Free',
-                },
-              ].map((channel) => {
-                const isEnabled = enabledChannels.includes(channel.id);
-                return (
-                  <div
-                    key={channel.id}
-                    className={`p-4 border transition-all flex flex-col justify-between ${
-                      !channel.supported
-                        ? 'bg-[#fbfbfa] border-[#eeeeea] opacity-75'
-                        : isEnabled
-                        ? 'bg-white border-[#141414] shadow-xs'
-                        : 'bg-[#fbfbfa] border-[#e3e3de]'
-                    }`}
-                  >
-                    <div>
-                      <div className="flex items-center justify-between pb-2">
-                        <div className="flex items-center gap-2">
-                          <PlatformBadge platform={channel.id} size={20} />
-                          <span className="text-xs font-bold text-[#141414]">
-                            {channel.name}
-                          </span>
-                        </div>
-
-                        {channel.supported ? (
-                          <button
-                            type="button"
-                            onClick={() => toggleChannel(channel.id)}
-                            className={`w-11 h-6 flex items-center p-0.5 border transition-colors cursor-pointer ${
-                              isEnabled
-                                ? 'bg-[#141414] border-[#141414] justify-end'
-                                : 'bg-white border-[#deded8] justify-start'
-                            }`}
-                            aria-label={`Toggle ${channel.name}`}
-                          >
-                            <span
-                              className={`w-4 h-4 block ${
-                                isEnabled ? 'bg-white' : 'bg-[#8a8a86]'
-                              }`}
-                            />
-                          </button>
-                        ) : (
-                          <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 bg-white border border-[#deded8] text-[#8a8a86]">
-                            {channel.badge}
-                          </span>
-                        )}
-                      </div>
-
-                      <p className="text-[11px] text-[#8a8a86] font-mono leading-relaxed mt-1">
-                        {channel.desc}
-                      </p>
-                    </div>
-
-                    <div className="pt-3 mt-2 border-t border-[#f6f6f4] flex items-center justify-between text-[10px] font-mono">
-                      <span className="text-[#8a8a86]">
-                        {isEnabled ? '● Scanning every sweep' : '○ Skipped during sweep'}
+                <div className="flex items-start gap-3 min-w-0">
+                  <PlatformBadge platform={channel.id} size={22} />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-bold text-[#141414]">
+                        {channel.name}
                       </span>
-                      {channel.supported && (
-                        <span className={isEnabled ? 'text-emerald-700 font-semibold' : 'text-[#8a8a86]'}>
-                          {isEnabled ? 'API calls per sweep' : 'No API cost'}
+                      {channel.tag && (
+                        <span
+                          className={`${pillClass} border-emerald-200 bg-emerald-50 text-emerald-700`}
+                        >
+                          {channel.tag}
                         </span>
                       )}
                     </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="flex items-center justify-between pt-1 text-[11px] font-mono text-[#8a8a86]">
-              <span>Tip: Turning off channels you do not need cuts down your sweep runtime by up to 60%.</span>
-            </div>
-          </div>
-
-          {/* Intent Filtering */}
-          <div className="bg-white border border-[#e3e3de] p-6 space-y-6">
-            <div className="flex items-start justify-between border-b border-[#eeeeea] pb-4">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 bg-[#f6f6f4] border border-[#e3e3de]">
-                  <Filter className="w-4 h-4 text-[#141414]" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-[#141414]">Intent Filtering</h3>
-                  <p className="text-xs text-[#8a8a86] font-mono">
-                    How strict the sweep is before anything reaches your feed.
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            <div className="space-y-5">
-              {/* Minimum Intent Filter Threshold */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-[#141414] font-mono">
-                    Minimum Intent Alert Threshold
-                  </span>
-                  <span className="text-xs font-mono text-emerald-700 font-semibold bg-emerald-50 px-2 py-0.5 border border-emerald-200">
-                    {minIntentThreshold === 0 ? 'No filtering' : `${minIntentThreshold}%+ Score`}
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2">
-                  {INTENT_THRESHOLD_OPTIONS.map((threshold) => (
-                    <button
-                      key={threshold}
-                      type="button"
-                      onClick={() => setMinIntentThreshold(threshold)}
-                      className={`py-2 px-3 text-xs font-mono border transition-all cursor-pointer ${
-                        minIntentThreshold === threshold
-                          ? 'bg-[#141414] text-white border-[#141414] font-medium'
-                          : 'bg-white text-[#4a4a47] border-[#deded8] hover:bg-[#f6f6f4]'
-                      }`}
-                    >
-                      {threshold === 0
-                        ? 'All mentions'
-                        : `${threshold}%${threshold === 75 ? ' (Recommended)' : ''}`}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* ── Feed retention ─────────────────────────────────────── */}
-              <div className="space-y-2 pt-2 border-t border-[#eeeeea]">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-[#141414] font-mono">
-                    Feed retention
-                  </span>
-                  <span className="text-xs font-mono text-[#8a8a86]">
-                    {feedRetentionDays === 0
-                      ? 'Keeping everything'
-                      : `Keeping last ${feedRetentionDays} day${feedRetentionDays === 1 ? '' : 's'}`}
-                  </span>
-                </div>
-
-                <div className="flex flex-wrap gap-1.5">
-                  {RETENTION_OPTIONS.map((opt) => (
-                    <button
-                      key={opt.days}
-                      type="button"
-                      onClick={() => setFeedRetentionDays(opt.days)}
-                      className={`px-2.5 py-1.5 text-[11px] font-mono border transition-all duration-150 cursor-pointer active:scale-[0.97] ${
-                        feedRetentionDays === opt.days
-                          ? 'bg-[#141414] text-white border-[#141414]'
-                          : 'bg-white text-[#4a4a47] border-[#e3e3de] hover:border-[#b5b5b0] hover:bg-[#f6f6f4]'
-                      }`}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-
-                <p className="text-[11px] font-mono text-[#8a8a86] leading-relaxed">
-                  After every sweep, mentions older than this window are deleted automatically.
-                  Whatever that sweep just found is always kept.
-                </p>
-
-                {posts.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      await saveSettings();
-                      const result = await pruneFeed();
-                      if (result.success) {
-                        addToast(
-                          result.deleted
-                            ? `Removed ${result.deleted} expired mention(s).`
-                            : 'Nothing expired yet.',
-                          'success',
-                        );
-                      } else {
-                        addToast(result.error || 'Could not prune the feed.', 'error');
-                      }
-                    }}
-                    className="mt-1 px-3 py-1.5 text-[11px] font-mono border border-[#e3e3de] bg-white text-[#4a4a47] hover:bg-[#f6f6f4] hover:border-[#b5b5b0] transition-all duration-150 cursor-pointer active:scale-[0.97]"
-                  >
-                    Apply now
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {/* Automated Sweep Schedule & Timing */}
-          <div className="bg-white border border-[#e3e3de] p-6 space-y-6">
-            <div className="flex items-start justify-between border-b border-[#eeeeea] pb-4">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 bg-[#f6f6f4] border border-[#e3e3de]">
-                  <Clock className="w-4 h-4 text-[#141414]" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-[#141414]">
-                    Automated Sweep Schedule & Timing
-                  </h3>
-                  <p className="text-xs text-[#8a8a86] font-mono">
-                    Configure custom execution hours, cadence and sweep scope.
-                  </p>
-                </div>
-              </div>
-
-              <span className="text-[10px] font-mono uppercase px-2 py-0.5 bg-[#f6f6f4] border border-[#deded8] text-[#141414] font-medium">
-                {sweepCadence === '24h' ? 'Daily Active' : `${sweepCadence} Active`}
-              </span>
-            </div>
-
-            <div className="space-y-5">
-              {/* Custom Execution Time (UTC) */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-semibold text-[#141414] flex items-center gap-1.5 font-mono">
-                    <Calendar className="w-3.5 h-3.5 text-[#8a8a86]" />
-                    <span>Custom Sweep Execution Time (UTC)</span>
-                  </label>
-                  <span className="text-xs font-mono text-emerald-700 bg-emerald-50 px-2 py-0.5 border border-emerald-200 font-medium">
-                    Scheduled at {sweepTime} UTC
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {[
-                    { label: '06:00 UTC', sub: 'Early Morning (Default)', value: '06:00' },
-                    { label: '09:00 UTC', sub: 'Market Open', value: '09:00' },
-                    { label: '14:00 UTC', sub: 'Midday Peak', value: '14:00' },
-                    { label: '18:00 UTC', sub: 'Evening Close', value: '18:00' },
-                  ].map((preset) => (
-                    <button
-                      key={preset.value}
-                      type="button"
-                      onClick={() => setSweepTime(preset.value)}
-                      className={`p-2.5 text-left border transition-all cursor-pointer ${
-                        sweepTime === preset.value
-                          ? 'bg-[#141414] text-white border-[#141414]'
-                          : 'bg-white text-[#4a4a47] border-[#deded8] hover:bg-[#f6f6f4]'
-                      }`}
-                    >
-                      <div className="text-xs font-mono font-bold">{preset.label}</div>
-                      <div
-                        className={`text-[10px] font-mono mt-0.5 ${
-                          sweepTime === preset.value ? 'text-[#deded8]' : 'text-[#8a8a86]'
-                        }`}
-                      >
-                        {preset.sub}
-                      </div>
-                    </button>
-                  ))}
-                </div>
-
-                {/* Custom Time Picker */}
-                <div className="flex flex-wrap items-center gap-3 pt-1">
-                  <span className="text-xs font-mono text-[#8a8a86]">Or enter custom time:</span>
-                  <div className="inline-flex items-center gap-2">
-                    <input
-                      type="time"
-                      value={sweepTime}
-                      onChange={(e) => setSweepTime(e.target.value || '06:00')}
-                      className="px-2.5 py-1.5 bg-[#fbfbfa] border border-[#deded8] text-xs font-mono text-[#141414] focus:outline-none focus:border-[#141414] cursor-pointer"
-                    />
-                    <span className="text-xs font-mono text-[#4a4a47]">UTC</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Sweep Frequency / Cadence */}
-              <div className="space-y-2 pt-2 border-t border-[#eeeeea]">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-semibold text-[#141414] font-mono">
-                    Execution Frequency
-                  </label>
-                  <span className="text-[11px] font-mono text-[#8a8a86]">
-                    Cadence of automated scans
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2">
-                  {[
-                    { id: '24h', label: 'Every 24 Hours', badge: 'Standard Daily' },
-                    { id: '12h', label: 'Every 12 Hours', badge: 'Twice Daily' },
-                    { id: '6h', label: 'Every 6 Hours', badge: 'Accelerated' },
-                  ].map((cad) => (
-                    <button
-                      key={cad.id}
-                      type="button"
-                      onClick={() => setSweepCadence(cad.id as '24h' | '12h' | '6h')}
-                      className={`p-2.5 text-center border transition-all cursor-pointer ${
-                        sweepCadence === cad.id
-                          ? 'bg-[#141414] text-white border-[#141414]'
-                          : 'bg-white text-[#4a4a47] border-[#deded8] hover:bg-[#f6f6f4]'
-                      }`}
-                    >
-                      <div className="text-xs font-mono font-medium">{cad.label}</div>
-                      <div
-                        className={`text-[10px] font-mono mt-0.5 ${
-                          sweepCadence === cad.id ? 'text-[#deded8]' : 'text-[#8a8a86]'
-                        }`}
-                      >
-                        {cad.badge}
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Lookback & Pagination Safety */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-[#eeeeea] text-xs font-mono">
-                <div className="p-4 border border-[#e3e3de] bg-[#fbfbfa] space-y-2 flex flex-col justify-between">
-                  <div>
-                    <div className="flex items-center gap-1.5 text-[#141414] font-semibold pb-1">
-                      <Clock className="w-3.5 h-3.5 text-[#8a8a86]" />
-                      <span>Lookback Duration</span>
-                    </div>
-                    <p className="text-[11px] text-[#8a8a86]">
-                      Time window analyzed during each automated sweep.
+                    <p className="text-[11px] text-[#8a8a86] font-mono mt-0.5">
+                      {channel.desc}
                     </p>
                   </div>
-
-                  <div className="flex items-center gap-2 pt-2">
-                    <button
-                      type="button"
-                      onClick={() => setLookbackHours(24)}
-                      className={`flex-1 py-1.5 px-2 text-xs border text-center transition-all cursor-pointer ${
-                        lookbackHours === 24
-                          ? 'bg-[#141414] text-white border-[#141414] font-medium'
-                          : 'bg-white text-[#4a4a47] border-[#deded8] hover:bg-[#f6f6f4]'
-                      }`}
-                    >
-                      24h Standard
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setLookbackHours(48)}
-                      className={`flex-1 py-1.5 px-2 text-xs border text-center transition-all cursor-pointer ${
-                        lookbackHours === 48
-                          ? 'bg-[#141414] text-white border-[#141414] font-medium'
-                          : 'bg-white text-[#4a4a47] border-[#deded8] hover:bg-[#f6f6f4]'
-                      }`}
-                    >
-                      48h Extended
-                    </button>
-                  </div>
                 </div>
 
-                <div className="p-4 border border-[#e3e3de] bg-[#fbfbfa] space-y-2 flex flex-col justify-between">
-                  <div>
-                    <div className="flex items-center gap-1.5 text-[#141414] font-semibold pb-1">
-                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-                      <span>Pagination Cap</span>
-                    </div>
-                    <p className="text-[11px] text-[#8a8a86]">
-                      Strict 2-page cap per platform protects API credit limits.
-                    </p>
-                  </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={isEnabled}
+                  aria-label={`${channel.name} monitoring`}
+                  disabled={atLimit}
+                  title={
+                    atLimit
+                      ? `Your ${planDetails.name} plan covers ${planMaxChannels} channels`
+                      : undefined
+                  }
+                  onClick={() => handleToggleChannel(channel.id)}
+                  className={`shrink-0 w-10 h-[22px] flex items-center p-0.5 border transition-colors duration-150 cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 ${
+                    isEnabled
+                      ? 'bg-[#141414] border-[#141414] justify-end'
+                      : 'bg-white border-[#deded8] justify-start'
+                  }`}
+                >
+                  <span
+                    className={`w-3.5 h-3.5 block transition-colors ${
+                      isEnabled ? 'bg-white' : 'bg-[#c9c9c4]'
+                    }`}
+                  />
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </Section>
 
-                  <div className="pt-2">
-                    <div className="px-2.5 py-1.5 bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-semibold flex items-center justify-between">
-                      <span>Rate Safety Locked</span>
-                      <span>100% Protected</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
+      {/* Schedule ------------------------------------------------------- */}
+      <Section
+        icon={<Clock className="w-4 h-4 text-[#141414]" />}
+        title="Sweep schedule"
+        description="When Echo runs on its own. All times are UTC."
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+          <Field label="Start time">
+            <input
+              type="time"
+              value={sweepTime}
+              onChange={(e) => setSweepTime(e.target.value || '06:00')}
+              className={`${inputClass} cursor-pointer`}
+            />
+          </Field>
+
+          <Field label="How often">
+            <Segmented
+              options={CADENCES.map((c) => c.id)}
+              value={sweepCadence}
+              onChange={setSweepCadence}
+              isAllowed={(id) =>
+                (CADENCES.find((c) => c.id === id)?.hours ?? 24) >= planMinSweepHours
+              }
+              format={(id) => CADENCES.find((c) => c.id === id)?.label ?? id}
+            />
+          </Field>
         </div>
 
-        {/* Right Column: Status & Operational Summary (1 col wide) */}
-        <div className="space-y-6">
-          {/* Workspace Status Overview Card */}
-          <div className="bg-white border border-[#e3e3de] p-5 space-y-4">
-            <div className="flex items-center justify-between pb-3 border-b border-[#eeeeea]">
-              <span className="text-xs font-mono uppercase font-bold text-[#141414]">
-                Workspace Overview
-              </span>
-              <span className="flex items-center gap-1 text-[10px] font-mono text-emerald-700 bg-emerald-50 px-2 py-0.5 border border-emerald-200 font-medium">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                Active
-              </span>
-            </div>
+        <Field
+          label="Search window"
+          hint="How far back each sweep looks. A wider window costs more but catches slower-moving conversations."
+        >
+          <Segmented
+            options={LOOKBACKS.map((l) => l.hours)}
+            value={lookbackHours}
+            onChange={setLookbackHours}
+            format={(h) => LOOKBACKS.find((l) => l.hours === h)?.label ?? `${h}h`}
+          />
+        </Field>
 
-            <div className="space-y-3 text-xs font-mono">
-              <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">
-                <span className="text-[#8a8a86]">Account Plan:</span>
-                <span className="font-bold text-[#141414]">
-                  {planDetails.name} (${planDetails.monthlyPrice}/mo)
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">
-                <span className="text-[#8a8a86]">Monitored Platforms:</span>
-                <span className="text-[#141414] font-medium">
-                  {enabledChannels.length} Active ({enabledChannels.map((c) => (c === 'twitter' ? 'X' : c === 'google' ? 'Web' : c.charAt(0).toUpperCase() + c.slice(1))).join(', ')})
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">
-                <span className="text-[#8a8a86]">Tracked Keywords:</span>
-                <span className="font-semibold text-[#141414]">
-                  {keywords.length} / {keywordLimit} active
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">
-                <span className="text-[#8a8a86]">Leads in Feed:</span>
-                <span className="font-semibold text-[#141414]">{posts.length} verified mentions</span>
-              </div>
-
-              <div className="flex items-center justify-between py-1 border-b border-[#f6f6f4]">
-                <span className="text-[#8a8a86]">Next Automated Sweep:</span>
-                <span className="text-[#141414] font-medium">
-                  {sweepCadence === '24h'
-                    ? `Daily at ${sweepTime} UTC`
-                    : `Every ${sweepCadence} (${sweepTime} UTC)`}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between py-1">
-                <span className="text-[#8a8a86]">Data Security:</span>
-                <span className="text-emerald-700 font-medium flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                  Encrypted & Isolated
-                </span>
-              </div>
-            </div>
-          </div>
+        <div className="flex items-center justify-between px-4 py-3 bg-[#fbfbfa] border border-[#eeeeea]">
+          <span className="text-[11px] font-mono text-[#8a8a86]">
+            Next automated sweep
+          </span>
+          <span className="text-[11px] font-mono text-[#141414] font-medium">
+            {nextSweepLabel}
+          </span>
         </div>
-      </div>
-    </div>
+      </Section>
+
+      {/* Feed ----------------------------------------------------------- */}
+      <Section
+        icon={<Inbox className="w-4 h-4 text-[#141414]" />}
+        title="Feed"
+        description="Decide what lands in your feed and how long it stays."
+      >
+        <Field
+          label="Minimum intent score"
+          hint="Mentions scoring below this are hidden. Lower it to see more, raise it to see only strong buying signals."
+          aside={
+            <span className="text-[11px] font-mono text-[#141414] font-medium">
+              {minIntentThreshold === 0 ? 'Showing everything' : `${minIntentThreshold}+`}
+            </span>
+          }
+        >
+          <Segmented
+            options={INTENT_THRESHOLD_OPTIONS}
+            value={minIntentThreshold}
+            onChange={setMinIntentThreshold}
+            format={(v) => (v === 0 ? 'All' : `${v}+`)}
+          />
+        </Field>
+
+        <Field
+          label="Keep mentions for"
+          hint="Applied after every sweep. Mentions older than this are deleted; whatever the current sweep just found is always kept."
+          aside={
+            posts.length > 0 ? (
+              <button
+                type="button"
+                onClick={handlePrune}
+                className="text-[11px] font-mono text-[#4a4a47] hover:text-[#141414] hover:underline cursor-pointer"
+              >
+                Apply now
+              </button>
+            ) : undefined
+          }
+        >
+          <Segmented
+            options={RETENTION_OPTIONS.map((o) => o.days)}
+            value={feedRetentionDays}
+            onChange={setFeedRetentionDays}
+            format={(d) => RETENTION_OPTIONS.find((o) => o.days === d)?.label ?? `${d}d`}
+          />
+        </Field>
+      </Section>
+    </form>
   );
 };

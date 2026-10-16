@@ -42,7 +42,6 @@ export const SUBSCRIPTION_PLANS: SubscriptionPlan[] = [
       'Up to 5 tracked keywords',
       'Daily 24h sweep cadence',
       '2 monitored channels',
-      'Email notifications',
     ],
   },
   {

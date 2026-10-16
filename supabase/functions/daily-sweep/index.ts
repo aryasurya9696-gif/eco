@@ -45,7 +45,34 @@ type SweepSettings = {
   min_intent_threshold: number | null;
   /** "HH:MM" in UTC. Null means the workspace never opted in. */
   sweep_time_utc: string | null;
+  /** '6h' | '12h' | '24h'. Anything else is treated as '24h'. */
+  sweep_frequency: string | null;
+  subscription_plan: string | null;
 };
+
+/**
+ * Plan limits. MUST stay in sync with SUBSCRIPTION_PLANS in
+ * src/lib/billing.ts -- the client already hides the options a plan cannot
+ * buy, but this is the authority that actually enforces them.
+ */
+const PLAN_MIN_SWEEP_HOURS: Record<string, number> = {
+  starter: 24,
+  pro: 12,
+  scale: 6,
+};
+
+const PLAN_MAX_CHANNELS: Record<string, number> = {
+  starter: 2,
+  pro: 5,
+  scale: 5,
+};
+
+/** Interval length in hours for a stored cadence string. */
+function cadenceHoursOf(frequency: string | null | undefined): number {
+  if (frequency === '6h') return 6;
+  if (frequency === '12h') return 12;
+  return 24;
+}
 
 /**
  * Parses the workspace's "HH:MM" sweep time into an hour of day.
@@ -57,6 +84,19 @@ function sweepHourOf(sweepTime: string | null | undefined): number | null {
   if (!m) return null;
   const hour = Number(m[1]);
   return hour >= 0 && hour <= 23 ? hour : null;
+}
+
+/**
+ * The cron fires every hour, so a cadence is just a predicate over the hour of
+ * day. A 6h cadence is due whenever the hour is congruent to the chosen hour
+ * modulo 6 (four times a day); 12h gives two, 24h gives exactly one.
+ *
+ * `cadenceHours` must already be clamped to the plan's fastest allowed
+ * interval, otherwise a downgraded workspace keeps its old aggressive cadence.
+ */
+function isSweepDue(currentHourUtc: number, sweepHour: number, cadenceHours: number): boolean {
+  if (cadenceHours >= 24) return currentHourUtc === sweepHour;
+  return currentHourUtc % cadenceHours === sweepHour % cadenceHours;
 }
 
 type PostRow = {
@@ -498,7 +538,7 @@ Deno.serve(async (req) => {
 
   const { data: profiles } = await supabase
     .from('profiles')
-    .select('id, enabled_channels, lookback_hours, min_intent_threshold, sweep_time_utc')
+    .select('id, enabled_channels, lookback_hours, min_intent_threshold, sweep_time_utc, sweep_frequency, subscription_plan')
     .in('id', userIds);
 
   const settingsByUser = new Map<string, SweepSettings>();
@@ -508,12 +548,14 @@ Deno.serve(async (req) => {
       lookback_hours: p.lookback_hours,
       min_intent_threshold: p.min_intent_threshold,
       sweep_time_utc: p.sweep_time_utc,
+      sweep_frequency: p.sweep_frequency,
+      subscription_plan: p.subscription_plan,
     });
   }
 
-  // The cron fires hourly and each workspace is swept in the hour it asked for,
-  // so "every day at 06:00 UTC" in Settings is actually true. Total treg spend
-  // is unchanged: each workspace still sweeps once per day.
+  // The cron fires every hour and each workspace is swept only in the hours its
+  // own hour + cadence make due, so "every day at 06:00 UTC" in Settings is
+  // actually true.
   const currentHourUtc = new Date().getUTCHours();
 
   for (const userId of userIds) {
@@ -521,11 +563,18 @@ Deno.serve(async (req) => {
     if (userKeywords.length === 0) continue;
 
     const settings = settingsByUser.get(userId);
+    const plan = settings?.subscription_plan ?? 'starter';
+
+    // A plan caps how often a workspace may sweep. Clamp upwards so a
+    // downgraded workspace slows back down instead of keeping the faster
+    // cadence it bought on the old plan.
+    const planMinHours = PLAN_MIN_SWEEP_HOURS[plan] ?? 24;
+    const cadenceHours = Math.max(cadenceHoursOf(settings?.sweep_frequency), planMinHours);
 
     // Respect the workspace's own sweep hour. Checked before the processed
     // counter so the two numbers mean what they say.
     const dueHour = sweepHourOf(settings?.sweep_time_utc);
-    if (dueHour !== null && dueHour !== currentHourUtc) {
+    if (dueHour !== null && !isSweepDue(currentHourUtc, dueHour, cadenceHours)) {
       usersSkipped++;
       continue;
     }
@@ -533,9 +582,12 @@ Deno.serve(async (req) => {
     usersProcessed++;
 
     const ALL: Platform[] = ['twitter', 'reddit', 'google', 'news'];
-    const channels: Platform[] = Array.isArray(settings?.enabled_channels) && settings.enabled_channels.length > 0
+    const requested: Platform[] = Array.isArray(settings?.enabled_channels) && settings.enabled_channels.length > 0
       ? settings.enabled_channels.filter((c): c is Platform => ALL.includes(c as Platform))
       : ['twitter', 'reddit', 'google'];
+    // A plan also caps how many channels may be scanned. The Settings UI stops
+    // the over-limit selection from being made; this is the backstop.
+    const channels: Platform[] = requested.slice(0, PLAN_MAX_CHANNELS[plan] ?? 2);
     const lookbackHours = Number(settings?.lookback_hours) || 24;
     const minIntent = Number(settings?.min_intent_threshold) || 0;
     const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
