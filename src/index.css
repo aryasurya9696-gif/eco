@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg-main: #f6f6f4;
+    --card-bg: #ffffff;
+    --border-color: #e3e3de;
+    --border-subtle: #eeeeea;
+    --text-primary: #141414;
+    --text-muted: #8a8a86;
+    --text-subtle: #9b9b96;
+    --linkedin-blue: #0a66c2;
+  }
+
+  body {
+    background-color: var(--bg-main);
+    color: var(--text-primary);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    letter-spacing: -0.012em;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    letter-spacing: -0.025em;
+  }
+}
+
+/* 58px grid pattern specified in PRD */
+.bg-grid-58 {
+  background-image:
+    linear-gradient(to right, #ecece7 1px, transparent 1px),
+    linear-gradient(to bottom, #ecece7 1px, transparent 1px);
+  background-size: 58px 58px;
+}
+
+.bg-grid-fade {
+  mask-image: radial-gradient(ellipse at center, black 45%, transparent 85%);
+  -webkit-mask-image: radial-gradient(ellipse at center, black 45%, transparent 85%);
+}
+
+/* Background Radar & Ambient Theme Animations */
+@keyframes ambient-pulse-glow {
+  0%, 100% {
+    opacity: 0.35;
+    transform: scale(0.96) translate(-50%, -50%);
+  }
+  50% {
+    opacity: 0.65;
+    transform: scale(1.06) translate(-50%, -50%);
+  }
+}
+
+@keyframes radar-sweep-beam {
+  0% {
+    transform: translate(-50%, -50%) rotate(0deg);
+  }
+  100% {
+    transform: translate(-50%, -50%) rotate(360deg);
+  }
+}
+
+.animate-ambient-glow {
+  animation: ambient-pulse-glow 6s ease-in-out infinite;
+}
+
+.animate-radar-beam {
+  animation: radar-sweep-beam 16s linear infinite;
+}
+
+/* Custom crisp scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d4d4ce;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #b5b5ad;
+}
