@@ -7,7 +7,7 @@ import React, {
   useState,
 } from 'react';
 import { supabase, isConfigured } from '../lib/supabase';
-import { performSocialFetchSweep } from '../lib/socialfetch';
+import { invokeSearchSweep } from '../lib/sweep';
 import { generateAiOutreachDraft, generateAiKeywordsFromOffer } from '../lib/ai';
 import { invokeFunction } from '../lib/api';
 import { SUBSCRIPTION_PLANS } from '../lib/billing';
@@ -498,7 +498,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return;
       }
 
-      const result = await performSocialFetchSweep();
+      const result = await invokeSearchSweep();
 
       if (isConfigured) {
         // The edge function already persisted anything new. Re-read so the feed
@@ -517,13 +517,8 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       setIsSweeping(false);
 
-      // Cost is now split: treg bills USD per call, SocialFetch bills one
-      // credit each and is only reached when treg could not answer.
-      const spend = result.usd_spent
-        ? ` (~$${result.usd_spent.toFixed(4)})`
-        : result.sf_credits_spent
-        ? ` (${result.sf_credits_spent} SocialFetch credit${result.sf_credits_spent === 1 ? '' : 's'})`
-        : '';
+      // treg bills USD per call, so surface the spend.
+      const spend = result.usd_spent ? ` (~$${result.usd_spent.toFixed(4)})` : '';
       const housekeeping = [
         result.dropped_stale ? `${result.dropped_stale} out-of-window result(s) dropped` : '',
         result.pruned ? `${result.pruned} expired mention(s) cleaned up` : '',

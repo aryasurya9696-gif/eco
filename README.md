@@ -1,6 +1,6 @@
 # Echo — Social Mention Intelligence
 
-Echo monitors your keywords across **X (Twitter)**, **Reddit**, **LinkedIn** and **web discussions** and surfaces buyer-intent mentions into a single feed. Scheduled sweeps score each mention for intent, filter it against your threshold, and drop the matches straight into your dashboard.
+Echo monitors your keywords across **X (Twitter)**, **Reddit**, the **open web** and the **press** and surfaces buyer-intent mentions into a single feed. Scheduled sweeps score each mention for intent, filter it against your threshold, and drop the matches straight into your dashboard.
 
 ---
 
@@ -20,7 +20,7 @@ Echo monitors your keywords across **X (Twitter)**, **Reddit**, **LinkedIn** and
 
 - **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Framer Motion, Lucide React, canvas-confetti.
 - **Backend**: Supabase (Postgres, Auth, Edge Functions, RLS).
-- **Edge Functions**: `social-search` (SocialFetch), `ai` (OpenAI), `billing` (Stripe), `daily-sweep` (cron).
+- **Edge Functions**: `social-search` (treg), `ai` (OpenAI), `billing` (Stripe), `daily-sweep` (cron).
 
 ---
 
@@ -43,7 +43,7 @@ VITE_SUPABASE_ANON_KEY=<your-anon-key>
 ```
 
 > **Never put secret keys in `.env`.** Any `VITE_`-prefixed variable is inlined
-> into the public JS bundle. SocialFetch, OpenAI and Stripe keys live in Edge
+> into the public JS bundle. The treg, OpenAI and Stripe keys live in Edge
 > Function secrets — see [Secrets](#secrets) below.
 
 ### 3. Apply the schema
@@ -70,7 +70,7 @@ run twice (everything is `IF NOT EXISTS` / `IF EXISTS` / `OR REPLACE`).
 
 ### 4. Set Edge Function secrets
 ```bash
-supabase secrets set SOCIALFETCH_API_KEY=sfk_your_key
+supabase secrets set TREG_TOKEN=treg_your_token     # https://treg.to — free signup, $1 credit
 supabase secrets set OPENAI_API_KEY=sk_your_key
 supabase secrets set STRIPE_SECRET_KEY=sk_live_your_key
 supabase secrets set APP_ORIGIN=https://your-app.example

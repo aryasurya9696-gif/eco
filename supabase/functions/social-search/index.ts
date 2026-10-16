@@ -3,15 +3,14 @@
 // ----------------------------------------------------------------------------
 // Fetches mentions for a workspace's keywords across its enabled channels.
 //
-// Two upstreams, tried in order per channel:
-//   1. treg.to  — one token, many providers, ~$0.0004-0.0019 a call
-//   2. SocialFetch — the original provider, kept as a fallback so its remaining
-//      credits are used up rather than stranded
+// One upstream: treg.to, a catalog of 3,900+ provider endpoints behind a single
+// token at the provider's own rate with no markup. The credential is injected
+// server-side, so nothing sensitive reaches the browser or this file's callers.
 //
-// The chain is not decorative. treg returns 503 provider_capacity_unavailable
-// when the upstream vendor it prefers is busy, and names an alternative in the
-// same error body — which is exactly why each channel has more than one treg
-// entry.
+// Each channel has a provider chain and the first endpoint that returns rows
+// wins. The chain is load-bearing rather than decorative: treg answers
+// 503 provider_capacity_unavailable when the vendor it would otherwise use is
+// busy, and names a usable alternative in the same error body.
 //
 // The caller's channels, lookback window, intent threshold and keywords are all
 // read from the database with the service role key. Nothing quota-relevant is
@@ -22,13 +21,12 @@
 // directories and the relative import fails to resolve on deploy.
 //
 // Deploy:  supabase functions deploy social-search
-// Secrets: supabase secrets set TREG_TOKEN=treg_...
-//          supabase secrets set SOCIALFETCH_API_KEY=sfk_...
-//          (each falls back to public.service_secrets, which only the service
-//           role can read, so neither key is ever exposed to the browser)
+// Secret:  supabase secrets set TREG_TOKEN=treg_...
+//          (falls back to public.service_secrets, which only the service role
+//           can read, so the token is never exposed to the browser)
 //
 // Request body: { keyword?: string }   (optional — sweeps all active keywords)
-// Response:     { ok, posts, scanned, channels, lookback_hours, credits, ... }
+// Response:     { ok, posts, scanned, channels, lookback_hours, usd_spent, ... }
 // ============================================================================
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
@@ -90,18 +88,15 @@ function rateLimit(key: string, limit: number, windowMs: number): boolean {
 }
 
 const TREG_BASE = 'https://treg.to';
-const SOCIALFETCH_BASE = 'https://api.socialfetch.dev';
-const MAX_PAGES = 2;
 const MAX_KEYWORDS_PER_SWEEP = 25;
 
 /**
- * treg has no cost meter on the response, so this tracks approximate USD spend
- * and is reported back to the UI. SocialFetch charges one credit per request.
+ * treg does not put a cost on the response, so this tracks approximate USD
+ * spend per sweep and reports it back for the UI.
  */
 let usdSpent = 0;
-let sfCreditsSpent = 0;
 
-type Platform = 'twitter' | 'reddit' | 'google' | 'linkedin' | 'news';
+type Platform = 'twitter' | 'reddit' | 'google' | 'news';
 
 interface KeywordRow {
   id: string;
@@ -176,8 +171,7 @@ function parseWhen(value: unknown): string | null {
 
   if (typeof value === 'number') {
     if (!Number.isFinite(value) || value <= 0) return null;
-    // X sends seconds, others milliseconds. Anything past ~2001 in ms is a date
-    // in the future otherwise, so the magnitude decides.
+    // X sends seconds, others milliseconds. The magnitude decides which.
     const ms = value > 1e12 ? value : value * 1000;
     const d = new Date(ms);
     return Number.isNaN(d.getTime()) ? null : d.toISOString();
@@ -213,7 +207,7 @@ function parseWhen(value: unknown): string | null {
 
 /**
  * Google snippets open with a date and an em dash — "Aug 11, 2026 — Top SaaS
- * analytics software". The endpoint returns no date field at all, so this is
+ * analytics software". That endpoint returns no date field at all, so this is
  * the only date signal available and it is worth reading.
  */
 function dateFromSnippet(snippet: string | null | undefined): string | null {
@@ -223,26 +217,45 @@ function dateFromSnippet(snippet: string | null | undefined): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Lookback window -> per-endpoint parameters
+// ---------------------------------------------------------------------------
+// No two endpoints agree on how a time window is spelled, and an unrecognised
+// query param is dropped rather than rejected — which is how an unfiltered
+// search once served a 2021 post into the feed.
+
+function redditTimeframe(lookbackHours: number): string {
+  if (lookbackHours <= 24) return 'day';
+  if (lookbackHours <= 72) return 'week';
+  if (lookbackHours <= 168) return 'month';
+  return 'year';
+}
+
+function sinceDate(lookbackHours: number): string {
+  return new Date(Date.now() - lookbackHours * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+// ---------------------------------------------------------------------------
 // Credentials
 // ---------------------------------------------------------------------------
-// Edge secrets win; otherwise the value is read from public.service_secrets
-// over the service role. That table has RLS on and no policies, so the browser
-// has no path to either key.
+// The edge secret wins; otherwise the value is read from
+// public.service_secrets over the service role. That table has RLS on and no
+// policies, so the browser has no path to the token.
 
 let tregToken = Deno.env.get('TREG_TOKEN') || '';
-let socialFetchKey = Deno.env.get('SOCIALFETCH_API_KEY') || '';
 
-async function secret(admin: ReturnType<typeof createClient>, name: string): Promise<string> {
+async function resolveToken(admin: ReturnType<typeof createClient>): Promise<string> {
+  if (tregToken) return tregToken;
   const { data, error } = await admin
     .from('service_secrets')
     .select('value')
-    .eq('name', name)
+    .eq('name', 'treg_token')
     .maybeSingle();
   if (error) {
-    console.warn(`[social-search] secret lookup failed for ${name}:`, error.message);
+    console.warn('[social-search] secret lookup failed:', error.message);
     return '';
   }
-  return typeof data?.value === 'string' ? data.value : '';
+  tregToken = typeof data?.value === 'string' ? data.value : '';
+  return tregToken;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +267,8 @@ async function secret(admin: ReturnType<typeof createClient>, name: string): Pro
  * side and relays the upstream body verbatim, so each endpoint keeps its own
  * response shape.
  *
- * Returns null on any failure so the caller can fall through to the next
- * provider in the chain instead of failing the whole sweep.
+ * Returns null on any failure so the caller falls through to the next provider
+ * in the chain instead of failing the whole sweep.
  */
 async function tregCall(
   endpointId: string,
@@ -286,8 +299,7 @@ async function tregCall(
     usdSpent += opts.costUsd;
 
     if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      console.warn(`[treg] ${endpointId} -> ${res.status}: ${text.slice(0, 160)}`);
+      console.warn(`[treg] ${endpointId} -> ${res.status}`);
       return null;
     }
     return await res.json();
@@ -300,101 +312,6 @@ async function tregCall(
 }
 
 // ---------------------------------------------------------------------------
-// SocialFetch transport (fallback)
-// ---------------------------------------------------------------------------
-
-async function socialFetchGet(
-  path: string,
-  params: Record<string, string | number | undefined>,
-): Promise<any | null> {
-  if (!socialFetchKey) return null;
-
-  const url = new URL(SOCIALFETCH_BASE + path);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
-  }
-
-  try {
-    const res = await fetch(url.toString(), {
-      headers: { 'x-api-key': socialFetchKey, Accept: 'application/json' },
-    });
-    sfCreditsSpent += 1;
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      console.warn(`[socialfetch] ${path} -> ${res.status}: ${text.slice(0, 160)}`);
-      return null;
-    }
-    return await res.json();
-  } catch (err) {
-    console.warn(`[socialfetch] ${path} threw:`, (err as Error)?.name);
-    return null;
-  }
-}
-
-async function socialFetchPaged(
-  path: string,
-  params: Record<string, string | number | undefined>,
-  paginate: 'cursor' | 'page',
-): Promise<any[]> {
-  const results: any[] = [];
-  let cursor: string | undefined;
-  let pageNo = 1;
-
-  for (let i = 0; i < MAX_PAGES; i++) {
-    const query: Record<string, string | number | undefined> = { ...params };
-    if (paginate === 'page') query.page = pageNo;
-    else if (cursor) query.cursor = cursor;
-
-    const body = await socialFetchGet(path, query);
-    if (!body) break;
-
-    const data = body.data ?? {};
-    const items = data.tweets ?? data.posts ?? data.results ?? [];
-    if (!Array.isArray(items) || items.length === 0) break;
-
-    results.push(...items);
-
-    const pg = data.page ?? {};
-    if (!pg.hasMore) break;
-    if (paginate === 'page') {
-      const next = typeof pg.nextPage === 'number' ? pg.nextPage : pageNo + 1;
-      if (next <= pageNo) break;
-      pageNo = next;
-    } else {
-      if (!pg.nextCursor || pg.nextCursor === cursor) break;
-      cursor = pg.nextCursor;
-    }
-  }
-  return results;
-}
-
-// ---------------------------------------------------------------------------
-// Lookback window -> per-endpoint parameters
-// ---------------------------------------------------------------------------
-// No two upstreams agree on how a time window is spelled, and an unrecognised
-// query param is silently dropped — which is how an all-time `section=top`
-// Twitter search once served a 2021 tweet into the feed.
-
-function redditTimeframe(lookbackHours: number): string {
-  if (lookbackHours <= 24) return 'day';
-  if (lookbackHours <= 72) return 'week';
-  if (lookbackHours <= 168) return 'month';
-  return 'year';
-}
-
-function datePosted(lookbackHours: number): string {
-  if (lookbackHours <= 1) return 'last-hour';
-  if (lookbackHours <= 24) return 'last-day';
-  if (lookbackHours <= 168) return 'last-week';
-  if (lookbackHours <= 720) return 'last-month';
-  return 'last-year';
-}
-
-function sinceDate(lookbackHours: number): string {
-  return new Date(Date.now() - lookbackHours * 3600 * 1000).toISOString().slice(0, 10);
-}
-
-// ---------------------------------------------------------------------------
 // Mappers
 // ---------------------------------------------------------------------------
 
@@ -402,8 +319,8 @@ function basePost(p: Omit<RawPost, 'intent_score'>): RawPost {
   return { ...p, intent_score: calculateIntentScore(p.body || '') };
 }
 
-/** treg · anyapi.x.search.posts — createdUtc is unix seconds. */
-function mapTregTwitter(t: any, kw: KeywordRow): RawPost | null {
+/** anyapi.x.search.posts — createdUtc is unix seconds. */
+function mapTwitter(t: any, kw: KeywordRow): RawPost | null {
   const postUrl = t?.url ?? (t?.id ? `https://x.com/i/status/${t.id}` : null);
   if (!postUrl) return null;
   const handle = t?.authorUsername ? `@${String(t.authorUsername).replace(/^@/, '')}` : null;
@@ -429,9 +346,8 @@ function mapTregTwitter(t: any, kw: KeywordRow): RawPost | null {
   });
 }
 
-/** treg · scrapecreators.reddit.search.posts. */
-function mapTregRedditSc(p: any, kw: KeywordRow): RawPost | null {
-  // permalink is relative here ("/r/SaaS/comments/..."), url is absolute.
+/** scrapecreators.reddit.search.posts — permalink here is relative, url is not. */
+function mapRedditScrapecreators(p: any, kw: KeywordRow): RawPost | null {
   const postUrl = p?.url ?? (p?.permalink ? `https://www.reddit.com${p.permalink}` : null);
   if (!postUrl) return null;
   return basePost({
@@ -455,17 +371,17 @@ function mapTregRedditSc(p: any, kw: KeywordRow): RawPost | null {
   });
 }
 
-/** treg · tikhub.x.reddit-app-fetch-dynamic-search — shape not pinned down. */
-function mapTregRedditTikhub(p: any, kw: KeywordRow): RawPost | null {
+/** tikhub.x.reddit-app-fetch-dynamic-search — shape is not pinned down. */
+function mapRedditTikhub(p: any, kw: KeywordRow): RawPost | null {
   const d = p?.data ?? p;
-  const postUrl = d?.url ?? d?.permalink ?? d?.post_url ?? null;
-  if (!postUrl) return null;
+  const raw = d?.url ?? d?.permalink ?? d?.post_url ?? null;
+  if (!raw) return null;
   return basePost({
     keyword_id: kw.id,
     matched_keyword: kw.keyword,
     platform: 'reddit',
     channel_source: d?.subreddit_name ?? d?.subreddit ?? 'r/reddit',
-    post_url: String(postUrl).startsWith('http') ? String(postUrl) : `https://www.reddit.com${postUrl}`,
+    post_url: String(raw).startsWith('http') ? String(raw) : `https://www.reddit.com${raw}`,
     author_name: d?.author ?? null,
     author_handle: d?.author ? `@${d.author}` : null,
     author_avatar_url: null,
@@ -475,8 +391,8 @@ function mapTregRedditTikhub(p: any, kw: KeywordRow): RawPost | null {
   });
 }
 
-/** treg · crawl4ai.web.search.rich — no date field; the snippet often has one. */
-function mapTregWeb(r: any, kw: KeywordRow): RawPost | null {
+/** crawl4ai.web.search.rich — no date field; the snippet often carries one. */
+function mapWeb(r: any, kw: KeywordRow): RawPost | null {
   const postUrl = r?.url;
   if (!postUrl) return null;
   let domain = 'Web';
@@ -499,8 +415,8 @@ function mapTregWeb(r: any, kw: KeywordRow): RawPost | null {
   });
 }
 
-/** treg · tinyfish.web.search.news — free, and every result carries a date. */
-function mapTregNews(r: any, kw: KeywordRow): RawPost | null {
+/** tinyfish.web.search.news — free, and every result carries a date. */
+function mapNews(r: any, kw: KeywordRow): RawPost | null {
   const postUrl = r?.url;
   if (!postUrl) return null;
   let domain = r?.site_name ?? 'News';
@@ -523,100 +439,13 @@ function mapTregNews(r: any, kw: KeywordRow): RawPost | null {
   });
 }
 
-/** SocialFetch fallbacks. */
-function mapSfTwitter(t: any, kw: KeywordRow): RawPost | null {
-  const postUrl = t?.url ?? (t?.id ? `https://x.com/i/status/${t.id}` : null);
-  if (!postUrl) return null;
-  return basePost({
-    keyword_id: kw.id,
-    matched_keyword: kw.keyword,
-    platform: 'twitter',
-    channel_source: 'X / Twitter',
-    post_url: postUrl,
-    author_name: t?.author?.displayName ?? null,
-    author_handle: t?.author?.handle ? `@${t.author.handle}` : null,
-    author_avatar_url: t?.author?.avatarUrl ?? null,
-    body: t?.text ?? null,
-    posted_at: parseWhen(t?.createdAt),
-    engagement: {
-      likes: t?.metrics?.likes ?? null,
-      retweets: t?.metrics?.retweets ?? null,
-      replies: t?.metrics?.replies ?? null,
-      views: t?.metrics?.views ?? null,
-    },
-  });
-}
-
-function mapSfReddit(p: any, kw: KeywordRow): RawPost | null {
-  const postUrl = p?.permalink ?? p?.url ?? null;
-  if (!postUrl) return null;
-  return basePost({
-    keyword_id: kw.id,
-    matched_keyword: kw.keyword,
-    platform: 'reddit',
-    channel_source: p?.subredditPrefixedName ?? (p?.subreddit ? `r/${p.subreddit}` : 'r/reddit'),
-    post_url: postUrl,
-    author_name: p?.author ? `u/${p.author}` : 'u/anonymous',
-    author_handle: p?.author ? `@${p.author}` : null,
-    author_avatar_url: null,
-    body: `${p?.title || ''} ${p?.bodyText || ''}`.trim() || null,
-    posted_at: parseWhen(p?.createdAt),
-    engagement: { likes: p?.score ?? null, comments: p?.commentCount ?? null },
-  });
-}
-
-function mapSfWeb(r: any, kw: KeywordRow): RawPost | null {
-  const postUrl = r?.url;
-  if (!postUrl) return null;
-  let domain = 'Web';
-  try {
-    domain = new URL(postUrl).hostname.replace(/^www\./, '');
-  } catch { /* keep default */ }
-  return basePost({
-    keyword_id: kw.id,
-    matched_keyword: kw.keyword,
-    platform: 'google',
-    channel_source: domain,
-    post_url: postUrl,
-    author_name: r?.title ?? domain,
-    author_handle: `@${domain}`,
-    author_avatar_url: null,
-    body: `${r?.title ?? ''} — ${r?.content ?? ''}`.trim() || null,
-    posted_at: parseWhen(r?.publishedAt ?? r?.date),
-    engagement: { likes: null, comments: null },
-  });
-}
-
-function mapSfLinkedIn(p: any, kw: KeywordRow): RawPost | null {
-  const postUrl = p?.url ?? p?.permalink;
-  if (!postUrl) return null;
-  const authorHandle = p?.author?.profileUrl ? p.author.profileUrl.split('/in/')[1] : null;
-  return basePost({
-    keyword_id: kw.id,
-    matched_keyword: kw.keyword,
-    platform: 'linkedin',
-    channel_source: 'LinkedIn',
-    post_url: postUrl,
-    author_name: p?.author?.name ?? null,
-    author_handle: authorHandle ? `@${authorHandle}` : null,
-    author_avatar_url: p?.author?.avatarUrl ?? null,
-    body: `${p?.title ?? ''} ${p?.text ?? ''}`.trim() || null,
-    posted_at: parseWhen(p?.publishedAt),
-    engagement: {
-      likes: p?.metrics?.reactions ?? null,
-      comments: p?.metrics?.comments ?? null,
-      author_followers: p?.author?.followers ?? null,
-    },
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Per-channel provider chains
 // ---------------------------------------------------------------------------
 
 /**
  * Runs the chain for one keyword on one channel and returns the first provider
- * that produced results. A provider that errors, times out or returns nothing
+ * that produced rows. A provider that errors, times out or returns nothing
  * hands over to the next.
  */
 async function searchChannel(
@@ -625,36 +454,26 @@ async function searchChannel(
   lookbackHours: number,
   served: Record<string, string>,
 ): Promise<RawPost[]> {
-  const note = (id: string) => {
-    served[platform] = id;
-  };
-
   // ── Twitter ────────────────────────────────────────────────────────────
   if (platform === 'twitter') {
     const t = await tregCall('anyapi.x.search.posts', {
       method: 'POST',
       // queryType Latest is the whole point: the default returns all-time top
-      // posts, which is what put a 2021 tweet in the feed.
+      // posts, which is what put a 2021 tweet into the feed.
       body: { query: kw.keyword, queryType: 'Latest', limit: 20 },
       costUsd: 0.0004,
     });
     const items = t?.output?.data?.items ?? [];
     if (items.length) {
-      note('treg:anyapi.x.search.posts');
-      return items.map((x: any) => mapTregTwitter(x, kw)).filter((p): p is RawPost => !!p);
-    }
-
-    const sf = await socialFetchPaged('/v1/twitter/search', { query: kw.keyword, section: 'latest' }, 'cursor');
-    if (sf.length) {
-      note('socialfetch:twitter');
-      return sf.map((x: any) => mapSfTwitter(x, kw)).filter((p): p is RawPost => !!p);
+      served.twitter = 'anyapi.x.search.posts';
+      return items.map((x: any) => mapTwitter(x, kw)).filter((p): p is RawPost => !!p);
     }
     return [];
   }
 
   // ── Reddit ─────────────────────────────────────────────────────────────
   if (platform === 'reddit') {
-    // tikhub is fastest and cheapest but its shared capacity runs out often;
+    // tikhub is cheapest and fastest but its shared capacity runs out often;
     // scrapecreators is the reliable second and answers in about a second.
     const tk = await tregCall('tikhub.x.reddit-app-fetch-dynamic-search', {
       query: {
@@ -670,8 +489,8 @@ async function searchChannel(
     });
     const tkItems = tk?.data?.posts ?? tk?.posts ?? [];
     if (Array.isArray(tkItems) && tkItems.length) {
-      note('treg:tikhub.x.reddit-app-fetch-dynamic-search');
-      return tkItems.map((x: any) => mapTregRedditTikhub(x, kw)).filter((p): p is RawPost => !!p);
+      served.reddit = 'tikhub.x.reddit-app-fetch-dynamic-search';
+      return tkItems.map((x: any) => mapRedditTikhub(x, kw)).filter((p): p is RawPost => !!p);
     }
 
     const sc = await tregCall('scrapecreators.reddit.search.posts', {
@@ -685,18 +504,8 @@ async function searchChannel(
     });
     const scItems = sc?.posts ?? [];
     if (Array.isArray(scItems) && scItems.length) {
-      note('treg:scrapecreators.reddit.search.posts');
-      return scItems.map((x: any) => mapTregRedditSc(x, kw)).filter((p): p is RawPost => !!p);
-    }
-
-    const sf = await socialFetchPaged(
-      '/v1/reddit/search',
-      { query: kw.keyword, timeframe: redditTimeframe(lookbackHours), sortBy: 'relevance' },
-      'cursor',
-    );
-    if (sf.length) {
-      note('socialfetch:reddit');
-      return sf.map((x: any) => mapSfReddit(x, kw)).filter((p): p is RawPost => !!p);
+      served.reddit = 'scrapecreators.reddit.search.posts';
+      return scItems.map((x: any) => mapRedditScrapecreators(x, kw)).filter((p): p is RawPost => !!p);
     }
     return [];
   }
@@ -710,39 +519,13 @@ async function searchChannel(
     });
     const items = r?.results ?? [];
     if (Array.isArray(items) && items.length) {
-      note('treg:crawl4ai.web.search.rich');
-      return items.map((x: any) => mapTregWeb(x, kw)).filter((p): p is RawPost => !!p);
-    }
-
-    const sf = await socialFetchPaged(
-      '/v1/web/search',
-      { query: kw.keyword, datePosted: datePosted(lookbackHours) },
-      'page',
-    );
-    if (sf.length) {
-      note('socialfetch:web');
-      return sf.map((x: any) => mapSfWeb(x, kw)).filter((p): p is RawPost => !!p);
+      served.google = 'crawl4ai.web.search.rich';
+      return items.map((x: any) => mapWeb(x, kw)).filter((p): p is RawPost => !!p);
     }
     return [];
   }
 
-  // ── LinkedIn ───────────────────────────────────────────────────────────
-  // treg has no keyword search for LinkedIn posts — only per-profile fetches —
-  // so SocialFetch remains the only source here.
-  if (platform === 'linkedin') {
-    const sf = await socialFetchPaged(
-      '/v1/linkedin/posts/search',
-      { query: kw.keyword, datePosted: datePosted(lookbackHours) },
-      'cursor',
-    );
-    if (sf.length) {
-      note('socialfetch:linkedin');
-      return sf.map((x: any) => mapSfLinkedIn(x, kw)).filter((p): p is RawPost => !!p);
-    }
-    return [];
-  }
-
-  // ── News (free) ────────────────────────────────────────────────────────
+  // ── News ───────────────────────────────────────────────────────────────
   if (platform === 'news') {
     const r = await tregCall('tinyfish.web.search.news', {
       query: {
@@ -754,8 +537,8 @@ async function searchChannel(
     });
     const items = r?.results ?? [];
     if (Array.isArray(items) && items.length) {
-      note('treg:tinyfish.web.search.news');
-      return items.map((x: any) => mapTregNews(x, kw)).filter((p): p is RawPost => !!p);
+      served.news = 'tinyfish.web.search.news';
+      return items.map((x: any) => mapNews(x, kw)).filter((p): p is RawPost => !!p);
     }
     return [];
   }
@@ -784,18 +567,14 @@ Deno.serve(async (req) => {
     auth: { persistSession: false },
   });
 
-  if (!tregToken) tregToken = await secret(admin, 'treg_token');
-  if (!socialFetchKey) socialFetchKey = await secret(admin, 'socialfetch_api_key');
-
-  if (!tregToken && !socialFetchKey) {
-    return fail('No search provider is configured on this deployment.', 503);
+  if (!await resolveToken(admin)) {
+    return fail('Search is not configured on this deployment.', 503);
   }
 
   // Captured BEFORE any search runs. prune_feed() uses this so the batch this
   // sweep is about to write is never deleted by the retention pass.
   const sweepStartedAt = new Date().toISOString();
   usdSpent = 0;
-  sfCreditsSpent = 0;
 
   // --- Load authoritative user settings (service role bypasses RLS) --------
   let profile: any = null;
@@ -827,7 +606,7 @@ Deno.serve(async (req) => {
     return fail('Workspace profile not found', 404);
   }
 
-  const ALL: Platform[] = ['twitter', 'reddit', 'google', 'linkedin', 'news'];
+  const ALL: Platform[] = ['twitter', 'reddit', 'google', 'news'];
   const enabledChannels: Platform[] = Array.isArray(profile?.enabled_channels)
     ? profile.enabled_channels.filter((c: string): c is Platform => ALL.includes(c as Platform))
     : ['twitter', 'reddit', 'google'];
@@ -863,7 +642,7 @@ Deno.serve(async (req) => {
   if (keywords.length === 0) {
     return json({
       ok: true, posts: [], scanned: 0, channels: enabledChannels,
-      lookback_hours: lookbackHours, usd_spent: 0, sf_credits_spent: 0, served_by: {},
+      lookback_hours: lookbackHours, usd_spent: 0, served_by: {},
     });
   }
 
@@ -872,7 +651,7 @@ Deno.serve(async (req) => {
   const served: Record<string, string> = {};
   let droppedStale = 0;
 
-  // Exact cutoff. The upstreams only accept coarse windows, so anything that
+  // Exact cutoff. The endpoints only accept coarse windows, so anything that
   // slips in outside the real lookback is dropped here.
   const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
   const withinLookback = (postedAt: string | null): boolean => {
@@ -942,7 +721,6 @@ Deno.serve(async (req) => {
     dropped_stale: droppedStale,
     pruned,
     usd_spent: Number(usdSpent.toFixed(6)),
-    sf_credits_spent: sfCreditsSpent,
     served_by: served,
   });
 });

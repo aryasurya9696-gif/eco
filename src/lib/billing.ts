@@ -55,7 +55,7 @@ export const SUBSCRIPTION_PLANS: SubscriptionPlan[] = [
     sweepCadence: '12h',
     aiDraftsEnabled: true,
     maxChannels: 5,
-    channels: ['X (Twitter)', 'Reddit', 'Web Discussions', 'LinkedIn', 'News'],
+    channels: ['X (Twitter)', 'Reddit', 'Web Discussions', 'News'],
     popular: true,
     desc: 'For high-growth B2B sales teams and outbound agencies.',
     features: [

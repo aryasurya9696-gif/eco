@@ -1,15 +1,14 @@
 /**
- * Social search client
+ * Search client
  * ----------------------------------------------------------------------------
- * Talks to the `social-search` Supabase Edge Function, which holds the
- * SocialFetch API key. Channels, lookback window and keywords are resolved
- * server-side from the caller's profile — nothing quota-relevant is trusted
- * from the browser.
+ * Talks to the `social-search` Supabase Edge Function, which holds the treg
+ * token. Channels, lookback window and keywords are resolved server-side from
+ * the caller's profile — nothing quota-relevant is trusted from the browser.
  */
 import type { MonitoredPost, Platform } from '../types';
 import { invokeFunction } from './api';
 
-export interface SocialSearchResult {
+export interface SweepResult {
   ok: boolean;
   posts: MonitoredPost[];
   scanned: number;
@@ -21,23 +20,21 @@ export interface SocialSearchResult {
   pruned?: number;
   /** Approximate treg spend for this sweep, in USD. */
   usd_spent?: number;
-  /** SocialFetch credits consumed; only the fallback path spends these. */
-  sf_credits_spent?: number;
-  /** Which upstream actually answered for each channel. */
+  /** Which treg endpoint actually answered for each channel. */
   served_by?: Record<string, string>;
   errors?: string[];
 }
 
 /**
- * Runs a sweep for the signed-in user.
+ * Runs a search sweep for the signed-in user.
  *
- * The function has already persisted anything new to `monitored_posts`, so the
- * returned rows are only used to refresh the client cache immediately.
+ * The edge function has already persisted anything new to `monitored_posts`, so
+ * the returned rows are only used to refresh the client cache immediately.
  */
-export async function performSocialFetchSweep(
+export async function invokeSearchSweep(
   options: { keyword?: string } = {},
-): Promise<SocialSearchResult> {
-  const res = await invokeFunction<SocialSearchResult>(
+): Promise<SweepResult> {
+  const res = await invokeFunction<SweepResult>(
     'social-search',
     options.keyword ? { keyword: options.keyword } : {},
     { timeoutMs: 120000 },
@@ -52,7 +49,6 @@ export async function performSocialFetchSweep(
     dropped_stale: res?.dropped_stale,
     pruned: res?.pruned,
     usd_spent: res?.usd_spent,
-    sf_credits_spent: res?.sf_credits_spent,
     served_by: res?.served_by,
     errors: res?.errors,
   };

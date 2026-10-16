@@ -84,7 +84,6 @@ const platformName = (p: MonitoredPost['platform']): string => {
   if (p === 'twitter') return 'X';
   if (p === 'reddit') return 'Reddit';
   if (p === 'google') return 'Web';
-  if (p === 'linkedin') return 'LinkedIn';
   return 'News';
 };
 

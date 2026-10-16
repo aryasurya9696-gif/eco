@@ -265,12 +265,6 @@ export const SettingsTab: React.FC = () => {
                   supported: true,
                 },
                 {
-                  id: 'linkedin' as const,
-                  name: 'LinkedIn Network',
-                  desc: 'B2B enterprise executive announcements and role changes.',
-                  supported: true,
-                },
-                {
                   id: 'news' as const,
                   name: 'Press & News',
                   desc: 'Product launches, funding rounds and hiring signals from the press.',

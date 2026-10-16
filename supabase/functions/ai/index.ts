@@ -183,7 +183,7 @@ Deno.serve(async (req) => {
     const prompt = [
       'You are a B2B growth marketing and intent-data specialist.',
       "Given the company's core offer and website below, generate 6 to 8 high-intent search keywords or phrases.",
-      'These phrases represent what potential customers search for on X (Twitter), Reddit, LinkedIn or the web when looking for a solution this company provides.',
+      'These phrases represent what potential customers search for on X (Twitter), Reddit, the open web or the press when looking for a solution this company provides.',
       '',
       'Company Core Offer: "' + offerText + '"',
       'Website: "' + website + '"',

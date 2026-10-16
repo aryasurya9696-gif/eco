@@ -18,7 +18,7 @@ interface LandingPageProps {
 interface DemoLead {
   id: string;
   keyword: string;
-  platform: 'twitter' | 'linkedin' | 'reddit' | 'google' | 'news';
+  platform: 'twitter' | 'reddit' | 'google' | 'news';
   channel_source?: string;
   author: string;
   handle: string;
@@ -41,10 +41,10 @@ const DEMO_LEADS: DemoLead[] = [
   {
     id: 'lead-2',
     keyword: 'b2b lead gen',
-    platform: 'linkedin',
+    platform: 'twitter',
     author: 'Sarah Chen',
-    handle: 'VP of Growth @ Horizon Scale',
-    body: "Traditional cold email open rates dropped 35% across our portfolio companies this quarter. We're actively shifting budget toward real-time social listening and buyer-intent triggers on LinkedIn & X. Looking for tools that monitor specific competitor mentions without enterprise bloatware pricing.",
+    handle: '@sarahbuildsgtm',
+    body: "Traditional cold email open rates dropped 35% across our portfolio companies this quarter. We're actively shifting budget toward real-time social listening and buyer-intent triggers. Looking for tools that monitor specific competitor mentions without enterprise bloatware pricing.",
     time: '5h ago',
     intent: 95,
   },
@@ -123,7 +123,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const faqs = [
     {
       q: 'How does the daily sweep work?',
-      a: 'Every morning at your configured schedule (e.g. 06:00 UTC), Echo sweeps public posts matching your keywords across X, LinkedIn, Reddit, the open web and the press. Matches are deduplicated and qualified straight into your feed.',
+      a: 'Every morning at your configured schedule (e.g. 06:00 UTC), Echo sweeps public posts matching your keywords across X, Reddit, the open web and the press. Matches are deduplicated and qualified straight into your feed.',
     },
     {
       q: 'How does Echo prevent runaway API usage?',
@@ -153,7 +153,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </span>
           <span className="text-white font-medium">Multi-Platform Intelligence is live:</span>
           <span className="text-[#a0a09a]">
-            Now monitoring buyer intent across <strong className="text-white font-medium">X, LinkedIn, Reddit, Web & News</strong>
+            Now monitoring buyer intent across <strong className="text-white font-medium">X, Reddit, Web & News</strong>
           </span>
           <span className="inline-flex items-center gap-1 text-emerald-400 group-hover:text-emerald-300 font-medium ml-1 transition-transform group-hover:translate-x-0.5">
             <span>Explore live feed</span>
@@ -305,7 +305,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
             <div className="pt-2 space-y-2.5">
               {/* Platform selector */}
               <div className="inline-flex flex-wrap items-center justify-center border border-[#e3e3de] bg-white p-0.5 text-xs font-mono">
-                {(['all', 'twitter', 'linkedin', 'reddit', 'google', 'news'] as const).map((p) => (
+                {(['all', 'twitter', 'reddit', 'google', 'news'] as const).map((p) => (
                   <button
                     key={p}
                     onClick={() => setSelectedPlatform(p)}
@@ -321,8 +321,6 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                         ? 'All Channels'
                         : p === 'twitter'
                         ? 'X'
-                        : p === 'linkedin'
-                        ? 'LinkedIn'
                         : p === 'reddit'
                         ? 'Reddit'
                         : p === 'news'
@@ -447,7 +445,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 <span className="text-xl font-mono font-bold text-[#8a8a86]">02</span>
                 <h3 className="text-sm font-bold text-[#141414]">Multi-channel daily sweep</h3>
                 <p className="text-xs text-[#4a4a47] font-mono leading-relaxed">
-                  Every morning at your scheduled time, Echo scans X, LinkedIn, Reddit, the open web and the press for buyer mentions.
+                  Every morning at your scheduled time, Echo scans X, Reddit, the open web and the press for buyer mentions.
                 </p>
               </div>
 
@@ -566,7 +564,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     </li>
                     <li className="flex items-start gap-2.5">
                       <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>2 Channels: X & LinkedIn daily sweeps</span>
+                      <span>4 Channels: X, Reddit, Web & News</span>
                     </li>
                     <li className="flex items-start gap-2.5">
                       <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
@@ -847,8 +845,6 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           <p>© {COPYRIGHT_YEAR} Echo Social Intelligence. All rights reserved.</p>
           <div className="flex items-center gap-3 text-[#4a4a47]">
             <span>X (Twitter)</span>
-            <span>•</span>
-            <span>LinkedIn</span>
             <span>•</span>
             <span>Reddit</span>
             <span>•</span>
