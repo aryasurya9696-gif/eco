@@ -374,7 +374,7 @@ export const SettingsTab: React.FC = () => {
                     Execution Frequency
                   </label>
                   <span className="text-[11px] font-mono text-[#8a8a86]">
-                    Cadence of SocialFetch scans
+                    Cadence of automated scans
                   </span>
                 </div>
 
@@ -521,8 +521,11 @@ export const SettingsTab: React.FC = () => {
               </div>
 
               <div className="flex items-center justify-between py-1">
-                <span className="text-[#8a8a86]">Database Storage:</span>
-                <span className="text-[#141414]">PostgreSQL + RLS</span>
+                <span className="text-[#8a8a86]">Data Security:</span>
+                <span className="text-emerald-700 font-medium flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                  Encrypted & Isolated
+                </span>
               </div>
             </div>
           </div>

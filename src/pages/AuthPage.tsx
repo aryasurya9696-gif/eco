@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { BrandLogo } from '../components/common/BrandLogo';
 import { useAuth } from '../context/AuthContext';
-import { ArrowLeft, ArrowRight, ShieldCheck, Zap } from 'lucide-react';
+import { ArrowLeft, ArrowRight, ShieldCheck, CheckCircle2 } from 'lucide-react';
 
 interface AuthPageProps {
   onNavigateHome: () => void;
@@ -12,11 +12,12 @@ export const AuthPage: React.FC<AuthPageProps> = ({
   onNavigateHome,
   onNavigateDashboard,
 }) => {
-  const { signIn, signUp, isMock } = useAuth();
+  const { signIn, signUp } = useAuth();
   const [mode, setMode] = useState<'signin' | 'signup'>('signup');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [infoMessage, setInfoMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -27,6 +28,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({
     }
 
     setError(null);
+    setInfoMessage(null);
     setIsSubmitting(true);
 
     try {
@@ -34,6 +36,8 @@ export const AuthPage: React.FC<AuthPageProps> = ({
         const res = await signUp(email, password);
         if (res.error) {
           setError(res.error);
+        } else if (res.message) {
+          setInfoMessage(res.message);
         } else {
           onNavigateDashboard();
         }
@@ -50,15 +54,6 @@ export const AuthPage: React.FC<AuthPageProps> = ({
     } finally {
       setIsSubmitting(false);
     }
-  };
-
-  const handleQuickDemo = async () => {
-    setEmail('founder@echo-demo.com');
-    setPassword('demopass123');
-    setIsSubmitting(true);
-    await signIn('founder@echo-demo.com', 'demopass123');
-    setIsSubmitting(false);
-    onNavigateDashboard();
   };
 
   return (
@@ -130,6 +125,14 @@ export const AuthPage: React.FC<AuthPageProps> = ({
             </div>
           )}
 
+          {/* Info Banner */}
+          {infoMessage && (
+            <div className="mb-5 p-3 bg-emerald-50 border border-emerald-200 text-xs font-mono text-emerald-800 flex items-start gap-2 animate-in fade-in duration-150">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
+              <span>{infoMessage}</span>
+            </div>
+          )}
+
           {/* Form */}
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-1.5">
@@ -170,26 +173,10 @@ export const AuthPage: React.FC<AuthPageProps> = ({
             </button>
           </form>
 
-          {/* Quick Demo Test Access */}
-          <div className="mt-6 pt-5 border-t border-[#eeeeea]">
-            <button
-              type="button"
-              onClick={handleQuickDemo}
-              className="w-full inline-flex items-center justify-center gap-1.5 py-2 px-3 bg-[#f6f6f4] hover:bg-[#ecece7] border border-[#e3e3de] text-xs font-mono text-[#4a4a47] rounded-none transition-colors cursor-pointer"
-            >
-              <Zap className="w-3 h-3 text-[#141414]" />
-              <span>Instant Test Account Access</span>
-            </button>
-          </div>
-
-          {/* Backend Info Notice */}
+          {/* Security Notice */}
           <div className="mt-4 flex items-center justify-center gap-1.5 text-[10px] font-mono text-[#8a8a86]">
             <ShieldCheck className="w-3 h-3 text-emerald-600" />
-            <span>
-              {isMock
-                ? 'Local sandbox mode active (auto-sync)'
-                : 'Connected to Supabase Auth & RLS'}
-            </span>
+            <span>Secure 256-bit encrypted authentication</span>
           </div>
         </div>
       </div>

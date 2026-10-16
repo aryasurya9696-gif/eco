@@ -8,7 +8,7 @@ interface AuthContextType {
   isLoading: boolean;
   isMock: boolean;
   signIn: (email: string, password?: string) => Promise<{ error?: string }>;
-  signUp: (email: string, password?: string) => Promise<{ error?: string }>;
+  signUp: (email: string, password?: string) => Promise<{ error?: string; message?: string }>;
   signOut: () => Promise<void>;
   updateProfile: (updates: Partial<Profile>) => Promise<{ error?: string }>;
   completeOnboarding: (data: { full_name: string; website: string; core_offer: string }) => Promise<{ error?: string }>;
@@ -49,6 +49,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             setUser(null);
             setProfile(null);
           }
+
+          setIsLoading(false);
 
           const { data: authListener } = supabase.auth.onAuthStateChange(async (_event, session) => {
             if (session?.user) {
@@ -155,16 +157,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return {};
   };
 
-  const signUp = async (email: string, password: string = 'password123'): Promise<{ error?: string }> => {
+  const signUp = async (email: string, password: string = 'password123'): Promise<{ error?: string; message?: string }> => {
     if (isConfigured && supabase) {
       const { data, error } = await supabase.auth.signUp({
         email,
         password,
       });
       if (error) return { error: error.message };
-      if (data.user) {
-        setUser({ id: data.user.id, email: data.user.email || email });
-        await fetchSupabaseProfile(data.user.id);
+      if (data.session?.user) {
+        setUser({ id: data.session.user.id, email: data.session.user.email || email });
+        await fetchSupabaseProfile(data.session.user.id);
+      } else if (data.user) {
+        return { message: 'Confirmation link sent to your email! Please verify your inbox to sign in.' };
       }
       return {};
     }

@@ -18,7 +18,7 @@ interface DashboardPageProps {
 export const DashboardPage: React.FC<DashboardPageProps> = ({
   onNavigateHome,
 }) => {
-  const { profile, isMock } = useAuth();
+  const { profile } = useAuth();
   const { isSweeping, runSweep, keywords } = useEcho();
   const [activeTab, setActiveTab] = useState<DashboardTab>('feed');
 
@@ -98,11 +98,10 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           </div>
 
           <div className="flex items-center gap-3">
-            {isMock && (
-              <span className="hidden md:inline-flex items-center gap-1 text-[10px] font-mono text-[#8a8a86] bg-[#f6f6f4] px-2.5 py-1 border border-[#e3e3de]">
-                Local Mock Engine Active
-              </span>
-            )}
+            <span className="hidden md:inline-flex items-center gap-1.5 text-[10px] font-mono text-emerald-800 bg-emerald-50 px-2.5 py-1 border border-emerald-200">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+              Live Radar Active
+            </span>
 
             <button
               onClick={runSweep}

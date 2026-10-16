@@ -1,8 +1,8 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { supabase, isConfigured } from '../lib/supabase';
+import { performSocialFetchSweep } from '../lib/socialfetch';
 import { useAuth } from './AuthContext';
 import type { Keyword, MonitoredPost, Platform, LeadStatus, InvoiceItem } from '../types';
-import { INITIAL_SEED_KEYWORDS, generateSeedPosts } from '../data/seedData';
 
 interface ToastMessage {
   id: string;
@@ -36,8 +36,8 @@ interface EchoContextType {
   generateAiDraft: (post: MonitoredPost, tone: 'professional' | 'casual' | 'consultative' | 'direct') => string;
   suggestKeywordsFromOffer: (offerText: string) => string[];
   // Phase 3: Export & Integrations
-  exportPostsToCsv: () => void;
-  exportPostsToJson: () => void;
+  exportPostsToCsv: (customPosts?: MonitoredPost[]) => void;
+  exportPostsToJson: (customPosts?: MonitoredPost[]) => void;
   slackWebhook: string;
   setSlackWebhook: (url: string) => void;
   emailDigest: boolean;
@@ -85,32 +85,10 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [sweepCadence, setSweepCadence] = useState<'24h' | '12h' | '6h'>('24h');
 
   // Billing
-  const [currentPlan, setCurrentPlan] = useState<'starter' | 'pro' | 'scale'>('pro');
-  const [monthlyCreditsUsed, setMonthlyCreditsUsed] = useState<number>(340);
+  const [currentPlan, setCurrentPlan] = useState<'starter' | 'pro' | 'scale'>('starter');
+  const [monthlyCreditsUsed, setMonthlyCreditsUsed] = useState<number>(0);
 
-  const invoices: InvoiceItem[] = [
-    {
-      id: 'INV-2025-003',
-      date: 'May 1, 2025',
-      amount: 79.0,
-      status: 'paid',
-      download_url: '#',
-    },
-    {
-      id: 'INV-2025-002',
-      date: 'Apr 1, 2025',
-      amount: 79.0,
-      status: 'paid',
-      download_url: '#',
-    },
-    {
-      id: 'INV-2025-001',
-      date: 'Mar 1, 2025',
-      amount: 79.0,
-      status: 'paid',
-      download_url: '#',
-    },
-  ];
+  const invoices: InvoiceItem[] = [];
 
   const addToast = (message: string, type: 'info' | 'success' | 'error' = 'info') => {
     const id = `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
@@ -198,15 +176,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setKeywords([]);
         }
       } else {
-        const initial = INITIAL_SEED_KEYWORDS.map((kw, idx) => ({
-          id: `kw-${idx + 1}`,
-          user_id: user.id,
-          keyword: kw,
-          is_active: true,
-          created_at: new Date(Date.now() - (4 - idx) * 86400000).toISOString(),
-        }));
-        setKeywords(initial);
-        localStorage.setItem(`${LOCAL_STORAGE_KEYWORDS_KEY}_${user.id}`, JSON.stringify(initial));
+        setKeywords([]);
       }
     }
     setIsLoadingKeywords(false);
@@ -239,10 +209,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setPosts([]);
         }
       } else {
-        const activeKws = keywords.map((k) => k.keyword);
-        const seeds = generateSeedPosts(user.id, activeKws);
-        setPosts(seeds);
-        localStorage.setItem(`${LOCAL_STORAGE_POSTS_KEY}_${user.id}`, JSON.stringify(seeds));
+        setPosts([]);
       }
     }
     setIsLoadingPosts(false);
@@ -371,52 +338,122 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }));
       setKeywords(rows);
       localStorage.setItem(`${LOCAL_STORAGE_KEYWORDS_KEY}_${user.id}`, JSON.stringify(rows));
-
-      const seeds = generateSeedPosts(user.id, capped);
-      setPosts(seeds);
-      localStorage.setItem(`${LOCAL_STORAGE_POSTS_KEY}_${user.id}`, JSON.stringify(seeds));
     }
 
     return true;
   };
 
-  const updatePostStatus = (postId: string, status: LeadStatus) => {
+  const updatePostStatus = async (postId: string, status: LeadStatus) => {
     setPosts((prev) =>
       prev.map((p) => (p.id === postId ? { ...p, status } : p))
     );
-    if (!isConfigured && user) {
+
+    if (isConfigured && supabase && user) {
+      try {
+        await supabase
+          .from('monitored_posts')
+          .update({ status })
+          .eq('id', postId)
+          .eq('user_id', user.id);
+      } catch (err: any) {
+        console.error('Error updating post status in Supabase:', err);
+      }
+    } else if (user) {
       const updated = posts.map((p) => (p.id === postId ? { ...p, status } : p));
       localStorage.setItem(`${LOCAL_STORAGE_POSTS_KEY}_${user.id}`, JSON.stringify(updated));
     }
+
     addToast(`Lead marked as ${status}`, 'info');
   };
 
   const runSweep = async () => {
     if (!user) return;
     setIsSweeping(true);
-    addToast('Initiating sweep across X & LinkedIn for active keywords...', 'info');
+    addToast('Scanning social networks across Twitter, Reddit & Web...', 'info');
 
-    setTimeout(() => {
-      const activeKwTexts = keywords.map((k) => k.keyword);
-      const newSeed = generateSeedPosts(user.id, activeKwTexts);
+    try {
+      const activeKeywords = keywords.filter((k) => k.is_active);
+      const activeKwTexts = activeKeywords.map((k) => k.keyword);
+      const startedAt = new Date().toISOString();
 
-      const existingUrls = new Set(posts.map((p) => p.post_url));
-      const newItems = newSeed.filter((p) => !existingUrls.has(p.post_url));
-      const combined = [...newItems, ...posts];
-
-      setPosts(combined);
-      setMonthlyCreditsUsed((prev) => prev + 30);
-      if (!isConfigured) {
-        localStorage.setItem(`${LOCAL_STORAGE_POSTS_KEY}_${user.id}`, JSON.stringify(combined));
+      // 1. Fetch live posts across channels via Social Fetch API
+      let fetchedPosts: MonitoredPost[] = [];
+      if (activeKeywords.length > 0) {
+        fetchedPosts = await performSocialFetchSweep(activeKeywords, user.id);
       }
+
+      // 2. If Supabase is connected, persist to monitored_posts and sweep_runs
+      if (isConfigured && supabase) {
+        if (fetchedPosts.length > 0) {
+          const postsToUpsert = fetchedPosts.map((p) => ({
+            user_id: user.id,
+            keyword_id: p.keyword_id && p.keyword_id.length === 36 ? p.keyword_id : null,
+            matched_keyword: p.matched_keyword,
+            platform: p.platform,
+            channel_source: p.channel_source || null,
+            post_url: p.post_url,
+            author_name: p.author_name || null,
+            author_handle: p.author_handle || null,
+            author_avatar_url: p.author_avatar_url || null,
+            body: p.body || null,
+            posted_at: p.posted_at || new Date().toISOString(),
+            intent_score: p.intent_score || 85,
+            status: 'new',
+            engagement: p.engagement || null,
+          }));
+
+          // Upsert posts avoiding duplicate (user_id, post_url)
+          await supabase
+            .from('monitored_posts')
+            .upsert(postsToUpsert, { onConflict: 'user_id,post_url', ignoreDuplicates: true });
+        }
+
+        // Record sweep run in Supabase
+        await supabase.from('sweep_runs').insert({
+          user_id: user.id,
+          status: 'completed',
+          started_at: startedAt,
+          completed_at: new Date().toISOString(),
+          posts_found: fetchedPosts.length,
+          keywords_checked: activeKwTexts,
+        });
+
+        // Query fresh posts from Supabase database
+        const { data: freshPosts, error } = await supabase
+          .from('monitored_posts')
+          .select('*')
+          .eq('user_id', user.id)
+          .order('posted_at', { ascending: false });
+
+        if (!error && freshPosts) {
+          setPosts(freshPosts as MonitoredPost[]);
+        } else if (fetchedPosts.length > 0) {
+          setPosts((prev) => [...fetchedPosts, ...prev]);
+        }
+      } else {
+        // Fallback local update if Supabase not configured
+        if (fetchedPosts.length > 0) {
+          setPosts((prev) => [...fetchedPosts, ...prev]);
+        }
+      }
+
+      setMonthlyCreditsUsed((prev) => prev + (fetchedPosts.length > 0 ? fetchedPosts.length : 1));
       setIsSweeping(false);
-      addToast(
-        newItems.length > 0
-          ? `Sweep complete: ${newItems.length} new matching posts retrieved.`
-          : 'Sweep complete: all current 24h posts already captured.',
-        'success'
-      );
-    }, 1200);
+
+      if (fetchedPosts.length > 0) {
+        addToast(
+          `Sweep completed! Found ${fetchedPosts.length} live opportunities across social channels.`,
+          'success'
+        );
+      } else if (activeKeywords.length === 0) {
+        addToast('No active keywords to track. Add keywords in Tracked Keywords tab.', 'info');
+      } else {
+        addToast('Sweep finished. No new mentions found in the last time window.', 'info');
+      }
+    } catch (err: any) {
+      setIsSweeping(false);
+      addToast(`Sweep error: ${err?.message || 'Failed to complete sweep'}`, 'error');
+    }
   };
 
   // Phase 2: AI Outreach Draft Generator
@@ -468,50 +505,79 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   // Phase 3: Export features
-  const exportPostsToCsv = () => {
-    if (posts.length === 0) {
-      addToast('No posts to export.', 'error');
+  const exportPostsToCsv = (customPosts?: MonitoredPost[]) => {
+    const targetPosts = customPosts && customPosts.length > 0 ? customPosts : posts;
+    if (!targetPosts || targetPosts.length === 0) {
+      addToast('No leads available to export.', 'error');
       return;
     }
 
-    const headers = ['Platform', 'Author Name', 'Author Handle', 'Matched Keyword', 'Intent Score', 'Status', 'Posted At', 'Post URL', 'Body'];
-    const rows = posts.map((p) => [
-      p.platform,
+    const headers = [
+      'Platform',
+      'Author Name',
+      'Author Handle',
+      'Matched Keyword',
+      'Intent Score',
+      'Status',
+      'Channel Source',
+      'Posted At',
+      'Post URL',
+      'Content / Body',
+    ];
+
+    const rows = targetPosts.map((p) => [
+      `"${(p.platform || '').replace(/"/g, '""')}"`,
       `"${(p.author_name || '').replace(/"/g, '""')}"`,
       `"${(p.author_handle || '').replace(/"/g, '""')}"`,
-      `"${p.matched_keyword}"`,
+      `"${(p.matched_keyword || '').replace(/"/g, '""')}"`,
       p.intent_score || 85,
-      p.status || 'new',
-      p.posted_at || '',
-      `"${p.post_url}"`,
-      `"${(p.body || '').replace(/"/g, '""').replace(/\n/g, ' ')}"`,
+      `"${p.status || 'new'}"`,
+      `"${(p.channel_source || '').replace(/"/g, '""')}"`,
+      `"${p.posted_at || ''}"`,
+      `"${(p.post_url || '').replace(/"/g, '""')}"`,
+      `"${(p.body || '').replace(/"/g, '""').replace(/\r?\n/g, ' ')}"`,
     ]);
 
-    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map((e) => e.join(','))].join('\n');
-    const encodedUri = encodeURI(csvContent);
+    // Prepend UTF-8 BOM (\uFEFF) for full Excel and Sheets compatibility
+    const csvString = '\uFEFF' + [headers.join(','), ...rows.map((e) => e.join(','))].join('\r\n');
+    const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
+    link.href = url;
     link.setAttribute('download', `echo_leads_${new Date().toISOString().slice(0, 10)}.csv`);
     document.body.appendChild(link);
     link.click();
-    document.body.removeChild(link);
-    addToast(`Exported ${posts.length} leads to CSV`, 'success');
+
+    setTimeout(() => {
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    }, 200);
+
+    addToast(`Successfully downloaded ${targetPosts.length} leads as CSV`, 'success');
   };
 
-  const exportPostsToJson = () => {
-    if (posts.length === 0) {
-      addToast('No posts to export.', 'error');
+  const exportPostsToJson = (customPosts?: MonitoredPost[]) => {
+    const targetPosts = customPosts && customPosts.length > 0 ? customPosts : posts;
+    if (!targetPosts || targetPosts.length === 0) {
+      addToast('No leads available to export.', 'error');
       return;
     }
 
-    const jsonString = `data:text/json;charset=utf-8,${encodeURIComponent(JSON.stringify(posts, null, 2))}`;
+    const jsonString = JSON.stringify(targetPosts, null, 2);
+    const blob = new Blob([jsonString], { type: 'application/json;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.setAttribute('href', jsonString);
+    link.href = url;
     link.setAttribute('download', `echo_leads_${new Date().toISOString().slice(0, 10)}.json`);
     document.body.appendChild(link);
     link.click();
-    document.body.removeChild(link);
-    addToast(`Exported ${posts.length} leads to JSON`, 'success');
+
+    setTimeout(() => {
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    }, 200);
+
+    addToast(`Successfully downloaded ${targetPosts.length} leads as JSON`, 'success');
   };
 
   return (

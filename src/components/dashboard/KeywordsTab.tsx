@@ -107,10 +107,10 @@ export const KeywordsTab: React.FC = () => {
         <div className="bg-[#ffffff] border border-[#e3e3de] p-5 space-y-2">
           <div className="flex items-center gap-2 text-xs font-mono text-[#141414] font-semibold">
             <Zap className="w-3.5 h-3.5" />
-            <span>Social Fetch Sweep Policy</span>
+            <span>Automated Sweep Policy</span>
           </div>
           <p className="text-xs text-[#8a8a86] font-mono leading-relaxed">
-            Every day at <span className="text-[#141414] font-medium">{sweepTime} UTC</span>, the Edge Function queries SocialFetch for posts from the last <span className="text-[#141414] font-medium">{lookbackHours} hours</span> matching each active keyword. Results are deduplicated on <span className="text-[#141414]">(user_id, post_url)</span>.
+            Every day at <span className="text-[#141414] font-medium">{sweepTime} UTC</span>, Echo scans connected social platforms for conversations from the last <span className="text-[#141414] font-medium">{lookbackHours} hours</span> matching each active keyword. Results are automatically deduplicated and verified.
           </p>
         </div>
 

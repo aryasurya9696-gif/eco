@@ -1,6 +1,6 @@
 -- ============================================================================
--- Echo — initial schema
--- Run via `supabase db push`, or paste into the SQL editor in the dashboard.
+-- Echo — Complete Multi-Platform Production Schema
+-- Supports X, LinkedIn, Reddit, Facebook, Google Discussions
 -- ============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -19,6 +19,11 @@ create table if not exists public.profiles (
   core_offer             text,
   onboarding_completed   boolean not null default false,
   onboarding_step        smallint not null default 0,
+  email_digest           boolean not null default true,
+  slack_webhook          text,
+  lookback_hours         int not null default 24,
+  sweep_time_utc         text not null default '06:00',
+  sweep_frequency        text not null default '24h',
   created_at             timestamptz not null default now(),
   updated_at             timestamptz not null default now()
 );
@@ -29,13 +34,14 @@ create policy "profiles_select_own"
   on public.profiles for select
   using (auth.uid() = id);
 
+create policy "profiles_insert_own"
+  on public.profiles for insert
+  with check (auth.uid() = id);
+
 create policy "profiles_update_own"
   on public.profiles for update
   using (auth.uid() = id)
   with check (auth.uid() = id);
-
--- profiles.insert is handled only by the trigger below (security definer),
--- so no client-facing insert policy is defined.
 
 -- keep updated_at fresh
 create or replace function public.set_updated_at()
@@ -48,6 +54,7 @@ begin
 end;
 $$;
 
+drop trigger if exists trg_profiles_updated_at on public.profiles;
 create trigger trg_profiles_updated_at
   before update on public.profiles
   for each row execute function public.set_updated_at();
@@ -135,21 +142,23 @@ create trigger trg_keyword_limit
 
 -- ---------------------------------------------------------------------------
 -- monitored_posts
--- Written only by the daily-sweep Edge Function (service role, bypasses RLS).
--- Users may only SELECT their own rows.
+-- Written by Edge Function (service role) or user sweep.
 -- ---------------------------------------------------------------------------
 create table if not exists public.monitored_posts (
   id                uuid primary key default gen_random_uuid(),
   user_id           uuid not null references auth.users(id) on delete cascade,
   keyword_id        uuid references public.keywords(id) on delete set null,
   matched_keyword   text not null,
-  platform          text not null check (platform in ('twitter', 'linkedin')),
+  platform          text not null check (platform in ('twitter', 'linkedin', 'reddit', 'facebook', 'google')),
+  channel_source    text,
   post_url          text not null,
   author_name       text,
   author_handle     text,
   author_avatar_url text,
   body              text,
   posted_at         timestamptz,
+  intent_score      int default 85,
+  status            text default 'new' check (status in ('new', 'saved', 'contacted', 'dismissed')),
   engagement        jsonb,
   raw               jsonb,
   created_at        timestamptz not null default now(),
@@ -168,14 +177,22 @@ create policy "monitored_posts_select_own"
   on public.monitored_posts for select
   using (auth.uid() = user_id);
 
--- no insert/update/delete policy for authenticated users on purpose —
--- only the service role (Edge Function) writes to this table.
+create policy "monitored_posts_insert_own"
+  on public.monitored_posts for insert
+  with check (auth.uid() = user_id);
+
+create policy "monitored_posts_update_own"
+  on public.monitored_posts for update
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+create policy "monitored_posts_delete_own"
+  on public.monitored_posts for delete
+  using (auth.uid() = user_id);
 
 -- ---------------------------------------------------------------------------
 -- sweep_runs
--- One row per Edge Function invocation, for observability. Not exposed to
--- the frontend; no RLS policies needed since only the service role touches it
--- (RLS is still enabled so a stray anon/authenticated query returns nothing).
+-- Audit log for automated runs.
 -- ---------------------------------------------------------------------------
 create table if not exists public.sweep_runs (
   id               uuid primary key default gen_random_uuid(),
@@ -187,4 +204,3 @@ create table if not exists public.sweep_runs (
 );
 
 alter table public.sweep_runs enable row level security;
--- intentionally no policies: service-role-only table.

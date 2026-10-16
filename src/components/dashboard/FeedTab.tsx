@@ -205,7 +205,7 @@ export const FeedTab: React.FC = () => {
           {/* Right Export & Sweep Controls */}
           <div className="flex items-center gap-2">
             <button
-              onClick={exportPostsToCsv}
+              onClick={() => exportPostsToCsv(filteredPosts)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#ffffff] hover:bg-[#f6f6f4] border border-[#e3e3de] text-xs font-mono text-[#141414] transition-colors cursor-pointer"
               title="Export visible leads to CSV"
             >
@@ -214,7 +214,7 @@ export const FeedTab: React.FC = () => {
             </button>
 
             <button
-              onClick={exportPostsToJson}
+              onClick={() => exportPostsToJson(filteredPosts)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#ffffff] hover:bg-[#f6f6f4] border border-[#e3e3de] text-xs font-mono text-[#141414] transition-colors cursor-pointer"
               title="Export visible leads to JSON"
             >
@@ -461,7 +461,7 @@ export const FeedTab: React.FC = () => {
                     <button
                       onClick={() => setInspectModalPost(post)}
                       className="p-1 text-[#8a8a86] hover:text-[#141414] border border-[#e3e3de] hover:bg-[#f6f6f4] transition-colors cursor-pointer"
-                      title="Inspect raw SocialFetch payload"
+                      title="Inspect lead metadata"
                     >
                       <Code className="w-3 h-3" />
                     </button>
@@ -630,7 +630,7 @@ export const FeedTab: React.FC = () => {
               <div className="flex items-center gap-2">
                 <Code className="w-4 h-4 text-[#141414]" />
                 <h3 className="text-sm font-bold text-[#141414]">
-                  SocialFetch Raw Lead Metadata
+                  Lead Details & Metadata
                 </h3>
               </div>
               <button

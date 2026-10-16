@@ -239,26 +239,30 @@ export const BillingTab: React.FC = () => {
           <h3 className="text-sm font-bold text-[#141414]">
             Recent Invoices
           </h3>
-          <div className="divide-y divide-[#eeeeea] text-xs font-mono">
-            {invoices.map((inv) => (
-              <div key={inv.id} className="py-2.5 flex items-center justify-between">
-                <div>
-                  <span className="text-[#141414] block">{inv.id}</span>
-                  <span className="text-[10px] text-[#8a8a86]">{inv.date}</span>
+          {invoices.length === 0 ? (
+            <p className="text-xs text-[#8a8a86] font-mono py-4">No billing invoices generated yet.</p>
+          ) : (
+            <div className="divide-y divide-[#eeeeea] text-xs font-mono">
+              {invoices.map((inv) => (
+                <div key={inv.id} className="py-2.5 flex items-center justify-between">
+                  <div>
+                    <span className="text-[#141414] block">{inv.id}</span>
+                    <span className="text-[10px] text-[#8a8a86]">{inv.date}</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="font-semibold text-[#141414]">${inv.amount.toFixed(2)}</span>
+                    <button
+                      onClick={() => addToast(`Receipt ${inv.id} downloaded.`, 'success')}
+                      className="p-1 text-[#8a8a86] hover:text-[#141414] cursor-pointer"
+                      title="Download PDF"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 </div>
-                <div className="flex items-center gap-3">
-                  <span className="font-semibold text-[#141414]">${inv.amount.toFixed(2)}</span>
-                  <button
-                    onClick={() => addToast(`Receipt ${inv.id} downloaded.`, 'success')}
-                    className="p-1 text-[#8a8a86] hover:text-[#141414] cursor-pointer"
-                    title="Download PDF"
-                  >
-                    <Download className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>
