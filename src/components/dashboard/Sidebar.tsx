@@ -6,6 +6,7 @@ import type { DashboardTab } from '../../types';
 import {
   Inbox,
   Tag,
+  Users,
   Settings,
   Wallet,
   LogOut,
@@ -27,6 +28,16 @@ interface SidebarProps {
   onNavigateHome: () => void;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
+  /**
+   * Runs that are not finished, shown as a badge so work in progress is visible
+   * from any tab. Owned by the page rather than fetched here, because the badge
+   * has to keep updating while the user is on the feed and the run list is not
+   * mounted.
+   *
+   * Zero renders no badge at all rather than a 0: a literal zero reads as "you
+   * have no runs" when the real answer is usually "nothing is running right now".
+   */
+  activeLeadRuns?: number;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -35,6 +46,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onNavigateHome,
   isCollapsed,
   onToggleCollapse,
+  activeLeadRuns = 0,
 }) => {
   const { user, profile, signOut } = useAuth();
   const { keywords, keywordLimit, posts, sweepTime, sweepCadence, lookbackHours, enabledChannels } = useEcho();
@@ -63,16 +75,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
       group: 'MAIN',
       items: [
         {
-          id: 'feed' as DashboardTab,
+          id: 'feed',
           label: 'Feed',
           icon: <Inbox className="w-4 h-4" />,
           count: posts.length,
         },
         {
-          id: 'keywords' as DashboardTab,
+          id: 'keywords',
           label: 'Keywords',
           icon: <Tag className="w-4 h-4" />,
           count: `${keywords.length}/${keywordLimit}`,
+        },
+        {
+          id: 'leads',
+          label: 'Leads',
+          icon: <Users className="w-4 h-4" />,
+          // Undefined rather than 0: the badge branch is guarded on
+          // !== undefined, so passing 0 would draw an empty pill.
+          count: activeLeadRuns > 0 ? activeLeadRuns : undefined,
         },
       ],
     },
@@ -80,12 +100,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
       group: 'ACCOUNT',
       items: [
         {
-          id: 'billing' as DashboardTab,
+          id: 'billing',
           label: 'Billing',
           icon: <Wallet className="w-4 h-4" />,
         },
         {
-          id: 'settings' as DashboardTab,
+          id: 'settings',
           label: 'Settings',
           icon: <Settings className="w-4 h-4" />,
         },

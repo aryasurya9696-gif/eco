@@ -6,8 +6,11 @@ import { FeedTab } from '../components/dashboard/FeedTab';
 import { KeywordsTab } from '../components/dashboard/KeywordsTab';
 import { SettingsTab } from '../components/dashboard/SettingsTab';
 import { BillingTab } from '../components/dashboard/BillingTab';
+import { LeadsTab } from '../components/dashboard/LeadsTab';
 import { OnboardingModal } from '../components/onboarding/OnboardingModal';
-import type { DashboardTab } from '../types';
+import type { DashboardTab, LeadsView } from '../types';
+import { leadsRouteFromHash, tabFromHash } from '../lib/leads';
+import { supabase } from '../lib/supabase';
 import { RefreshCw, Radio } from 'lucide-react';
 
 interface DashboardPageProps {
@@ -20,7 +23,57 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 }) => {
   const { profile } = useAuth();
   const { isSweeping, runSweep, keywords } = useEcho();
-  const [activeTab, setActiveTab] = useState<DashboardTab>('feed');
+  // Read the tab out of the hash on first paint rather than always starting on
+  // the feed. Without this a refresh on #dashboard/leads/run/<id> came up showing
+  // the feed with the hash still pointing at Leads, which reads as a broken link.
+  const [activeTab, setActiveTab] = useState<DashboardTab>(
+    () => (tabFromHash() as DashboardTab) ?? 'feed',
+  );
+
+  // The Leads sub-view, also from the hash, so a run link survives a refresh.
+  const [leadsRoute, setLeadsRoute] = useState<{ view: LeadsView; runId: string | null }>(
+    () => leadsRouteFromHash(),
+  );
+
+  /**
+   * Unfinished runs, for the sidebar badge.
+   *
+   * Held on the page rather than fetched inside the sidebar, so the count keeps
+   * updating while the user is on the feed and the run list is unmounted.
+   *
+   * lead_active_run_count() takes no arguments and is not SECURITY DEFINER: it
+   * reads auth.uid() and RLS still applies, so this cannot be pointed at another
+   * workspace. A failed poll deliberately leaves the previous number rather than
+   * setting zero — a transient blip should not make work in progress vanish.
+   */
+  const [activeLeadRuns, setActiveLeadRuns] = useState(0);
+
+  useEffect(() => {
+    const client = supabase;
+    if (!client) return;
+
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const { count, error } = await client.rpc('lead_active_run_count');
+        if (cancelled || error) return;
+        setActiveLeadRuns(count ?? 0);
+      } catch {
+        /* keep the last known count */
+      }
+    };
+
+    void poll();
+    // 15s is slow enough not to matter and fast enough that a run started on
+    // another tab shows its badge here within one poll.
+    const timer = setInterval(poll, 15000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
 
   // Sidebar collapse state with localStorage persistence
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() => {
@@ -56,6 +109,47 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
+  // The hash can change without this component remounting: the browser Back
+  // button, or a link from elsewhere in the app. Keep both in step with it.
+  useEffect(() => {
+    const syncFromHash = () => {
+      const tab = tabFromHash() as DashboardTab | null;
+      if (tab) setActiveTab(tab);
+      setLeadsRoute(leadsRouteFromHash());
+    };
+
+    window.addEventListener('hashchange', syncFromHash);
+    return () => window.removeEventListener('hashchange', syncFromHash);
+  }, []);
+
+  // replaceState rather than assigning location.hash: assigning pushes a history
+  // entry, so Back after switching Leads panels would walk back through every
+  // panel click instead of leaving the dashboard. Switching panels is not
+  // navigation, and neither is switching tabs.
+  const replaceHash = (hash: string) => {
+    window.history.replaceState(
+      null,
+      '',
+      `${window.location.pathname}${window.location.search}${hash}`,
+    );
+  };
+
+  const handleTabChange = (tab: DashboardTab) => {
+    setActiveTab(tab);
+    if (tab === 'leads') {
+      replaceHash(`#dashboard/leads/${leadsRoute.view}`);
+    } else {
+      replaceHash(`#dashboard/${tab}`);
+    }
+  };
+
+  const handleLeadsViewChange = (view: LeadsView) => {
+    // Switching away from a run clears the id, so returning to Runs does not
+    // leave the previous run id in the hash ready to be reopened by Back.
+    setLeadsRoute({ view, runId: null });
+    replaceHash(`#dashboard/leads/${view}`);
+  };
+
   // Check if onboarding needs to be shown
   const showOnboarding = Boolean(profile && !profile.onboarding_completed);
 
@@ -64,10 +158,11 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       {/* Sidebar */}
       <Sidebar
         activeTab={activeTab}
-        onTabChange={setActiveTab}
+        onTabChange={handleTabChange}
         onNavigateHome={onNavigateHome}
         isCollapsed={isSidebarCollapsed}
         onToggleCollapse={toggleSidebar}
+        activeLeadRuns={activeLeadRuns}
       />
 
       {/* Main Content Area with 58px Grid Pattern */}
@@ -83,6 +178,8 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                   ? 'Monitored Mentions Feed'
                   : activeTab === 'keywords'
                   ? 'Keyword Management'
+                  : activeTab === 'leads'
+                  ? 'Leads'
                   : activeTab === 'billing'
                   ? 'Credits & Billing'
                   : 'Workspace Settings'}
@@ -122,6 +219,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         >
           {activeTab === 'feed' && <FeedTab />}
           {activeTab === 'keywords' && <KeywordsTab />}
+          {activeTab === 'leads' && (
+            <LeadsTab
+              view={leadsRoute.view}
+              runId={leadsRoute.runId}
+              onViewChange={handleLeadsViewChange}
+            />
+          )}
           {activeTab === 'billing' && <BillingTab />}
           {activeTab === 'settings' && <SettingsTab />}
         </main>
