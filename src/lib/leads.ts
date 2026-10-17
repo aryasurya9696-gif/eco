@@ -244,6 +244,32 @@ const UNKNOWN_PROVIDER = {
   ink: 'text-[#8a8a86]',
 };
 
+/**
+ * The shipped email order, for display only.
+ *
+ * The list itself is duplicated from the worker's registry on purpose, and the
+ * duplication is bounded deliberately: the worker is authoritative for what it
+ * calls, this exists so the cell ladder can show five rungs before any run has
+ * been worked. When a user has a saved or smart order, the run view sends that
+ * instead — until then the rungs show the default, which is also what the worker
+ * would do, so they agree.
+ *
+ * The alternative — importing the registry — is not available: it lives in
+ * supabase/functions, which the browser bundler does not resolve.
+ */
+export const DEFAULT_EMAIL_ORDER: string[] = [
+  'quickenrich.people.email.find',
+  'trykitt.people.email.find',
+  'aiark.people.email.find',
+  'tomba.people.email.find',
+  'leadsforge.people.email.find',
+];
+
+/** The provider's display name, or the raw id when it is one we do not know. */
+export function providerLabel(endpointId: string): string {
+  return providerStyle(endpointId).label;
+}
+
 export interface ProviderStyle {
   label: string;
   chip: string;
