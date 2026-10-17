@@ -1,5 +1,5 @@
 import React from 'react';
-import { Check, ArrowRight } from 'lucide-react';
+import { ArrowRight } from 'lucide-react';
 
 /**
  * Pricing, built like a plan picker.
@@ -179,64 +179,86 @@ export const LandingPricing: React.FC<LandingPricingProps> = ({
           })}
         </div>
 
-        {/* ---- What a search costs ------------------------------------------ */}
-        <div className="mt-14 bg-white border border-[#e3e3de] p-6 md:p-7">
-          <div className="flex flex-wrap items-center justify-between gap-2 pb-4 border-b border-[#eeeeea]">
+        {/*
+          What one search costs.
+
+          Laid out as tiles across the row rather than a list beside a paragraph.
+          A four-item list in a two-column split leaves half the card empty and
+          makes the reader work down a column to compare four numbers that sit
+          side by side far more naturally. Mobile collapses to two columns, which
+          keeps the credit figure and its channel name adjacent rather than
+          separated by a wrap.
+        */}
+        <div className="mt-14 bg-white border border-[#e3e3de]">
+          <div className="flex flex-wrap items-center justify-between gap-3 px-6 md:px-7 py-4 border-b border-[#eeeeea]">
             <p className="text-[10px] font-mono uppercase tracking-wider text-[#141414] font-bold">
               What one search costs
             </p>
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-[#f6f6f4] border border-[#e3e3de] text-[10px] font-mono text-[#4a4a47]">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-              New accounts start with {welcomeCredits} free credits
+            <span className="text-[11px] text-[#4a4a47]">
+              Charged once per sweep, per channel
             </span>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-10">
-            <ul>
-              {searchCosts.map((s) => (
-                <li
-                  key={s.channel}
-                  className="flex items-center justify-between gap-4 py-2.5 border-b border-[#f5f5f2]"
-                >
-                  <div className="flex items-baseline gap-2.5 min-w-0">
-                    <Check className="w-3.5 h-3.5 text-[#141414] flex-shrink-0 self-center" />
-                    <span className="text-sm text-[#141414]">{s.channel}</span>
-                  </div>
-                  <span className="text-xs font-mono text-[#141414] flex-shrink-0">
-                    {s.credits} cr
+          <div className="grid grid-cols-2 lg:grid-cols-4 divide-x divide-y lg:divide-y-0 divide-[#eeeeea]">
+            {searchCosts.map((s) => (
+              <div key={s.channel} className="px-6 py-5">
+                <p className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">
+                  {s.channel}
+                </p>
+                <div className="flex items-baseline gap-1 mt-1.5">
+                  <span className="text-2xl font-bold tracking-tight text-[#141414]">
+                    {s.credits}
                   </span>
-                </li>
-              ))}
-            </ul>
-            <div className="text-[11px] text-[#8a8a86] font-mono leading-relaxed py-3 sm:pl-6">
-              <p>
-                A channel is charged once per sweep, whether it worked first time or
-                took a fallback. You are never charged for the retry.
-              </p>
-              <p className="mt-2">
-                A search that finds nothing, or that the provider charges nothing for,
-                is not billed at all.
-              </p>
-            </div>
+                  <span className="text-[11px] font-mono text-[#8a8a86]">
+                    {s.credits === 1 ? 'credit' : 'credits'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-[#8a8a86] mt-1.5 leading-snug">
+                  {s.note}
+                </p>
+              </div>
+            ))}
+          </div>
+
+          <div className="px-6 md:px-7 py-4 border-t border-[#eeeeea] bg-[#fbfbfa] flex flex-col sm:flex-row sm:items-center gap-x-6 gap-y-1">
+            <p className="text-[12px] text-[#4a4a47]">
+              A fallback never costs extra — if the first provider is busy you are
+              charged the same as if it had worked.
+            </p>
+            <p className="text-[12px] text-[#8a8a86] sm:ml-auto sm:text-right">
+              A search that finds nothing is not billed.
+            </p>
           </div>
         </div>
 
-        {/* ---- Close -------------------------------------------------------- */}
-        <div className="mt-10 flex flex-col sm:flex-row sm:items-center justify-between gap-5 bg-white border border-[#e3e3de] p-6">
+        {/*
+          Close.
+
+          The free tier is stated once, here, and made concrete rather than
+          repeated as a badge above.
+
+          Deliberately described in sweeps rather than in searches. A full sweep
+          at the product maximum is 32 credits, more than the welcome grant, so
+          "20 searches" would be both the flattering end of the range and a unit
+          the product does not actually think in. A new workspace starts with a
+          couple of keywords, where a few days of daily sweeping is the honest
+          answer.
+        */}
+        <div className="mt-4 bg-[#141414] text-white px-6 md:px-8 py-6 flex flex-col sm:flex-row sm:items-center justify-between gap-5">
           <div>
-            <p className="text-sm text-[#141414] font-medium">
-              Want to look before you spend anything?
+            <p className="text-sm font-medium">
+              Start with {welcomeCredits} free credits
             </p>
-            <p className="text-xs text-[#8a8a86] mt-1 max-w-md">
-              New accounts get {welcomeCredits} free credits, enough to run real
-              searches and see what comes back. No card, nothing to cancel.
+            <p className="text-xs text-white/60 mt-1.5 max-w-md leading-relaxed">
+              A few days of daily sweeps on a handful of keywords, before you pay
+              anything. No card, nothing to cancel.
             </p>
           </div>
           <button
             onClick={onStart}
-            className="inline-flex items-center justify-center gap-2 px-6 py-3 bg-[#121212] hover:bg-black text-white text-sm font-mono transition-colors shrink-0 cursor-pointer"
+            className="inline-flex items-center justify-center gap-2 px-6 py-3 bg-white hover:bg-[#f0f0f0] text-[#141414] text-sm font-mono transition-colors shrink-0 cursor-pointer"
           >
-            Start free
+            Create free account
             <ArrowRight className="w-3.5 h-3.5" />
           </button>
         </div>
