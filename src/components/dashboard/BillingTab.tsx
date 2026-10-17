@@ -219,24 +219,42 @@ export const BillingTab: React.FC = () => {
             </button>
           </div>
 
-          {/* Lifetime figures. Shown because a balance alone does not tell
-              someone whether the product is paying for itself. */}
-          <dl className="grid grid-cols-3 divide-x divide-[#eeeeea] text-center">
-            <div className="p-3">
+          {/* Lifetime figures.
+              "Bought" counts only credits that came through a settled payment.
+              The alternative was lifetime_granted, which includes the welcome
+              grant — so a workspace that has never paid anything would be told
+              it had bought 200 credits, which the bank statement would
+              contradict. Free credits are shown as their own figure rather than
+              quietly folded into a purchase total.
+              "Searches run" is a real count from the server, not the length of
+              the recent list, which is capped at 50 for rendering and would
+              therefore read 50 to exactly the people with the most usage. */}
+          <dl className="grid grid-cols-2 sm:grid-cols-4 gap-px bg-[#eeeeea] text-center">
+            <div className="bg-white p-3">
               <dt className="text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">Bought</dt>
               <dd className="text-sm font-mono text-[#141414] mt-1">
-                {formatCredits(wallet?.lifetime_granted ?? 0)}
+                {formatCredits(wallet?.credits_purchased ?? 0)}
               </dd>
             </div>
-            <div className="p-3">
+            <div className="bg-white p-3">
+              <dt className="text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">Free</dt>
+              <dd className="text-sm font-mono text-[#141414] mt-1">
+                {formatCredits(wallet?.credits_free ?? 0)}
+              </dd>
+            </div>
+            <div className="bg-white p-3">
               <dt className="text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">Spent</dt>
               <dd className="text-sm font-mono text-[#141414] mt-1">
                 {formatCredits(wallet?.lifetime_consumed ?? 0)}
               </dd>
             </div>
-            <div className="p-3">
-              <dt className="text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">Searches run</dt>
-              <dd className="text-sm font-mono text-[#141414] mt-1">{history.usage.length}</dd>
+            <div className="bg-white p-3">
+              <dt className="text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">
+                Searches run
+              </dt>
+              <dd className="text-sm font-mono text-[#141414] mt-1">
+                {formatCredits(wallet?.search_count ?? 0)}
+              </dd>
             </div>
           </dl>
         </div>

@@ -21,6 +21,18 @@ export interface Wallet {
   available: number;
   lifetime_granted: number;
   lifetime_consumed: number;
+  /** Credits that came through a settled payment. Excludes free grants. */
+  credits_purchased: number;
+  /** Credits that were given away — the welcome grant, or any future promo. */
+  credits_free: number;
+  /**
+   * Every search ever run, counted on the server.
+   *
+   * Not derivable from the recent-searches list, which the API caps at 50 rows
+   * for rendering. Counting that array would read 50 to anyone past 50 searches,
+   * which is exactly backwards: the heaviest users are the ones checking.
+   */
+  search_count: number;
   recognised_revenue_usd: number;
   service_cost_usd: number;
 }

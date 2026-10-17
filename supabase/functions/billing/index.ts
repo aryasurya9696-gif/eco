@@ -72,6 +72,20 @@ const num = (v: unknown): number => {
 };
 
 /**
+ * Platform -> pricing operation.
+ *
+ * Module level rather than local to each action, because three separate places
+ * here need the same mapping and three private copies is three chances to type
+ * one of them wrong. The keys here are the platform names the product uses.
+ */
+const OPERATION_OF: Record<string, string> = {
+  twitter: 'treg.twitter.search',
+  reddit: 'treg.reddit.search',
+  google: 'treg.web.search',
+  news: 'treg.news.search',
+};
+
+/**
  * The wallet summary the Billing tab renders.
  *
  * `available` is what can actually be spent right now: the balance minus
@@ -86,8 +100,50 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
     .maybeSingle();
 
   if (error) throw new Error(`wallet lookup failed: ${error.message}`);
+
+  // A workspace with no wallet row at all is the one that most needs telling
+  // they are out of credits, so this path must still report the sweep cost.
+  // Returning early without it left the UI with nothing to warn about, which is
+  // the opposite of what someone on zero credits should see.
   if (!wallet) {
-    return { ok: true, wallet: { balance: 0, reserved: 0, available: 0 } };
+    const empty = { balance: 0, reserved: 0, available: 0 };
+    const [profileRes, keywordCount, priceRows] = await Promise.all([
+      admin.from('profiles').select('enabled_channels').eq('id', userId).maybeSingle(),
+      admin.from('keywords').select('id', { count: 'exact', head: true })
+        .eq('user_id', userId).eq('is_active', true),
+      admin.from('pricing_config').select('operation, credits').eq('enabled', true),
+    ]);
+
+    const channels: string[] = Array.isArray(profileRes.data?.enabled_channels)
+      ? profileRes.data.enabled_channels
+      : ['twitter', 'reddit', 'google'];
+    const priceOf = new Map<string, number>(
+      (priceRows.data ?? []).map((p: any) => [p.operation, num(p.credits)]),
+    );
+
+    let cost = 0;
+    for (const ch of channels) cost += (keywordCount ?? 0) * (priceOf.get(OPERATION_OF[ch]) ?? 0);
+
+    return {
+      ok: true,
+      wallet: {
+        ...empty,
+        lifetime_granted: 0,
+        lifetime_consumed: 0,
+        credits_purchased: 0,
+        credits_free: 0,
+        search_count: 0,
+        recognised_revenue_usd: 0,
+        service_cost_usd: 0,
+      },
+      sweep: {
+        keywords: keywordCount ?? 0,
+        channels,
+        credits: cost,
+        affordable: cost === 0,
+        shortfall: cost,
+      },
+    };
   }
 
   const balance = num(wallet.balance);
@@ -111,12 +167,6 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
     .select('operation, credits')
     .eq('enabled', true);
 
-  const opOf: Record<string, string> = {
-    twitter: 'treg.twitter.search',
-    reddit: 'treg.reddit.search',
-    google: 'treg.web.search',
-    news: 'treg.news.search',
-  };
   const priceOf = new Map<string, number>((pricing ?? []).map((p: any) => [p.operation, num(p.credits)]));
 
   const channels: string[] = Array.isArray(profile?.enabled_channels)
@@ -125,10 +175,33 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
 
   let sweepCost = 0;
   for (const ch of channels) {
-    sweepCost += (keywords ?? 0) * (priceOf.get(opOf[ch]) ?? 0);
+    sweepCost += (keywords ?? 0) * (priceOf.get(OPERATION_OF[ch]) ?? 0);
   }
 
   const available = Math.max(balance - reserved, 0);
+
+  // Two totals the history query cannot supply.
+  //
+  // lifetime_granted is every credit this workspace has ever received, which
+  // includes the welcome grant. Labelling that "bought" would tell someone who
+  // has never paid anything that they have, which is both wrong and the kind of
+  // wrong a bank statement later corrects. Credits that came from a settled
+  // payment are counted separately from credits that were given away.
+  const [paidAgg, usageCount] = await Promise.all([
+    admin.from('payment_orders')
+      .select('credits_granted')
+      .eq('user_id', userId)
+      .eq('status', 'succeeded'),
+    admin.from('api_usage')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId),
+  ]);
+
+  const creditsPurchased = (paidAgg.data ?? []).reduce(
+    (sum: number, p: any) => sum + num(p.credits_granted),
+    0,
+  );
+  const lifetimeGranted = num(wallet.lifetime_granted);
 
   return {
     ok: true,
@@ -136,8 +209,16 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
       balance,
       reserved,
       available,
-      lifetime_granted: num(wallet.lifetime_granted),
+      lifetime_granted: lifetimeGranted,
       lifetime_consumed: num(wallet.lifetime_consumed),
+      // What actually went through a payment, and what was given. Never merged.
+      credits_purchased: creditsPurchased,
+      credits_free: Math.max(lifetimeGranted - creditsPurchased, 0),
+      // A real total, not the length of the recent-searches list. That list is
+      // capped for rendering, and a counter derived from it would read 50 to
+      // anyone who has run more than 50 searches — flattering precisely for the
+      // people most likely to be checking it.
+      search_count: usageCount ?? 0,
       recognised_revenue_usd: num(wallet.recognised_revenue_usd),
       service_cost_usd: num(wallet.service_cost_usd),
     },
@@ -237,12 +318,7 @@ async function actionQuote(
   userId: string,
   channels: string[],
 ) {
-  const opOf: Record<string, string> = {
-    twitter: 'treg.twitter.search',
-    reddit: 'treg.reddit.search',
-    google: 'treg.web.search',
-    news: 'treg.news.search',
-  };
+  const opOf: Record<string, string> = OPERATION_OF;
   const ops = channels.map((c) => opOf[c]).filter(Boolean);
 
   const { data: keywords } = await admin
