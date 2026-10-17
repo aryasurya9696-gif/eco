@@ -335,46 +335,54 @@ export const BillingTab: React.FC = () => {
         {history.usage.length === 0 ? (
           <p className="text-xs text-[#8a8a86] py-4">No searches yet.</p>
         ) : (
-          <div className="border border-[#e3e3de] bg-white overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-[#eeeeea] text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">
-                  <th className="text-left font-normal px-3 py-2">When</th>
-                  <th className="text-left font-normal px-3 py-2">Channel</th>
-                  <th className="text-right font-normal px-3 py-2">Credits</th>
-                  <th className="text-right font-normal px-3 py-2">Cost to us</th>
-                  <th className="text-left font-normal px-3 py-2 w-24">Result</th>
-                </tr>
-              </thead>
-              <tbody className="font-mono">
-                {history.usage.map((u) => (
-                  <tr key={u.id} className="border-b border-[#f5f5f2] last:border-0">
-                    <td className="px-3 py-2 text-[#8a8a86] whitespace-nowrap">
-                      {formatDateTime(u.created_at)}
-                    </td>
-                    <td className="px-3 py-2 text-[#141414] whitespace-nowrap">
-                      {operationLabel(u.operation)}
-                    </td>
-                    <td className="px-3 py-2 text-right text-[#141414]">
-                      {u.credits_charged > 0 ? formatCredits(u.credits_charged) : '—'}
-                    </td>
-                    <td className="px-3 py-2 text-right text-[#8a8a86]">
-                      {formatUsd(u.provider_cost_usd)}
-                    </td>
-                    <td className="px-3 py-2">
-                      <OutcomeBadge outcome={u.outcome} />
-                    </td>
+          <>
+            {/* Hidden columns rather than a horizontal scroll. Five columns of
+                short values do not need a scrollbar on a narrow screen, they need
+                one of them hidden — and the one dropped is the least important
+                to the person reading it. */}
+            <div className="border border-[#e3e3de] bg-white">
+              <table className="w-full text-xs table-fixed">
+                <thead>
+                  <tr className="border-b border-[#eeeeea] text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">
+                    <th className="text-left font-normal px-3 py-2.5 w-[34%]">When</th>
+                    <th className="text-left font-normal px-3 py-2.5 w-[24%]">Channel</th>
+                    <th className="text-right font-normal px-3 py-2.5 w-[16%]">Credits</th>
+                    <th className="text-right font-normal px-3 py-2.5 hidden sm:table-cell">
+                      Cost to us
+                    </th>
+                    <th className="text-left font-normal px-3 py-2.5 w-[26%]">Result</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody className="font-mono">
+                  {history.usage.map((u) => (
+                    <tr key={u.id} className="border-b border-[#f5f5f2] last:border-0">
+                      <td className="px-3 py-2.5 text-[#8a8a86] truncate">
+                        {formatDateTime(u.created_at)}
+                      </td>
+                      <td className="px-3 py-2.5 text-[#141414] truncate">
+                        {operationLabel(u.operation)}
+                      </td>
+                      <td className="px-3 py-2.5 text-right text-[#141414]">
+                        {u.credits_charged > 0 ? formatCredits(u.credits_charged) : '—'}
+                      </td>
+                      <td className="px-3 py-2.5 text-right text-[#8a8a86] hidden sm:table-cell">
+                        {formatUsd(u.provider_cost_usd)}
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <OutcomeBadge outcome={u.outcome} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="text-[10px] text-[#8a8a86] font-mono mt-2 max-w-2xl leading-relaxed">
+              Cost is what the search provider reported for that call, not an estimate.
+              A search that found nothing, or that the provider charged nothing for, is
+              not billed.
+            </p>
+          </>
         )}
-        <p className="text-[10px] text-[#8a8a86] font-mono mt-2">
-          Cost to us is what the search provider reported for that call, not an
-          estimate. A search that found nothing, or that the provider charged
-          nothing for, is not billed.
-        </p>
       </section>
 
       {/* ---- Payments ----------------------------------------------------- */}
@@ -385,31 +393,33 @@ export const BillingTab: React.FC = () => {
         {history.payments.length === 0 ? (
           <p className="text-xs text-[#8a8a86] py-4">No payments yet.</p>
         ) : (
-          <div className="border border-[#e3e3de] bg-white overflow-x-auto">
-            <table className="w-full text-xs">
+          <div className="border border-[#e3e3de] bg-white">
+            <table className="w-full text-xs table-fixed">
               <thead>
                 <tr className="border-b border-[#eeeeea] text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">
-                  <th className="text-left font-normal px-3 py-2">Date</th>
-                  <th className="text-left font-normal px-3 py-2">Package</th>
-                  <th className="text-right font-normal px-3 py-2">Amount</th>
-                  <th className="text-right font-normal px-3 py-2">Credits</th>
-                  <th className="text-left font-normal px-3 py-2 w-28">Status</th>
+                  <th className="text-left font-normal px-3 py-2.5 w-[24%]">Date</th>
+                  <th className="text-left font-normal px-3 py-2.5 w-[26%]">Package</th>
+                  <th className="text-right font-normal px-3 py-2.5 w-[20%]">Amount</th>
+                  <th className="text-right font-normal px-3 py-2.5 hidden sm:table-cell w-[16%]">
+                    Credits
+                  </th>
+                  <th className="text-left font-normal px-3 py-2.5 w-[14%]">Status</th>
                 </tr>
               </thead>
               <tbody className="font-mono">
                 {history.payments.map((p) => (
                   <tr key={p.id} className="border-b border-[#f5f5f2] last:border-0">
-                    <td className="px-3 py-2 text-[#8a8a86] whitespace-nowrap">
+                    <td className="px-3 py-2.5 text-[#8a8a86] truncate">
                       {formatDate(p.created_at)}
                     </td>
-                    <td className="px-3 py-2 text-[#141414]">{p.package_code}</td>
-                    <td className="px-3 py-2 text-right text-[#141414]">
+                    <td className="px-3 py-2.5 text-[#141414] truncate">{p.package_code}</td>
+                    <td className="px-3 py-2.5 text-right text-[#141414]">
                       {formatUsd(p.gross_usd)}
                     </td>
-                    <td className="px-3 py-2 text-right text-[#141414]">
+                    <td className="px-3 py-2.5 text-right text-[#141414] hidden sm:table-cell">
                       {p.credits_granted > 0 ? formatCredits(p.credits_granted) : '—'}
                     </td>
-                    <td className="px-3 py-2">
+                    <td className="px-3 py-2.5">
                       <StatusBadge status={p.status} />
                     </td>
                   </tr>
@@ -426,32 +436,32 @@ export const BillingTab: React.FC = () => {
           <h2 className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] mb-3">
             Balance history
           </h2>
-          <div className="border border-[#e3e3de] bg-white overflow-x-auto">
-            <table className="w-full text-xs">
+          <div className="border border-[#e3e3de] bg-white">
+            <table className="w-full text-xs table-fixed">
               <thead>
                 <tr className="border-b border-[#eeeeea] text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">
-                  <th className="text-left font-normal px-3 py-2">When</th>
-                  <th className="text-left font-normal px-3 py-2">Type</th>
-                  <th className="text-right font-normal px-3 py-2">Change</th>
-                  <th className="text-right font-normal px-3 py-2">Balance</th>
+                  <th className="text-left font-normal px-3 py-2.5 w-[34%]">When</th>
+                  <th className="text-left font-normal px-3 py-2.5 w-[28%]">Type</th>
+                  <th className="text-right font-normal px-3 py-2.5 w-[20%]">Change</th>
+                  <th className="text-right font-normal px-3 py-2.5 w-[18%]">Balance</th>
                 </tr>
               </thead>
               <tbody className="font-mono">
                 {history.ledger.map((l) => (
                   <tr key={l.id} className="border-b border-[#f5f5f2] last:border-0">
-                    <td className="px-3 py-2 text-[#8a8a86] whitespace-nowrap">
+                    <td className="px-3 py-2.5 text-[#8a8a86] truncate">
                       {formatDateTime(l.created_at)}
                     </td>
-                    <td className="px-3 py-2 text-[#141414]">{ledgerLabel(l.kind)}</td>
+                    <td className="px-3 py-2.5 text-[#141414] truncate">{ledgerLabel(l.kind)}</td>
                     <td
-                      className={`px-3 py-2 text-right ${
+                      className={`px-3 py-2.5 text-right ${
                         l.delta >= 0 ? 'text-emerald-700' : 'text-[#141414]'
                       }`}
                     >
                       {l.delta >= 0 ? '+' : ''}
                       {formatCredits(l.delta)}
                     </td>
-                    <td className="px-3 py-2 text-right text-[#8a8a86]">
+                    <td className="px-3 py-2.5 text-right text-[#8a8a86]">
                       {formatCredits(l.balance_after)}
                     </td>
                   </tr>

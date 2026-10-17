@@ -142,13 +142,44 @@ export function formatCredits(n: number): string {
   return Number.isInteger(n) ? String(n) : n.toFixed(2);
 }
 
+/**
+ * Money for display.
+ *
+ * A single search costs around $0.001, so a plain two-decimal format renders
+ * every cost as $0.00 and the whole column is meaningless. But going to eight
+ * decimals to compensate is worse: $0.00100000 is noise pretending to be
+ * precision, and the trailing zeros are storage format, not information.
+ *
+ * So: enough decimals to show the first meaningful digit, and no more. A reddit
+ * call reads $0.001, a web search $0.00015, and a card payment $10.00. Zero
+ * stays $0.00 rather than becoming $0, because this is a currency column.
+ */
 export function formatUsd(n: number, opts: { decimals?: number } = {}): string {
-  const d = opts.decimals ?? 2;
-  // Sub-cent costs are the normal case here — a single search costs around
-  // $0.001 — so eight decimals by default keeps the number meaningful instead
-  // of rendering as $0.00.
-  const decimals = opts.decimals ?? (n !== 0 && Math.abs(n) < 0.01 ? 8 : d);
-  return `$${n.toFixed(decimals)}`;
+  if (opts.decimals !== undefined) return `$${n.toFixed(opts.decimals)}`;
+
+  const abs = Math.abs(n);
+  if (abs === 0) return '$0.00';
+  if (abs >= 0.01) return `$${n.toFixed(2)}`;
+
+  // Smallest non-zero digit decides how many decimals are worth showing.
+  const magnitude = Math.floor(Math.log10(abs));
+  const decimals = Math.min(Math.max(-magnitude + 2, 2), 6);
+
+  // toFixed pads to the requested precision, which is how $0.001 arrives as
+  // $0.00100. Those zeros are storage format, not precision, so they go — while
+  // still keeping two decimals, because a currency column showing $25.5 rather
+  // than $25.50 reads as a typo.
+  let s = n.toFixed(decimals);
+  if (s.includes('.')) {
+    s = s.replace(/0+$/, '');
+    if (s.endsWith('.')) {
+      s += '00';
+    } else {
+      const frac = s.split('.')[1].length;
+      if (frac < 2) s += '0'.repeat(2 - frac);
+    }
+  }
+  return `$${s}`;
 }
 
 export function formatDate(iso: string): string {
