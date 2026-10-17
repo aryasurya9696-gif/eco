@@ -46,13 +46,14 @@ graph TD
 - **Inspection Modal**: Deep-dive lead modal showing author follower count, bio, channel source, and raw payload.
 
 ### Phase 4: Billing, Plans & Workspace Preferences (Implemented)
-- **Subscription Tiers**:
-  - *Starter*: 5 keywords, 2 channels (X & Web), daily 24h sweep, $29/month.
-  - *Pro* (Popular): 10 keywords, all 5 channels, AI outreach drafts, Slack alerts, $79/month.
-  - *Scale*: 25 keywords, all 5 channels, accelerated 6h sweep, unlimited exports, $199/month.
-- **Usage Meters**: Active keyword count against the plan limit (e.g. 4/10), mentions found this session, and the configured sweep cadence.
-- **Payment**: Stripe-hosted Checkout. A plan is activated server-side only after the `billing` edge function confirms `payment_status === 'paid'`. Card details never touch Echo.
-- **Workspace Preferences**: Custom sweep time, lookback window (24h/48h), active channel configuration, minimum intent threshold, and a Slack/Discord webhook.
+- **Subscription Tiers**: limits are derived from what a workspace costs to serve, not picked by feel. Worst case, every Reddit call taking the fallback, a 30-day month:
+  - *Starter*: 8 keywords, 3 channels, daily 24h sweep, $29/month. Costs $0.87 to serve at full use — 97.0% margin.
+  - *Pro* (Popular): 20 keywords, all 4 channels, 12h sweep, $79/month. Costs $4.54 — 94.3% margin.
+  - *Scale*: 40 keywords, all 4 channels, 6h sweep, $199/month. Costs $18.14 — 90.9% margin.
+- **Credit Meter**: Every metered provider call draws credits (1 on X and the web, 2 on Reddit, 0 on press and news). Plans grant an allowance each period; top-ups add to it. Conversion is 20 credits per dollar, tunable by an admin in `billing_config`.
+- **Accounting**: A top-up is not profit. Cash taken is deferred revenue and a liability; it is recognised as revenue only as the credits are spent, each spend carrying the provider cost of the call it paid for. `billing_summary` reports the recognised/deferred split and a reconciliation delta that must be zero.
+- **Payment**: Stripe-hosted Checkout for both plans and top-ups. Credits are granted by the Stripe webhook, not the browser, and settlement is idempotent on the Checkout session id. Card details never touch Echo.
+- **Workspace Preferences**: Custom sweep time, cadence, lookback window (24h/48h), active channel configuration, minimum intent threshold, and feed retention.
 - **Retired**: the credit-based lead-unlocking system (per-lead credit packs, credit ledger, paywalled contact enrichment) was removed. Feed cards show the author and post directly with no paywall.
 
 ### Phase 5: CRM Sync & Enterprise (Roadmap)

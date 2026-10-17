@@ -154,7 +154,7 @@ created for the calling user.
 | Table | Notes |
 |---|---|
 | `profiles` | One row per user; plan, sweep settings and intent threshold |
-| `keywords` | Max 5/10/25 active depending on plan, enforced by trigger |
+| `keywords` | Max 8/20/40 active depending on plan, enforced by trigger |
 | `monitored_posts` | Unique on `(user_id, post_url)`; written by edge functions |
 | `sweep_runs` | Cron audit log (service-role only) |
 
