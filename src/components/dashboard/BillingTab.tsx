@@ -315,9 +315,18 @@ export const BillingTab: React.FC = () => {
               <p className="text-sm font-mono text-[#141414] mt-1.5">
                 {formatCredits(p.total_credits)} credits
               </p>
-              <p className="text-[10px] text-[#8a8a86] font-mono mt-0.5">
-                {formatUsd(p.per_credit_usd)} per credit
-              </p>
+
+              {/*
+                No per-credit price here, deliberately.
+
+                Every package costs the same $0.05 a credit, so the line repeated
+                the same number three times and distinguished nothing. A customer
+                choosing between these options is comparing the totals, which are
+                already the largest thing on each card. The unit price is still in
+                the data — it is what the credit value next to the balance is
+                derived from, and the billing page does not need to restate it
+                where it cannot inform a choice.
+              */}
 
               <button
                 onClick={() => void buy(p.code)}
