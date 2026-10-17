@@ -150,6 +150,15 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     replaceHash(`#dashboard/leads/${view}`);
   };
 
+  // Opening a specific run writes the run id into the hash, so the link works
+  // and Back returns to the list. The id is checked as a uuid rather than
+  // concatenated blindly: it ends up in a query string the browser will send.
+  const handleOpenRun = (id: string) => {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) return;
+    setLeadsRoute({ view: 'run', runId: id });
+    replaceHash(`#dashboard/leads/run/${id}`);
+  };
+
   // Check if onboarding needs to be shown
   const showOnboarding = Boolean(profile && !profile.onboarding_completed);
 
@@ -224,6 +233,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               view={leadsRoute.view}
               runId={leadsRoute.runId}
               onViewChange={handleLeadsViewChange}
+              onOpenRun={handleOpenRun}
             />
           )}
           {activeTab === 'billing' && <BillingTab />}

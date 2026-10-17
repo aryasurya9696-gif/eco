@@ -1,58 +1,79 @@
 import React from 'react';
-import {
-  Search,
-  ListChecks,
-  FlaskConical,
-  ShieldOff,
-  Plus,
-} from 'lucide-react';
-import type { LeadsView } from '../../types';
+import { ListChecks, Plus, Search, FlaskConical, ShieldOff, ArrowLeft } from 'lucide-react';
+import type { LeadsView, LeadRow, LeadRun, LeadAttempt } from '../../types';
+import { getRun } from '../../lib/leads';
+import { supabase } from '../../lib/supabase';
+import { subscribeToRun, mergeRow, summarise } from '../../lib/leads-live';
+import { RunsList } from '../leads/RunsList';
+import { LeadsTable } from '../leads/LeadsTable';
+import { RunStatusPill } from '../leads/StatusBadge';
+import { CreditsMeter, Counter } from '../leads/CreditsMeter';
+import { EmptyPanel, EmptyState } from '../leads/EmptyPanel';
 
-interface SubNavItem {
-  view: LeadsView;
-  label: string;
-  icon: React.ReactNode;
-}
-
-const SUB_NAV: SubNavItem[] = [
-  { view: 'runs', label: 'Runs', icon: <ListChecks className="w-3.5 h-3.5" /> },
-  { view: 'new', label: 'New search', icon: <Plus className="w-3.5 h-3.5" /> },
-  { view: 'clean', label: 'Clean a list', icon: <Search className="w-3.5 h-3.5" /> },
-  { view: 'lab', label: 'Provider lab', icon: <FlaskConical className="w-3.5 h-3.5" /> },
-  { view: 'optouts', label: 'Opt-outs', icon: <ShieldOff className="w-3.5 h-3.5" /> },
-];
+/**
+ * The Leads tab.
+ *
+ * A tab, not an app: same sidebar, same wallet, same login as Feed. The
+ * sub-views live in the hash so a run link survives a refresh and a browser Back
+ * returns to the list rather than to the feed.
+ *
+ * Routing and data live here; each screen is a leaf that owns its own fetching.
+ */
 
 interface LeadsTabProps {
   view: LeadsView;
   runId: string | null;
   onViewChange: (view: LeadsView) => void;
+  onOpenRun: (runId: string) => void;
 }
 
-export const LeadsTab: React.FC<LeadsTabProps> = ({ view, runId, onViewChange }) => {
-  // A run is a detail screen, so it hides the sub-nav: the way back is Runs, and
-  // leaving a row of five panels above a table that belongs to none of them only
-  // invites the wrong click.
+export const LeadsTab: React.FC<LeadsTabProps> = ({ view, runId, onViewChange, onOpenRun }) => {
+  // A run is a detail screen, so the sub-nav is hidden: five panels above a
+  // table that belongs to none of them only invites the wrong click.
   if (view === 'run') {
-    return <RunPlaceholder runId={runId} onBack={() => onViewChange('runs')} />;
+    return (
+      <RunView
+        runId={runId}
+        onBack={() => onViewChange('runs')}
+      />
+    );
   }
 
   return (
     <div className="space-y-6">
       <SubNav view={view} onViewChange={onViewChange} />
-      {view === 'runs' && <RunsView onNewSearch={() => onViewChange('new')} />}
-      {view === 'new' && <NewSearchView />}
-      {view === 'clean' && <EmptyPanel
-        title="Clean a list"
-        body="Import a CSV of people or companies and Echo will verify the addresses it already has, and find the ones it does not. The price is shown before anything runs."
-      />}
-      {view === 'lab' && <EmptyPanel
-        title="Provider lab"
-        body="Run the same leads through each email provider alone, and through the waterfall, and see which actually finds the most for what it costs. Uses your own rows, so the numbers are yours."
-      />}
-      {view === 'optouts' && <EmptyPanel
-        title="Opt-outs"
-        body="People and domains you never want contacted. Echo checks this list before every paid call, so a suppressed address is never even looked up."
-      />}
+
+      {view === 'runs' && (
+        <RunsList
+          onOpenRun={onOpenRun}
+          onNewSearch={() => onViewChange('new')}
+        />
+      )}
+
+      {view === 'new' && (
+        <NewSearchPlaceholder onBack={() => onViewChange('runs')} />
+      )}
+
+      {view === 'clean' && (
+        <EmptyPanel
+          title="Clean a list"
+          body="Import a CSV of people or companies and Echo will verify the addresses it already has, and find the ones it does not. The price is shown before anything runs."
+        />
+      )}
+
+      {view === 'lab' && (
+        <EmptyPanel
+          title="Provider lab"
+          body="Run the same leads through each email provider alone, and through the waterfall, and see which actually finds the most for what it costs. Uses your own rows, so the numbers are yours."
+        />
+      )}
+
+      {view === 'optouts' && (
+        <EmptyPanel
+          title="Opt-outs"
+          body="People and domains you never want contacted. Echo checks this list before every paid call, so a suppressed address is never even looked up."
+        />
+      )}
     </div>
   );
 };
@@ -61,19 +82,27 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ view, runId, onViewChange })
 // Sub-nav
 // ---------------------------------------------------------------------------
 
-const SubNav: React.FC<{
-  view: LeadsView;
-  onViewChange: (view: LeadsView) => void;
-}> = ({ view, onViewChange }) => (
+const SUB_NAV: Array<{ view: LeadsView; label: string; icon: React.ReactNode }> = [
+  { view: 'runs', label: 'Runs', icon: <ListChecks className="w-3.5 h-3.5" /> },
+  { view: 'new', label: 'New search', icon: <Plus className="w-3.5 h-3.5" /> },
+  { view: 'clean', label: 'Clean a list', icon: <Search className="w-3.5 h-3.5" /> },
+  { view: 'lab', label: 'Provider lab', icon: <FlaskConical className="w-3.5 h-3.5" /> },
+  { view: 'optouts', label: 'Opt-outs', icon: <ShieldOff className="w-3.5 h-3.5" /> },
+];
+
+const SubNav: React.FC<{ view: LeadsView; onViewChange: (v: LeadsView) => void }> = ({
+  view,
+  onViewChange,
+}) => (
   <div className="flex items-center gap-1 border-b border-[#e3e3de] -mt-2">
     {SUB_NAV.map((item) => {
-      const isActive = view === item.view;
+      const active = view === item.view;
       return (
         <button
           key={item.view}
           onClick={() => onViewChange(item.view)}
           className={`flex items-center gap-1.5 px-3 py-2 text-xs font-mono transition-colors cursor-pointer border-b-2 -mb-px ${
-            isActive
+            active
               ? 'border-[#141414] text-[#141414] font-medium'
               : 'border-transparent text-[#8a8a86] hover:text-[#141414]'
           }`}
@@ -87,89 +116,180 @@ const SubNav: React.FC<{
 );
 
 // ---------------------------------------------------------------------------
-// Runs
+// One run — the table, live
 // ---------------------------------------------------------------------------
 
-const RunsView: React.FC<{ onNewSearch: () => void }> = ({ onNewSearch }) => (
-  <EmptyState
-    title="No runs yet"
-    body="Describe who buys from you and Echo finds them."
-    action={{ label: 'New search', onClick: onNewSearch }}
-  />
+const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId, onBack }) => {
+  const [run, setRun] = React.useState<LeadRun | null>(null);
+  const [rows, setRows] = React.useState<LeadRow[]>([]);
+  const [total, setTotal] = React.useState(0);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
+  const [live, setLive] = React.useState(false);
+
+  const fetchPage = React.useCallback(async (id: string) => {
+    const res = await getRun(id, { limit: 500, offset: 0 });
+    if (!res.ok) throw new Error(res.error);
+    return { rows: res.rows, total: res.total };
+  }, []);
+
+  // Initial page. Then the subscription owns the updates.
+  React.useEffect(() => {
+    if (!runId) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+
+    getRun(runId, { limit: 500, offset: 0 })
+      .then((res) => {
+        if (cancelled) return;
+        if (!res.ok) {
+          setError(res.error);
+          setLoading(false);
+          return;
+        }
+        setRun(res.run);
+        setRows(res.rows);
+        setTotal(res.total);
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError((err as Error)?.message ?? 'Could not load the run.');
+        setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+
+  // Live updates, with polling underneath until the socket proves itself.
+  React.useEffect(() => {
+    if (!runId || !supabase) return;
+
+    const dispose = subscribeToRun(supabase, runId, fetchPage, {
+      onPage: (pageRows, pageTotal) => {
+        setRows(pageRows);
+        setTotal(pageTotal);
+        setLoading(false);
+      },
+      onRow: (row) => setRows((prev) => mergeRow(prev, row)),
+      onRun: (next) => setRun(next),
+      onLiveChange: setLive,
+    });
+
+    return dispose;
+  }, [runId, fetchPage, supabase]);
+
+  const stats = React.useMemo(() => summarise(rows), [rows]);
+
+  // Attempt history is fetched per expanded row rather than with the page.
+  const attemptsFor = React.useCallback(async (rowId: string): Promise<LeadAttempt[]> => {
+    if (!supabase) return [];
+    const { data } = await supabase
+      .from('lead_attempts')
+      .select('*')
+      .eq('row_id', rowId)
+      .order('created_at', { ascending: true });
+    return (data ?? []) as LeadAttempt[];
+  }, []);
+
+  if (!runId) {
+    return <EmptyState title="No run selected" body="Pick a run from the list." />;
+  }
+
+  if (error) {
+    return (
+      <div className="space-y-4">
+        <BackLink onBack={onBack} />
+        <div className="bg-white border border-[#e3e3de] px-8 py-10">
+          <p className="text-xs font-mono text-[#c0462e]">{error}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <BackLink onBack={onBack} />
+
+      {/* Header */}
+      <div className="bg-white border border-[#e3e3de] px-4 py-3">
+        <div className="flex items-center gap-4 flex-wrap">
+          <div className="min-w-0">
+            <h2 className="text-sm font-bold tracking-tight text-[#141414] truncate">
+              {run?.name || (run?.target ? `${run.target} leads` : 'Run')}
+            </h2>
+            <span className="text-[10px] font-mono text-[#8a8a86]">
+              {total} {total === 1 ? 'row' : 'rows'}
+              {run?.target ? ` of ${run.target}` : ''}
+            </span>
+          </div>
+
+          {run && (
+            <RunStatusPill
+              status={run.status}
+              pauseReason={run.pause_reason}
+              done={stats.found}
+              target={run.target}
+            />
+          )}
+
+          {/* Live or polling. Shown because a table that stopped updating with
+              no indication is indistinguishable from a run that stopped. */}
+          <span
+            className={`text-[10px] font-mono px-1.5 py-0.5 border rounded-none ${
+              live ? 'text-emerald-700 border-emerald-200 bg-emerald-50' : 'text-[#8a8a86] border-[#e3e3de]'
+            }`}
+            title={live ? 'Updating over a live connection' : 'Updating every few seconds'}
+          >
+            {live ? 'live' : 'polling'}
+          </span>
+
+          <div className="ml-auto flex items-center gap-6">
+            <Counter label="Found" value={stats.found} />
+            <Counter label="Verified" value={stats.verified} tone={stats.verified ? 'good' : 'default'} />
+            <Counter label="Catch-all" value={stats.catchAll} tone={stats.catchAll ? 'warn' : 'default'} />
+            <Counter label="Spent" value={Math.round(stats.credits * 100) / 100} />
+            <CreditsMeter balance={1000} runMax={run?.max_credits ?? null} compact />
+          </div>
+        </div>
+
+        {run?.status === 'paused' && run.pause_reason && (
+          <p className="text-[10px] font-mono text-[#b5801f] mt-2 pt-2 border-t border-[#eeeeea]">
+            Paused: {run.pause_reason === 'credits'
+              ? 'out of credits for the worst case. Top up and resume.'
+              : run.pause_reason.replace(/_/g, ' ')}
+          </p>
+        )}
+      </div>
+
+      <LeadsTable rows={rows} total={total} loading={loading} attemptsFor={attemptsFor} />
+    </div>
+  );
+};
+
+const BackLink: React.FC<{ onBack: () => void }> = ({ onBack }) => (
+  <button
+    onClick={onBack}
+    className="inline-flex items-center gap-1.5 text-xs font-mono text-[#8a8a86] hover:text-[#141414] transition-colors cursor-pointer"
+  >
+    <ArrowLeft className="w-3 h-3" />
+    Runs
+  </button>
 );
 
 // ---------------------------------------------------------------------------
-// Placeholders
+// New search — Wave C
 // ---------------------------------------------------------------------------
-// Phase 1 is the shell: the tab, the sub-nav, the routing and the states. These
-// stand in for the panels that later phases fill in, so the routing and the empty
-// states can be clicked and refreshed before anything behind them exists.
 
-const NewSearchView: React.FC = () => (
-  <EmptyPanel
-    title="New search"
-    body="Your website and what you sell are already on file, so this starts from your profile: Echo reads the site, writes an ideal customer profile from it, and shows you a free count of the companies that match before you spend anything."
-  />
-);
-
-const RunPlaceholder: React.FC<{ runId: string | null; onBack: () => void }> = ({
-  runId,
-  onBack,
-}) => (
+const NewSearchPlaceholder: React.FC<{ onBack: () => void }> = ({ onBack }) => (
   <div className="space-y-4">
-    <button
-      onClick={onBack}
-      className="text-xs font-mono text-[#8a8a86] hover:text-[#141414] transition-colors cursor-pointer"
-    >
-      ← Runs
-    </button>
+    <BackLink onBack={onBack} />
     <EmptyPanel
-      title="Run detail"
-      body={
-        runId
-          ? `The run table for ${runId.slice(0, 8)} fills in here, provider by provider, as the workers find each person.`
-          : 'No run selected.'
-      }
+      title="New search"
+      body="Your website and what you sell are already on file, so this starts from your profile: Echo reads the site, writes an ideal customer profile from it, and shows you a free count of the companies that match before you spend anything."
     />
-  </div>
-);
-
-// ---------------------------------------------------------------------------
-// Shared shapes
-// ---------------------------------------------------------------------------
-
-/**
- * The first-run empty state.
- *
- * One line of copy and one action, per the design language: the user either has
- * runs or does not, and there is nothing to choose between. The button is the
- * whole call to action, so it is not wrapped in a card or given a subtitle.
- */
-export const EmptyState: React.FC<{
-  title: string;
-  body: string;
-  action?: { label: string; onClick: () => void };
-}> = ({ title, body, action }) => (
-  <div className="bg-white border border-[#e3e3de] px-8 py-16 flex flex-col items-center text-center">
-    <h3 className="text-sm font-bold tracking-tight text-[#141414]">{title}</h3>
-    <p className="text-xs font-mono text-[#8a8a86] mt-2 max-w-md leading-relaxed">{body}</p>
-    {action && (
-      <button
-        onClick={action.onClick}
-        className="mt-6 inline-flex items-center gap-2 px-4 py-2 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer"
-      >
-        {action.label}
-      </button>
-    )}
-  </div>
-);
-
-/** A titled panel for a sub-view that is routed but not built yet. */
-const EmptyPanel: React.FC<{ title: string; body: string }> = ({ title, body }) => (
-  <div className="bg-white border border-[#e3e3de] px-8 py-12">
-    <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-3">
-      {title}
-    </span>
-    <p className="text-xs font-mono text-[#4a4a47] leading-relaxed max-w-2xl">{body}</p>
   </div>
 );

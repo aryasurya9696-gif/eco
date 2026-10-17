@@ -135,12 +135,30 @@ export async function listRuns(limit = 50): Promise<LeadRun[]> {
   return res.runs ?? [];
 }
 
+/**
+ * Union return, because the function genuinely has two answers.
+ *
+ * A run id that is not a uuid, and a run belonging to somebody else, both come
+ * back as { ok: false } rather than as a thrown error — "not found" is an answer
+ * here, not a failure of the request. Typing it as always-succeeding would make
+ * every caller's error branch unreachable, and a run id pointing at another
+ * workspace would render as an empty table rather than as not-found.
+ */
+export type GetRunResult =
+  | { ok: true; run: LeadRun; rows: LeadRow[]; total: number }
+  | { ok: false; error: string };
+
 export async function getRun(
   runId: string,
   opts: { limit?: number; offset?: number } = {},
-): Promise<{ run: LeadRun; rows: LeadRow[]; total: number }> {
+): Promise<GetRunResult> {
   const { limit = 200, offset = 0 } = opts;
-  return invokeFunction('leads', { action: 'get_run', run_id: runId, limit, offset });
+  return invokeFunction<GetRunResult>('leads', {
+    action: 'get_run',
+    run_id: runId,
+    limit,
+    offset,
+  });
 }
 
 export async function getActiveRunCount(): Promise<number> {
