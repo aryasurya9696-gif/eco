@@ -88,7 +88,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                   ? 'Workspace Settings'
                   : activeTab === 'admin'
                   ? 'Billing & Profit'
-                  : 'Subscription & Billing'}
+                  : 'Credits & Plan'}
               </h1>
             </div>
 
