@@ -90,30 +90,23 @@ function rateLimit(key: string, limit: number, windowMs: number): boolean {
 const TREG_BASE = 'https://treg.to';
 const MAX_KEYWORDS_PER_SWEEP = 25;
 
-/**
- * treg does not put a cost on the response, so this tracks approximate USD
- * spend per sweep and reports it back for the UI.
- */
 // ---------------------------------------------------------------------------
-// Rate card — USD per successful provider call.
+// Platform -> pricing operation
 //
-// These are treg's own published prices, not estimates:
-//   GET https://treg.to/catalog/endpoints/<id>  ->  endpoint.cost.usd
-//
-// They set the running total reported at the end of a search, which is the only
-// honest read on what the search layer costs to run. Guessing low makes that
-// figure a fiction, which is how the twitter rate came to be recorded at less
-// than half its real cost.
+// One logical operation per channel, and the charge hangs off that rather than
+// off the provider call. Reddit is why: its primary and its fallback are both
+// billed calls, so pricing per call would make the same keyword cost two
+// credits on one sweep and four the next depending on which provider happened to
+// be up. The customer pays for the search, not for the retry.
 // ---------------------------------------------------------------------------
-const TREG_COST_USD = {
-  twitter: 0.00075,        // anyapi.x.search.posts                  observed 2026-09-11
-  reddit: 0.001,           // tikhub.x.reddit-app-fetch-dynamic-search rate card 2026-07-28
-  redditFallback: 0.00188, // scrapecreators.reddit.search.posts      rate card 2026-07-28
-  google: 0.00015,         // crawl4ai.web.search.rich               observed 2026-10-09
-  news: 0,                 // tinyfish.web.search.news               rate card 2026-09-23
-} as const;
+type Platform = 'twitter' | 'reddit' | 'google' | 'news';
 
-
+const OPERATION_OF: Record<Platform, string> = {
+  twitter: 'treg.twitter.search',
+  reddit: 'treg.reddit.search',
+  google: 'treg.web.search',
+  news: 'treg.news.search',
+};
 
 /**
  * Refuse to start once the wallet cannot cover a plausible run. A dry account
@@ -139,8 +132,6 @@ async function tregBalanceUsd(): Promise<number | null> {
 let usdSpent = 0;
 /** Provider calls issued, for the run telemetry. */
 let callsMade = 0;
-
-type Platform = 'twitter' | 'reddit' | 'google' | 'news';
 
 interface KeywordRow {
   id: string;
@@ -303,22 +294,79 @@ async function resolveToken(admin: ReturnType<typeof createClient>): Promise<str
 }
 
 // ---------------------------------------------------------------------------
-// treg transport
+// treg transport — measured cost
 // ---------------------------------------------------------------------------
+//
+// treg reports what it actually charged on every call:
+//
+//   x-treg-cost-micro        integer micro-USD. 1000 means $0.001.
+//   x-treg-call-id           join key for GET /calls/{id}
+//   x-treg-upstream-failed   present when the upstream provider failed
+//   x-treg-idempotent-replay a replayed call, already stored, charged 0
+//   x-treg-cache             "hit" means the repeat rate, 10% from the 2nd call
+//
+// That header is why this replaces a hardcoded rate card. The old table guessed
+// what a call cost; if treg's price moved, or a fallback fired, or the endpoint
+// was metered per_result instead of per_call, the reported spend was fiction.
+// Reading the charge means the profit figures are measured.
+//
+// The classification below is built on that rather than on a table of status
+// codes. A response that reports a non-zero charge was billed whatever its
+// status; one that reports zero was not. That is the provider telling us the
+// answer directly, instead of us inferring it from the shape of the error.
+
+/** Whether treg charged for this call, as reported by the provider itself. */
+type Billable = 'billed' | 'free' | 'uncertain';
+
+interface TregResult {
+  /** True when treg reported a non-zero charge. */
+  billable: Billable;
+  data: any | null;
+  costMicro: number;
+  callId: string | null;
+  status: number | null;
+  /** True when the upstream failed but treg still billed us for the attempt. */
+  upstreamFailed: boolean;
+  /** A replayed call: the answer came from treg's store and cost nothing. */
+  replay: boolean;
+  /** Seconds treg spent queueing before dispatch, when it reports it. */
+  queueWaitMs: number | null;
+  errorCode: string | null;
+}
+
+function emptyResult(over: Partial<TregResult> = {}): TregResult {
+  return {
+    billable: 'free', data: null, costMicro: 0, callId: null, status: null,
+    upstreamFailed: false, replay: false, queueWaitMs: null, errorCode: null,
+    ...over,
+  };
+}
 
 /**
- * Calls one catalogued endpoint. treg injects the provider credential server
- * side and relays the upstream body verbatim, so each endpoint keeps its own
- * response shape.
+ * Calls one catalogued endpoint and reports what it cost.
  *
- * Returns null on any failure so the caller falls through to the next provider
- * in the chain instead of failing the whole sweep.
+ * Never throws. A provider that fails hands back a result carrying an outcome
+ * rather than an exception, because the difference between "free" and "we might
+ * still be charged" is what decides whether the customer is billed, and losing
+ * that distinction in a thrown error is how a refund gets issued for money that
+ * was already spent.
+ *
+ * idempotencyKey makes the call safe to retry: treg returns the stored answer
+ * and charges 0 for a replay, so a network blip does not become a double charge.
  */
 async function tregCall(
   endpointId: string,
-  opts: { method?: 'GET' | 'POST'; query?: Record<string, string | number | undefined>; body?: unknown; costUsd: number; timeoutMs?: number },
-): Promise<any | null> {
-  if (!tregToken) return null;
+  opts: {
+    method?: 'GET' | 'POST';
+    query?: Record<string, string | number | undefined>;
+    body?: unknown;
+    timeoutMs?: number;
+    idempotencyKey?: string;
+    /** Tagged onto the call in treg's own ledger for per-customer attribution. */
+    customerId?: string;
+  },
+): Promise<TregResult> {
+  if (!tregToken) return emptyResult();
 
   const url = new URL(`${TREG_BASE}/call/${endpointId}`);
   for (const [k, v] of Object.entries(opts.query ?? {})) {
@@ -327,7 +375,10 @@ async function tregCall(
 
   const method = opts.method ?? 'GET';
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 20000);
+  // treg queues before dispatch and reported a ~2s wait in practice, so the
+  // default sits comfortably above that. Cutting it close turns a slow provider
+  // into an uncertain charge, which is the expensive kind of wrong.
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 45000);
   callsMade++;
 
   try {
@@ -337,22 +388,66 @@ async function tregCall(
         'X-Treg-Token': tregToken,
         Accept: 'application/json',
         ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(opts.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : {}),
+        ...(opts.customerId ? { 'X-Treg-Meta': `customer=${opts.customerId}` } : {}),
       },
       body: opts.body ? JSON.stringify(opts.body) : undefined,
       signal: controller.signal,
     });
 
+    const callId = res.headers.get('x-treg-call-id');
+    const costMicro = Number(res.headers.get('x-treg-cost-micro') ?? '0') || 0;
+    const upstreamFailed = res.headers.has('x-treg-upstream-failed');
+    const replay = res.headers.get('x-treg-idempotent-replay') === 'true';
+    const smoothed = res.headers.get('x-treg-smoothed');
+    const queueWaitMs = smoothed
+      ? Number((/wait=(\d+)/.exec(smoothed)?.[1] ?? '0')) || null
+      : null;
+
+    // The charge is whatever treg says it is. Zero means free, whatever the
+    // status was.
+    const billable: Billable = costMicro > 0 ? 'billed' : 'free';
+    usdSpent += costMicro / 1e6;
+
     if (!res.ok) {
-      // treg meters per_success, so a call it declined to serve is free.
-      console.warn(`[treg] ${endpointId} -> ${res.status}`);
-      return null;
+      // 409 and 410 mean treg still holds the call: 409 is it running, 410 is
+      // charged with the answer lost. Both are the one case where we cannot say
+      // what happened, and guessing wrong in the customer's favour means giving
+      // away a call we paid for.
+      const uncertain = res.status === 409 || res.status === 410;
+      console.warn(`[treg] ${endpointId} -> ${res.status}${uncertain ? ' (uncertain)' : ''}`);
+      return emptyResult({
+        billable: uncertain ? 'uncertain' : billable,
+        costMicro,
+        callId,
+        status: res.status,
+        upstreamFailed,
+        replay,
+        queueWaitMs,
+        errorCode: `http_${res.status}`,
+      });
     }
 
-    usdSpent += opts.costUsd;
-    return await res.json();
+    return {
+      billable,
+      data: await res.json(),
+      costMicro,
+      callId,
+      status: res.status,
+      upstreamFailed,
+      replay,
+      queueWaitMs,
+      errorCode: null,
+    };
   } catch (err) {
+    // An abort means we stopped waiting, not that treg stopped working. It may
+    // well have completed and charged. Treated as uncertain, never as free.
+    const aborted = (err as Error)?.name === 'AbortError';
     console.warn(`[treg] ${endpointId} threw:`, (err as Error)?.name);
-    return null;
+    return emptyResult({
+      billable: 'uncertain',
+      errorCode: aborted ? 'timeout' : 'network_error',
+    });
   } finally {
     clearTimeout(timer);
   }
@@ -487,6 +582,190 @@ function mapNews(r: any, kw: KeywordRow): RawPost | null {
 }
 
 // ---------------------------------------------------------------------------
+// Credit accounting
+// ---------------------------------------------------------------------------
+// The sweep is charged per operation, not per provider call, so what decides a
+// charge is whether that channel produced any billable call at all. A channel
+// where every call came back free — no results, or an error treg never charges
+// for — costs the customer nothing, which is the promise the old system broke
+// by billing for the retry.
+//
+// Prices come from pricing_config, never from the request. A client that could
+// name its own price would not need the table.
+
+interface OperationTally {
+  operation: string;
+  calls: number;
+  costMicro: number;
+  /** Any call in this operation that treg reported a charge for. */
+  billed: boolean;
+  /** Any call whose outcome could not be determined. */
+  uncertain: boolean;
+  /** A call treg charged for even though the upstream provider failed. */
+  upstreamFailed: boolean;
+  callIds: string[];
+  errorCodes: string[];
+}
+
+function newTally(operation: string): OperationTally {
+  return {
+    operation, calls: 0, costMicro: 0, billed: false,
+    uncertain: false, upstreamFailed: false, callIds: [], errorCodes: [],
+  };
+}
+
+function record(tally: OperationTally, r: TregResult): void {
+  tally.calls += 1;
+  tally.costMicro += r.costMicro;
+  if (r.billable === 'billed') tally.billed = true;
+  if (r.billable === 'uncertain') tally.uncertain = true;
+  if (r.upstreamFailed) tally.upstreamFailed = true;
+  if (r.callId) tally.callIds.push(r.callId);
+  if (r.errorCode) tally.errorCodes.push(r.errorCode);
+}
+
+/**
+ * Reads the price of each operation from the database. A missing or disabled
+ * operation is absent from the map rather than priced at zero, so it cannot turn
+ * into a free search by accident.
+ */
+async function loadPricing(
+  admin: ReturnType<typeof createClient>,
+): Promise<Map<string, number>> {
+  const { data, error } = await admin
+    .from('pricing_config')
+    .select('operation, credits, enabled')
+    .eq('enabled', true);
+  if (error) {
+    console.error('[billing] pricing lookup failed:', error.message);
+    return new Map();
+  }
+  return new Map((data ?? []).map((r: any) => [r.operation, Number(r.credits)]));
+}
+
+interface Reservation {
+  id: string;
+  reserved: number;
+}
+
+/**
+ * Holds the credits for a whole sweep before any provider call. Refusing here
+ * is the point: the customer is told they are short, and treg is never called,
+ * so an empty wallet costs nothing rather than everything.
+ */
+async function reserveSweep(
+  admin: ReturnType<typeof createClient>,
+  userId: string,
+  credits: number,
+  key: string,
+  context: Record<string, unknown>,
+): Promise<Reservation | { shortfall: number; required: number; available: number }> {
+  const { data, error } = await admin.rpc('wallet_reserve', {
+    p_user_id: userId,
+    p_credits: credits,
+    p_idempotency_key: key,
+    p_context: context,
+  });
+  if (error) {
+    console.error('[billing] reserve failed:', error.message);
+    // Fail closed. Serving without a hold would mean the balance is never
+    // checked, which is the unbounded-free-usage defect all over again.
+    return { shortfall: credits, required: credits, available: 0 };
+  }
+  const r = data as any;
+  if (r?.ok) {
+    return { id: r.reservation_id, reserved: Number(r.reserved ?? credits) };
+  }
+  return {
+    shortfall: Number(r?.shortfall ?? credits),
+    required: Number(r?.required ?? credits),
+    available: Number(r?.available ?? 0),
+  };
+}
+
+/** Settles a hold for what was actually billable, and returns the new balance. */
+async function settleSweep(
+  admin: ReturnType<typeof createClient>,
+  reservationId: string,
+  creditsCharged: number,
+  providerCostUsd: number,
+  key: string,
+  note: string,
+): Promise<number | null> {
+  const { data, error } = await admin.rpc('wallet_settle', {
+    p_reservation_id: reservationId,
+    p_credits_charged: creditsCharged,
+    p_provider_cost: providerCostUsd,
+    p_idempotency_key: key,
+    p_note: note,
+  });
+  if (error) {
+    console.error('[billing] settle failed:', error.message);
+    return null;
+  }
+  return Number((data as any)?.balance_after ?? 0);
+}
+
+/** Returns a hold untouched. For every outcome treg does not bill. */
+async function releaseSweep(
+  admin: ReturnType<typeof createClient>,
+  reservationId: string,
+  reason: string,
+): Promise<void> {
+  const { error } = await admin.rpc('wallet_release', {
+    p_reservation_id: reservationId,
+    p_reason: reason,
+  });
+  if (error) console.error('[billing] release failed:', error.message);
+}
+
+/**
+ * One usage row per operation per sweep. Metadata only — the post bodies go to
+ * monitored_posts, which is where they belong, and keeping a second copy here
+ * would mean holding public content twice.
+ */
+async function recordUsage(
+  admin: ReturnType<typeof createClient>,
+  userId: string,
+  runKey: string,
+  tallies: Map<string, OperationTally>,
+  reservationId: string | null,
+): Promise<void> {
+  const rows = [...tallies.values()]
+    .filter((t) => t.calls > 0)
+    .map((t) => ({
+      user_id: userId,
+      // Distinct per operation, so the unique key is what makes a retried
+      // sweep write once instead of twice.
+      idempotency_key: `${runKey}:${t.operation}`,
+      operation: t.operation,
+      provider: 'treg',
+      provider_call_id: t.callIds[0] ?? null,
+      provider_cost_usd: Number((t.costMicro / 1e6).toFixed(8)),
+      credits_charged: 0,
+      revenue_usd: 0,
+      outcome: t.uncertain ? 'uncertain'
+        : t.upstreamFailed ? 'upstream_failed'
+        : t.billed ? 'success'
+        : 'free',
+      reservation_id: reservationId,
+      metadata: {
+        calls: t.calls,
+        billed: t.billed,
+        upstream_failed: t.upstreamFailed,
+        call_ids: t.callIds,
+        errors: t.errorCodes,
+      },
+    }));
+  if (rows.length === 0) return;
+
+  const { error } = await admin
+    .from('api_usage')
+    .upsert(rows, { onConflict: 'idempotency_key', ignoreDuplicates: true });
+  if (error) console.error('[billing] usage record failed:', error.message);
+}
+
+// ---------------------------------------------------------------------------
 // Per-channel provider chains
 // ---------------------------------------------------------------------------
 
@@ -506,17 +785,26 @@ async function searchChannel(
   kw: KeywordRow,
   lookbackHours: number,
   served: Record<string, string>,
+  tally: OperationTally,
+  userId: string,
+  runNonce: string,
 ): Promise<RawPost[]> {
+  // Stable within a sweep so an internal retry is free, and different between
+  // sweeps so a deliberate second search is charged normally.
+  const idem = `ss:${runNonce}:${kw.id}:${platform}`;
+  const common = { customerId: userId, idempotencyKey: idem };
+
   // ── Twitter ────────────────────────────────────────────────────────────
   if (platform === 'twitter') {
     const t = await tregCall('anyapi.x.search.posts', {
+      ...common,
       method: 'POST',
       // queryType Latest is the whole point: the default returns all-time top
       // posts, which is what put a 2021 tweet into the feed.
       body: { query: kw.keyword, queryType: 'Latest', limit: 20 },
-      costUsd: TREG_COST_USD.twitter,
     });
-    const items = t?.output?.data?.items ?? [];
+    record(tally, t);
+    const items = t.data?.output?.data?.items ?? [];
     if (items.length) {
       served.twitter = 'anyapi.x.search.posts';
       return items.map((x: any) => mapTwitter(x, kw)).filter((p): p is RawPost => !!p);
@@ -529,6 +817,7 @@ async function searchChannel(
     // tikhub is cheapest and fastest but its shared capacity runs out often;
     // scrapecreators is the reliable second and answers in about a second.
     const tk = await tregCall('tikhub.x.reddit-app-fetch-dynamic-search', {
+      ...common,
       query: {
         query: kw.keyword,
         search_type: 'post',
@@ -538,24 +827,28 @@ async function searchChannel(
         time_range: redditTimeframe(lookbackHours),
         need_format: 'true',
       },
-      costUsd: TREG_COST_USD.reddit,
     });
-    const tkItems = tk?.data?.posts ?? tk?.posts ?? [];
+    record(tally, tk);
+    const tkItems = tk.data?.data?.posts ?? tk.data?.posts ?? [];
     if (Array.isArray(tkItems) && tkItems.length) {
       served.reddit = 'tikhub.x.reddit-app-fetch-dynamic-search';
       return tkItems.map((x: any) => mapRedditTikhub(x, kw)).filter((p): p is RawPost => !!p);
     }
 
+    // Distinct key: this is a different provider answering the same search, and
+    // reusing the primary's key would make treg reject it as a mismatched replay.
     const sc = await tregCall('scrapecreators.reddit.search.posts', {
+      ...common,
+      idempotencyKey: `${idem}:fb`,
       query: {
         query: kw.keyword,
         timeframe: redditTimeframe(lookbackHours),
         sort: 'relevance',
         limit: 25,
       },
-      costUsd: TREG_COST_USD.redditFallback,
     });
-    const scItems = sc?.posts ?? [];
+    record(tally, sc);
+    const scItems = sc.data?.posts ?? [];
     if (Array.isArray(scItems) && scItems.length) {
       served.reddit = 'scrapecreators.reddit.search.posts';
       return scItems.map((x: any) => mapRedditScrapecreators(x, kw)).filter((p): p is RawPost => !!p);
@@ -566,11 +859,11 @@ async function searchChannel(
   // ── Google / web ───────────────────────────────────────────────────────
   if (platform === 'google') {
     const r = await tregCall('crawl4ai.web.search.rich', {
+      ...common,
       query: { q: kw.keyword, rich: 1 },
-      costUsd: TREG_COST_USD.google,
-      timeoutMs: 25000,
     });
-    const items = r?.results ?? [];
+    record(tally, r);
+    const items = r.data?.results ?? [];
     if (Array.isArray(items) && items.length) {
       served.google = 'crawl4ai.web.search.rich';
       return items.map((x: any) => mapWeb(x, kw)).filter((p): p is RawPost => !!p);
@@ -581,14 +874,15 @@ async function searchChannel(
   // ── News ───────────────────────────────────────────────────────────────
   if (platform === 'news') {
     const r = await tregCall('tinyfish.web.search.news', {
+      ...common,
       query: {
         query: kw.keyword,
         domain_type: 'news',
         after_date: sinceDate(lookbackHours),
       },
-      costUsd: TREG_COST_USD.news,
     });
-    const items = r?.results ?? [];
+    record(tally, r);
+    const items = r.data?.results ?? [];
     if (Array.isArray(items) && items.length) {
       served.news = 'tinyfish.web.search.news';
       return items.map((x: any) => mapNews(x, kw)).filter((p): p is RawPost => !!p);
@@ -715,6 +1009,49 @@ Deno.serve(async (req) => {
   const served: Record<string, string> = {};
   let droppedStale = 0;
 
+  // ---- Price the sweep, then hold it before a single provider call ----------
+  //
+  // All or nothing. A sweep that ran for six of eight keywords would charge for
+  // a truncated search and quietly under-report the results, so a workspace that
+  // cannot cover the whole thing gets nothing and a clear message instead.
+  const runKey = `ss:${Date.now().toString(36)}:${userId}`;
+  const runNonce = runKey.slice(3);
+
+  const pricing = await loadPricing(admin);
+  const wanted = [...new Set(enabledChannels.map((c) => OPERATION_OF[c]))]
+    .filter((op) => pricing.has(op));
+
+  // A channel with no configured price is not free — it is unavailable. Running
+  // it would serve the customer something we cannot bill for.
+  const unpriced = enabledChannels.filter((c) => !pricing.has(OPERATION_OF[c]));
+  if (unpriced.length > 0) {
+    console.warn(`[social-search] no configured price for: ${unpriced.join(', ')}`);
+  }
+
+  const creditsPerKeyword = wanted.reduce((sum, op) => sum + (pricing.get(op) ?? 0), 0);
+  const creditsRequired = creditsPerKeyword * keywords.length;
+
+  const hold = await reserveSweep(admin, userId, creditsRequired, runKey, {
+    scope: 'social-search',
+    keywords: keywords.length,
+    channels: wanted,
+    credits_per_keyword: creditsPerKeyword,
+  });
+
+  if ('shortfall' in hold) {
+    // Nothing has been called. This is the whole point of reserving first.
+    console.warn(
+      `[social-search] skipping search for ${userId}: needs ${hold.required} credits, has ${hold.available}`,
+    );
+    return json({
+      ok: false,
+      error: 'insufficient_credits',
+      required: hold.required,
+      available: hold.available,
+      shortfall: hold.shortfall,
+    }, 402);
+  }
+
   // Exact cutoff. The endpoints only accept coarse windows, so anything that
   // slips in outside the real lookback is dropped here.
   const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
@@ -723,11 +1060,18 @@ Deno.serve(async (req) => {
     return Date.parse(postedAt) >= cutoffMs;
   };
 
+  const tallies = new Map<string, OperationTally>();
+  for (const op of wanted) tallies.set(op, newTally(op));
+  const billableChannels = enabledChannels.filter((c) => pricing.has(OPERATION_OF[c]));
+
   for (const kw of keywords) {
     // Channels run in parallel; providers inside a channel run in sequence so a
     // fallback only costs money once the cheaper one has actually failed.
     const perChannel = await Promise.all(
-      enabledChannels.map((ch) => searchChannel(ch, kw, lookbackHours, served)),
+      billableChannels.map((ch) => {
+        const tally = tallies.get(OPERATION_OF[ch])!;
+        return searchChannel(ch, kw, lookbackHours, served, tally, userId, runNonce);
+      }),
     );
 
     for (const post of perChannel.flat()) {
@@ -743,6 +1087,42 @@ Deno.serve(async (req) => {
       collected.push(post);
     }
   }
+
+  // ---- Settle for what actually billed ------------------------------------
+  //
+  // A channel that produced no billable call costs nothing. This is the second
+  // half of the predictability promise: the customer pays for searches that
+  // were paid for, not for the ones that were free or for the retries behind
+  // them.
+  let creditsCharged = 0;
+  let providerCostUsd = 0;
+  const perOperation: Record<string, number> = {};
+
+  for (const [op, t] of tallies) {
+    providerCostUsd += t.costMicro / 1e6;
+    // An operation whose calls were all billed, or whose fate we cannot
+    // determine, is charged. One that was entirely free is not.
+    const charged = (t.billed || t.uncertain) ? (pricing.get(op) ?? 0) * keywords.length : 0;
+    creditsCharged += charged;
+    perOperation[op] = charged;
+  }
+
+  let balanceAfter: number | null = null;
+  let charged = false;
+
+  if (creditsCharged > 0) {
+    balanceAfter = await settleSweep(
+      admin, hold.id, creditsCharged, providerCostUsd,
+      `${runKey}:settle`, `${keywords.length} keywords across ${billableChannels.length} channels`,
+    );
+    charged = true;
+  } else {
+    // Nothing billable happened: no results, or every call failed in a way treg
+    // does not charge for. The hold goes back in full.
+    await releaseSweep(admin, hold.id, 'no billable provider calls');
+  }
+
+  await recordUsage(admin, userId, runKey, tallies, hold.id);
 
   // --- Persist to monitored_posts (service role) ---------------------------
   if (collected.length > 0) {
@@ -785,6 +1165,17 @@ Deno.serve(async (req) => {
     dropped_stale: droppedStale,
     pruned,
     served_by: served,
+    // Measured from treg's own cost headers, not from a rate card.
+    usd_spent: Number(usdSpent.toFixed(6)),
+    calls_made: callsMade,
+    billing: {
+      charged,
+      credits_charged: creditsCharged,
+      credits_required: creditsRequired,
+      provider_cost_usd: Number(providerCostUsd.toFixed(8)),
+      per_operation: perOperation,
+      balance_after: balanceAfter,
+    },
   });
 });
 
