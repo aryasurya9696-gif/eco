@@ -1,4 +1,4 @@
-﻿-- ============================================================================
+-- ============================================================================
 -- Echo — Complete database install (single paste)
 -- ----------------------------------------------------------------------------
 -- Project ref: fteoyqhogzuapfdledeg
@@ -960,3 +960,1238 @@ grant  execute on function public.clear_feed(uuid) to authenticated, service_rol
 
 
 
+
+-- ============================================================================
+-- Inlined: 20261102_credit_wallet.sql
+-- ============================================================================
+-- ============================================================================
+-- Credit wallet â€” the tables
+-- ----------------------------------------------------------------------------
+-- Prepaid credits. A workspace buys a block of credits once and spends them
+-- down as it searches; there is no plan, no renewal and no recurring charge.
+--
+-- The shape of this schema is driven by one fact about the provider. treg may
+-- charge us for a call whose answer never arrives â€” a timeout mid-flight, or a
+-- 410 that means "charged, result lost". A model that decrements the balance
+-- after the fact cannot tell those apart from a free failure, and either
+-- refunds money we spent or bills for a job the customer did not get. So the
+-- balance moves in two phases instead:
+--
+--   reserve  before the provider call   balance -> reserved
+--   settle   after a known outcome      draw from grants, drop reserved
+--   release  after a non-billable fail   reserved -> balance, no charge
+--
+-- Because the reserve happens before any money is at risk, the ledger can never
+-- discover that it is already spent. That is the whole point of putting the
+-- gate here rather than after the response.
+--
+-- Money is numeric(20,6) everywhere. Credits are fractional by nature, floats
+-- lose pennies at exactly the scale where the numbers stop being toy values.
+--
+-- Definition order below is dependency order, not reading order. A foreign key
+-- needs its target to exist first: topup_packages before payment_orders,
+-- payment_orders before credit_grants, and the three of those before
+-- credit_ledger, which references all of them.
+-- ============================================================================
+
+-- ---------------------------------------------------------------------------
+-- wallet
+-- One row per user. balance is what they own; reserved is the slice of that
+-- currently held for a call in flight. available = balance - reserved.
+-- The check constraints are the last line of defence: if a reserve path is ever
+-- coded wrong, the database refuses rather than quietly going negative.
+-- ---------------------------------------------------------------------------
+create table if not exists public.wallet (
+  user_id                 uuid primary key references auth.users(id) on delete cascade,
+  balance                 numeric(20,6) not null default 0 check (balance >= 0),
+  reserved                numeric(20,6) not null default 0 check (reserved >= 0),
+  lifetime_granted        numeric(20,6) not null default 0 check (lifetime_granted >= 0),
+  lifetime_consumed       numeric(20,6) not null default 0 check (lifetime_consumed >= 0),
+  -- Revenue is recognised when credits are consumed, not when cash arrives. The
+  -- difference between the two is unspent balance, which is a liability.
+  recognised_revenue_usd  numeric(20,6) not null default 0,
+  service_cost_usd        numeric(20,6) not null default 0,
+  updated_at              timestamptz not null default now(),
+  -- A reserve can never hold more than is actually owned.
+  constraint wallet_reserved_within_balance check (reserved <= balance)
+);
+
+comment on table public.wallet is
+  'Prepaid credit balance per user. available = balance - reserved.';
+comment on column public.wallet.reserved is
+  'Credits held for in-flight provider calls. Not spendable until settled or released.';
+
+alter table public.wallet enable row level security;
+
+drop policy if exists wallet_select_own on public.wallet;
+create policy wallet_select_own
+  on public.wallet for select
+  using (auth.uid() = user_id);
+
+-- No insert, update or delete policy. A client cannot write its own balance.
+
+-- ---------------------------------------------------------------------------
+-- topup_packages
+-- What can be bought. Readable by the client so the pricing on screen is the
+-- pricing charged; writable by nobody through the API. Changing a price is a
+-- deliberate SQL edit, which is the point â€” there is no admin surface in this
+-- product, so an accidental edit cannot come from the app.
+--
+-- provider_ref stays null until the payment account exists. Checkout fills it
+-- in on first use, so going live needs no migration and no redeploy.
+-- ---------------------------------------------------------------------------
+create table if not exists public.topup_packages (
+  code          text primary key,
+  display_name  text not null,
+  gross_usd     numeric(20,6) not null check (gross_usd > 0),
+  credits       numeric(20,6) not null check (credits > 0),
+  -- Kept separate from credits so a promotional bonus can be added without a
+  -- migration. It becomes its own grant row at zero unit price.
+  bonus_credits numeric(20,6) not null default 0 check (bonus_credits >= 0),
+  currency      text not null default 'USD',
+  active        boolean not null default true,
+  sort_order    int not null default 0,
+  provider_ref  text,
+  created_at    timestamptz not null default now()
+);
+
+alter table public.topup_packages enable row level security;
+
+drop policy if exists topup_packages_select_all on public.topup_packages;
+create policy topup_packages_select_all
+  on public.topup_packages for select
+  using (auth.role() = 'authenticated');
+
+-- ---------------------------------------------------------------------------
+-- payment_orders
+-- One row per attempted purchase. provider_ref carries the gateway's own
+-- reference and is unique, which is what makes the webhook path replay-proof:
+-- a payment.succeeded delivered twice finds the row already settled and stops.
+-- ---------------------------------------------------------------------------
+create table if not exists public.payment_orders (
+  id                uuid primary key default gen_random_uuid(),
+  user_id           uuid not null references auth.users(id) on delete cascade,
+  provider          text not null default 'dodo',
+  package_code      text not null references public.topup_packages(code),
+  provider_order_id text unique,
+  provider_ref      text unique,
+  gross_usd         numeric(20,6) not null check (gross_usd > 0),
+  -- Left null until a real charge tells us the rate. Guessing it would put a
+  -- fabricated number in the profit report.
+  fee_usd           numeric(20,6) check (fee_usd is null or fee_usd >= 0),
+  net_usd           numeric(20,6),
+  currency          text not null default 'USD',
+  credits_granted   numeric(20,6) not null default 0 check (credits_granted >= 0),
+  status            text not null default 'created' check (status in (
+                      'created', 'pending', 'succeeded', 'failed', 'refunded')),
+  checkout_url      text,
+  created_at        timestamptz not null default now(),
+  settled_at        timestamptz
+);
+
+create index if not exists idx_payment_orders_user_created
+  on public.payment_orders(user_id, created_at desc);
+
+create index if not exists idx_payment_orders_status
+  on public.payment_orders(status)
+  where status in ('created', 'pending');
+
+alter table public.payment_orders enable row level security;
+
+drop policy if exists payment_orders_select_own on public.payment_orders;
+create policy payment_orders_select_own
+  on public.payment_orders for select
+  using (auth.uid() = user_id);
+
+-- ---------------------------------------------------------------------------
+-- credit_grants
+-- The FIFO pool. A grant is one issuance and it remembers what that issuance
+-- actually cost per credit.
+--
+-- Keeping them discrete rather than storing a single balance is what makes
+-- revenue honest. If a $10 top-up carried a 10% bonus, folding the bonus into
+-- the same row would recognise $0.05 of revenue per bonus credit that nobody
+-- ever paid. Separate rows with their own unit_price_usd â€” the bonus row at 0
+-- â€” keeps recognised revenue equal to cash received, to the credit.
+-- ---------------------------------------------------------------------------
+create table if not exists public.credit_grants (
+  id                 uuid primary key default gen_random_uuid(),
+  user_id            uuid not null references auth.users(id) on delete cascade,
+  source             text not null check (source in ('topup', 'bonus', 'grant', 'adjustment')),
+  payment_order_id   uuid references public.payment_orders(id) on delete set null,
+  credits            numeric(20,6) not null check (credits > 0),
+  credits_remaining  numeric(20,6) not null check (credits_remaining >= 0),
+  -- Cash received divided by credits issued. The rate revenue is recognised at.
+  unit_price_usd     numeric(20,6) not null default 0 check (unit_price_usd >= 0),
+  expires_at         timestamptz,
+  created_at         timestamptz not null default now(),
+  constraint credit_grants_remaining_within_total check (credits_remaining <= credits)
+);
+
+create index if not exists idx_credit_grants_fifo
+  on public.credit_grants(user_id, expires_at nulls last, created_at)
+  where credits_remaining > 0;
+
+create index if not exists idx_credit_grants_order
+  on public.credit_grants(payment_order_id)
+  where payment_order_id is not null;
+
+alter table public.credit_grants enable row level security;
+
+drop policy if exists credit_grants_select_own on public.credit_grants;
+create policy credit_grants_select_own
+  on public.credit_grants for select
+  using (auth.uid() = user_id);
+
+-- ---------------------------------------------------------------------------
+-- reservations
+-- Backing store for the two-phase model. Exists so the database, not the
+-- calling code, is the thing that refuses a second finalisation. A sweep that
+-- settles twice, or settles after releasing, is a double charge; catching that
+-- in a constraint means the bug cannot reach the ledger.
+-- ---------------------------------------------------------------------------
+create table if not exists public.reservations (
+  id                uuid primary key default gen_random_uuid(),
+  user_id           uuid not null references auth.users(id) on delete cascade,
+  idempotency_key   text not null unique,
+  credits_held      numeric(20,6) not null check (credits_held >= 0),
+  status            text not null default 'held'
+                      check (status in ('held', 'settled', 'released')),
+  reason            text,
+  context           jsonb not null default '{}'::jsonb,
+  created_at        timestamptz not null default now(),
+  finalised_at      timestamptz
+);
+
+create index if not exists idx_reservations_user_status
+  on public.reservations(user_id, status, created_at desc);
+
+-- Stale holds are worth finding: a reservation that never finalised is credits
+-- locked up with nothing coming to release them.
+create index if not exists idx_reservations_held
+  on public.reservations(created_at)
+  where status = 'held';
+
+alter table public.reservations enable row level security;
+
+drop policy if exists reservations_select_own on public.reservations;
+create policy reservations_select_own
+  on public.reservations for select
+  using (auth.uid() = user_id);
+
+-- ---------------------------------------------------------------------------
+-- credit_ledger
+-- Append-only. Every movement of the balance lands here with the numbers needed
+-- to reconstruct it later: what moved, what it was worth, what it cost us, and
+-- what it was tied to.
+--
+-- Append-only is enforced by giving clients no update or delete policy at all,
+-- rather than by a trigger that could be bypassed by a role nobody thought of.
+-- ---------------------------------------------------------------------------
+create table if not exists public.credit_ledger (
+  id                bigint generated always as identity primary key,
+  user_id           uuid not null references auth.users(id) on delete cascade,
+  delta             numeric(20,6) not null,
+  balance_after     numeric(20,6) not null,
+  kind              text not null check (kind in (
+                      'topup', 'grant', 'bonus', 'usage', 'refund',
+                      'reversal', 'expiry', 'adjustment')),
+  reservation_id    uuid references public.reservations(id) on delete set null,
+  grant_id          uuid references public.credit_grants(id) on delete set null,
+  payment_order_id  uuid references public.payment_orders(id) on delete set null,
+  api_usage_id      bigint,
+  -- Recognised on consumption only. A topup row carries zero: cash arrived, it
+  -- was not earned, and calling it revenue would let a workspace book money it
+  -- has not spent yet.
+  revenue_usd       numeric(20,6) not null default 0,
+  service_cost_usd  numeric(20,6) not null default 0,
+  idempotency_key   text unique,
+  note              text,
+  metadata          jsonb not null default '{}'::jsonb,
+  created_at        timestamptz not null default now()
+);
+
+create index if not exists idx_credit_ledger_user_created
+  on public.credit_ledger(user_id, created_at desc);
+
+create index if not exists idx_credit_ledger_reservation
+  on public.credit_ledger(reservation_id)
+  where reservation_id is not null;
+
+alter table public.credit_ledger enable row level security;
+
+drop policy if exists credit_ledger_select_own on public.credit_ledger;
+create policy credit_ledger_select_own
+  on public.credit_ledger for select
+  using (auth.uid() = user_id);
+
+-- ---------------------------------------------------------------------------
+-- api_usage
+-- One row per billable provider call, carrying the provider's own reported
+-- cost. treg returns what it actually charged in x-treg-cost-micro, so the cost
+-- column here is measured rather than estimated and the profit it implies is
+-- real. The pricing_config estimate covers only the window before the response
+-- comes back.
+--
+-- Metadata only. A full response body would carry whatever people posted
+-- publicly, which is not ours to keep.
+-- ---------------------------------------------------------------------------
+create table if not exists public.api_usage (
+  id                  bigint generated always as identity primary key,
+  user_id             uuid not null references auth.users(id) on delete cascade,
+  idempotency_key     text not null unique,
+  operation           text not null,
+  provider            text not null default 'treg',
+  provider_call_id    text,
+  provider_cost_usd   numeric(20,8) not null default 0 check (provider_cost_usd >= 0),
+  credits_charged     numeric(20,6) not null default 0 check (credits_charged >= 0),
+  revenue_usd         numeric(20,6) not null default 0,
+  gross_profit_usd    numeric(20,8) generated always as (revenue_usd - provider_cost_usd) stored,
+  -- success          the caller got what it asked for
+  -- free             ran, found nothing, treg did not bill
+  -- upstream_failed  treg billed but the upstream provider failed; paid, no value
+  -- not_billed       failed in a way treg never charges for
+  -- uncertain        we may have been charged and cannot tell yet; reconcile later
+  outcome             text not null check (outcome in (
+                        'success', 'free', 'upstream_failed',
+                        'not_billed', 'uncertain')),
+  http_status         int,
+  duration_ms         int,
+  error_code          text,
+  reservation_id      uuid references public.reservations(id) on delete set null,
+  metadata            jsonb not null default '{}'::jsonb,
+  created_at          timestamptz not null default now()
+);
+
+create index if not exists idx_api_usage_user_created
+  on public.api_usage(user_id, created_at desc);
+
+create index if not exists idx_api_usage_operation
+  on public.api_usage(operation, created_at desc);
+
+-- Reconciliation against treg's own ledger. A call id present in
+-- GET /calls/{id} but absent here means we were charged for something we never
+-- recorded, which is exactly what this index makes findable.
+create index if not exists idx_api_usage_provider_call
+  on public.api_usage(provider_call_id)
+  where provider_call_id is not null;
+
+create index if not exists idx_api_usage_uncertain
+  on public.api_usage(created_at)
+  where outcome = 'uncertain';
+
+alter table public.api_usage enable row level security;
+
+drop policy if exists api_usage_select_own on public.api_usage;
+create policy api_usage_select_own
+  on public.api_usage for select
+  using (auth.uid() = user_id);
+
+-- ---------------------------------------------------------------------------
+-- pricing_config
+-- The single place a price lives. Edge functions read it at call time and never
+-- accept a price from the client.
+--
+-- provider_cost_usd is a pre-call estimate. The authoritative figure is what
+-- treg reports afterwards, which lands in api_usage.provider_cost_usd.
+-- cost_verified records whether the number has actually been confirmed against
+-- the catalog or a live call, so an unverified estimate is never mistaken for a
+-- measured cost in a report.
+--
+-- There is no admin UI for this table, by design. It is edited by SQL.
+-- ---------------------------------------------------------------------------
+create table if not exists public.pricing_config (
+  operation          text primary key,
+  display_name       text not null,
+  provider_endpoint  text not null,
+  provider_cost_usd  numeric(20,8) not null default 0 check (provider_cost_usd >= 0),
+  cost_verified      boolean not null default false,
+  cost_source        text not null default 'unverified' check (cost_source in (
+                       'catalog', 'rate_card', 'observed', 'live_confirmed', 'unverified')),
+  credits            numeric(20,6) not null check (credits >= 0),
+  enabled            boolean not null default true,
+  version            int not null default 1,
+  effective_from     timestamptz not null default now(),
+  updated_at         timestamptz not null default now()
+);
+
+alter table public.pricing_config enable row level security;
+
+drop policy if exists pricing_config_select_all on public.pricing_config;
+create policy pricing_config_select_all
+  on public.pricing_config for select
+  using (auth.role() = 'authenticated');
+
+-- ---------------------------------------------------------------------------
+-- pricing_audit
+-- Who changed a price, when, and from what to what. changed_by is a free-text
+-- operator label rather than a user reference: this product has no admin role,
+-- so there is no identity to point at, and inventing one would reintroduce
+-- exactly the surface that was deliberately left out.
+--
+-- Written by a trigger rather than by application code, so a change made
+-- directly in SQL is recorded too.
+-- ---------------------------------------------------------------------------
+create table if not exists public.pricing_audit (
+  id          bigint generated always as identity primary key,
+  operation   text not null,
+  field       text not null,
+  old_value   jsonb,
+  new_value   jsonb,
+  changed_by  text,
+  changed_at  timestamptz not null default now(),
+  reason      text
+);
+
+create index if not exists idx_pricing_audit_operation
+  on public.pricing_audit(operation, changed_at desc);
+
+alter table public.pricing_audit enable row level security;
+
+-- ---------------------------------------------------------------------------
+-- webhook_events
+-- Dodo retries, and retries can arrive hours apart and out of order. The
+-- webhook id is recorded before processing and marked afterwards, which is what
+-- lets a redelivery of the same event be recognised as a redelivery.
+-- ---------------------------------------------------------------------------
+create table if not exists public.webhook_events (
+  id            bigint generated always as identity primary key,
+  provider      text not null default 'dodo',
+  webhook_id    text not null unique,
+  event_type    text not null,
+  payload       jsonb not null default '{}'::jsonb,
+  status        text not null default 'received' check (status in (
+                  'received', 'processed', 'failed', 'ignored')),
+  attempts      int not null default 0,
+  last_error    text,
+  received_at   timestamptz not null default now(),
+  processed_at  timestamptz
+);
+
+create index if not exists idx_webhook_events_status
+  on public.webhook_events(status, received_at);
+
+alter table public.webhook_events enable row level security;
+
+-- No client policies at all. The browser never reads this.
+
+-- ============================================================================
+-- Inlined: 20261103_wallet_rpcs.sql
+-- ============================================================================
+-- ============================================================================
+-- Credit wallet â€” the functions
+-- ----------------------------------------------------------------------------
+-- Six entry points. Everything that moves money goes through one of them, and
+-- none of them is reachable by a client, because a client that can write its
+-- own balance is a client that can set it to a million.
+--
+-- The two-phase shape is the whole design:
+--
+--   wallet_reserve    take the credits before the provider call, so the answer
+--                     to "can this workspace afford this" is known while the
+--                     answer is still free to change
+--   wallet_settle     charge what was actually billable and drop the rest
+--   wallet_release    give the hold back untouched when nothing was billed
+--
+-- Three properties these are built to hold, each of which was a real defect in
+-- the previous credit system:
+--
+-- 1. No unbounded free usage. The reserve refuses before a single provider call
+--    is made. The earlier version tallied a shortfall after the fact and then
+--    discarded it, so a workspace with no credits kept being served and the
+--    balance never left zero.
+--
+-- 2. Predictable billing. A sweep reserves for its worst case and settles for
+--    what actually billed, so a Reddit keyword whose primary fell through to
+--    the fallback costs the same either way. The customer is billed for the
+--    result, not for the retry.
+--
+-- 3. No overdraft, by decision. Out of credits is a refusal, not a loan. The
+--    database refuses to hold a balance below zero regardless.
+--
+-- Every function returns jsonb rather than raising, except where raising is the
+-- clearer answer. A caller that wants to know "can they afford it" needs the
+-- shortfall to render a message, and an exception cannot carry that back.
+-- ============================================================================
+
+-- ---------------------------------------------------------------------------
+-- wallet_apply_grant
+-- The only path that adds credits. Cash in, a grant row, a ledger row and the
+-- wallet totals, all in one transaction.
+--
+-- The caller passes the unit price it actually received the money at rather
+-- than this function deriving one from the package, because a refund, a
+-- discount or a partial capture all mean the real rate is not the list rate.
+-- Deriving it here would quietly recognise revenue that was never collected.
+-- ---------------------------------------------------------------------------
+create or replace function public.wallet_apply_grant(
+  p_user_id          uuid,
+  p_credits          numeric,
+  p_source           text,
+  p_unit_price_usd   numeric,
+  p_payment_order_id uuid default null,
+  p_idempotency_key  text default null,
+  p_expires_at       timestamptz default null,
+  p_metadata         jsonb    default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_wallet       public.wallet%rowtype;
+  v_credits      numeric := greatest(coalesce(p_credits, 0), 0);
+  v_unit         numeric := greatest(coalesce(p_unit_price_usd, 0), 0);
+  v_grant_id     uuid;
+  v_seen_balance numeric;
+  v_balance      numeric;
+begin
+  if v_credits <= 0 then
+    return jsonb_build_object('ok', false, 'error', 'invalid_amount');
+  end if;
+
+  -- Replaying a grant must not double the balance. This is the path a retried
+  -- payment webhook lands on, and a retry there is expected rather than a bug.
+  --
+  -- The ledger is where the answer lives, because the unique constraint on
+  -- idempotency_key is on the ledger. Anything less direct than asking the
+  -- ledger will eventually disagree with that constraint and turn a routine
+  -- retry into an error.
+  if p_idempotency_key is not null then
+    select l.grant_id, l.balance_after into v_grant_id, v_seen_balance
+      from public.credit_ledger l
+     where l.idempotency_key = p_idempotency_key;
+
+    if found then
+      return jsonb_build_object(
+        'ok', true,
+        'duplicate', true,
+        'grant_id', v_grant_id,
+        'balance_after', v_seen_balance
+      );
+    end if;
+  end if;
+
+  insert into public.wallet (user_id) values (p_user_id)
+    on conflict (user_id) do nothing;
+
+  select * into v_wallet from public.wallet where user_id = p_user_id for update;
+  if not found then
+    raise exception 'wallet_apply_grant: wallet % not found', p_user_id;
+  end if;
+
+  insert into public.credit_grants (
+    user_id, source, payment_order_id, credits, credits_remaining,
+    unit_price_usd, expires_at
+  ) values (
+    p_user_id, p_source, p_payment_order_id, v_credits, v_credits,
+    v_unit, p_expires_at
+  ) returning id into v_grant_id;
+
+  v_balance := v_wallet.balance + v_credits;
+
+  update public.wallet
+     set balance          = v_balance,
+         lifetime_granted = lifetime_granted + v_credits,
+         updated_at       = now()
+   where user_id = p_user_id;
+
+  -- Revenue stays zero here on purpose. Cash received is not revenue until the
+  -- credits that represent it are actually consumed; until then it is a
+  -- liability sitting on the balance sheet.
+  insert into public.credit_ledger (
+    user_id, delta, balance_after, kind, grant_id, payment_order_id,
+    revenue_usd, service_cost_usd, idempotency_key, note, metadata
+  ) values (
+    p_user_id, v_credits, v_balance,
+    case when p_source = 'topup' then 'topup'::text else 'grant'::text end,
+    v_grant_id, p_payment_order_id,
+    0, 0, p_idempotency_key,
+    'Credits added (' || p_source || ')',
+    coalesce(p_metadata, '{}'::jsonb)
+  );
+
+  return jsonb_build_object(
+    'ok', true,
+    'duplicate', false,
+    'grant_id', v_grant_id,
+    'credits_granted', v_credits,
+    'unit_price_usd', v_unit,
+    'balance_after', v_balance
+  );
+end;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- wallet_reserve
+-- Take the credits for a whole job up front, before any provider call. For a
+-- sweep this is every keyword times every channel at once: the job either runs
+-- or it does not. A sweep that ran for six of eight keywords would charge for a
+-- truncated search and quietly under-report the results.
+--
+-- Returns ok=false with the shortfall rather than raising, so the caller can
+-- tell the user how much is missing.
+-- ---------------------------------------------------------------------------
+create or replace function public.wallet_reserve(
+  p_user_id         uuid,
+  p_credits         numeric,
+  p_idempotency_key text,
+  p_context         jsonb default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_wallet      public.wallet%rowtype;
+  v_needed      numeric := greatest(coalesce(p_credits, 0), 0);
+  v_available   numeric;
+  v_reservation uuid;
+  v_existing    uuid;
+begin
+  if v_needed <= 0 then
+    return jsonb_build_object('ok', true, 'reserved', 0, 'reservation_id', null);
+  end if;
+
+  if p_idempotency_key is null or p_idempotency_key = '' then
+    raise exception 'wallet_reserve: idempotency_key is required';
+  end if;
+
+  -- A retried request reuses the same hold rather than stacking a second one.
+  select id into v_existing
+    from public.reservations
+   where idempotency_key = p_idempotency_key;
+  if found then
+    return jsonb_build_object(
+      'ok', true,
+      'duplicate', true,
+      'reservation_id', v_existing,
+      'reserved', (select credits_held from public.reservations where id = v_existing)
+    );
+  end if;
+
+  insert into public.wallet (user_id) values (p_user_id)
+    on conflict (user_id) do nothing;
+
+  -- The row lock is what makes concurrent sweeps safe. Two workspaces, or the
+  -- same workspace sweeping twice at the same moment, both queue here; the
+  -- second one reads the balance the first one already moved. Without it both
+  -- would read the same pre-reserve figure and both would decide they could
+  -- afford it.
+  select * into v_wallet from public.wallet where user_id = p_user_id for update;
+  if not found then
+    raise exception 'wallet_reserve: wallet % not found', p_user_id;
+  end if;
+
+  v_available := v_wallet.balance - v_wallet.reserved;
+
+  if v_available < v_needed then
+    return jsonb_build_object(
+      'ok', false,
+      'error', 'insufficient_credits',
+      'required', v_needed,
+      'available', greatest(v_available, 0),
+      'shortfall', v_needed - greatest(v_available, 0),
+      'balance_after', v_wallet.balance
+    );
+  end if;
+
+  insert into public.reservations (
+    user_id, idempotency_key, credits_held, status, context
+  ) values (
+    p_user_id, p_idempotency_key, v_needed, 'held', coalesce(p_context, '{}'::jsonb)
+  ) returning id into v_reservation;
+
+  update public.wallet
+     set reserved  = reserved + v_needed,
+         updated_at = now()
+   where user_id = p_user_id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'duplicate', false,
+    'reservation_id', v_reservation,
+    'reserved', v_needed,
+    'available_after', v_available - v_needed,
+    'balance_after', v_wallet.balance
+  );
+end;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- wallet_settle
+-- Close a reservation and charge what was actually billable.
+--
+-- p_credits_charged is what the outcomes actually justified, which can be less
+-- than what was reserved: a search that found nothing is free, a call that
+-- failed in a way treg never bills for is free. The difference returns to the
+-- balance rather than being kept.
+--
+-- Costs are drawn from the grants FIFO at each grant's own unit price, so a
+-- bonus tranche consumed later recognises at zero and does not inflate revenue
+-- beyond what was collected.
+-- ---------------------------------------------------------------------------
+create or replace function public.wallet_settle(
+  p_reservation_id  uuid,
+  p_credits_charged numeric,
+  p_provider_cost   numeric default 0,
+  p_idempotency_key text default null,
+  p_note            text    default null,
+  p_metadata        jsonb   default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_res       public.reservations%rowtype;
+  v_wallet    public.wallet%rowtype;
+  v_charge    numeric := greatest(coalesce(p_credits_charged, 0), 0);
+  v_cost      numeric := greatest(coalesce(p_provider_cost, 0), 0);
+  v_needed    numeric := v_charge;
+  v_take      numeric;
+  v_revenue   numeric := 0;
+  v_drawn     numeric := 0;
+  v_new_bal   numeric;
+  v_ledger_id bigint;
+  v_row       record;
+begin
+  -- FOR UPDATE plus the status check is what makes settling twice impossible.
+  -- A double settle is a double charge, and it has to be impossible at the
+  -- database rather than merely unlikely in the caller.
+  select * into v_res from public.reservations where id = p_reservation_id for update;
+  if not found then
+    return jsonb_build_object('ok', false, 'error', 'reservation_not_found');
+  end if;
+
+  if v_res.status <> 'held' then
+    return jsonb_build_object(
+      'ok', false,
+      'error', 'reservation_already_finalised',
+      'status', v_res.status
+    );
+  end if;
+
+  -- Never charge more than was held, whatever the caller passes. A sweep that
+  -- over-reports its own billing should be clipped, not obeyed.
+  if v_charge > v_res.credits_held then
+    v_charge := v_res.credits_held;
+    v_needed  := v_charge;
+  end if;
+
+  select * into v_wallet from public.wallet where user_id = v_res.user_id for update;
+
+  update public.reservations
+     set status = 'settled', finalised_at = now(), reason = coalesce(p_note, 'settled')
+   where id = p_reservation_id;
+
+  if v_charge > 0 then
+    -- Oldest live grant first, soonest expiry ahead of never-expiring ones.
+    for v_row in
+      select id, credits_remaining, unit_price_usd
+        from public.credit_grants
+       where user_id = v_res.user_id
+         and credits_remaining > 0
+         and (expires_at is null or expires_at > now())
+       order by expires_at nulls last, created_at
+       for update
+    loop
+      exit when v_needed <= 0;
+
+      v_take := least(v_needed, v_row.credits_remaining);
+
+      update public.credit_grants
+         set credits_remaining = credits_remaining - v_take
+       where id = v_row.id;
+
+      v_revenue := v_revenue + (v_take * v_row.unit_price_usd);
+      v_drawn   := v_drawn + v_take;
+      v_needed  := v_needed - v_take;
+    end loop;
+  end if;
+
+  -- If the grants ran dry the charge is clipped to what could actually be
+  -- drawn. It cannot silently fall through to a negative balance.
+  v_charge  := v_drawn;
+  v_new_bal := v_wallet.balance - v_charge;
+
+  update public.wallet
+     set balance                = v_new_bal,
+         reserved               = reserved - v_res.credits_held,
+         lifetime_consumed      = lifetime_consumed + v_charge,
+         recognised_revenue_usd = recognised_revenue_usd + v_revenue,
+         service_cost_usd       = service_cost_usd + v_cost,
+         updated_at             = now()
+   where user_id = v_res.user_id;
+
+  insert into public.credit_ledger (
+    user_id, delta, balance_after, kind, reservation_id,
+    revenue_usd, service_cost_usd, idempotency_key, note, metadata
+  ) values (
+    v_res.user_id, -v_charge, v_new_bal, 'usage', p_reservation_id,
+    v_revenue, v_cost, p_idempotency_key, p_note,
+    coalesce(p_metadata, '{}'::jsonb) || jsonb_build_object(
+      'reserved', v_res.credits_held,
+      'released', v_res.credits_held - v_charge,
+      'provider_cost', v_cost
+    )
+  ) returning id into v_ledger_id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'credits_charged', v_charge,
+    'credits_released', v_res.credits_held - v_charge,
+    'revenue_recognized', round(v_revenue, 6),
+    'service_cost', round(v_cost, 8),
+    'ledger_id', v_ledger_id,
+    'balance_after', v_new_bal
+  );
+end;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- wallet_release
+-- Give a hold back untouched. For every outcome treg does not bill: a
+-- pre-call validation failure, a 5xx, a 429, a 503 for capacity, a 402 for our
+-- own balance running out, a provider 4xx, a search that returned nothing.
+--
+-- This is the function that makes the difference between a provider that is
+-- briefly unavailable costing the customer a charge and costing nothing. It
+-- writes no usage row and no ledger row, because nothing happened.
+--
+-- Uncertain outcomes do not come here. A timeout where treg may still have
+-- charged is settled as uncertain and reconciled later, because refunding it
+-- automatically is how a workspace ends up being served for free.
+-- ---------------------------------------------------------------------------
+create or replace function public.wallet_release(
+  p_reservation_id uuid,
+  p_reason         text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_res    public.reservations%rowtype;
+  v_wallet public.wallet%rowtype;
+begin
+  select * into v_res from public.reservations where id = p_reservation_id for update;
+  if not found then
+    return jsonb_build_object('ok', false, 'error', 'reservation_not_found');
+  end if;
+
+  if v_res.status <> 'held' then
+    return jsonb_build_object(
+      'ok', false,
+      'error', 'reservation_already_finalised',
+      'status', v_res.status
+    );
+  end if;
+
+  select * into v_wallet from public.wallet where user_id = v_res.user_id for update;
+
+  update public.reservations
+     set status = 'released', finalised_at = now(), reason = coalesce(p_reason, 'released')
+   where id = p_reservation_id;
+
+  update public.wallet
+     set reserved    = reserved - v_res.credits_held,
+         updated_at = now()
+   where user_id = v_res.user_id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'released', v_res.credits_held,
+    'balance_after', v_wallet.balance
+  );
+end;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- wallet_topup_from_order
+-- Settle a paid order into credits. Idempotent twice over: on the order's own
+-- status, so a second webhook for a settled order does nothing, and on the
+-- ledger key, so a replay cannot double the grant even if the status somehow
+-- looked unsettled.
+--
+-- The bonus, if the package has one, becomes a separate grant at zero unit
+-- price rather than being folded into the paid one. Folding it in would
+-- recognise revenue on credits that were given away.
+-- ---------------------------------------------------------------------------
+create or replace function public.wallet_topup_from_order(
+  p_order_id      uuid,
+  p_fee_usd       numeric default null,
+  p_net_usd       numeric default null,
+  p_provider_ref  text  default null,
+  p_idempotency_key text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_order    public.payment_orders%rowtype;
+  v_pkg      public.topup_packages%rowtype;
+  v_unit     numeric;
+  v_result   jsonb;
+  v_bonus    jsonb;
+begin
+  select * into v_order from public.payment_orders where id = p_order_id for update;
+  if not found then
+    return jsonb_build_object('ok', false, 'error', 'order_not_found');
+  end if;
+
+  if v_order.status = 'succeeded' and v_order.credits_granted > 0 then
+    return jsonb_build_object('ok', true, 'duplicate', true, 'order_id', p_order_id);
+  end if;
+
+  select * into v_pkg from public.topup_packages where code = v_order.package_code;
+
+  -- Net cash is what actually arrived. Gross would recognise revenue the
+  -- gateway kept.
+  v_unit := case
+              when v_order.net_usd is not null then v_order.net_usd / v_order.credits_granted
+              when p_net_usd    is not null then p_net_usd / v_order.credits_granted
+              else v_pkg.gross_usd / v_pkg.credits
+            end;
+
+  v_result := public.wallet_apply_grant(
+    p_user_id          => v_order.user_id,
+    p_credits          => v_pkg.credits,
+    p_source           => 'topup',
+    p_unit_price_usd   => v_unit,
+    p_payment_order_id => p_order_id,
+    p_idempotency_key  => coalesce(p_idempotency_key, 'topup:' || p_order_id::text),
+    p_metadata         => jsonb_build_object('package', v_order.package_code)
+  );
+
+  if v_pkg.bonus_credits > 0 then
+    v_bonus := public.wallet_apply_grant(
+      p_user_id          => v_order.user_id,
+      p_credits          => v_pkg.bonus_credits,
+      p_source           => 'bonus',
+      p_unit_price_usd   => 0,
+      p_payment_order_id => p_order_id,
+      p_idempotency_key  => coalesce(p_idempotency_key, 'topup:' || p_order_id::text) || ':bonus',
+      p_metadata         => jsonb_build_object('package', v_order.package_code)
+    );
+  end if;
+
+  update public.payment_orders
+     set status          = 'succeeded',
+         credits_granted = v_pkg.credits + v_pkg.bonus_credits,
+         fee_usd         = p_fee_usd,
+         net_usd         = coalesce(p_net_usd, v_order.net_usd),
+         provider_ref    = coalesce(p_provider_ref, v_order.provider_ref),
+         settled_at      = now()
+   where id = p_order_id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'duplicate', false,
+    'order_id', p_order_id,
+    'credits_granted', v_pkg.credits + v_pkg.bonus_credits,
+    'unit_price_usd', v_unit,
+    'balance_after', v_result->'balance_after'
+  );
+end;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- wallet_revoke_grant
+-- The refund path. Take back the unspent portion of a grant, leaving whatever
+-- was consumed alone: that work was delivered and the money was spent.
+--
+-- The balance floors at zero rather than going negative. A workspace that
+-- already spent the credits and then got a refund has nothing left to give
+-- back, and the difference is ours to absorb, not theirs to owe.
+-- ---------------------------------------------------------------------------
+create or replace function public.wallet_revoke_grant(
+  p_grant_id uuid,
+  p_reason   text default 'refund'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_grant    public.credit_grants%rowtype;
+  v_wallet   public.wallet%rowtype;
+  v_take     numeric;
+  v_new_bal  numeric;
+  v_ledger   bigint;
+begin
+  select * into v_grant from public.credit_grants where id = p_grant_id for update;
+  if not found then
+    return jsonb_build_object('ok', false, 'error', 'grant_not_found');
+  end if;
+
+  if v_grant.credits_remaining <= 0 then
+    return jsonb_build_object('ok', true, 'revoked', 0, 'reason', 'already_fully_spent');
+  end if;
+
+  select * into v_wallet from public.wallet where user_id = v_grant.user_id for update;
+
+  v_take := least(v_grant.credits_remaining, v_wallet.balance);
+  v_new_bal := v_wallet.balance - v_take;
+
+  update public.credit_grants
+     set credits_remaining = credits_remaining - v_take
+   where id = p_grant_id;
+
+  update public.wallet
+     set balance          = v_new_bal,
+         lifetime_granted = greatest(lifetime_granted - v_take, 0),
+         updated_at       = now()
+   where user_id = v_grant.user_id;
+
+  insert into public.credit_ledger (
+    user_id, delta, balance_after, kind, grant_id, revenue_usd, note
+  ) values (
+    v_grant.user_id, -v_take, v_new_bal, 'reversal', p_grant_id, 0,
+    coalesce(p_reason, 'refund')
+  ) returning id into v_ledger;
+
+  return jsonb_build_object(
+    'ok', true,
+    'revoked', v_take,
+    'unrevokable', v_grant.credits_remaining - v_take,
+    'balance_after', v_new_bal
+  );
+end;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- quote_sweep
+-- What a sweep would cost, without reserving anything. Lets the client show a
+-- running figure and lets the cron decide who to skip before it starts making
+-- provider calls, rather than discovering the shortfall halfway through.
+--
+-- Credits come from pricing_config, never from the caller. A client that could
+-- name its own price would not need this table at all.
+-- ---------------------------------------------------------------------------
+create or replace function public.quote_sweep(p_user_id uuid, p_keywords int, p_operations text[])
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $fn$
+declare
+  v_wallet   public.wallet%rowtype;
+  v_needed   numeric := 0;
+  v_count    int      := greatest(coalesce(p_keywords, 0), 0);
+  v_credits  numeric;
+  v_available numeric;
+  v_op       text;
+begin
+  select * into v_wallet from public.wallet where user_id = p_user_id;
+  if not found then
+    return jsonb_build_object('ok', false, 'error', 'wallet_not_found');
+  end if;
+
+  v_available := greatest(v_wallet.balance - v_wallet.reserved, 0);
+
+  -- A disabled or unknown operation contributes nothing and is simply absent
+  -- from the total, rather than failing the whole quote. The caller separately
+  -- refuses to run a disabled operation, so a silent zero here cannot turn into
+  -- a free sweep.
+  foreach v_op in array coalesce(p_operations, array[]::text[]) loop
+    select p.credits into v_credits
+      from public.pricing_config p
+     where p.operation = v_op and p.enabled = true;
+
+    if found then
+      v_needed := v_needed + (v_count * v_credits);
+    end if;
+  end loop;
+
+  -- Deliberately no revenue figure here. What a job is worth depends on which
+  -- grants it draws down at what unit price, which is only known at settlement.
+  -- Multiplying credits by the headline rate would report a number that is
+  -- usually close and occasionally wrong, which is worse than reporting none.
+  return jsonb_build_object(
+    'ok', true,
+    'keywords', v_count,
+    'required', v_needed,
+    'available', v_available,
+    'affordable', v_available >= v_needed,
+    'shortfall', greatest(v_needed - v_available, 0)
+  );
+end;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- Grants, revokes
+-- None of these are reachable by a client. The whole reason the wallet cannot
+-- be tampered with is that there is no path from the API to these functions;
+-- a revoke here would undo the entire model.
+-- ---------------------------------------------------------------------------
+revoke execute on function public.wallet_apply_grant(uuid, numeric, text, numeric, uuid, text, timestamptz, jsonb) from public, anon, authenticated;
+revoke execute on function public.wallet_reserve(uuid, numeric, text, jsonb) from public, anon, authenticated;
+revoke execute on function public.wallet_settle(uuid, numeric, numeric, text, text, jsonb) from public, anon, authenticated;
+revoke execute on function public.wallet_release(uuid, text) from public, anon, authenticated;
+revoke execute on function public.wallet_topup_from_order(uuid, numeric, numeric, text, text) from public, anon, authenticated;
+revoke execute on function public.wallet_revoke_grant(uuid, text) from public, anon, authenticated;
+revoke execute on function public.quote_sweep(uuid, integer, text[]) from public, anon, authenticated;
+
+grant execute on function public.wallet_apply_grant(uuid, numeric, text, numeric, uuid, text, timestamptz, jsonb) to service_role;
+grant execute on function public.wallet_reserve(uuid, numeric, text, jsonb) to service_role;
+grant execute on function public.wallet_settle(uuid, numeric, numeric, text, text, jsonb) to service_role;
+grant execute on function public.wallet_release(uuid, text) to service_role;
+grant execute on function public.wallet_topup_from_order(uuid, numeric, numeric, text, text) to service_role;
+grant execute on function public.wallet_revoke_grant(uuid, text) to service_role;
+grant execute on function public.quote_sweep(uuid, integer, text[]) to service_role;
+
+-- ---------------------------------------------------------------------------
+-- A wallet row for every existing user
+-- Created here rather than in a signup trigger so that users who already exist
+-- have a balance to read. Rows are inserted on demand by the functions anyway;
+-- this just means nobody's first billing page render is an error.
+-- ---------------------------------------------------------------------------
+insert into public.wallet (user_id)
+select id from auth.users
+on conflict (user_id) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- A pricing change is always audited, including one made directly in SQL
+-- ---------------------------------------------------------------------------
+create or replace function public.audit_pricing_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_field text;
+begin
+  foreach v_field in array array['credits', 'enabled', 'provider_cost_usd', 'cost_verified'] loop
+    if to_jsonb(new) -> v_field is distinct from to_jsonb(old) -> v_field then
+      insert into public.pricing_audit (operation, field, old_value, new_value)
+      values (
+        coalesce(new.operation, old.operation),
+        v_field,
+        to_jsonb(old) -> v_field,
+        to_jsonb(new) -> v_field
+      );
+    end if;
+  end loop;
+  return new;
+end;
+$fn$;
+
+drop trigger if exists trg_pricing_audit on public.pricing_config;
+create trigger trg_pricing_audit
+  after update on public.pricing_config
+  for each row execute function public.audit_pricing_change();
+
+revoke execute on function public.audit_pricing_change() from public, anon, authenticated;
+
+-- ============================================================================
+-- Inlined: 20261104_pricing_seed.sql
+-- ============================================================================
+-- ============================================================================
+-- Credit wallet â€” the seed prices
+-- ----------------------------------------------------------------------------
+-- What things cost, and what can be bought.
+--
+-- The provider costs below were read out of treg's own catalog rather than
+-- estimated, and two of them were confirmed against a live call, which is where
+-- the live_confirmed marker comes from. They are still only the estimate the
+-- system quotes before a call: the figure that actually lands in the profit
+-- report is whatever treg reports in x-treg-cost-micro afterwards, so a provider
+-- price change shows up in the numbers without anyone editing this file.
+--
+-- This table is edited by SQL. There is no admin screen for it in this product,
+-- which is deliberate â€” the price lives in one place, it is versioned, and
+-- every change to it is audited whether it came from a migration or from an
+-- editor.
+-- ============================================================================
+
+-- ---------------------------------------------------------------------------
+-- topup_packages
+-- 20 credits per dollar. The unit price is derived from these rows when a grant
+-- is issued and stored on the grant itself, so changing a package price later
+-- never reprices credits that were already sold.
+-- ---------------------------------------------------------------------------
+insert into public.topup_packages (code, display_name, gross_usd, credits, bonus_credits, currency, active, sort_order)
+values
+  ('starter_200',  '200 credits',  10.00,  200,  0, 'USD', true, 10),
+  ('standard_500', '500 credits',  25.00,  500,  0, 'USD', true, 20),
+  ('pack_1000',    '1000 credits', 50.00, 1000,  0, 'USD', true, 30)
+on conflict (code) do update
+   set display_name  = excluded.display_name,
+       gross_usd     = excluded.gross_usd,
+       credits       = excluded.credits,
+       bonus_credits = excluded.bonus_credits,
+       currency      = excluded.currency,
+       active        = excluded.active,
+       sort_order    = excluded.sort_order;
+
+-- ---------------------------------------------------------------------------
+-- pricing_config
+-- One row per logical operation, never per provider call.
+--
+-- Reddit is the case that forces this. Its primary and its fallback are both
+-- billed calls, so a per-call price would make the same keyword cost two
+-- credits on one sweep and four the next depending on whether the primary
+-- happened to work. Charging per operation makes it two either way. The
+-- fallback chain lives in the treg client as routing, which is where routing
+-- belongs; what the customer pays is one number.
+--
+-- cost_verified says the figure was confirmed rather than assumed. Everything
+-- else about these rows is a business decision and changes with the pricing
+-- conversation, not with treg.
+-- ---------------------------------------------------------------------------
+insert into public.pricing_config (
+  operation, display_name, provider_endpoint, provider_cost_usd,
+  cost_verified, cost_source, credits, enabled, version, effective_from
+)
+values
+  (
+    'treg.twitter.search',
+    'Twitter search',
+    'anyapi.x.search.posts',
+    0.00075,
+    true, 'catalog', 1, true, 1, now()
+  ),
+  (
+    'treg.reddit.search',
+    'Reddit search',
+    'tikhub.x.reddit-app-fetch-dynamic-search',
+    0.00100,
+    true, 'live_confirmed', 2, true, 1, now()
+  ),
+  (
+    'treg.web.search',
+    'Web search',
+    'crawl4ai.web.search.rich',
+    0.00015,
+    true, 'catalog', 1, true, 1, now()
+  ),
+  (
+    -- Charged one credit despite costing us nothing: treg bills this at zero.
+    -- It is the only operation here with no provider cost, which makes it the
+    -- one line in the margin report that will read 100%. That is correct.
+    'treg.news.search',
+    'Press & news',
+    'tinyfish.web.search.news',
+    0.00000,
+    true, 'live_confirmed', 1, true, 1, now()
+  )
+on conflict (operation) do update
+   set display_name      = excluded.display_name,
+       provider_endpoint = excluded.provider_endpoint,
+       -- credits, enabled and version are deliberately left alone on re-seed.
+       -- Re-running a migration must never silently reprice live customers or
+       -- re-enable an endpoint somebody deliberately switched off. Price
+       -- changes go through an explicit update, which the audit trigger records.
+       provider_cost_usd  = excluded.provider_cost_usd,
+       cost_verified      = excluded.cost_verified,
+       cost_source        = excluded.cost_source;
