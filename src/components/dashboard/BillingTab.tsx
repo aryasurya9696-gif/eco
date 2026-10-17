@@ -54,6 +54,41 @@ export const BillingTab: React.FC = () => {
   const [busyCode, setBusyCode] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  /**
+   * The package picked on the landing page, carried over in sessionStorage.
+   *
+   * Someone who chose "Buy 500 credits" on the pricing section should not arrive
+   * here to be asked to choose again.
+   *
+   * Read in a lazy state initialiser rather than an effect: it is a one-time read
+   * of an external value, which is what initialisation is for, and an effect would
+   * cost an extra render pass to arrive at the same place.
+   *
+   * The clearing is a separate effect that sets no state. Doing both in the
+   * initialiser would be impure, and React re-runs initialisers under StrictMode,
+   * so a second run would find the key already gone and lose the highlight.
+   */
+  const [intendedCode] = useState<string | null>(() => {
+    try {
+      return sessionStorage.getItem('echo_intended_package');
+    } catch {
+      // Storage unavailable. The tab works fine without the hint.
+      return null;
+    }
+  });
+
+  useEffect(() => {
+    // Consumed once. A later visit should not keep flagging a package they have
+    // since ignored or already bought.
+    try {
+      if (sessionStorage.getItem('echo_intended_package')) {
+        sessionStorage.removeItem('echo_intended_package');
+      }
+    } catch {
+      // Nothing to do; the hint simply persists until the tab is closed.
+    }
+  }, []);
+
   const load = useCallback(async () => {
     setError(null);
     try {
@@ -233,11 +268,22 @@ export const BillingTab: React.FC = () => {
           Buy credits
         </h2>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          {packages.map((p) => (
+          {packages.map((p) => {
+            const isIntended = intendedCode === p.code;
+            return (
             <div
               key={p.code}
-              className="border border-[#e3e3de] bg-white p-4 flex flex-col hover:border-[#141414] transition-colors"
+              className={`border bg-white p-4 flex flex-col transition-colors ${
+                isIntended
+                  ? 'border-[#141414] ring-1 ring-[#141414]'
+                  : 'border-[#e3e3de] hover:border-[#141414]'
+              }`}
             >
+              {isIntended && (
+                <p className="text-[9px] font-mono uppercase tracking-wider text-[#141414] mb-2 -mt-1">
+                  You picked this one
+                </p>
+              )}
               <div className="flex items-baseline justify-between">
                 <span className="text-lg font-mono font-medium text-[#141414]">
                   {formatUsd(p.gross_usd, { decimals: 0 })}
@@ -259,16 +305,21 @@ export const BillingTab: React.FC = () => {
               <button
                 onClick={() => void buy(p.code)}
                 disabled={busyCode !== null}
-                className="mt-4 w-full py-2 bg-[#141414] text-white text-xs hover:bg-[#2a2a2a] disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+                className={`mt-4 w-full py-2.5 text-xs disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer flex items-center justify-center gap-1.5 ${
+                  isIntended
+                    ? 'bg-[#141414] text-white hover:bg-[#2a2a2a]'
+                    : 'border border-[#141414] text-[#141414] hover:bg-[#141414] hover:text-white'
+                }`}
               >
                 {busyCode === p.code ? (
                   <Loader2 className="w-3 h-3 animate-spin" />
                 ) : (
-                  <>Top up <ExternalLink className="w-3 h-3" /></>
+                  <>Buy {formatCredits(p.total_credits)} credits <ExternalLink className="w-3 h-3" /></>
                 )}
               </button>
             </div>
-          ))}
+            );
+          })}
         </div>
         <p className="text-[10px] text-[#8a8a86] font-mono mt-2">
           Credits do not expire and there is no subscription. What you buy is what

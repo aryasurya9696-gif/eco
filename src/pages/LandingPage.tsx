@@ -21,12 +21,34 @@ import {
  * The customer still pays for one search either way, which is the point of
  * pricing per operation rather than per call.
  */
-const SEARCH_COSTS: Array<{ channel: string; credits: number; note: string }> = [
-  { channel: 'X / Twitter', credits: 1, note: 'latest posts, not all-time top' },
-  { channel: 'Reddit', credits: 2, note: 'two providers, one search for you' },
-  { channel: 'Web', credits: 1, note: 'rich results with dates' },
-  { channel: 'Press & news', credits: 1, note: 'every result carries a date' },
+const SEARCH_COSTS: Array<{
+  key: 'twitter' | 'reddit' | 'google' | 'news';
+  channel: string;
+  credits: number;
+  note: string;
+}> = [
+  { key: 'twitter', channel: 'X / Twitter', credits: 1, note: 'latest posts, not all-time top' },
+  { key: 'reddit', channel: 'Reddit', credits: 2, note: 'two providers, one search for you' },
+  { key: 'google', channel: 'Web', credits: 1, note: 'rich results with dates' },
+  { key: 'news', channel: 'Press & news', credits: 1, note: 'every result carries a date' },
 ];
+
+/**
+ * What one full daily sweep costs at the product's own caps: eight keywords
+ * across the three most expensive channels, since only three run at once.
+ *
+ * The maximum rather than an average, on purpose. Quoting an average would
+ * flatter every package, and someone who later tracks all eight keywords on the
+ * pricier channels would find their credits gone sooner than they were told.
+ */
+const MAX_KEYWORDS_PER_SWEEP = 8;
+const MAX_CHANNELS_PER_SWEEP = 3;
+const SWEEP_COST =
+  MAX_KEYWORDS_PER_SWEEP *
+  [...SEARCH_COSTS]
+    .sort((a, b) => b.credits - a.credits)
+    .slice(0, MAX_CHANNELS_PER_SWEEP)
+    .reduce((sum, s) => sum + s.credits, 0);
 
 /** Credits granted to a new account, matching the welcome grant in the database. */
 const WELCOME_CREDITS = 20;
@@ -149,6 +171,26 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     packages.length > 0 && packages[0].credits > 0
       ? packages[0].gross_usd / packages[0].credits
       : 0.05;
+
+  /**
+   * Buying from the landing page and buying from the billing tab should feel like
+   * one continuous action, not two. The package chosen out here is carried across
+   * so the billing page opens on the card they picked rather than making them
+   * choose it a second time.
+   *
+   * sessionStorage rather than a query string, because the destination depends on
+   * whether they are signed in and two URLs would mean reading it on both ends.
+   */
+  const beginPurchase = (code: string) => {
+    try {
+      sessionStorage.setItem('echo_intended_package', code);
+    } catch {
+      // Private browsing, or storage disabled. Losing the hint is a small
+      // annoyance; failing to render the page over it would be absurd.
+    }
+    if (isLoggedIn) onNavigateDashboard();
+    else onNavigateAuth();
+  };
 
   // Prices come from topup_packages, the same table checkout charges from. The
   // fallback above only applies where nothing is deployed. A landing page that
@@ -543,6 +585,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         searchCosts={SEARCH_COSTS}
         welcomeCredits={WELCOME_CREDITS}
         perSearchPrice={perSearchPrice}
+        sweepCost={SWEEP_COST}
+        onBuy={beginPurchase}
         onStart={() => (isLoggedIn ? onNavigateDashboard() : onNavigateAuth())}
       />
 
