@@ -46,8 +46,11 @@ graph TD
 - **Inspection Modal**: Deep-dive lead modal showing author follower count, bio, channel source, and raw payload.
 
 ### Phase 4: Workspace Preferences (Implemented)
-- **No billing.** Echo is free. There is no plan, no purchase, no payment processor and no credit balance. Every workspace gets the same allowance: 8 keywords, 3 channels scanned at once out of 4 available, and a daily sweep.
-- **Limits are constants, not entitlements.** `public.keyword_limit()` and `public.channel_limit()` exist so the ceiling is enforced in one place and cannot be raised per workspace.
+- **Prepaid credits, not subscriptions.** There is no plan, no recurring charge and no entitlement tier. A workspace buys a credit balance (1 credit = $0.05; packages 200/$10, 500/$25, 1000/$50) through a Dodo Payments checkout, and search draws it down. A new workspace starts with 20 welcome credits.
+- **Two gates, both server-side.** The credit balance and the product caps apply together and refuse separately, with distinct messages: out of credits is a refusal, never a loan, and a sweep that cannot be paid for in full does not run partially.
+- **Limits are constants, not entitlements.** `public.keyword_limit()` (8) and `public.channel_limit()` (3) exist so the ceiling is enforced in one place and cannot be raised per workspace. Every workspace has the same allowance.
+- **Cost is measured, not assumed.** Each provider call is priced from the cost header on its response and recorded per call, so gross revenue, provider cost and margin are all real figures rather than a rate card.
+- **Only the backend moves money.** Credits are granted by the payment webhook after it verifies a signature, and spent through six service-role RPCs. No credit is ever granted or charged from the browser.
 - **Workspace Preferences**: custom sweep time, cadence, lookback window (24h/48h), active channel configuration, minimum intent threshold, and feed retention.
 
 ### Phase 5: CRM Sync & Enterprise (Roadmap)
@@ -209,5 +212,5 @@ alter table public.sweep_runs enable row level security;
 1. **Local Development:** Run `npm run dev` and open `http://localhost:5173/`.
 2. **Onboarding Flow:** Launch the app, enter Name, Website, Core Offer, add 4 keywords from suggestions, and verify the confetti explosion.
 3. **Feed Verification:** Filter by platform (X vs LinkedIn), expand post bodies with "Show more", generate an AI outreach draft, and toggle lead statuses.
-4. **Keyword Enforcement:** Add keywords until 10 are active; verify that the input is locked and the warning notice displays.
-5. **Settings & Billing:** Configure Webhook URL, adjust lookback window, change subscription tier, and verify usage meters.
+4. **Keyword Enforcement:** Add keywords until 8 are active; verify that the input is locked and the warning notice displays.
+5. **Settings & Billing:** Configure Webhook URL, adjust lookback window and feed retention, buy a credit package, and verify the balance, the per-operation cost table and the credit ledger.

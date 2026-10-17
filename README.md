@@ -126,22 +126,39 @@ select cron.schedule(
 |---|---|
 | Vendor API keys | Held only in Edge Function secrets; never in `.env` or the bundle |
 | Sweep function | Requires the `x-sweep-secret` header — not publicly invokable |
+| Credits | Only six service-role RPCs move them; the browser cannot grant or charge |
+| Payment events | HMAC-verified over the raw body before anything is granted |
 | Edge functions | Verify the caller's JWT and derive identity server-side; per-user rate limits |
 | Keyword limits | Enforced by a Postgres trigger, not just the client |
 | Webhook URLs | Validated against Slack/Discord host allow-list |
 
 ---
 
-## 🆓 No billing
+## 💳 Prepaid credits
 
-Echo is free. There is no plan, no purchase, no payment processor and no credit
-balance, so there is nothing to configure and nothing to keep in sync between
-client and server.
+Echo sells prepaid credits. One credit is **$0.05** — packages are 200/$10,
+500/$25, 1,000/$50. There are no subscriptions, no recurring charges and no
+plans.
 
-The ceilings on a workspace are constants in one place, enforced by a trigger:
-`public.keyword_limit()` (8) and `public.channel_limit()` (3). They exist because
-search runs on a metered provider and the per-workspace cost has to be bounded —
-they are not a way to charge more.
+Every search is measured against what it actually cost, not a rate card: each
+Treg call is priced from the `x-treg-cost-micro` header on its response and
+written to `api_usage`. A call that fails costs nothing; a call that is
+uncertain is never auto-refunded, because that is how a workspace ends up served
+for free.
+
+Out of credits is a refusal, not a loan. There is no negative balance, no
+overdraft and no partial sweep — if a sweep cannot be paid for in full, it does
+not run. Product caps apply alongside the balance and say so separately:
+`public.keyword_limit()` (8) and `public.channel_limit()` (3).
+
+**Supabase owns the wallet, not the payment provider.** Credits arrive only
+through the `billing-webhook` edge function, after the backend has verified a
+payment signature. The browser can read a balance and nothing else: every
+function that moves credits is `SECURITY DEFINER` with a pinned `search_path`
+and revoked from `anon` and `authenticated`.
+
+See [`supabase/README.md`](supabase/README.md) for the wallet RPCs, the
+two-phase reserve/settle model and the margin views.
 
 ---
 
@@ -149,10 +166,15 @@ they are not a way to charge more.
 
 | Table | Notes |
 |---|---|
-| `profiles` | One row per user; plan, sweep settings and intent threshold |
-| `keywords` | Max 8/20/40 active depending on plan, enforced by trigger |
+| `profiles` | One row per user; sweep settings, intent threshold, retention |
+| `keywords` | Max 8 active, enforced by trigger on the server |
 | `monitored_posts` | Unique on `(user_id, post_url)`; written by edge functions |
 | `sweep_runs` | Cron audit log (service-role only) |
+| `wallet` | Balance, reserved, lifetime totals, recognised revenue |
+| `credit_grants` | Each purchase as its own row at its own price |
+| `credit_ledger` | Every credit movement; `idempotency_key` unique |
+| `api_usage` | One row per Treg call with its real cost |
+| `pricing_config` | Credit price per operation, change-audited |
 
 ---
 
