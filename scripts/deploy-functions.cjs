@@ -43,7 +43,10 @@ const FUNCTIONS = {
   billing: true,
   'daily-sweep': false,
   'billing-webhook': false,
-  leads: true, // added in Phase 1 of the Leads build; user actions use a JWT
+  // Cron-driven, like daily-sweep. It was marked true when the tab was built,
+  // before the function existed, and that value would have 401'd the worker
+  // every minute while cron reported success.
+  leads: false,
 };
 
 const only = process.argv.slice(2);
@@ -70,7 +73,20 @@ for (const name of targets) {
   if (!verify) args.push('--no-verify-jwt');
 
   console.log(`deploying ${name} (verify_jwt=${verify})`);
-  execFileSync('npx', args, { cwd: ROOT, stdio: 'inherit' });
+  // Two Windows problems, in order. npx is a shell script rather than an
+  // executable, so spawning 'npx' directly is ENOENT; resolving it to npx.cmd
+  // fixes that but then fails EINVAL, because a .cmd is only executable through
+  // a shell. So on Windows the whole thing goes through shell:true.
+  const isWin = process.platform === 'win32';
+  const npx = isWin ? 'npx.cmd' : 'npx';
+  execFileSync(npx, args, {
+    cwd: ROOT,
+    stdio: 'inherit',
+    // Quoting is left to the shell here; args contain no user input, only
+    // function names from the map above and the project ref from the
+    // environment.
+    shell: isWin,
+  });
 }
 
 // Prove the cron-driven one is actually reachable the way cron reaches it, and
