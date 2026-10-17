@@ -5,10 +5,12 @@ import { getRun } from '../../lib/leads';
 import { supabase } from '../../lib/supabase';
 import { subscribeToRun, mergeRow, summarise } from '../../lib/leads-live';
 import { RunsList } from '../leads/RunsList';
+import { CleanList } from '../leads/CleanList';
 import { LeadsTable } from '../leads/LeadsTable';
 import { RunStatusPill } from '../leads/StatusBadge';
 import { CreditsMeter, Counter } from '../leads/CreditsMeter';
 import { EmptyPanel, EmptyState } from '../leads/EmptyPanel';
+import { ExportMenu } from '../leads/ExportMenu';
 
 /**
  * The Leads tab.
@@ -54,12 +56,7 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ view, runId, onViewChange, o
         <NewSearchPlaceholder onBack={() => onViewChange('runs')} />
       )}
 
-      {view === 'clean' && (
-        <EmptyPanel
-          title="Clean a list"
-          body="Import a CSV of people or companies and Echo will verify the addresses it already has, and find the ones it does not. The price is shown before anything runs."
-        />
-      )}
+      {view === 'clean' && <CleanList onOpenRun={onOpenRun} />}
 
       {view === 'lab' && (
         <EmptyPanel
@@ -248,6 +245,7 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
           </span>
 
           <div className="ml-auto flex items-center gap-6">
+        <ExportMenu runId={runId} rowCount={total} />
             <Counter label="Found" value={stats.found} />
             <Counter label="Verified" value={stats.verified} tone={stats.verified ? 'good' : 'default'} />
             <Counter label="Catch-all" value={stats.catchAll} tone={stats.catchAll ? 'warn' : 'default'} />

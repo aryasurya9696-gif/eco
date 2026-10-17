@@ -204,6 +204,85 @@ export async function estimateRun(input: {
 }
 
 // ---------------------------------------------------------------------------
+// Starting and feeding a run
+// ---------------------------------------------------------------------------
+
+/**
+ * The most rows one run can be priced for.
+ *
+ * `start_run` clamps its target to 2000 before it calls `estimate_lead_run`, and
+ * it is the *maximum* that is checked against the wallet. Importing more than
+ * this into a run priced for 2000 would be working past the ceiling that was
+ * reserved, so the run would pause on credits partway through instead of failing
+ * at the start — which is the worse of the two places to find out. The cap is
+ * enforced here and the user is told, rather than discovered.
+ */
+export const MAX_RUN_ROWS = 2000;
+
+/** What the function takes, and what it gives back on failure. */
+export type StartRunResult =
+  | { ok: true; run: LeadRun }
+  | { ok: false; error: string; message?: string; shortfall?: number; max_credits?: number };
+
+export async function startRun(input: {
+  kind: 'find' | 'clean' | 'lab';
+  target: number;
+  name?: string;
+  mode?: string;
+  icp_id?: string | null;
+  phone?: boolean;
+  company_data?: boolean;
+  row_cap_usd?: number;
+}): Promise<StartRunResult> {
+  return invokeFunction<StartRunResult>('leads', {
+    action: 'start',
+    ...input,
+    // Clamped here as well as server-side, so the target the user is told about
+    // and the target that is priced are the same number rather than the first
+    // being optimistic and the second quietly smaller.
+    target: Math.max(1, Math.min(MAX_RUN_ROWS, Math.floor(input.target))),
+  });
+}
+
+/**
+ * Union, because the function has two answers.
+ *
+ * `skipped` is not an error and is not a failure count. It is rows that matched
+ * something on the caller's opt-outs list and were therefore never written — so
+ * it is reported alongside the inserted count rather than as an exception, and a
+ * suppressed row is never billed for.
+ */
+export type ImportResult =
+  | { ok: true; inserted: number; skipped: number }
+  | { ok: false; error: string };
+
+/**
+ * Sends one batch of rows into an existing run.
+ *
+ * One thousand is the function's own cap and it slices to that, so a larger batch
+ * would be silently truncated and the caller would believe every row went in.
+ * The caller batches; this refuses to pretend otherwise.
+ */
+export async function importRows(
+  runId: string,
+  rows: Array<{
+    person_name?: string;
+    first_name?: string;
+    last_name?: string;
+    company_name?: string;
+    domain?: string;
+    website?: string;
+    title?: string;
+    email?: string;
+    linkedin_url?: string;
+    extra?: Record<string, string>;
+  }>,
+): Promise<ImportResult> {
+  if (rows.length > 1000) throw new Error('importRows takes at most 1000 rows');
+  return invokeFunction<ImportResult>('leads', { action: 'import', run_id: runId, rows });
+}
+
+// ---------------------------------------------------------------------------
 // Controls
 // ---------------------------------------------------------------------------
 
