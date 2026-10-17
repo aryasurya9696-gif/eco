@@ -21,7 +21,6 @@ import {
   formatDateTime,
   formatUsd,
   creditsToUsd,
-  operationLabel,
   ledgerLabel,
   type History,
   type Package,
@@ -345,63 +344,19 @@ export const BillingTab: React.FC = () => {
         </p>
       </section>
 
-      {/* ---- Recent searches ---------------------------------------------- */}
-      <section>
-        <h2 className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] mb-3">
-          Recent searches
-        </h2>
-        {history.usage.length === 0 ? (
-          <p className="text-xs text-[#8a8a86] py-4">No searches yet.</p>
-        ) : (
-          <>
-            {/* Hidden columns rather than a horizontal scroll. Five columns of
-                short values do not need a scrollbar on a narrow screen, they need
-                one of them hidden — and the one dropped is the least important
-                to the person reading it. */}
-            <div className="border border-[#e3e3de] bg-white">
-              <table className="w-full text-xs table-fixed">
-                <thead>
-                  <tr className="border-b border-[#eeeeea] text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">
-                    <th className="text-left font-normal px-3 py-2.5 w-[34%]">When</th>
-                    <th className="text-left font-normal px-3 py-2.5 w-[24%]">Channel</th>
-                    <th className="text-right font-normal px-3 py-2.5 w-[16%]">Credits</th>
-                    <th className="text-right font-normal px-3 py-2.5 hidden sm:table-cell">
-                      Cost to us
-                    </th>
-                    <th className="text-left font-normal px-3 py-2.5 w-[26%]">Result</th>
-                  </tr>
-                </thead>
-                <tbody className="font-mono">
-                  {history.usage.map((u) => (
-                    <tr key={u.id} className="border-b border-[#f5f5f2] last:border-0">
-                      <td className="px-3 py-2.5 text-[#8a8a86] truncate">
-                        {formatDateTime(u.created_at)}
-                      </td>
-                      <td className="px-3 py-2.5 text-[#141414] truncate">
-                        {operationLabel(u.operation)}
-                      </td>
-                      <td className="px-3 py-2.5 text-right text-[#141414]">
-                        {u.credits_charged > 0 ? formatCredits(u.credits_charged) : '—'}
-                      </td>
-                      <td className="px-3 py-2.5 text-right text-[#8a8a86] hidden sm:table-cell">
-                        {formatUsd(u.provider_cost_usd)}
-                      </td>
-                      <td className="px-3 py-2.5">
-                        <OutcomeBadge outcome={u.outcome} />
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <p className="text-[10px] text-[#8a8a86] font-mono mt-2 max-w-2xl leading-relaxed">
-              Cost is what the search provider reported for that call, not an estimate.
-              A search that found nothing, or that the provider charged nothing for, is
-              not billed.
-            </p>
-          </>
-        )}
-      </section>
+        {/*
+          A per-search log used to live here, showing what each call cost us.
+
+          Removed on request. Every column was either internal - our provider
+          cost, which the customer cannot act on and did not ask about - or a
+          restatement of the credit balance the wallet card above already shows.
+          It was also the only section rendering values straight out of the usage
+          rows, so it was the one thing here that could go wrong quietly.
+
+          The billing API still returns usage, so this changes what the page shows
+          rather than what the system records. The numbers stay in api_usage and in
+          the reconciliation views.
+        */}
 
       {/* ---- Payments ----------------------------------------------------- */}
       <section>
@@ -412,16 +367,16 @@ export const BillingTab: React.FC = () => {
           <p className="text-xs text-[#8a8a86] py-4">No payments yet.</p>
         ) : (
           <div className="border border-[#e3e3de] bg-white">
-            <table className="w-full text-xs table-fixed">
+            <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-[#eeeeea] text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">
-                  <th className="text-left font-normal px-3 py-2.5 w-[24%]">Date</th>
-                  <th className="text-left font-normal px-3 py-2.5 w-[26%]">Package</th>
-                  <th className="text-right font-normal px-3 py-2.5 w-[20%]">Amount</th>
-                  <th className="text-right font-normal px-3 py-2.5 hidden sm:table-cell w-[16%]">
+                  <th className="text-left font-normal px-3 py-2.5">Date</th>
+                  <th className="text-left font-normal px-3 py-2.5">Package</th>
+                  <th className="text-right font-normal px-3 py-2.5">Amount</th>
+                  <th className="text-right font-normal px-3 py-2.5 hidden sm:table-cell">
                     Credits
                   </th>
-                  <th className="text-left font-normal px-3 py-2.5 w-[14%]">Status</th>
+                  <th className="text-left font-normal px-3 py-2.5">Status</th>
                 </tr>
               </thead>
               <tbody className="font-mono">
@@ -455,13 +410,13 @@ export const BillingTab: React.FC = () => {
             Balance history
           </h2>
           <div className="border border-[#e3e3de] bg-white">
-            <table className="w-full text-xs table-fixed">
+            <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-[#eeeeea] text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">
-                  <th className="text-left font-normal px-3 py-2.5 w-[34%]">When</th>
-                  <th className="text-left font-normal px-3 py-2.5 w-[28%]">Type</th>
-                  <th className="text-right font-normal px-3 py-2.5 w-[20%]">Change</th>
-                  <th className="text-right font-normal px-3 py-2.5 w-[18%]">Balance</th>
+                  <th className="text-left font-normal px-3 py-2.5">When</th>
+                  <th className="text-left font-normal px-3 py-2.5">Type</th>
+                  <th className="text-right font-normal px-3 py-2.5">Change</th>
+                  <th className="text-right font-normal px-3 py-2.5">Balance</th>
                 </tr>
               </thead>
               <tbody className="font-mono">
@@ -491,18 +446,6 @@ export const BillingTab: React.FC = () => {
       )}
     </div>
   );
-};
-
-const OutcomeBadge: React.FC<{ outcome: string }> = ({ outcome }) => {
-  const map: Record<string, { label: string; cls: string }> = {
-    success: { label: 'Found', cls: 'text-emerald-700' },
-    free: { label: 'No charge', cls: 'text-[#8a8a86]' },
-    upstream_failed: { label: 'Provider failed', cls: 'text-amber-700' },
-    not_billed: { label: 'Not billed', cls: 'text-[#8a8a86]' },
-    uncertain: { label: 'Pending', cls: 'text-amber-700' },
-  };
-  const m = map[outcome] ?? { label: outcome, cls: 'text-[#8a8a86]' };
-  return <span className={`text-[10px] ${m.cls}`}>{m.label}</span>;
 };
 
 const StatusBadge: React.FC<{ status: string }> = ({ status }) => {
