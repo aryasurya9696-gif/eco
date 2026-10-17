@@ -10,8 +10,6 @@ import { supabase, isConfigured } from '../lib/supabase';
 import { invokeSearchSweep } from '../lib/sweep';
 import type { KeywordSuggestionResult } from '../lib/ai';
 import { generateAiOutreachDraft, generateAiKeywordsFromOffer } from '../lib/ai';
-import { invokeFunction } from '../lib/api';
-import { SUBSCRIPTION_PLANS } from '../lib/billing';
 import { useAuth } from './AuthContext';
 import type { Keyword, MonitoredPost, Platform, LeadStatus } from '../types';
 
@@ -21,8 +19,6 @@ interface ToastMessage {
   type: 'info' | 'success' | 'error';
 }
 
-type PlanId = 'starter' | 'pro' | 'scale';
-type BillingInterval = 'month' | 'year';
 
 interface EchoContextType {
   keywords: Keyword[];
@@ -76,16 +72,6 @@ interface EchoContextType {
   saveSettings: () => Promise<void>;
   enabledChannels: Platform[];
   toggleChannel: (platform: Platform) => void;
-  // Subscription
-  subscriptionPlan: PlanId;
-  subscriptionInterval: BillingInterval;
-  subscriptionStatus: 'active' | 'past_due' | 'canceled';
-  subscriptionRenewsAt: string;
-  changeSubscriptionPlan: (
-    planId: PlanId,
-    interval: BillingInterval
-  ) => Promise<{ success: boolean; error?: string }>;
-  currentPlan: PlanId;
   /** Mentions surfaced since this session started (a cheap usage readout). */
   mentionsFound: number;
 }
@@ -96,15 +82,11 @@ const LOCAL_STORAGE_KEYWORDS_KEY = 'echo_mock_keywords';
 const LOCAL_STORAGE_POSTS_KEY = 'echo_mock_posts';
 const LOCAL_STORAGE_SETTINGS_KEY = 'echo_mock_settings';
 
-/** Plan -> keyword allowance. Derived from billing.ts; mirrors
- *  public.plan_keyword_limit() in Postgres. */
-const PLAN_KEYWORD_LIMITS: Record<PlanId, number> = SUBSCRIPTION_PLANS.reduce(
-  (acc, plan) => {
-    acc[plan.id] = plan.keywordLimit;
-    return acc;
-  },
-  {} as Record<PlanId, number>,
-);
+/**
+ * How many keywords a workspace may track. Mirrors public.keyword_limit()
+ * in Postgres, which is what actually enforces it.
+ */
+const KEYWORD_LIMIT = 8;
 
 const channelLabel = (platform: Platform): string => {
   if (platform === 'twitter') return 'X';
@@ -123,13 +105,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [isSweeping, setIsSweeping] = useState<boolean>(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
-  // Subscription
-  const [subscriptionPlan, setSubscriptionPlan] = useState<PlanId>('starter');
-  const [subscriptionInterval, setSubscriptionInterval] = useState<BillingInterval>('month');
-  const [subscriptionStatus, setSubscriptionStatus] =
-    useState<'active' | 'past_due' | 'canceled'>('active');
-  const [subscriptionRenewsAt, setSubscriptionRenewsAt] = useState<string>('');
-
+  
   // Filtering
   const [filterKeyword, setFilterKeyword] = useState<string>('all');
   const [filterPlatform, setFilterPlatform] = useState<Platform | 'all'>('all');
@@ -145,7 +121,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [enabledChannels, setEnabledChannels] = useState<Platform[]>(['twitter', 'reddit', 'google']);
   const [mentionsFound, setMentionsFound] = useState<number>(0);
 
-  const keywordLimit = PLAN_KEYWORD_LIMITS[subscriptionPlan];
+  const keywordLimit = KEYWORD_LIMIT;
 
   // --- Toasts ---------------------------------------------------------------
   const dismissToast = useCallback((id: string) => {
@@ -268,10 +244,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (Array.isArray(profile.enabled_channels) && profile.enabled_channels.length > 0) {
         setEnabledChannels(profile.enabled_channels);
       }
-      if (profile.subscription_plan) setSubscriptionPlan(profile.subscription_plan);
-      if (profile.subscription_interval) setSubscriptionInterval(profile.subscription_interval);
-      if (profile.subscription_status) setSubscriptionStatus(profile.subscription_status);
-      if (profile.subscription_renews_at) setSubscriptionRenewsAt(profile.subscription_renews_at);
     }
 
     // Local sandbox preferences overlay (mock mode only for server fields).
@@ -288,7 +260,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (parsed.feedRetentionDays !== undefined) {
           setFeedRetentionDays(parsed.feedRetentionDays);
         }
-        if (parsed.currentPlan !== undefined) setSubscriptionPlan(parsed.currentPlan);
         if (Array.isArray(parsed.enabledChannels) && parsed.enabledChannels.length > 0) {
           setEnabledChannels(parsed.enabledChannels);
         }
@@ -322,7 +293,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (!user) return { success: false, error: 'You must be logged in.' };
 
       if (keywords.length >= keywordLimit) {
-        const errorMsg = `Your ${subscriptionPlan} plan allows ${keywordLimit} keywords — remove one to add another.`;
+        const errorMsg = `You can track ${keywordLimit} keywords - remove one to add another.`;
         addToast(errorMsg, 'error');
         return { success: false, error: errorMsg };
       }
@@ -367,7 +338,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       addToast(`Added keyword "${clean}"`, 'success');
       return { success: true };
     },
-    [keywords, keywordLimit, subscriptionPlan, user, addToast, loadKeywords],
+    [keywords, keywordLimit, user, addToast, loadKeywords],
   );
 
   const removeKeyword = useCallback(
@@ -566,35 +537,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [profile, keywords, enabledChannels, keywordLimit, lookbackHours],
   );
 
-  // --- Subscription ---------------------------------------------------------
-
-  const changeSubscriptionPlan = useCallback(
-    async (planId: PlanId, interval: BillingInterval): Promise<{ success: boolean; error?: string }> => {
-      if (!isConfigured) {
-        setSubscriptionPlan(planId);
-        setSubscriptionInterval(interval);
-        addToast(`[Sandbox] Switched to the ${planId} plan.`, 'success');
-        return { success: true };
-      }
-
-      try {
-        const res = await invokeFunction<{ checkoutUrl?: string }>('billing', {
-          planId,
-          interval,
-        });
-
-        if (!res?.checkoutUrl) {
-          return { success: false, error: 'Checkout is unavailable. Payments may not be configured.' };
-        }
-        window.location.href = res.checkoutUrl;
-        return { success: true };
-      } catch (err) {
-        return { success: false, error: (err as Error)?.message };
-      }
-    },
-    [addToast],
-  );
-
   // --- Settings persistence -------------------------------------------------
 
   const saveSettings = useCallback(async () => {
@@ -604,7 +546,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       `${LOCAL_STORAGE_SETTINGS_KEY}_${user.id}`,
       JSON.stringify({
         lookbackHours,
-        currentPlan: subscriptionPlan,
         sweepTime,
         sweepCadence,
         minIntentThreshold,
@@ -636,7 +577,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [
     user,
     lookbackHours,
-    subscriptionPlan,
     sweepTime,
     sweepCadence,
     minIntentThreshold,
@@ -808,12 +748,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       saveSettings,
       enabledChannels,
       toggleChannel,
-      subscriptionPlan,
-      subscriptionInterval,
-      subscriptionStatus,
-      subscriptionRenewsAt,
-      changeSubscriptionPlan,
-      currentPlan: subscriptionPlan,
       mentionsFound,
     }),
     [
@@ -849,11 +783,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       saveSettings,
       enabledChannels,
       toggleChannel,
-      subscriptionPlan,
-      subscriptionInterval,
-      subscriptionStatus,
-      subscriptionRenewsAt,
-      changeSubscriptionPlan,
       mentionsFound,
     ],
   );

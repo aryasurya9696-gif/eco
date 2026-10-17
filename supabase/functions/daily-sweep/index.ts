@@ -35,9 +35,7 @@ const TREG_BASE = 'https://treg.to';
 
 /** Hard caps so one busy day can never run away. */
 const MAX_USERS_PER_RUN = 500;
-// Must equal public.plan_max_keywords(). A workspace cannot be given more
-// keywords than this, so anything higher would be dead headroom.
-const MAX_KEYWORDS_PER_USER = 40;
+const MAX_KEYWORDS_PER_USER = 8;
 
 type Platform = 'twitter' | 'reddit' | 'google' | 'news';
 
@@ -49,25 +47,14 @@ type SweepSettings = {
   sweep_time_utc: string | null;
   /** '6h' | '12h' | '24h'. Anything else is treated as '24h'. */
   sweep_frequency: string | null;
-  subscription_plan: string | null;
 };
 
 /**
- * Plan limits. MUST stay in sync with SUBSCRIPTION_PLANS in
- * src/lib/billing.ts -- the client already hides the options a plan cannot
- * buy, but this is the authority that actually enforces them.
+ * Echo is free, so these are the product's limits rather than anything a
+ * workspace can buy past. They mirror public.keyword_limit() and
+ * public.channel_limit().
  */
-const PLAN_MIN_SWEEP_HOURS: Record<string, number> = {
-  starter: 24,
-  pro: 12,
-  scale: 6,
-};
-
-const PLAN_MAX_CHANNELS: Record<string, number> = {
-  starter: 3,
-  pro: 4,
-  scale: 4,
-};
+const MAX_CHANNELS = 3;
 
 /** Interval length in hours for a stored cadence string. */
 function cadenceHoursOf(frequency: string | null | undefined): number {
@@ -236,11 +223,6 @@ function sinceDate(lookbackHours: number): string {
 //   GET https://treg.to/catalog/endpoints/<id>  ->  endpoint.cost.usd
 //
 // They matter twice over: they set the running total reported at the end of a
-// sweep, and they are what the plan limits in public.plan_keyword_limit() are
-// sized against. Guessing low here makes every margin figure a fiction, which
-// is how the twitter rate came to be recorded at less than half its real cost.
-//
-// Keep in step with supabase/migrations/20261024_billing_economics.sql.
 // ---------------------------------------------------------------------------
 const TREG_COST_USD = {
   twitter: 0.00075,        // anyapi.x.search.posts                  observed 2026-09-11
@@ -249,41 +231,6 @@ const TREG_COST_USD = {
   google: 0.00015,         // crawl4ai.web.search.rich               observed 2026-10-09
   news: 0,                 // tinyfish.web.search.news               rate card 2026-09-23
 } as const;
-
-// Credits charged per successful call. These are the customer-facing prices and
-// live in public.billing_config under 'operation_pricing' so an admin can
-// retune them without a deploy; the values here are only the fallback used when
-// the config row is missing.
-//
-// The ratio between credits and cost is what sets the margin on each call. At
-// 20 credits per dollar one credit is $0.05, so a Reddit call at 2 credits
-// ($0.10) against a $0.00288 cost is a 97% margin.
-const DEFAULT_CREDITS_PER_OPERATION: Record<string, number> = {
-  sweep_call_twitter: 1,
-  sweep_call_reddit: 2,
-  sweep_call_google: 1,
-  sweep_call_news: 0,
-};
-
-let operationCredits: Record<string, number> = { ...DEFAULT_CREDITS_PER_OPERATION };
-
-/** Accumulators, reset per run. */
-let creditsCharged = 0;
-const perOperation = new Map<string, { calls: number; credits: number; costUsd: number }>();
-
-function tally(operation: string, costUsd: number) {
-  creditsCharged += operationCredits[operation] ?? 0;
-  const row = perOperation.get(operation) ?? { calls: 0, credits: 0, costUsd: 0 };
-  row.calls += 1;
-  row.credits += operationCredits[operation] ?? 0;
-  row.costUsd += costUsd;
-  perOperation.set(operation, row);
-}
-
-function resetCreditCounters() {
-  creditsCharged = 0;
-  perOperation.clear();
-}
 
 
 /**
@@ -315,7 +262,7 @@ let callsMade = 0;
 
 async function tregCall(
   endpointId: string,
-  opts: { method?: 'GET' | 'POST'; query?: Record<string, string | number | undefined>; body?: unknown; costUsd: number; operation: string; timeoutMs?: number },
+  opts: { method?: 'GET' | 'POST'; query?: Record<string, string | number | undefined>; body?: unknown; costUsd: number; timeoutMs?: number },
 ): Promise<any | null> {
   if (!tregToken) return null;
 
@@ -350,7 +297,6 @@ async function tregCall(
     }
 
     usdSpent += opts.costUsd;
-    tally(opts.operation, opts.costUsd);
     return await res.json();
   } catch (err) {
     console.warn(`[treg] ${endpointId} threw:`, (err as Error)?.name);
@@ -486,7 +432,6 @@ async function searchChannel(
       // is what once put a 2021 tweet into the feed.
       body: { query: kw, queryType: 'Latest', limit: 20 },
       costUsd: TREG_COST_USD.twitter,
-      operation: 'sweep_call_twitter',
     });
     const items = t?.output?.data?.items ?? [];
     return items.length
@@ -503,7 +448,6 @@ async function searchChannel(
         sort: 'RELEVANCE', time_range: redditTimeframe(lookbackHours), need_format: 'true',
       },
       costUsd: TREG_COST_USD.reddit,
-      operation: 'sweep_call_reddit',
     });
     const tkItems = tk?.data?.posts ?? tk?.posts ?? [];
     if (Array.isArray(tkItems) && tkItems.length) {
@@ -513,7 +457,6 @@ async function searchChannel(
     const sc = await tregCall('scrapecreators.reddit.search.posts', {
       query: { query: kw, timeframe: redditTimeframe(lookbackHours), sort: 'relevance', limit: 25 },
       costUsd: TREG_COST_USD.redditFallback,
-      operation: 'sweep_call_reddit',
     });
     const scItems = sc?.posts ?? [];
     return Array.isArray(scItems) && scItems.length
@@ -523,7 +466,7 @@ async function searchChannel(
 
   if (platform === 'google') {
     const r = await tregCall('crawl4ai.web.search.rich', { query: { q: kw, rich: 1 }, costUsd: TREG_COST_USD.google,
-      operation: 'sweep_call_google', timeoutMs: 25000 });
+      timeoutMs: 25000 });
     const items = r?.results ?? [];
     return Array.isArray(items) && items.length
       ? items.map((x: any) => mapWeb(x, userId, kwId, kw)).filter((r2): r2 is PostRow => !!r2)
@@ -534,7 +477,6 @@ async function searchChannel(
     const r = await tregCall('tinyfish.web.search.news', {
       query: { query: kw, domain_type: 'news', after_date: sinceDate(lookbackHours) },
       costUsd: TREG_COST_USD.news,
-      operation: 'sweep_call_news',
     });
     const items = r?.results ?? [];
     return Array.isArray(items) && items.length
@@ -607,28 +549,6 @@ Deno.serve(async (req) => {
   usdSpent = 0;
   usdSpentBefore = 0;
   callsMade = 0;
-  resetCreditCounters();
-
-  // Credit prices are admin-tunable, so read them rather than trusting the
-  // compiled-in defaults. A failure here is not fatal: the defaults are the
-  // published list prices.
-  try {
-    const { data: cfg } = await supabase
-      .from('billing_config')
-      .select('value')
-      .eq('key', 'operation_pricing')
-      .maybeSingle();
-    const configured: Record<string, number> = {};
-    for (const [key, entry] of Object.entries(cfg?.value ?? {})) {
-      const credits = Number((entry as any)?.credits);
-      if (Number.isFinite(credits)) configured[key] = credits;
-    }
-    if (Object.keys(configured).length > 0) {
-      operationCredits = { ...DEFAULT_CREDITS_PER_OPERATION, ...configured };
-    }
-  } catch {
-    // Keep the defaults.
-  }
 
   const { data: runRow } = await supabase.from('sweep_runs').insert({}).select().single();
   const runId = runRow?.id;
@@ -686,7 +606,6 @@ Deno.serve(async (req) => {
       min_intent_threshold: p.min_intent_threshold,
       sweep_time_utc: p.sweep_time_utc,
       sweep_frequency: p.sweep_frequency,
-      subscription_plan: p.subscription_plan,
     });
   }
 
@@ -700,13 +619,7 @@ Deno.serve(async (req) => {
     if (userKeywords.length === 0) continue;
 
     const settings = settingsByUser.get(userId);
-    const plan = settings?.subscription_plan ?? 'starter';
-
-    // A plan caps how often a workspace may sweep. Clamp upwards so a
-    // downgraded workspace slows back down instead of keeping the faster
-    // cadence it bought on the old plan.
-    const planMinHours = PLAN_MIN_SWEEP_HOURS[plan] ?? 24;
-    const cadenceHours = Math.max(cadenceHoursOf(settings?.sweep_frequency), planMinHours);
+    const cadenceHours = cadenceHoursOf(settings?.sweep_frequency);
 
     // Respect the workspace's own sweep hour. Checked before the processed
     // counter so the two numbers mean what they say.
@@ -722,18 +635,18 @@ Deno.serve(async (req) => {
     // is what makes the per-workspace margin figure real.
     usdSpentBefore = usdSpent;
     const callsBefore = callsMade;
-    resetCreditCounters();
 
     const ALL: Platform[] = ['twitter', 'reddit', 'google', 'news'];
     const requested: Platform[] = Array.isArray(settings?.enabled_channels) && settings.enabled_channels.length > 0
       ? settings.enabled_channels.filter((c): c is Platform => ALL.includes(c as Platform))
       : ['twitter', 'reddit', 'google'];
-    // A plan also caps how many channels may be scanned. The Settings UI stops
-    // the over-limit selection from being made; this is the backstop.
-    const channels: Platform[] = requested.slice(0, PLAN_MAX_CHANNELS[plan] ?? 2);
+    // A flat cap on how many channels may be scanned. The Settings UI stops the
+    // over-limit selection from being made; this is the backstop.
+    const channels: Platform[] = requested.slice(0, MAX_CHANNELS);
     const lookbackHours = Number(settings?.lookback_hours) || 24;
     const minIntent = Number(settings?.min_intent_threshold) || 0;
     const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
+
     let droppedStale = 0;
 
     const rowsToUpsert: PostRow[] = [];
@@ -787,43 +700,6 @@ Deno.serve(async (req) => {
       errors.push({ user: userId, kw: '*', platform: 'prune', message: String(pruneErr) });
     }
 
-    // ---- settle the credit meter for this workspace -----------------------
-    // One call, carrying the per-channel breakdown in metadata, rather than one
-    // per provider call. Overdraft is allowed so a workspace keeps working while
-    // a top-up settles; the shortfall shows up as a negative balance and is
-    // visible on the billing page instead of silently producing an empty feed.
-    const userUsd = Number((usdSpent - usdSpentBefore).toFixed(6));
-    const userCalls = callsMade - callsBefore;
-    const breakdown = Object.fromEntries(perOperation);
-
-    if (userCalls > 0) {
-      try {
-        const { data: settled } = await supabase.rpc('spend_credits', {
-          p_user_id: userId,
-          p_credits: creditsCharged,
-          p_operation: 'sweep',
-          p_service_cost_usd: userUsd,
-          p_calls: userCalls,
-          p_provider: 'treg',
-          p_provider_ref: runId ?? null,
-          p_allow_overdraft: true,
-          p_idempotency_key: runId ? `sweep:${runId}:${userId}` : null,
-          p_metadata: { byOperation: breakdown, runId },
-        });
-
-        if (settled?.shortfall > 0) {
-          errors.push({
-            user: userId,
-            kw: '*',
-            platform: 'credits',
-            message: `Credit balance short by ${settled.shortfall} after this sweep.`,
-          });
-        }
-      } catch (spendErr) {
-        errors.push({ user: userId, kw: '*', platform: 'credits', message: String(spendErr) });
-      }
-    }
-
     totalStale += droppedStale;
   }
 
@@ -834,7 +710,6 @@ Deno.serve(async (req) => {
         finished_at: new Date().toISOString(),
         users_processed: usersProcessed,
         posts_inserted: postsInserted,
-        usd_spent: Number(usdSpent.toFixed(6)),
         errors,
       })
       .eq('id', runId);

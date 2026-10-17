@@ -38,7 +38,7 @@ export interface KeywordRequestContext {
   existingKeywords?: string[];
   /** Channels the workspace actually scans. */
   channels?: string[];
-  /** How many keywords the plan still allows. */
+  /** How many keywords the workspace still has room for. */
   slots?: number;
   lookbackHours?: number;
 }
@@ -55,7 +55,7 @@ interface DraftResponse {
 
 /**
  * Buyer-intent keyword suggestions derived from the user's core offer, the
- * content of their own website, and the channels their plan scans.
+ * content of their own website, and the channels they scan.
  */
 export async function generateAiKeywordsFromOffer(
   offerText: string,
@@ -177,7 +177,7 @@ export function fallbackKeywordSuggestions(
   ];
 
   const matched = CATEGORY_HINTS.filter((h) => h.match.test(lower)).flatMap((h) => h.core);
-  // Two categories: the smallest plan allows 5 keywords, and a third set only
+  // Two categories: a fresh workspace allows 8 keywords, and a third set only
   // filled the list with near-duplicates of the weakest one.
   const cats = (matched.length ? matched : ['b2b saas tool', 'workflow software']).slice(0, 2);
 

@@ -100,12 +100,10 @@ const MAX_KEYWORDS_PER_SWEEP = 25;
 // These are treg's own published prices, not estimates:
 //   GET https://treg.to/catalog/endpoints/<id>  ->  endpoint.cost.usd
 //
-// They matter twice over: they set the running total reported at the end of a
-// sweep, and they are what the plan limits in public.plan_keyword_limit() are
-// sized against. Guessing low here makes every margin figure a fiction, which
-// is how the twitter rate came to be recorded at less than half its real cost.
-//
-// Keep in step with supabase/migrations/20261024_billing_economics.sql.
+// They set the running total reported at the end of a search, which is the only
+// honest read on what the search layer costs to run. Guessing low makes that
+// figure a fiction, which is how the twitter rate came to be recorded at less
+// than half its real cost.
 // ---------------------------------------------------------------------------
 const TREG_COST_USD = {
   twitter: 0.00075,        // anyapi.x.search.posts                  observed 2026-09-11
@@ -115,40 +113,6 @@ const TREG_COST_USD = {
   news: 0,                 // tinyfish.web.search.news               rate card 2026-09-23
 } as const;
 
-// Credits charged per successful call. These are the customer-facing prices and
-// live in public.billing_config under 'operation_pricing' so an admin can
-// retune them without a deploy; the values here are only the fallback used when
-// the config row is missing.
-//
-// The ratio between credits and cost is what sets the margin on each call. At
-// 20 credits per dollar one credit is $0.05, so a Reddit call at 2 credits
-// ($0.10) against a $0.00288 cost is a 97% margin.
-const DEFAULT_CREDITS_PER_OPERATION: Record<string, number> = {
-  sweep_call_twitter: 1,
-  sweep_call_reddit: 2,
-  sweep_call_google: 1,
-  sweep_call_news: 0,
-};
-
-let operationCredits: Record<string, number> = { ...DEFAULT_CREDITS_PER_OPERATION };
-
-/** Accumulators, reset per run. */
-let creditsCharged = 0;
-const perOperation = new Map<string, { calls: number; credits: number; costUsd: number }>();
-
-function tally(operation: string, costUsd: number) {
-  creditsCharged += operationCredits[operation] ?? 0;
-  const row = perOperation.get(operation) ?? { calls: 0, credits: 0, costUsd: 0 };
-  row.calls += 1;
-  row.credits += operationCredits[operation] ?? 0;
-  row.costUsd += costUsd;
-  perOperation.set(operation, row);
-}
-
-function resetCreditCounters() {
-  creditsCharged = 0;
-  perOperation.clear();
-}
 
 
 /**
@@ -173,7 +137,7 @@ async function tregBalanceUsd(): Promise<number | null> {
 }
 
 let usdSpent = 0;
-/** Provider calls issued, for the credit settlement. */
+/** Provider calls issued, for the run telemetry. */
 let callsMade = 0;
 
 type Platform = 'twitter' | 'reddit' | 'google' | 'news';
@@ -352,7 +316,7 @@ async function resolveToken(admin: ReturnType<typeof createClient>): Promise<str
  */
 async function tregCall(
   endpointId: string,
-  opts: { method?: 'GET' | 'POST'; query?: Record<string, string | number | undefined>; body?: unknown; costUsd: number; operation: string; timeoutMs?: number },
+  opts: { method?: 'GET' | 'POST'; query?: Record<string, string | number | undefined>; body?: unknown; costUsd: number; timeoutMs?: number },
 ): Promise<any | null> {
   if (!tregToken) return null;
 
@@ -385,7 +349,6 @@ async function tregCall(
     }
 
     usdSpent += opts.costUsd;
-    tally(opts.operation, opts.costUsd);
     return await res.json();
   } catch (err) {
     console.warn(`[treg] ${endpointId} threw:`, (err as Error)?.name);
@@ -532,6 +495,12 @@ function mapNews(r: any, kw: KeywordRow): RawPost | null {
  * that produced rows. A provider that errors, times out or returns nothing
  * hands over to the next.
  */
+/**
+ * Providers are tried in order and the first one that returns rows wins, so a
+ * fallback only costs money once the cheaper option has actually failed. This
+ * is not hypothetical: treg answers 503 provider_capacity_unavailable when the
+ * vendor it would otherwise use is busy.
+ */
 async function searchChannel(
   platform: Platform,
   kw: KeywordRow,
@@ -546,7 +515,6 @@ async function searchChannel(
       // posts, which is what put a 2021 tweet into the feed.
       body: { query: kw.keyword, queryType: 'Latest', limit: 20 },
       costUsd: TREG_COST_USD.twitter,
-      operation: 'sweep_call_twitter',
     });
     const items = t?.output?.data?.items ?? [];
     if (items.length) {
@@ -571,7 +539,6 @@ async function searchChannel(
         need_format: 'true',
       },
       costUsd: TREG_COST_USD.reddit,
-      operation: 'sweep_call_reddit',
     });
     const tkItems = tk?.data?.posts ?? tk?.posts ?? [];
     if (Array.isArray(tkItems) && tkItems.length) {
@@ -587,7 +554,6 @@ async function searchChannel(
         limit: 25,
       },
       costUsd: TREG_COST_USD.redditFallback,
-      operation: 'sweep_call_reddit',
     });
     const scItems = sc?.posts ?? [];
     if (Array.isArray(scItems) && scItems.length) {
@@ -602,7 +568,6 @@ async function searchChannel(
     const r = await tregCall('crawl4ai.web.search.rich', {
       query: { q: kw.keyword, rich: 1 },
       costUsd: TREG_COST_USD.google,
-      operation: 'sweep_call_google',
       timeoutMs: 25000,
     });
     const items = r?.results ?? [];
@@ -622,7 +587,6 @@ async function searchChannel(
         after_date: sinceDate(lookbackHours),
       },
       costUsd: TREG_COST_USD.news,
-      operation: 'sweep_call_news',
     });
     const items = r?.results ?? [];
     if (Array.isArray(items) && items.length) {
@@ -667,7 +631,7 @@ Deno.serve(async (req) => {
     console.warn(
       `[social-search] treg balance $${balanceUsd.toFixed(4)} below the $${MIN_TREG_BALANCE_USD} floor.`,
     );
-    return fail('Search credits are temporarily unavailable. Please try again shortly.', 503);
+    return fail('Search is temporarily unavailable. Please try again shortly.', 503);
   }
 
   // Captured BEFORE any search runs. prune_feed() uses this so the batch this
@@ -675,27 +639,6 @@ Deno.serve(async (req) => {
   const sweepStartedAt = new Date().toISOString();
   usdSpent = 0;
   callsMade = 0;
-  resetCreditCounters();
-
-  // Credit prices are admin-tunable; read them rather than trusting the
-  // compiled-in defaults.
-  try {
-    const { data: cfg } = await admin
-      .from('billing_config')
-      .select('value')
-      .eq('key', 'operation_pricing')
-      .maybeSingle();
-    const configured: Record<string, number> = {};
-    for (const [key, entry] of Object.entries(cfg?.value ?? {})) {
-      const credits = Number((entry as any)?.credits);
-      if (Number.isFinite(credits)) configured[key] = credits;
-    }
-    if (Object.keys(configured).length > 0) {
-      operationCredits = { ...DEFAULT_CREDITS_PER_OPERATION, ...configured };
-    }
-  } catch {
-    // Keep the defaults.
-  }
 
   // --- Load authoritative user settings (service role bypasses RLS) --------
   let profile: any = null;
@@ -833,29 +776,6 @@ Deno.serve(async (req) => {
   // --- Retention pass ------------------------------------------------------
   const pruned = await pruneOldMentions(admin, userId, sweepStartedAt);
 
-  // --- Credit meter -------------------------------------------------------
-  // Settled once for the whole manual sweep rather than per call. Overdraft is
-  // allowed so a user who tops up mid-session is not cut off; the shortfall
-  // shows as a negative balance on the billing page.
-  let creditResult: any = null;
-  if (callsMade > 0) {
-    try {
-      const { data } = await admin.rpc('spend_credits', {
-        p_user_id: userId,
-        p_credits: creditsCharged,
-        p_operation: 'manual_sweep',
-        p_service_cost_usd: Number(usdSpent.toFixed(6)),
-        p_calls: callsMade,
-        p_provider: 'treg',
-        p_allow_overdraft: true,
-        p_metadata: { byOperation: Object.fromEntries(perOperation), manual: true },
-      });
-      creditResult = data;
-    } catch (err) {
-      console.warn('[social-search] credit settlement failed:', err);
-    }
-  }
-
   return json({
     ok: true,
     posts: collected,
@@ -864,9 +784,6 @@ Deno.serve(async (req) => {
     lookback_hours: lookbackHours,
     dropped_stale: droppedStale,
     pruned,
-    usd_spent: Number(usdSpent.toFixed(6)),
-    credits_charged: creditsCharged,
-    credits_remaining: creditResult?.balance_after ?? null,
     served_by: served,
   });
 });

@@ -75,6 +75,12 @@ begin
     'operation_pricing', (
       select value from public.billing_config where key = 'operation_pricing'
     ),
+    'plan_grants', (
+      select value from public.billing_config where key = 'plan_grants'
+    ),
+    'topup_packages', (
+      select value from public.billing_config where key = 'topup_packages'
+    ),
     'credits_per_usd', v_rate
   );
 end;

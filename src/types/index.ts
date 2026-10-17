@@ -16,13 +16,8 @@ export interface Profile {
   min_intent_threshold?: number;
   /** 0 = keep forever; otherwise days of mentions to retain. */
   feed_retention_days?: number;
-  is_admin?: boolean;
   sweep_time_utc?: string;
   sweep_frequency?: string;
-  subscription_plan?: 'starter' | 'pro' | 'scale';
-  subscription_interval?: 'month' | 'year';
-  subscription_status?: 'active' | 'past_due' | 'canceled';
-  subscription_renews_at?: string;
   created_at: string;
   updated_at: string;
 }
@@ -73,6 +68,6 @@ export interface SweepRun {
   errors: any[];
 }
 
-export type DashboardTab = 'feed' | 'keywords' | 'settings' | 'billing' | 'admin';
+export type DashboardTab = 'feed' | 'keywords' | 'settings';
 
 export const APP_NAME = 'Echo';

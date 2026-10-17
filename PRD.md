@@ -45,16 +45,10 @@ graph TD
 - **Daily Email Digest**: Automated summary email dispatched at user's scheduled sweep hour.
 - **Inspection Modal**: Deep-dive lead modal showing author follower count, bio, channel source, and raw payload.
 
-### Phase 4: Billing, Plans & Workspace Preferences (Implemented)
-- **Subscription Tiers**: limits are derived from what a workspace costs to serve, not picked by feel. Worst case, every Reddit call taking the fallback, a 30-day month:
-  - *Starter*: 8 keywords, 3 channels, daily 24h sweep, $29/month. Costs $0.87 to serve at full use — 97.0% margin.
-  - *Pro* (Popular): 20 keywords, all 4 channels, 12h sweep, $79/month. Costs $4.54 — 94.3% margin.
-  - *Scale*: 40 keywords, all 4 channels, 6h sweep, $199/month. Costs $18.14 — 90.9% margin.
-- **Credit Meter**: Every metered provider call draws credits (1 on X and the web, 2 on Reddit, 0 on press and news). Plans grant an allowance each period; top-ups add to it. Conversion is 20 credits per dollar, tunable by an admin in `billing_config`.
-- **Accounting**: A top-up is not profit. Cash taken is deferred revenue and a liability; it is recognised as revenue only as the credits are spent, each spend carrying the provider cost of the call it paid for. `billing_summary` reports the recognised/deferred split and a reconciliation delta that must be zero.
-- **Payment**: Stripe-hosted Checkout for both plans and top-ups. Credits are granted by the Stripe webhook, not the browser, and settlement is idempotent on the Checkout session id. Card details never touch Echo.
-- **Workspace Preferences**: Custom sweep time, cadence, lookback window (24h/48h), active channel configuration, minimum intent threshold, and feed retention.
-- **Retired**: the credit-based lead-unlocking system (per-lead credit packs, credit ledger, paywalled contact enrichment) was removed. Feed cards show the author and post directly with no paywall.
+### Phase 4: Workspace Preferences (Implemented)
+- **No billing.** Echo is free. There is no plan, no purchase, no payment processor and no credit balance. Every workspace gets the same allowance: 8 keywords, 3 channels scanned at once out of 4 available, and a daily sweep.
+- **Limits are constants, not entitlements.** `public.keyword_limit()` and `public.channel_limit()` exist so the ceiling is enforced in one place and cannot be raised per workspace.
+- **Workspace Preferences**: custom sweep time, cadence, lookback window (24h/48h), active channel configuration, minimum intent threshold, and feed retention.
 
 ### Phase 5: CRM Sync & Enterprise (Roadmap)
 - Native two-way integrations with HubSpot, Salesforce, and Attio.

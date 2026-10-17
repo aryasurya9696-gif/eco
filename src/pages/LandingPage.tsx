@@ -5,7 +5,6 @@ import {
   ArrowRight,
   Check,
   ExternalLink,
-  Sparkles,
   ChevronDown
 } from 'lucide-react';
 
@@ -103,7 +102,6 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 }) => {
   const [selectedKeyword, setSelectedKeyword] = useState<string>('all');
   const [selectedPlatform, setSelectedPlatform] = useState<string>('all');
-  const [annualBilling, setAnnualBilling] = useState<boolean>(true);
   const [openFaq, setOpenFaq] = useState<number | null>(null);
 
   const handleCta = () => {
@@ -460,322 +458,76 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </div>
         </section>
 
-        {/* PRICING */}
-        <section id="pricing" className="py-20 px-6 border-t border-[#e3e3de] bg-[#ffffff]">
-          <div className="max-w-5xl mx-auto space-y-12">
-            {/* Header & Toggle */}
-            <div className="text-center max-w-xl mx-auto space-y-4">
-              <span className="text-[11px] font-mono uppercase tracking-wider text-[#8a8a86] block">
-                Transparent Pricing
+      {/* WHAT'S INCLUDED */}
+      <section id="pricing" className="py-20 px-6 border-t border-[#e3e3de] bg-[#fbfbfa]">
+        <div className="max-w-4xl mx-auto">
+          <div className="text-center mb-14">
+            <h2 className="text-3xl md:text-4xl font-bold tracking-tight text-[#141414] mb-4">
+              Everything, for nothing
+            </h2>
+            <p className="text-[#4a4a47] max-w-xl mx-auto leading-relaxed">
+              There is no trial that expires and no card you can be charged. One plan,
+              it costs nothing, and it does not change.
+            </p>
+          </div>
+
+          <div className="bg-white border border-[#141414] p-8 md:p-10">
+            <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-3 pb-6 border-b border-[#eeeeea]">
+              <div>
+                <p className="text-xs font-mono uppercase tracking-wider text-[#141414] font-bold">
+                  Echo
+                </p>
+                <div className="flex items-baseline gap-2 mt-2">
+                  <span className="text-5xl font-bold tracking-tight text-[#141414]">
+                    $0
+                  </span>
+                  <span className="text-sm font-mono text-[#8a8a86]">forever</span>
+                </div>
+              </div>
+              <span className="self-start sm:self-auto inline-flex items-center px-3 py-1.5 bg-[#141414] text-white text-[10px] font-mono uppercase tracking-wider">
+                No card required
               </span>
-              <h2 className="text-3xl sm:text-4xl font-bold tracking-tight text-[#141414]">
-                Simple, predictable plans for every team.
-              </h2>
-              <p className="text-xs sm:text-sm text-[#4a4a47]">
-                Track high-intent buyer leads with zero surprise bills. Daily sweeps with bounded pagination.
+            </div>
+
+            <ul className="grid grid-cols-1 md:grid-cols-2 gap-x-10 gap-y-4 pt-6">
+              {[
+                '8 tracked keywords',
+                '3 channels at once',
+                '4 channels to choose from',
+                'A sweep every day, at an hour you pick',
+                'A 24 or 48 hour search window',
+                'Press and news monitoring included',
+                'Intent scoring on every mention',
+                'AI keyword suggestions from your offer',
+                'AI outreach drafts',
+                'Feed retention you control, up to a year',
+                'CSV and JSON export',
+                'Daily automatic sweeps, no cron to set up',
+              ].map((feature) => (
+                <li key={feature} className="flex items-start gap-3 text-sm text-[#4a4a47]">
+                  <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
+                  <span>{feature}</span>
+                </li>
+              ))}
+            </ul>
+
+            <div className="mt-8 pt-6 border-t border-[#eeeeea] flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <p className="text-xs font-mono text-[#8a8a86] leading-relaxed max-w-md">
+                Searches run on a metered provider, which is why the keyword and channel
+                caps exist. They are a ceiling on our cost per workspace, not a way to
+                charge you more.
               </p>
-
-              {/* Segmented Pill Toggle */}
-              <div className="pt-2 flex justify-center">
-                <div className="inline-flex items-center p-1 bg-[#f0f0ec] border border-[#e3e3de] rounded-full text-xs font-mono">
-                  <button
-                    type="button"
-                    onClick={() => setAnnualBilling(false)}
-                    className={`px-4 py-2 rounded-full transition-all duration-200 cursor-pointer ${
-                      !annualBilling
-                        ? 'bg-white text-[#141414] font-semibold shadow-xs'
-                        : 'text-[#6e6e6a] hover:text-[#141414]'
-                    }`}
-                  >
-                    Monthly billing
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAnnualBilling(true)}
-                    className={`flex items-center gap-2 px-4 py-2 rounded-full transition-all duration-200 cursor-pointer ${
-                      annualBilling
-                        ? 'bg-[#141414] text-white font-semibold shadow-xs'
-                        : 'text-[#6e6e6a] hover:text-[#141414]'
-                    }`}
-                  >
-                    <span>Annual billing</span>
-                    <span
-                      className={`text-[10px] font-mono px-2 py-0.5 rounded-full font-bold transition-colors ${
-                        annualBilling
-                          ? 'bg-emerald-400 text-[#141414]'
-                          : 'bg-emerald-100 text-emerald-800'
-                      }`}
-                    >
-                      Save 20%
-                    </span>
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* 3 Pricing Cards */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-stretch">
-              {/* Starter */}
-              <div className="border border-[#e3e3de] p-7 flex flex-col justify-between bg-white hover:border-[#141414] transition-all duration-200 hover:shadow-md">
-                <div>
-                  {/* Card Header */}
-                  <div className="flex items-center justify-between pb-3">
-                    <span className="text-xs font-mono uppercase font-bold text-[#141414] tracking-wide">
-                      Starter
-                    </span>
-                    <span className="text-[11px] font-mono text-[#8a8a86]">Solo & Brand</span>
-                  </div>
-
-                  <p className="text-xs text-[#5a5a56] min-h-[36px] leading-relaxed">
-                    For founders and early products monitoring brand mentions and initial pain points.
-                  </p>
-
-                  {/* Price Block */}
-                  <div className="pt-5 pb-5 border-t border-[#eeeeea] mt-4">
-                    <div className="flex items-baseline gap-2">
-                      <span className="text-4xl font-bold font-mono text-[#141414] tracking-tight">
-                        {annualBilling ? '$23' : '$29'}
-                      </span>
-                      <span className="text-xs font-mono text-[#8a8a86]">/ month</span>
-                      {annualBilling && (
-                        <span className="text-xs font-mono text-[#8a8a86] line-through">
-                          $29
-                        </span>
-                      )}
-                    </div>
-
-                    <div className="mt-2 min-h-[24px] flex items-center justify-between text-[11px] font-mono">
-                      <span className="text-[#8a8a86]">
-                        {annualBilling ? 'Billed annually ($276/yr)' : 'Billed month-to-month'}
-                      </span>
-                      {annualBilling && (
-                        <span className="text-emerald-700 font-semibold bg-emerald-50 px-2 py-0.5 rounded-xs border border-emerald-200">
-                          Save $72/yr
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Feature List */}
-                  <ul className="space-y-3 pt-5 border-t border-[#eeeeea] text-xs font-mono text-[#4a4a47]">
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>Up to 5 tracked keywords</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>4 Channels: X, Reddit, Web & News</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>Strict 2-page safety bounds</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>Automatic duplicate prevention</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>AI keyword auto-suggest from your offer</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>CSV & JSON lead export</span>
-                    </li>
-                  </ul>
-                </div>
-
-                {/* Button */}
-                <div className="pt-8 mt-auto">
-                  <button
-                    onClick={handleCta}
-                    className="w-full h-11 bg-white hover:bg-[#f6f6f4] border border-[#deded8] hover:border-[#141414] text-xs font-mono text-[#141414] font-medium transition-all duration-200 cursor-pointer shadow-2xs"
-                  >
-                    Start 14-Day Free Trial
-                  </button>
-                </div>
-              </div>
-
-              {/* Pro (Highlighted / Most Popular) */}
-              <div className="border-2 border-[#141414] p-7 flex flex-col justify-between bg-white shadow-xl relative hover:shadow-2xl transition-all duration-200">
-                {/* Floating Top Badge */}
-                <div className="absolute -top-3.5 left-1/2 -translate-x-1/2 px-3.5 py-0.5 bg-[#141414] text-white text-[10px] font-mono uppercase tracking-wider font-semibold shadow-xs">
-                  Most Popular
-                </div>
-
-                <div>
-                  {/* Card Header */}
-                  <div className="flex items-center justify-between pb-3">
-                    <span className="text-xs font-mono uppercase font-bold text-[#141414] tracking-wide">
-                      Pro
-                    </span>
-                    <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 text-[10px] font-mono font-medium rounded-xs">
-                      Best Value
-                    </span>
-                  </div>
-
-                  <p className="text-xs text-[#5a5a56] min-h-[36px] leading-relaxed">
-                    For B2B outbound teams turning active social conversations into pipeline.
-                  </p>
-
-                  {/* Price Block */}
-                  <div className="pt-5 pb-5 border-t border-[#eeeeea] mt-4">
-                    <div className="flex items-baseline gap-2">
-                      <span className="text-4xl font-bold font-mono text-[#141414] tracking-tight">
-                        {annualBilling ? '$63' : '$79'}
-                      </span>
-                      <span className="text-xs font-mono text-[#8a8a86]">/ month</span>
-                      {annualBilling && (
-                        <span className="text-xs font-mono text-[#8a8a86] line-through">
-                          $79
-                        </span>
-                      )}
-                    </div>
-
-                    <div className="mt-2 min-h-[24px] flex items-center justify-between text-[11px] font-mono">
-                      <span className="text-[#8a8a86]">
-                        {annualBilling ? 'Billed annually ($756/yr)' : 'Billed month-to-month'}
-                      </span>
-                      {annualBilling && (
-                        <span className="text-emerald-700 font-semibold bg-emerald-50 px-2 py-0.5 rounded-xs border border-emerald-200">
-                          Save $192/yr
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Feature List */}
-                  <ul className="space-y-3 pt-5 border-t border-[#eeeeea] text-xs font-mono text-[#4a4a47]">
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
-                      <span className="font-medium text-[#141414]">Up to 10 tracked keywords</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
-                      <span className="font-medium text-[#141414]">All 5 Channels (X, IN, Reddit, FB, Google)</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Sparkles className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
-                      <span className="font-medium text-[#141414]">AI Outreach Drafter (4 tones)</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
-                      <span>Hourly automated sweeps on a schedule</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
-                      <span>Buyer intent score qualification</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
-                      <span>Priority API sweep queue</span>
-                    </li>
-                  </ul>
-                </div>
-
-                {/* Button */}
-                <div className="pt-8 mt-auto">
-                  <button
-                    onClick={handleCta}
-                    className="w-full h-11 bg-[#141414] hover:bg-black text-white text-xs font-mono font-medium transition-all duration-200 cursor-pointer shadow-sm hover:shadow-md"
-                  >
-                    Start Pro Free Trial →
-                  </button>
-                </div>
-              </div>
-
-              {/* Scale */}
-              <div className="border border-[#e3e3de] p-7 flex flex-col justify-between bg-white hover:border-[#141414] transition-all duration-200 hover:shadow-md">
-                <div>
-                  {/* Card Header */}
-                  <div className="flex items-center justify-between pb-3">
-                    <span className="text-xs font-mono uppercase font-bold text-[#141414] tracking-wide">
-                      Scale
-                    </span>
-                    <span className="text-[11px] font-mono text-[#8a8a86]">Agencies & RevOps</span>
-                  </div>
-
-                  <p className="text-xs text-[#5a5a56] min-h-[36px] leading-relaxed">
-                    For agencies and scaleups tracking whole market categories and competitors.
-                  </p>
-
-                  {/* Price Block */}
-                  <div className="pt-5 pb-5 border-t border-[#eeeeea] mt-4">
-                    <div className="flex items-baseline gap-2">
-                      <span className="text-4xl font-bold font-mono text-[#141414] tracking-tight">
-                        {annualBilling ? '$159' : '$199'}
-                      </span>
-                      <span className="text-xs font-mono text-[#8a8a86]">/ month</span>
-                      {annualBilling && (
-                        <span className="text-xs font-mono text-[#8a8a86] line-through">
-                          $199
-                        </span>
-                      )}
-                    </div>
-
-                    <div className="mt-2 min-h-[24px] flex items-center justify-between text-[11px] font-mono">
-                      <span className="text-[#8a8a86]">
-                        {annualBilling ? 'Billed annually ($1,908/yr)' : 'Billed month-to-month'}
-                      </span>
-                      {annualBilling && (
-                        <span className="text-emerald-700 font-semibold bg-emerald-50 px-2 py-0.5 rounded-xs border border-emerald-200">
-                          Save $480/yr
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Feature List */}
-                  <ul className="space-y-3 pt-5 border-t border-[#eeeeea] text-xs font-mono text-[#4a4a47]">
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>Up to 25 tracked keywords</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>12h accelerated sweep frequency</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Sparkles className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>Unlimited AI response drafts</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>Multi-seat team workspace</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>Custom CRM & Zapier sync</span>
-                    </li>
-                    <li className="flex items-start gap-2.5">
-                      <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                      <span>Dedicated onboarding assistance</span>
-                    </li>
-                  </ul>
-                </div>
-
-                {/* Button */}
-                <div className="pt-8 mt-auto">
-                  <button
-                    onClick={handleCta}
-                    className="w-full h-11 bg-white hover:bg-[#f6f6f4] border border-[#deded8] hover:border-[#141414] text-xs font-mono text-[#141414] font-medium transition-all duration-200 cursor-pointer shadow-2xs"
-                  >
-                    Start Scale Free Trial
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Bottom Assurance */}
-            <div className="pt-4 flex flex-wrap items-center justify-center gap-6 text-xs font-mono text-[#8a8a86] border-t border-[#eeeeea]">
-              <span>✓ 14-day free trial on all plans</span>
-              <span>•</span>
-              <span>✓ No credit card required</span>
-              <span>•</span>
-              <span>✓ Cancel or switch anytime with 1 click</span>
+              <a
+                href="#hero"
+                className="inline-flex items-center justify-center gap-2 px-6 py-3 bg-[#121212] hover:bg-black text-white text-sm font-mono transition-colors shrink-0"
+              >
+                Start tracking
+              </a>
             </div>
           </div>
-        </section>
+        </div>
+      </section>
+
 
         {/* FAQ ACCORDION */}
         <section id="faq" className="py-16 px-6 border-t border-[#e3e3de] bg-[#f6f6f4]">

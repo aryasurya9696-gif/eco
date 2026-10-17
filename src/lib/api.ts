@@ -1,7 +1,7 @@
 /**
  * Echo — Edge Function client
  * ----------------------------------------------------------------------------
- * Every privileged API (search, OpenAI, Stripe billing) runs as a
+ * Every privileged API (search and OpenAI) runs as a
  * Supabase Edge Function. The browser never holds a vendor API key.
  *
  * supabase.functions.invoke() automatically attaches the signed-in user's JWT,

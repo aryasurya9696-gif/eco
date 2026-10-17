@@ -20,7 +20,7 @@ Echo monitors your keywords across **X (Twitter)**, **Reddit**, the **open web**
 
 - **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Framer Motion, Lucide React, canvas-confetti.
 - **Backend**: Supabase (Postgres, Auth, Edge Functions, RLS).
-- **Edge Functions**: `social-search` (treg), `ai` (OpenAI), `billing` (Stripe), `daily-sweep` (cron).
+- **Edge Functions**: `social-search` (treg), `ai` (OpenAI), `daily-sweep` (treg)
 
 ---
 
@@ -43,7 +43,7 @@ VITE_SUPABASE_ANON_KEY=<your-anon-key>
 ```
 
 > **Never put secret keys in `.env`.** Any `VITE_`-prefixed variable is inlined
-> into the public JS bundle. The treg, OpenAI and Stripe keys live in Edge
+> into the public JS bundle. The treg and OpenAI keys live in Edge
 > Function secrets — see [Secrets](#secrets) below.
 
 ### 3. Apply the schema
@@ -59,7 +59,7 @@ run twice (everything is `IF NOT EXISTS` / `IF EXISTS` / `OR REPLACE`).
 |---|---|
 | `20250101000000_echo_schema.sql` | `profiles`, `keywords`, `monitored_posts`, `sweep_runs` + RLS + triggers |
 | `20250102000000_add_enabled_channels.sql` | `profiles.enabled_channels` |
-| `20261017_security_hardening.sql` | Plan-aware keyword limit, `min_intent_threshold`, server-column guard, `apply_subscription_plan` |
+| `20261017_security_hardening.sql` | Keyword limit, `min_intent_threshold`, |
 | `20261018_remove_credits_system.sql` | Drops `lead_unlocks`, `credit_transactions`, `profiles.credits_balance` |
 | `20261019_security_lint_cleanup.sql` | Advisor-driven fixes: RPC revokes, `(select auth.uid())` policies, FK index |
 | `20261020_backfill_and_constraints.sql` | Re-scores existing posts onto the current 0–97 scale; adds `CHECK` constraints on channels + threshold |
@@ -72,7 +72,6 @@ run twice (everything is `IF NOT EXISTS` / `IF EXISTS` / `OR REPLACE`).
 ```bash
 supabase secrets set TREG_TOKEN=treg_your_token     # https://treg.to — free signup, $1 credit
 supabase secrets set OPENAI_API_KEY=sk_your_key
-supabase secrets set STRIPE_SECRET_KEY=sk_live_your_key
 supabase secrets set APP_ORIGIN=https://your-app.example
 supabase secrets set SWEEP_CRON_SECRET="$(openssl rand -hex 32)"
 ```
@@ -84,11 +83,9 @@ wins when both are present.
 ```bash
 supabase functions deploy social-search
 supabase functions deploy ai
-supabase functions deploy billing
 supabase functions deploy daily-sweep --no-verify-jwt
 ```
 
-Without `STRIPE_SECRET_KEY`, `billing` refuses every request, so plan changes
 are unavailable. It never falls back to granting access for free.
 
 ### 6. Schedule the sweep
@@ -128,24 +125,23 @@ select cron.schedule(
 | Concern | How it is handled |
 |---|---|
 | Vendor API keys | Held only in Edge Function secrets; never in `.env` or the bundle |
-| Subscription state | Server-only. `subscription_plan` / `_status` / `_renews_at` are blocked from client writes by both a column grant and a trigger |
-| Plan changes | Applied only via `apply_subscription_plan` (service-role only), invoked by the Stripe-verifying `billing` function |
 | Sweep function | Requires the `x-sweep-secret` header — not publicly invokable |
 | Edge functions | Verify the caller's JWT and derive identity server-side; per-user rate limits |
-| Keyword limits | Enforced by a Postgres trigger from the user's plan, not just the client |
+| Keyword limits | Enforced by a Postgres trigger, not just the client |
 | Webhook URLs | Validated against Slack/Discord host allow-list |
 
 ---
 
-## 💳 Billing
+## 🆓 No billing
 
-Plans are defined in two places that must stay in sync:
-- Client: `src/lib/billing.ts`
-- Server: `public.plan_keyword_limit()` in `20261017_security_hardening.sql`
+Echo is free. There is no plan, no purchase, no payment processor and no credit
+balance, so there is nothing to configure and nothing to keep in sync between
+client and server.
 
-Plan changes go through Stripe Checkout. A plan is activated only after the
-`billing` function confirms `payment_status === 'paid'` and that the session was
-created for the calling user.
+The ceilings on a workspace are constants in one place, enforced by a trigger:
+`public.keyword_limit()` (8) and `public.channel_limit()` (3). They exist because
+search runs on a metered provider and the per-workspace cost has to be bounded —
+they are not a way to charge more.
 
 ---
 

@@ -12,7 +12,6 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { PlatformBadge } from '../common/PlatformBadge';
-import { getPlan } from '../../lib/billing';
 import type { Platform } from '../../types';
 
 const CORE_OFFER_MAX = 280;
@@ -123,18 +122,16 @@ const Field: React.FC<{
   </div>
 );
 
-/** Segmented control. Every option gets an equal column. */
+//** Segmented control. Every option gets an equal column. */
 function Segmented<T extends string | number>({
   options,
   value,
   onChange,
-  isAllowed,
   format,
 }: {
   options: readonly T[];
   value: T;
   onChange: (next: T) => void;
-  isAllowed?: (option: T) => boolean;
   format?: (option: T) => string;
 }) {
   return (
@@ -144,16 +141,13 @@ function Segmented<T extends string | number>({
     >
       {options.map((option) => {
         const selected = option === value;
-        const allowed = isAllowed ? isAllowed(option) : true;
 
         return (
           <button
             key={String(option)}
             type="button"
-            disabled={!allowed}
             aria-pressed={selected}
             onClick={() => onChange(option)}
-            title={allowed ? undefined : 'Not included in your plan'}
             className={`px-3 py-2 text-[11px] font-mono border transition-colors duration-150 cursor-pointer active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-35 disabled:active:scale-100 ${
               selected
                 ? 'bg-[#141414] text-white border-[#141414] font-medium'
@@ -196,7 +190,6 @@ export const SettingsTab: React.FC = () => {
     enabledChannels,
     toggleChannel,
     saveSettings,
-    subscriptionPlan,
     addToast,
   } = useEcho();
 
@@ -214,14 +207,13 @@ export const SettingsTab: React.FC = () => {
   }, []);
   const now = useMemo(() => new Date(nowMs), [nowMs]);
 
-  const planDetails = getPlan(subscriptionPlan);
-  const planMaxChannels = planDetails.maxChannels;
-  const planMinSweepHours = planDetails.sweepCadenceHours;
+  // Echo is free, so these are the product's limits rather than anything a
+  // workspace can buy past. They mirror public.keyword_limit() and
+  // public.channel_limit() on the server.
+  const channelLimit = 3;
 
   const cadenceHours =
     CADENCES.find((c) => c.id === sweepCadence)?.hours ?? 24;
-  const effectiveSweepHours = Math.max(cadenceHours, planMinSweepHours);
-
   const sweepHour = useMemo(() => {
     const parsed = /^(\d{1,2}):/.exec(sweepTime);
     const hour = parsed ? Number(parsed[1]) : 6;
@@ -237,12 +229,12 @@ export const SettingsTab: React.FC = () => {
     for (let offset = 0; offset <= 24; offset += 1) {
       const candidate = new Date(midnight + (offset * 24 + sweepHour) * 3600_000);
       if (candidate <= now) continue;
-      if (isSweepDue(candidate.getUTCHours(), sweepHour, effectiveSweepHours)) {
+      if (isSweepDue(candidate.getUTCHours(), sweepHour, cadenceHours)) {
         return candidate;
       }
     }
     return null;
-  }, [now, sweepHour, effectiveSweepHours]);
+  }, [now, sweepHour, cadenceHours]);
 
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -261,13 +253,13 @@ export const SettingsTab: React.FC = () => {
     }
   };
 
-  const channelLimitReached = enabledChannels.length >= planMaxChannels;
+  const channelLimitReached = enabledChannels.length >= channelLimit;
 
   const handleToggleChannel = (id: Platform) => {
     const active = enabledChannels.includes(id);
     if (!active && channelLimitReached) {
       addToast(
-        `The ${planDetails.name} plan covers ${planMaxChannels} channels. Remove one to add another.`,
+        `You can monitor ${channelLimit} channels. Remove one to add another.`,
         'error',
       );
       return;
@@ -329,7 +321,6 @@ export const SettingsTab: React.FC = () => {
       {/* At a glance ---------------------------------------------------- */}
       <dl className="grid grid-cols-2 sm:grid-cols-4 border border-[#e3e3de] bg-white divide-x divide-y sm:divide-y-0 sm:divide-x divide-[#eeeeea]">
         {[
-          { label: 'Plan', value: planDetails.name },
           {
             label: 'Keywords',
             value: `${keywords.length}/${keywordLimit}`,
@@ -432,7 +423,7 @@ export const SettingsTab: React.FC = () => {
                 : 'border-[#deded8] text-[#8a8a86]'
             }`}
           >
-            {enabledChannels.length}/{planMaxChannels} used
+            {enabledChannels.length}/{channelLimit} used
           </span>
         }
       >
@@ -475,7 +466,7 @@ export const SettingsTab: React.FC = () => {
                   disabled={atLimit}
                   title={
                     atLimit
-                      ? `Your ${planDetails.name} plan covers ${planMaxChannels} channels`
+                      ? `You can monitor ${channelLimit} channels`
                       : undefined
                   }
                   onClick={() => handleToggleChannel(channel.id)}
@@ -518,9 +509,6 @@ export const SettingsTab: React.FC = () => {
               options={CADENCES.map((c) => c.id)}
               value={sweepCadence}
               onChange={setSweepCadence}
-              isAllowed={(id) =>
-                (CADENCES.find((c) => c.id === id)?.hours ?? 24) >= planMinSweepHours
-              }
               format={(id) => CADENCES.find((c) => c.id === id)?.label ?? id}
             />
           </Field>
