@@ -150,8 +150,20 @@ export async function startCheckout(packageCode: string): Promise<CheckoutRespon
 // ---------------------------------------------------------------------------
 
 /** Credits are whole numbers in practice but stay numeric, so never floor one. */
-export function formatCredits(n: number): string {
-  return Number.isInteger(n) ? String(n) : n.toFixed(2);
+/**
+ * Credits as text.
+ *
+ * The input is coerced first, deliberately. These are called from render paths
+ * over values that arrive from the database, and Number.isInteger(undefined) is
+ * false — so a missing field falls through to undefined.toFixed(), which throws.
+ * A throw inside React's render takes the whole view down with it, turning one
+ * missing number into a blank screen. Returning a dash keeps the page readable
+ * and makes the absence visible rather than silent.
+ */
+export function formatCredits(n: number | null | undefined): string {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return '—';
+  return Number.isInteger(v) ? String(v) : v.toFixed(2);
 }
 
 /**
@@ -166,12 +178,17 @@ export function formatCredits(n: number): string {
  * call reads $0.001, a web search $0.00015, and a card payment $10.00. Zero
  * stays $0.00 rather than becoming $0, because this is a currency column.
  */
-export function formatUsd(n: number, opts: { decimals?: number } = {}): string {
-  if (opts.decimals !== undefined) return `$${n.toFixed(opts.decimals)}`;
+export function formatUsd(n: number | null | undefined, opts: { decimals?: number } = {}): string {
+  // Same reasoning as formatCredits: a missing or non-numeric value must not
+  // throw from inside a render. '$—' reads as "we do not know", which is the
+  // truth, where '$0.00' would be a confident lie about someone's balance.
+  const v = Number(n);
+  if (!Number.isFinite(v)) return '$—';
+  if (opts.decimals !== undefined) return `$${v.toFixed(opts.decimals)}`;
 
-  const abs = Math.abs(n);
+  const abs = Math.abs(v);
   if (abs === 0) return '$0.00';
-  if (abs >= 0.01) return `$${n.toFixed(2)}`;
+  if (abs >= 0.01) return `$${v.toFixed(2)}`;
 
   // Smallest non-zero digit decides how many decimals are worth showing.
   const magnitude = Math.floor(Math.log10(abs));
@@ -181,7 +198,7 @@ export function formatUsd(n: number, opts: { decimals?: number } = {}): string {
   // $0.00100. Those zeros are storage format, not precision, so they go — while
   // still keeping two decimals, because a currency column showing $25.5 rather
   // than $25.50 reads as a typo.
-  let s = n.toFixed(decimals);
+  let s = v.toFixed(decimals);
   if (s.includes('.')) {
     s = s.replace(/0+$/, '');
     if (s.endsWith('.')) {
@@ -230,9 +247,17 @@ export function operationLabel(operation: string): string {
  * mixing the two is how a display figure starts contradicting an invoice.
  */
 export function creditsToUsd(credits: number, packages: Package[]): number {
-  if (packages.length === 0) return 0;
-  const cheapest = packages.reduce((min, p) => (p.per_credit_usd < min.per_credit_usd ? p : min));
-  return credits * cheapest.per_credit_usd;
+  if (!Array.isArray(packages) || packages.length === 0) return 0;
+  // reduce with no initial value throws on an empty array, and a package whose
+  // per_credit_usd is missing would poison the comparison for every package after
+  // it. Filtered first, so one malformed row cannot take the page down with it.
+  const priced = packages.filter((p) => Number.isFinite(Number(p?.per_credit_usd)));
+  if (priced.length === 0) return 0;
+  const cheapest = priced.reduce((min, p) =>
+    Number(p.per_credit_usd) < Number(min.per_credit_usd) ? p : min,
+  );
+  const value = Number(credits);
+  return Number.isFinite(value) ? value * Number(cheapest.per_credit_usd) : 0;
 }
 
 export function ledgerLabel(kind: string): string {

@@ -45,8 +45,12 @@ export const LandingPricing: React.FC<LandingPricingProps> = ({
   onBuy,
   onStart,
 }) => {
-  const cheapestPerSearch = Math.min(...searchCosts.map((s) => s.credits));
-  const dearestPerSearch = Math.max(...searchCosts.map((s) => s.credits));
+  // Spreading an empty array into Math.min gives Infinity rather than throwing,
+  // which would render "about 0 searches" instead of explaining itself. Guarded
+  // so an empty cost list cannot quietly produce confident nonsense.
+  const costs = searchCosts.map((s) => Number(s?.credits)).filter((n) => Number.isFinite(n));
+  const cheapestPerSearch = costs.length > 0 ? Math.min(...costs) : 1;
+  const dearestPerSearch = costs.length > 0 ? Math.max(...costs) : 1;
 
   // The middle package is the one most people land on, so it gets the emphasis.
   // Derived rather than flagged, so reordering the database does not silently
@@ -132,7 +136,7 @@ export const LandingPricing: React.FC<LandingPricingProps> = ({
                   </div>
 
                   <p className="text-[11px] text-[#8a8a86] font-mono mt-3">
-                    ${perSearchPrice.toFixed(2)} per credit
+                    ${Number(perSearchPrice).toFixed(2)} per credit
                   </p>
 
                   {/* What it actually buys, at both ends of the channel mix. */}
