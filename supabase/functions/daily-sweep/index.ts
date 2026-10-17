@@ -671,6 +671,7 @@ async function recordUsage(
   runKey: string,
   tallies: Map<string, OperationTally>,
   reservationId: string | null,
+  charges: Map<string, { credits: number; revenueUsd: number }>,
 ): Promise<void> {
   const rows = [...tallies.values()]
     .filter((t) => t.calls > 0)
@@ -683,8 +684,8 @@ async function recordUsage(
       provider: 'treg',
       provider_call_id: t.callIds[0] ?? null,
       provider_cost_usd: Number((t.costMicro / 1e6).toFixed(8)),
-      credits_charged: 0,
-      revenue_usd: 0,
+      credits_charged: charges.get(t.operation)?.credits ?? 0,
+      revenue_usd: Number((charges.get(t.operation)?.revenueUsd ?? 0).toFixed(6)),
       outcome: t.uncertain ? 'uncertain'
         : t.upstreamFailed ? 'upstream_failed'
         : t.billed ? 'success'
@@ -740,7 +741,7 @@ async function searchChannel(
     record(tally, t);
     const items = t.data?.output?.data?.items ?? [];
     return items.length
-      ? items.map((x: any) => mapTwitter(x, userId, kwId, kw)).filter((r): r is PostRow => !!r)
+      ? items.map((x: any) => mapTwitter(x, userId, kwId, kw)).filter((r: any): r is PostRow => !!r)
       : [];
   }
 
@@ -757,7 +758,7 @@ async function searchChannel(
     record(tally, tk);
     const tkItems = tk.data?.data?.posts ?? tk.data?.posts ?? [];
     if (Array.isArray(tkItems) && tkItems.length) {
-      return tkItems.map((x: any) => mapRedditTikhub(x, userId, kwId, kw)).filter((r): r is PostRow => !!r);
+      return tkItems.map((x: any) => mapRedditTikhub(x, userId, kwId, kw)).filter((r: any): r is PostRow => !!r);
     }
 
     // Distinct key: a different provider answering the same search. Reusing the
@@ -770,7 +771,7 @@ async function searchChannel(
     record(tally, sc);
     const scItems = sc.data?.posts ?? [];
     return Array.isArray(scItems) && scItems.length
-      ? scItems.map((x: any) => mapRedditScrapecreators(x, userId, kwId, kw)).filter((r): r is PostRow => !!r)
+      ? scItems.map((x: any) => mapRedditScrapecreators(x, userId, kwId, kw)).filter((r: any): r is PostRow => !!r)
       : [];
   }
 
@@ -867,6 +868,25 @@ Deno.serve(async (req) => {
   const runId = runRow?.id;
 
   const errors: Array<Record<string, string>> = [];
+
+  // Close out holds whose sweep died between reserving and settling. Without
+  // this, an isolate eviction or a wall-clock kill in that window locked those
+  // credits out of the workspace's balance permanently — invisible until
+  // someone read an ops view by hand.
+  let reaped: { settled: number; released: number } | null = null;
+  try {
+    const { data, error } = await supabase.rpc('reap_stale_reservations', {
+      p_older_than: '1 hour',
+    });
+    if (error) {
+      errors.push({ user: '*', kw: '*', platform: '*', message: `reaper: ${error.message}` });
+    } else if (data && (data.settled > 0 || data.released > 0)) {
+      reaped = { settled: data.settled, released: data.released };
+      console.warn(`[sweep] reaped ${data.settled} settled, ${data.released} released stale holds`);
+    }
+  } catch (reaperErr) {
+    errors.push({ user: '*', kw: '*', platform: '*', message: `reaper: ${String(reaperErr)}` });
+  }
   let usersProcessed = 0;
   let usersSkipped = 0;
   let postsInserted = 0;
@@ -878,7 +898,27 @@ Deno.serve(async (req) => {
   const skippedNoCredits: Array<{ user: string; required: number; available: number; shortfall: number }> = [];
   let totalCreditsCharged = 0;
   let totalProviderCostUsd = 0;
+  // Provider failures across the run. tregCall never throws — deliberately, so a
+  // dead provider falls through the chain instead of killing the request — which
+  // means a run where every call failed used to report ok: true and
+  // errorCount: 0. The errors array only ever held database failures.
+  const providerFailures: Array<{ user: string; operation: string; code: string }> = [];
   const pricing = await loadPricing(supabase);
+
+  // What one credit is realised at, for the usage ledger. Taken from the live
+  // packages rather than assumed, so a price change moves the reported revenue
+  // with it instead of leaving a stale figure in the profit report.
+  const { data: pkgsForPrice } = await supabase
+    .from('topup_packages')
+    .select('gross_usd, credits')
+    .eq('active', true)
+    .order('gross_usd')
+    .limit(1);
+  const pricePerCredit =
+    (pkgsForPrice ?? []).reduce(
+      (sum: number, p: { gross_usd: number; credits: number }) => sum + (Number(p.credits) > 0 ? Number(p.gross_usd) / Number(p.credits) : 0),
+      0,
+    );
 
   const { data: keywords, error: keywordsError } = await supabase
     .from('keywords')
@@ -1043,6 +1083,7 @@ Deno.serve(async (req) => {
     let creditsCharged = 0;
     let providerCostUsd = 0;
     const perOperation: Record<string, number> = {};
+    const charges = new Map<string, { credits: number; revenueUsd: number }>();
 
     for (const [op, t] of tallies) {
       providerCostUsd += t.costMicro / 1e6;
@@ -1051,20 +1092,45 @@ Deno.serve(async (req) => {
       const charged = (t.billed || t.uncertain) ? (pricing.get(op) ?? 0) * userKeywords.length : 0;
       creditsCharged += charged;
       perOperation[op] = charged;
+      // What the usage ledger records, so it carries the same figures the wallet
+      // was debited rather than a hardcoded zero. Revenue is reconstructed at the
+      // rate these credits were bought for, which is what wallet_settle works
+      // out — the two records then agree instead of diverging.
+      charges.set(op, {
+        credits: charged,
+        revenueUsd: charged * pricePerCredit,
+      });
     }
 
+    let charged = false;
     if (creditsCharged > 0) {
-      await settleSweep(
+      // The result is checked. settleSweep returns null when the RPC fails;
+      // ignoring that reported a charge that never happened and left the hold in
+      // place forever, shrinking this workspace's balance on every later sweep.
+      const balanceAfter = await settleSweep(
         supabase, hold.id, creditsCharged, providerCostUsd, `${runKey}:settle`,
         `${userKeywords.length} keywords across ${billableChannels.length} channels`,
       );
-      totalCreditsCharged += creditsCharged;
+      charged = balanceAfter !== null;
+      if (charged) {
+        totalCreditsCharged += creditsCharged;
+      } else {
+        errors.push({
+          user: userId, kw: '*', platform: '*',
+          message: 'credit settlement failed; reservation left held for the reaper',
+        });
+      }
     } else {
       await releaseSweep(supabase, hold.id, 'no billable provider calls');
     }
 
     totalProviderCostUsd += providerCostUsd;
-    await recordUsage(supabase, userId, runKey, tallies, hold.id);
+    for (const [op, t] of tallies) {
+      for (const code of t.errorCodes) {
+        providerFailures.push({ user: userId, operation: op, code });
+      }
+    }
+    await recordUsage(supabase, userId, runKey, tallies, hold.id, charges);
 
     if (rowsToUpsert.length > 0) {
       const { error: upsertError } = await supabase
@@ -1109,7 +1175,10 @@ Deno.serve(async (req) => {
   }
 
   return json({
-    ok: true,
+    // False only when every provider call this run failed. A run that swept some
+    // workspaces and found nothing is a success; one where nothing was reachable
+    // is not, and saying otherwise hides an outage behind a healthy-looking count.
+    ok: providerFailures.length === 0 || providerFailures.length < callsMade,
     hourUtc: currentHourUtc,
     usersProcessed,
     usersSkipped,
@@ -1121,6 +1190,9 @@ Deno.serve(async (req) => {
     callsMade,
     balanceUsd,
     errorCount: errors.length,
+    provider_failure_count: providerFailures.length,
+    provider_failures: providerFailures.slice(0, 12),
+    reaped_reservations: reaped,
     billing: {
       creditsCharged: Number(totalCreditsCharged.toFixed(6)),
       providerCostUsd: Number(totalProviderCostUsd.toFixed(8)),

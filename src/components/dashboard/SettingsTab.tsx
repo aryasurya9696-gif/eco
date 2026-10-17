@@ -239,18 +239,27 @@ export const SettingsTab: React.FC = () => {
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSaving(true);
-    const result = await updateProfile({
-      full_name: fullName,
-      website,
-      core_offer: coreOffer,
-    });
-    await saveSettings();
+
+    // Both writes, one message. The profile save is what the user asked for; the
+    // settings sync rides along with it, and its outcome is folded into the same
+    // notification instead of being announced separately. saveSettings used to
+    // toast on both paths, so every Save press produced two messages.
+    const [profileResult, settingsResult] = await Promise.all([
+      updateProfile({ full_name: fullName, website, core_offer: coreOffer }),
+      saveSettings(),
+    ]);
+
     setIsSaving(false);
-    if (result.error) {
-      addToast(`Could not save: ${result.error}`, 'error');
-    } else {
-      addToast('Settings saved.', 'success');
+
+    if (profileResult.error) {
+      addToast(`Could not save: ${profileResult.error}`, 'error');
+      return;
     }
+    if (settingsResult.warning) {
+      addToast(settingsResult.warning, 'error');
+      return;
+    }
+    addToast('Settings saved.', 'success');
   };
 
   const channelLimitReached = enabledChannels.length >= channelLimit;
@@ -268,7 +277,16 @@ export const SettingsTab: React.FC = () => {
   };
 
   const handlePrune = async () => {
-    await saveSettings();
+    // Retention is read from the profile, so the pending retention setting has to
+    // land before pruning. Its failure is surfaced rather than swallowed — the
+    // prune would otherwise run against the old value and report a success that
+    // used the wrong number.
+    const saved = await saveSettings();
+    if (!saved.ok) {
+      addToast(saved.warning || 'Could not save your retention setting.', 'error');
+      return;
+    }
+
     const result = await pruneFeed();
     if (result.success) {
       addToast(

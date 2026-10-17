@@ -42,11 +42,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
   // Compute user initials for avatar
   const getInitials = () => {
     if (profile?.full_name) {
-      const parts = profile.full_name.trim().split(' ');
+      // Split on runs of whitespace, not single spaces. "John  Doe" with a
+      // double space — which a paste from a form produces constantly — gave
+      // ['John', '', 'Doe'], and parts[1][0] was undefined, rendering the
+      // avatar as "Jundefined".
+      const parts = profile.full_name.trim().split(/\s+/).filter(Boolean);
       if (parts.length >= 2) {
         return (parts[0][0] + parts[1][0]).toUpperCase();
       }
-      return profile.full_name.slice(0, 2).toUpperCase();
+      if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
     }
     if (user?.email) {
       return user.email.slice(0, 2).toUpperCase();

@@ -54,33 +54,8 @@ export async function invokeSearchSweep(
   };
 }
 
-/**
- * Buyer-intent heuristic, mirrored from the edge function for local rendering
- * of freshly fetched rows. Server-side scoring remains authoritative.
- */
-export function calculateIntentScore(text: string): number {
-  if (!text) return 30;
-  const lower = text.toLowerCase();
-
-  const highIntent = [
-    'looking for', 'recommend', 'recommendation', 'alternative to', 'switching from',
-    'anyone using', 'best tool for', 'best software for', 'pricing', 'how much does',
-    'budget', 'quote', 'need software', 'any suggestions', 'help choosing', 'rfp',
-    'demo', 'trial', 'contract', 'enterprise plan', 'migration',
-  ];
-  const mediumIntent = [
-    'tool', 'software', 'automation', 'platform', 'integration', 'workflow',
-    'alternative', 'vs', 'versus',
-  ];
-  const negative = [
-    'hiring', 'job opening', 'we are looking for candidates', 'free template',
-    'looking to buy followers', 'crypto giveaway',
-  ];
-
-  let score = 30;
-  for (const p of highIntent) if (lower.includes(p)) score += 9;
-  for (const p of mediumIntent) if (lower.includes(p)) score += 3;
-  for (const p of negative) if (lower.includes(p)) score -= 40;
-
-  return Math.max(0, Math.min(97, Math.round(score)));
-}
+// The buyer-intent heuristic lives only in the edge functions now. A copy used
+// to sit here for "local rendering of freshly fetched rows", but nothing called
+// it — the rows that reach the browser already carry the score the server
+// computed. Two copies of a scoring algorithm drift, and the one that goes
+// unedited is the one nobody notices.

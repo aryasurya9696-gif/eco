@@ -176,6 +176,34 @@ const NEGATIVE_PHRASES = [
 ];
 
 /**
+ * A URL that came from an external provider is only kept if it is http or https.
+ *
+ * Without this, a provider returning `javascript:...` — or any row written
+ * straight into monitored_posts — becomes a clickable javascript: link in the
+ * feed. React does not strip the scheme, and `rel="noopener"` has nothing to do
+ * with it. Browsers currently block javascript: in a new browsing context, so
+ * this is defence in depth rather than a live hole, but it is the difference
+ * between an untrusted upstream choosing where a link goes and not.
+ *
+ * Returns null for anything rejected, so the caller drops the row rather than
+ * storing a link that leads nowhere.
+ */
+function safePostUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    // Credentials in a URL are a phishing lure at best.
+    if (parsed.username || parsed.password) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Score 0-100. Base 30, +9 per strong intent phrase, +3 per supporting phrase,
  * heavy penalty for recruiting/promo noise. Capped 0..97.
  */
@@ -463,7 +491,7 @@ function basePost(p: Omit<RawPost, 'intent_score'>): RawPost {
 
 /** anyapi.x.search.posts — createdUtc is unix seconds. */
 function mapTwitter(t: any, kw: KeywordRow): RawPost | null {
-  const postUrl = t?.url ?? (t?.id ? `https://x.com/i/status/${t.id}` : null);
+  const postUrl = safePostUrl(t?.url) ?? (t?.id ? safePostUrl(`https://x.com/i/status/${t.id}`) : null);
   if (!postUrl) return null;
   const handle = t?.authorUsername ? `@${String(t.authorUsername).replace(/^@/, '')}` : null;
   return basePost({
@@ -490,7 +518,7 @@ function mapTwitter(t: any, kw: KeywordRow): RawPost | null {
 
 /** scrapecreators.reddit.search.posts — permalink here is relative, url is not. */
 function mapRedditScrapecreators(p: any, kw: KeywordRow): RawPost | null {
-  const postUrl = p?.url ?? (p?.permalink ? `https://www.reddit.com${p.permalink}` : null);
+  const postUrl = safePostUrl(p?.url) ?? (p?.permalink ? safePostUrl(`https://www.reddit.com${p.permalink}`) : null);
   if (!postUrl) return null;
   return basePost({
     keyword_id: kw.id,
@@ -523,7 +551,7 @@ function mapRedditTikhub(p: any, kw: KeywordRow): RawPost | null {
     matched_keyword: kw.keyword,
     platform: 'reddit',
     channel_source: d?.subreddit_name ?? d?.subreddit ?? 'r/reddit',
-    post_url: String(raw).startsWith('http') ? String(raw) : `https://www.reddit.com${raw}`,
+    post_url: safePostUrl(String(raw).startsWith('http') ? raw : `https://www.reddit.com${raw}`) as string,
     author_name: d?.author ?? null,
     author_handle: d?.author ? `@${d.author}` : null,
     author_avatar_url: null,
@@ -535,7 +563,7 @@ function mapRedditTikhub(p: any, kw: KeywordRow): RawPost | null {
 
 /** crawl4ai.web.search.rich — no date field; the snippet often carries one. */
 function mapWeb(r: any, kw: KeywordRow): RawPost | null {
-  const postUrl = r?.url;
+  const postUrl = safePostUrl(r?.url);
   if (!postUrl) return null;
   let domain = 'Web';
   try {
@@ -559,7 +587,7 @@ function mapWeb(r: any, kw: KeywordRow): RawPost | null {
 
 /** tinyfish.web.search.news — free, and every result carries a date. */
 function mapNews(r: any, kw: KeywordRow): RawPost | null {
-  const postUrl = r?.url;
+  const postUrl = safePostUrl(r?.url);
   if (!postUrl) return null;
   let domain = r?.site_name ?? 'News';
   try {
@@ -730,6 +758,7 @@ async function recordUsage(
   runKey: string,
   tallies: Map<string, OperationTally>,
   reservationId: string | null,
+  charges: Map<string, { credits: number; revenueUsd: number }>,
 ): Promise<void> {
   const rows = [...tallies.values()]
     .filter((t) => t.calls > 0)
@@ -742,8 +771,8 @@ async function recordUsage(
       provider: 'treg',
       provider_call_id: t.callIds[0] ?? null,
       provider_cost_usd: Number((t.costMicro / 1e6).toFixed(8)),
-      credits_charged: 0,
-      revenue_usd: 0,
+      credits_charged: charges.get(t.operation)?.credits ?? 0,
+      revenue_usd: Number((charges.get(t.operation)?.revenueUsd ?? 0).toFixed(6)),
       outcome: t.uncertain ? 'uncertain'
         : t.upstreamFailed ? 'upstream_failed'
         : t.billed ? 'success'
@@ -807,7 +836,7 @@ async function searchChannel(
     const items = t.data?.output?.data?.items ?? [];
     if (items.length) {
       served.twitter = 'anyapi.x.search.posts';
-      return items.map((x: any) => mapTwitter(x, kw)).filter((p): p is RawPost => !!p);
+      return items.map((x: any) => mapTwitter(x, kw)).filter((p: any): p is RawPost => !!p);
     }
     return [];
   }
@@ -832,7 +861,7 @@ async function searchChannel(
     const tkItems = tk.data?.data?.posts ?? tk.data?.posts ?? [];
     if (Array.isArray(tkItems) && tkItems.length) {
       served.reddit = 'tikhub.x.reddit-app-fetch-dynamic-search';
-      return tkItems.map((x: any) => mapRedditTikhub(x, kw)).filter((p): p is RawPost => !!p);
+      return tkItems.map((x: any) => mapRedditTikhub(x, kw)).filter((p: any): p is RawPost => !!p);
     }
 
     // Distinct key: this is a different provider answering the same search, and
@@ -851,7 +880,7 @@ async function searchChannel(
     const scItems = sc.data?.posts ?? [];
     if (Array.isArray(scItems) && scItems.length) {
       served.reddit = 'scrapecreators.reddit.search.posts';
-      return scItems.map((x: any) => mapRedditScrapecreators(x, kw)).filter((p): p is RawPost => !!p);
+      return scItems.map((x: any) => mapRedditScrapecreators(x, kw)).filter((p: any): p is RawPost => !!p);
     }
     return [];
   }
@@ -866,7 +895,7 @@ async function searchChannel(
     const items = r.data?.results ?? [];
     if (Array.isArray(items) && items.length) {
       served.google = 'crawl4ai.web.search.rich';
-      return items.map((x: any) => mapWeb(x, kw)).filter((p): p is RawPost => !!p);
+      return items.map((x: any) => mapWeb(x, kw)).filter((p: any): p is RawPost => !!p);
     }
     return [];
   }
@@ -885,7 +914,7 @@ async function searchChannel(
     const items = r.data?.results ?? [];
     if (Array.isArray(items) && items.length) {
       served.news = 'tinyfish.web.search.news';
-      return items.map((x: any) => mapNews(x, kw)).filter((p): p is RawPost => !!p);
+      return items.map((x: any) => mapNews(x, kw)).filter((p: any): p is RawPost => !!p);
     }
     return [];
   }
@@ -1018,6 +1047,19 @@ Deno.serve(async (req) => {
   const runNonce = runKey.slice(3);
 
   const pricing = await loadPricing(admin);
+
+  // Realised price per credit, from the live packages. Used for the usage
+  // ledger's revenue column so the two records of a charge agree.
+  const { data: pkgsForPrice } = await admin
+    .from('topup_packages')
+    .select('gross_usd, credits')
+    .eq('active', true)
+    .order('gross_usd')
+    .limit(1);
+  const pricePerCredit = (pkgsForPrice ?? []).reduce(
+    (sum: number, p: { gross_usd: number; credits: number }) => sum + (Number(p.credits) > 0 ? Number(p.gross_usd) / Number(p.credits) : 0),
+    0,
+  );
   const wanted = [...new Set(enabledChannels.map((c) => OPERATION_OF[c]))]
     .filter((op) => pricing.has(op));
 
@@ -1097,6 +1139,7 @@ Deno.serve(async (req) => {
   let creditsCharged = 0;
   let providerCostUsd = 0;
   const perOperation: Record<string, number> = {};
+  const charges = new Map<string, { credits: number; revenueUsd: number }>();
 
   for (const [op, t] of tallies) {
     providerCostUsd += t.costMicro / 1e6;
@@ -1105,24 +1148,32 @@ Deno.serve(async (req) => {
     const charged = (t.billed || t.uncertain) ? (pricing.get(op) ?? 0) * keywords.length : 0;
     creditsCharged += charged;
     perOperation[op] = charged;
+    // What the usage ledger records, so it carries the same figures the wallet
+    // was debited rather than a hardcoded zero. Revenue at the rate these
+    // credits were bought for, which is what wallet_settle works out.
+    charges.set(op, { credits: charged, revenueUsd: charged * pricePerCredit });
   }
 
   let balanceAfter: number | null = null;
   let charged = false;
 
   if (creditsCharged > 0) {
+    // Checked. settleSweep returns null when the RPC fails, and this used to set
+    // charged = true regardless — the response then said "charged" with
+    // balance_after null while the hold stayed put, quietly reducing what this
+    // workspace could spend on every future search.
     balanceAfter = await settleSweep(
       admin, hold.id, creditsCharged, providerCostUsd,
       `${runKey}:settle`, `${keywords.length} keywords across ${billableChannels.length} channels`,
     );
-    charged = true;
+    charged = balanceAfter !== null;
   } else {
     // Nothing billable happened: no results, or every call failed in a way treg
     // does not charge for. The hold goes back in full.
     await releaseSweep(admin, hold.id, 'no billable provider calls');
   }
 
-  await recordUsage(admin, userId, runKey, tallies, hold.id);
+  await recordUsage(admin, userId, runKey, tallies, hold.id, charges);
 
   // --- Persist to monitored_posts (service role) ---------------------------
   if (collected.length > 0) {
@@ -1153,11 +1204,26 @@ Deno.serve(async (req) => {
     }
   }
 
+  // Provider failures are reported, not swallowed. tregCall never throws — that
+  // is deliberate, so a dead provider falls through the chain instead of killing
+  // the request — but it also means a sweep where every channel 500s used to
+  // return ok: true with an empty feed and no explanation anywhere.
+  const providerErrors = [...tallies.values()]
+    .flatMap((t) => t.errorCodes.map((code) => ({ operation: t.operation, code })));
+  const allCallsFailed =
+    providerErrors.length > 0 && [...tallies.values()].every((t) => t.calls > 0 && !t.billed);
+
   // --- Retention pass ------------------------------------------------------
   const pruned = await pruneOldMentions(admin, userId, sweepStartedAt);
 
   return json({
-    ok: true,
+    ok: !allCallsFailed,
+    // Explicit rather than inferred from an empty feed: "nothing new today" and
+    // "the provider was down" look identical to a customer otherwise, and only
+    // one of them is worth retrying.
+    ...(allCallsFailed
+      ? { error: 'search_provider_unavailable', provider_errors: providerErrors.slice(0, 8) }
+      : {}),
     posts: collected,
     scanned: keywords.length,
     channels: enabledChannels,
@@ -1170,6 +1236,9 @@ Deno.serve(async (req) => {
     calls_made: callsMade,
     billing: {
       charged,
+      // Surfaced so a client can tell "charged and it worked" from "charged and
+      // every call failed", which are the same shape to a reader otherwise.
+      provider_errors: providerErrors.slice(0, 8),
       credits_charged: creditsCharged,
       credits_required: creditsRequired,
       provider_cost_usd: Number(providerCostUsd.toFixed(8)),

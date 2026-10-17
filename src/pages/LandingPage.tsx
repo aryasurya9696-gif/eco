@@ -368,7 +368,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
             {/* Subtitle */}
             <p className="text-base sm:text-lg text-[#555550] max-w-xl mx-auto leading-relaxed">
-              Track keywords that signal purchase intent. Every morning, Echo automatically sweeps discussions across 5 platforms and delivers qualified buyer leads straight to your feed.
+              Track keywords that signal purchase intent. Every morning, Echo automatically sweeps discussions across 4 channels and delivers qualified buyer leads straight to your feed.
             </p>
 
             {/* Dual CTAs */}
@@ -557,7 +557,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 <span className="text-xl font-mono font-bold text-[#8a8a86]">01</span>
                 <h3 className="text-sm font-bold text-[#141414]">Set your keywords</h3>
                 <p className="text-xs text-[#4a4a47] font-mono leading-relaxed">
-                  Enter keywords describing your buyer pain points, competitors, or category queries — 5 on Starter, 10 on Pro, 25 on Scale.
+                  Enter keywords describing your buyer pain points, competitors, or category queries — up to {MAX_KEYWORDS_PER_SWEEP} per workspace, on any package.
                 </p>
               </div>
 

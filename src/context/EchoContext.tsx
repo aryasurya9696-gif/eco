@@ -69,7 +69,7 @@ interface EchoContextType {
   setSweepTime: (time: string) => void;
   sweepCadence: '24h' | '12h' | '6h';
   setSweepCadence: (cadence: '24h' | '12h' | '6h') => void;
-  saveSettings: () => Promise<void>;
+  saveSettings: () => Promise<{ ok: boolean; warning?: string }>;
   enabledChannels: Platform[];
   toggleChannel: (platform: Platform) => void;
   /** Mentions surfaced since this session started (a cheap usage readout). */
@@ -424,9 +424,37 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
             ? supabase.from('monitored_posts').update({ status }).eq('post_url', targetPost.post_url)
             : null;
 
-          if (query) await query.eq('user_id', user.id);
+          if (query) {
+            // PostgREST resolves a write as HTTP 200 with an error body, so a
+            // rejected update arrives as a value rather than a rejection.
+            // `await query.eq(...)` never throws, which is why the catch below was
+            // unreachable — an RLS denial or a bad column left the row unchanged
+            // while the optimistic state kept the new status and the toast
+            // claimed success. The next sweep then redrew the feed and undid it,
+            // which read as the app randomly forgetting the user's own edit.
+            const { error } = await query.eq('user_id', user.id);
+            if (error) {
+              console.error('Error updating post status in database:', error);
+              // Roll back only this row, so a concurrent change to another lead
+              // is not discarded along with it.
+              setPosts((prev) =>
+                targetPost
+                  ? prev.map((p) => (p.id === postId ? { ...p, status: targetPost.status } : p))
+                  : prev,
+              );
+              addToast(`Could not mark that lead as ${status}.`, 'error');
+              return;
+            }
+          }
         } catch (err) {
           console.error('Error updating post status in database:', err);
+          setPosts((prev) =>
+            targetPost
+              ? prev.map((p) => (p.id === postId ? { ...p, status: targetPost.status } : p))
+              : prev,
+          );
+          addToast(`Could not mark that lead as ${status}.`, 'error');
+          return;
         }
       } else if (user) {
         const updated = posts.map((p) => (p.id === postId ? { ...p, status } : p));
@@ -539,8 +567,22 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   // --- Settings persistence -------------------------------------------------
 
-  const saveSettings = useCallback(async () => {
-    if (!user) return;
+  /**
+   * Writes preferences locally, then to the database.
+   *
+   * Deliberately silent. It used to toast on both paths, and every caller toasts
+   * too — pressing Save produced two "saved" notifications, and pruning produced
+   * a "preferences saved" toast nobody asked for followed by the one that said
+   * what actually happened. The result is returned instead; the caller owns the
+   * single message, which is the only one that can describe what the user tried
+   * to do.
+   *
+   * A server rejection is still a partial success: localStorage already took the
+   * write, so this is reported as a warning about the server, not as a failure of
+   * the save.
+   */
+  const saveSettings = useCallback(async (): Promise<{ ok: boolean; warning?: string }> => {
+    if (!user) return { ok: false, warning: 'Not signed in.' };
 
     localStorage.setItem(
       `${LOCAL_STORAGE_SETTINGS_KEY}_${user.id}`,
@@ -568,12 +610,11 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (error) {
         console.error('Error syncing profile settings to database:', error);
-        addToast(`Settings saved locally, but the server rejected them: ${error.message}`, 'error');
-        return;
+        return { ok: true, warning: `Saved on this device, but the server rejected them: ${error.message}` };
       }
     }
 
-    addToast('Preferences saved successfully.', 'success');
+    return { ok: true };
   }, [
     user,
     lookbackHours,
@@ -582,7 +623,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     minIntentThreshold,
     feedRetentionDays,
     enabledChannels,
-    addToast,
   ]);
 
   // --- Feed cleanup -----------------------------------------------------

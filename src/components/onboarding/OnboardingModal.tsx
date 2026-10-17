@@ -13,7 +13,7 @@ interface OnboardingModalProps {
 
 export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComplete }) => {
   const { profile, updateProfile, completeOnboarding } = useAuth();
-  const { saveInitialKeywords, suggestKeywordsFromOffer } = useEcho();
+  const { saveInitialKeywords, suggestKeywordsFromOffer, keywordLimit } = useEcho();
 
   const [step, setStep] = useState<number>(profile?.onboarding_step || 1);
   const [fullName, setFullName] = useState<string>(profile?.full_name || '');
@@ -300,7 +300,13 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
                       What should we watch for?
                     </h2>
                     <p className="text-xs text-[#8a8a86] mt-1 font-mono">
-                      Add up to 10 keywords. We'll search connected social channels and web communities daily for these mentions.
+                      {/* The real limit, not a hopeful one. It was 10 here while
+                          the workspace caps at 8 and EchoContext silently
+                          truncated on save, so two keywords vanished with no
+                          message after a success animation. */}
+                      Add up to {keywordLimit} keywords. We&apos;ll search
+                      connected social channels and web communities daily for
+                      these mentions.
                     </p>
                   </div>
 
@@ -309,7 +315,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
                       keywords={keywords}
                       onAdd={(kw) => setKeywords((prev) => [...prev, kw])}
                       onRemove={(kw) => setKeywords((prev) => prev.filter((k) => k !== kw))}
-                      max={10}
+                      max={keywordLimit}
                       suggestions={[
                         fullName ? fullName.toLowerCase() : 'your company',
                         ...aiSuggestions,

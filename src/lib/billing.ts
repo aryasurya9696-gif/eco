@@ -160,7 +160,16 @@ export async function startCheckout(packageCode: string): Promise<CheckoutRespon
  * missing number into a blank screen. Returning a dash keeps the page readable
  * and makes the absence visible rather than silent.
  */
-export function formatCredits(n: number | null | undefined): string {
+export function formatCredits(n: number | null | undefined | string): string {
+  // The signature admits string because the values genuinely arrive as strings:
+  // these columns come back from PostgREST and JSON does not always give a number
+  // where one is expected. Guessing at the cast is what let the guards below be
+  // written as arithmetic checks only.
+  //
+  // null is checked explicitly. Number(null) is 0, which is finite and an
+  // integer, so an isFinite guard alone lets null through and renders it as a
+  // confident "0". A missing value and a zero balance are different facts.
+  if (n === null || n === undefined || n === '') return '—';
   const v = Number(n);
   if (!Number.isFinite(v)) return '—';
   return Number.isInteger(v) ? String(v) : v.toFixed(2);
@@ -178,10 +187,11 @@ export function formatCredits(n: number | null | undefined): string {
  * call reads $0.001, a web search $0.00015, and a card payment $10.00. Zero
  * stays $0.00 rather than becoming $0, because this is a currency column.
  */
-export function formatUsd(n: number | null | undefined, opts: { decimals?: number } = {}): string {
-  // Same reasoning as formatCredits: a missing or non-numeric value must not
-  // throw from inside a render. '$—' reads as "we do not know", which is the
-  // truth, where '$0.00' would be a confident lie about someone's balance.
+export function formatUsd(n: number | null | undefined | string, opts: { decimals?: number } = {}): string {
+  // Same reasoning as formatCredits, including the null case: Number(null) is 0,
+  // so without the explicit check a missing balance renders as $0.00 — the
+  // confident lie this function exists to avoid.
+  if (n === null || n === undefined || n === '') return '$—';
   const v = Number(n);
   if (!Number.isFinite(v)) return '$—';
   if (opts.decimals !== undefined) return `$${v.toFixed(opts.decimals)}`;
@@ -228,17 +238,6 @@ export function formatDateTime(iso: string): string {
   });
 }
 
-const OPERATION_LABEL: Record<string, string> = {
-  'treg.twitter.search': 'Twitter',
-  'treg.reddit.search': 'Reddit',
-  'treg.web.search': 'Web',
-  'treg.news.search': 'Press & news',
-};
-
-export function operationLabel(operation: string): string {
-  return OPERATION_LABEL[operation] ?? operation;
-}
-
 /**
  * What a search is worth, derived from the packages rather than assumed.
  *
@@ -248,10 +247,13 @@ export function operationLabel(operation: string): string {
  */
 export function creditsToUsd(credits: number, packages: Package[]): number {
   if (!Array.isArray(packages) || packages.length === 0) return 0;
-  // reduce with no initial value throws on an empty array, and a package whose
-  // per_credit_usd is missing would poison the comparison for every package after
-  // it. Filtered first, so one malformed row cannot take the page down with it.
-  const priced = packages.filter((p) => Number.isFinite(Number(p?.per_credit_usd)));
+  // per_credit_usd is null-checked as well as finite-checked. Number(null) is 0,
+  // so a package with a missing price passed a bare isFinite test and then won
+  // the "cheapest" comparison as though it were free — making every balance read
+  // "worth $0.00".
+  const priced = packages.filter(
+    (p) => p?.per_credit_usd !== null && p?.per_credit_usd !== undefined && Number.isFinite(Number(p.per_credit_usd)),
+  );
   if (priced.length === 0) return 0;
   const cheapest = priced.reduce((min, p) =>
     Number(p.per_credit_usd) < Number(min.per_credit_usd) ? p : min,

@@ -471,6 +471,175 @@ select 'price_change_is_audited',
 update public.pricing_config set credits = 1 where operation = 'treg.twitter.search';
 
 -- ===========================================================================
+-- A paid order carries a fee, and the fee must not stop the grant
+-- ===========================================================================
+-- The payment processor is a merchant of record: the fee is the business, so
+-- every real payment has one. The credit unit price used to be derived by
+-- dividing by the order's own credits_granted, which is 0 until the grant is
+-- written, so a fee-bearing payment raised 22012 division_by_zero and the
+-- customer paid and received nothing. The fee-less path took a different branch
+-- and worked, which is why the bug survived.
+--
+-- The package is what was bought, so it is the divisor.
+-- ---------------------------------------------------------------------------
+select pg_temp.reset_wallet('231f8d14-488f-4413-a1db-bb34a910ec1c'::uuid);
+
+insert into public.payment_orders (user_id, package_code, gross_usd, status)
+values ('231f8d14-488f-4413-a1db-bb34a910ec1c', 'starter_200', 10.00, 'created');
+
+insert into _results (test, ok, detail)
+select 'fee_bearing_payment_still_grants_credits',
+       (out->>'ok')::boolean
+         and (out->>'credits_granted')::numeric = 200
+         and (out->>'unit_price_usd')::numeric = 9.70 / 200,
+       jsonb_build_object(
+         'out', out,
+         'note', 'unit price is net of the fee, not the list price')
+  from (select public.wallet_topup_from_order(
+          (select id from public.payment_orders
+            where status = 'created' order by created_at desc limit 1),
+          0.30, 9.70, 'acc_fee_pay', 'acc:fee') as out) q;
+
+insert into _results (test, ok, detail)
+select 'fee_bearing_payment_credits_land_in_wallet',
+       (select balance from public.wallet
+         where user_id = '231f8d14-488f-4413-a1db-bb34a910ec1c') = 200,
+       jsonb_build_object('balance',
+         (select balance from public.wallet
+           where user_id = '231f8d14-488f-4413-a1db-bb34a910ec1c'));
+
+-- The provider redelivers. The idempotency key is derived from the order id, so
+-- this holds however many times it retries.
+insert into _results (test, ok, detail)
+select 'topup_replay_grants_nothing_twice',
+       (out->>'duplicate')::boolean
+         and (select balance from public.wallet
+               where user_id = '231f8d14-488f-4413-a1db-bb34a910ec1c') = 200,
+       jsonb_build_object('out', out,
+         'note', 'a redelivery grants nothing and leaves the balance at 200')
+  from (select public.wallet_topup_from_order(
+          (select id from public.payment_orders
+            where provider_ref = 'acc_fee_pay'),
+          0.30, 9.70, 'acc_fee_pay', 'acc:fee') as out) q;
+
+delete from public.payment_orders where provider_ref = 'acc_fee_pay';
+
+-- ===========================================================================
+-- A hold left behind by a dead sweep is closed, not held forever
+-- ===========================================================================
+-- Reserve happens before the provider calls and settle after them. The window
+-- between the two is not made survivable by a guarantee: an isolate eviction or a
+-- wall-clock kill inside it leaves the credits reserved permanently, and the
+-- workspace loses spendable balance on every subsequent sweep without ever being
+-- told. A view listed them; nothing acted on it.
+-- ---------------------------------------------------------------------------
+select pg_temp.reset_wallet('231f8d14-488f-4413-a1db-bb34a910ec1c'::uuid);
+
+select public.wallet_apply_grant('231f8d14-488f-4413-a1db-bb34a910ec1c'::uuid, 20, 'topup', 0.05, null, 't:reap-grant');
+
+-- Reserved through the real entry point, then backdated to look like a sweep
+-- that died two hours ago. Inserting the row directly would leave the wallet's
+-- reserved counter untouched and the reaper would drive it negative — which is
+-- what the check constraint did when this test was written the other way.
+select public.wallet_reserve(
+         '231f8d14-488f-4413-a1db-bb34a910ec1c'::uuid, 12, 'reap-test:old');
+
+update public.reservations
+   set created_at = now() - interval '2 hours'
+ where idempotency_key = 'reap-test:old';
+
+-- A hold from a minute ago: a sweep still in flight, and must not be touched.
+select public.wallet_reserve(
+         '231f8d14-488f-4413-a1db-bb34a910ec1c'::uuid, 3, 'reap-test:fresh');
+
+-- The reaper's own counts and the state of the rows are read in two separate
+-- statements on purpose. A single statement has one snapshot, taken before it
+-- runs, so asserting on the rows it is about to change reads their pre-call
+-- values — which would have made this test unable to pass in either direction.
+create temp table _reap_out on commit drop as
+  select public.reap_stale_reservations('1 hour') as out;
+
+insert into _results (test, ok, detail)
+select 'reaper_releases_only_holds_past_its_window',
+       (out->>'released')::int = 1
+         and (out->>'settled')::int = 0
+         and (select status from public.reservations
+               where idempotency_key = 'reap-test:old') = 'released'
+         and (select status from public.reservations
+               where idempotency_key = 'reap-test:fresh') = 'held',
+       jsonb_build_object('out', out,
+         'note', 'the hour-old hold is closed, the one-minute-old hold is a sweep still in flight')
+  from _reap_out;
+
+-- A reserve does not reduce balance; it moves credits into reserved, and
+-- available = balance - reserved. So the wallet is still whole at 20 and only
+-- the live hold is still reserved. What matters is that 15 became 3: without
+-- the reaper the workspace would have been 12 credits short on every sweep
+-- from here on, with nothing in the interface to say so.
+insert into _results (test, ok, detail)
+select 'reaped_hold_frees_the_dead_sweeps_hold',
+       (select balance from public.wallet
+         where user_id = '231f8d14-488f-4413-a1db-bb34a910ec1c') = 20
+         and (select reserved from public.wallet
+               where user_id = '231f8d14-488f-4413-a1db-bb34a910ec1c') = 3,
+       jsonb_build_object(
+         'balance', (select balance from public.wallet
+                      where user_id = '231f8d14-488f-4413-a1db-bb34a910ec1c'),
+         'reserved', (select reserved from public.wallet
+                       where user_id = '231f8d14-488f-4413-a1db-bb34a910ec1c'),
+         'note', 'the dead sweep hold is gone, the live one is untouched');
+
+delete from public.reservations where idempotency_key like 'reap-test:%';
+
+-- ===========================================================================
+-- A client cannot act on another workspace's feed
+-- ===========================================================================
+-- The guard also tested session_user, which describes the connection rather than
+-- the request, so any path authenticating as postgres while carrying a user JWT
+-- skipped it entirely. Probed live: a different signed-in user deleted another
+-- user's post and the function answered success, deleted: 1.
+--
+-- Runs here as the function owner with no request claims, which is the same
+-- shape: the check must rest on who is asking, not on how the connection
+-- happens to have authenticated.
+-- ---------------------------------------------------------------------------
+insert into public.monitored_posts (user_id, matched_keyword, platform, post_url, body)
+values ('231f8d14-488f-4413-a1db-bb34a910ec1c', 'xpost-test', 'reddit',
+        'https://acceptance.example/clear-feed-probe', 'probe')
+on conflict (user_id, post_url) do nothing;
+
+insert into _results (test, ok, detail)
+select 'cross_workspace_clear_feed_is_refused',
+       (out->>'success')::boolean = false
+         and (out->>'error') = 'unauthorized',
+       jsonb_build_object('out', out)
+  from (select public.clear_feed('231f8d14-488f-4413-a1db-bb34a910ec1c'::uuid) as out) q;
+
+insert into _results (test, ok, detail)
+select 'refused_clear_feed_leaves_the_posts_alone',
+       (select count(*) from public.monitored_posts
+         where post_url = 'https://acceptance.example/clear-feed-probe') = 1,
+       jsonb_build_object('note', 'the other workspace still has its post');
+
+delete from public.monitored_posts where post_url = 'https://acceptance.example/clear-feed-probe';
+
+-- ===========================================================================
+-- The sweep's shape is one number, defined once
+-- ===========================================================================
+-- Billing priced a sweep from every stored keyword and every configured channel,
+-- while the sweep itself truncated to the caps and the interactive search used a
+-- third count. A workspace at the limit was told its sweep cost more than the
+-- sweep could ever reserve, and could be shown as able to afford a sweep the
+-- cron then skipped every night.
+-- ---------------------------------------------------------------------------
+insert into _results (test, ok, detail)
+select 'sweep_shape_matches_the_caps_the_sweep_applies',
+       (public.sweep_shape()->>'max_keywords')::int = public.keyword_limit()
+         and (public.sweep_shape()->>'max_channels')::int = public.channel_limit(),
+       jsonb_build_object('shape', public.sweep_shape(),
+         'note', 'billing quotes off this, so it cannot drift from the sweep');
+
+-- ===========================================================================
 -- Cleanup, before the verdict
 -- ===========================================================================
 select pg_temp.reset_wallet('231f8d14-488f-4413-a1db-bb34a910ec1c'::uuid);

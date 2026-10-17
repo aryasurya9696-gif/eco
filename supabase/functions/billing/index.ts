@@ -169,13 +169,23 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
 
   const priceOf = new Map<string, number>((pricing ?? []).map((p: any) => [p.operation, num(p.credits)]));
 
-  const channels: string[] = Array.isArray(profile?.enabled_channels)
+  // The caps the cron actually applies. Quoting the sweep as if the tables
+  // were unlimited told a workspace at the limit that its next sweep cost more
+  // than the sweep could ever reserve, and could show "you can afford this"
+  // for a sweep the cron then skipped every single night.
+  const { data: shape } = await admin.rpc('sweep_shape');
+  const maxKeywords = Number(shape?.max_keywords ?? 8);
+  const maxChannels = Number(shape?.max_channels ?? 3);
+
+  const enabledChannels: string[] = Array.isArray(profile?.enabled_channels)
     ? profile.enabled_channels
     : ['twitter', 'reddit', 'google'];
+  const channels = enabledChannels.slice(0, maxChannels);
+  const effectiveKeywords = Math.min(keywords ?? 0, maxKeywords);
 
   let sweepCost = 0;
   for (const ch of channels) {
-    sweepCost += (keywords ?? 0) * (priceOf.get(OPERATION_OF[ch]) ?? 0);
+    sweepCost += effectiveKeywords * (priceOf.get(OPERATION_OF[ch]) ?? 0);
   }
 
   const available = Math.max(balance - reserved, 0);
@@ -223,8 +233,13 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
       service_cost_usd: num(wallet.service_cost_usd),
     },
     sweep: {
-      keywords: keywords ?? 0,
+      // What will actually be swept, not what is stored. A workspace holding 12
+      // keywords is quoted for 8, and told so, rather than discovering the
+      // difference when two of its keywords never appear.
+      keywords: effectiveKeywords,
+      keywords_configured: keywords ?? 0,
       channels,
+      channels_configured: enabledChannels,
       credits: sweepCost,
       // Whether the next scheduled sweep can run at all. Checked here so the
       // warning is visible before the cron silently skips the workspace.
@@ -329,8 +344,8 @@ async function actionQuote(
 
   const { data, error } = await admin.rpc('quote_sweep', {
     p_user_id: userId,
-    p_keywords: keywords ?? 0,
-    p_operations: ops,
+    p_keywords: Math.min(keywords ?? 0, 8),
+    p_operations: ops.slice(0, 3),
   });
   if (error) throw new Error(`quote failed: ${error.message}`);
 
@@ -358,13 +373,15 @@ async function actionCheckout(
     .maybeSingle();
 
   if (error) throw new Error(`package lookup failed: ${error.message}`);
-  if (!pkg) return { ok: false, error: 'unknown_package' };
+  if (!pkg) return { __status: 404, ok: false, error: 'unknown_package' };
 
   const apiKey = Deno.env.get('DODO_PAYMENTS_API_KEY');
   if (!apiKey) {
     // No payment account configured yet. Saying so plainly beats a checkout
-    // button that silently does nothing.
+    // button that silently does nothing. 503 rather than 400: nothing is wrong
+    // with what the customer asked for.
     return {
+      __status: 503,
       ok: false,
       error: 'payments_not_configured',
       message: 'Card payments are not switched on yet.',
@@ -381,6 +398,28 @@ async function actionCheckout(
     .eq('id', userId)
     .maybeSingle();
 
+  // The order row is created first, so its id can be carried into the session's
+  // metadata. That is the only identifier the webhook is reliably handed back:
+  // a checkout-session id and a payment id are different things, and matching
+  // one against the other could never succeed.
+  const { data: order, error: orderError } = await admin
+    .from('payment_orders')
+    .insert({
+      user_id: userId,
+      provider: 'dodo',
+      package_code: pkg.code,
+      gross_usd: num(pkg.gross_usd),
+      currency: pkg.currency,
+      status: 'created',
+    })
+    .select('id')
+    .single();
+
+  if (orderError) {
+    console.error('[billing] order insert failed:', orderError.message);
+    return fail('Could not start checkout', 500);
+  }
+
   const res = await fetch(`${base}/checkout/sessions`, {
     method: 'POST',
     headers: {
@@ -390,37 +429,31 @@ async function actionCheckout(
     body: JSON.stringify({
       product_cart: [{ product_id: pkg.code, quantity: 1 }],
       customer: { email: profile?.email, name: profile?.full_name },
-      return_url: `${Deno.env.get('APP_ORIGIN') ?? ''}/?billing=returned`,
+      metadata: { order_id: order.id, package_code: pkg.code },
+      // Returns to the dashboard, not the marketing page, and the hash is what
+      // this app's router reads.
+      return_url: `${Deno.env.get('APP_ORIGIN') ?? ''}/#dashboard?billing=returned`,
     }),
   });
 
   if (!res.ok) {
     const body = await res.text();
     console.error('[billing] checkout session failed:', res.status, body.slice(0, 300));
-    return { ok: false, error: 'checkout_failed' };
+    // Leave the order abandoned rather than deleting it: if the provider did
+    // charge and only the response failed, the webhook can still find it.
+    return fail('Payment provider rejected the request', 502);
   }
 
   const session = await res.json();
 
-  const { data: order, error: orderError } = await admin
+  await admin
     .from('payment_orders')
-    .insert({
-      user_id: userId,
-      provider: 'dodo',
-      package_code: pkg.code,
+    .update({
       provider_order_id: session?.id ?? null,
-      gross_usd: num(pkg.gross_usd),
-      currency: pkg.currency,
-      status: 'created',
       checkout_url: session?.url ?? null,
+      status: 'pending',
     })
-    .select('id')
-    .single();
-
-  if (orderError) {
-    console.error('[billing] order insert failed:', orderError.message);
-    return { ok: false, error: 'order_create_failed' };
-  }
+    .eq('id', order.id);
 
   return { ok: true, order_id: order.id, checkout_url: session?.url ?? null };
 }
@@ -435,7 +468,7 @@ async function actionStatus(admin: ReturnType<typeof createClient>, userId: stri
     .maybeSingle();
 
   if (error) throw new Error(`order lookup failed: ${error.message}`);
-  if (!data) return { ok: false, error: 'order_not_found' };
+  if (!data) return { __status: 404, ok: false, error: 'order_not_found' };
 
   return { ok: true, order: { ...data, gross_usd: num(data.gross_usd), credits_granted: num(data.credits_granted) } };
 }
@@ -461,22 +494,42 @@ Deno.serve(async (req) => {
   }
 
   try {
+    // Actions return a body; a body carrying __status is sent with that status
+    // rather than a blanket 200. An ok:false at HTTP 200 is indistinguishable
+    // from success to any client that checks res.ok, which is how a customer
+    // ends up sitting on a spinner waiting for a checkout that never opened.
+    let result: any;
+    let status = 200;
+
     switch (body?.action) {
       case 'balance':
-        return json(await actionBalance(admin, userId));
+        result = await actionBalance(admin, userId);
+        break;
       case 'packages':
-        return json(await actionPackages(admin));
+        result = await actionPackages(admin);
+        break;
       case 'history':
-        return json(await actionHistory(admin, userId));
+        result = await actionHistory(admin, userId);
+        break;
       case 'quote':
-        return json(await actionQuote(admin, userId, Array.isArray(body.channels) ? body.channels : []));
+        result = await actionQuote(admin, userId, Array.isArray(body.channels) ? body.channels : []);
+        break;
       case 'checkout':
-        return json(await actionCheckout(admin, userId, String(body.packageCode ?? '')));
+        result = await actionCheckout(admin, userId, String(body.packageCode ?? ''));
+        break;
       case 'status':
-        return json(await actionStatus(admin, userId, String(body.orderId ?? '')));
+        result = await actionStatus(admin, userId, String(body.orderId ?? ''));
+        break;
       default:
         return fail('Unknown action', 400);
     }
+
+    if (typeof result?.__status === 'number') {
+      status = result.__status;
+      const { __status: _omit, ...clean } = result;
+      return json(clean, status);
+    }
+    return json(result, status);
   } catch (err) {
     console.error('[billing] action failed:', (err as Error)?.message);
     return fail('Billing request failed', 500);

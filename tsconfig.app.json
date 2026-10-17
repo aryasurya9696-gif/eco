@@ -17,6 +17,15 @@
     "jsx": "react-jsx",
 
     /* Linting */
+    /* `strict` was simply absent rather than deliberately relaxed, which meant
+       noImplicitAny and strictNullChecks never ran over this tree. The absence
+       is what hid the `.filter((r): r is T => ...)` implicit-any errors in the
+       edge functions for as long as they existed: they were invisible to
+       `npm run build`, and the typechecking that did happen was run by hand
+       against a strict-off config, so "typecheck clean" did not mean what it
+       said. Enabling it now costs nothing — the tree passes as-is — and the next
+       untyped callback fails at build time instead of in a deployed function. */
+    "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "erasableSyntaxOnly": true,

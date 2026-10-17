@@ -90,24 +90,45 @@ export const BillingTab: React.FC = () => {
 
   const load = useCallback(async () => {
     setError(null);
-    try {
-      // Packages first: the balance's "worth $" line is derived from them, and
-      // fetching them together would mean rendering a balance with no price for
-      // a frame.
-      const [pkgs, bal, hist] = await Promise.all([
-        fetchPackages(),
-        fetchBalance(),
-        fetchHistory(),
-      ]);
-      setPackages(pkgs);
-      setWallet(bal.wallet);
-      setSweep(bal.sweep);
-      setHistory(hist);
-    } catch (err) {
-      setError((err as Error)?.message ?? 'Could not load your billing details.');
-    } finally {
-      setLoading(false);
+    // Settled, not all. These are three independent concerns, and one failing
+    // query used to blank the page — including the balance, which had already
+    // arrived fine. A customer should still see their credits because a payments
+    // history query timed out.
+    const [pkgRes, balRes, histRes] = await Promise.allSettled([
+      fetchPackages(),
+      fetchBalance(),
+      fetchHistory(),
+    ]);
+
+    const failures: string[] = [];
+
+    if (pkgRes.status === 'fulfilled') {
+      setPackages(pkgRes.value);
+    } else {
+      failures.push('packages');
     }
+
+    if (balRes.status === 'fulfilled' && balRes.value?.wallet) {
+      setWallet(balRes.value.wallet);
+      setSweep(balRes.value.sweep);
+    } else {
+      failures.push('balance');
+    }
+
+    if (histRes.status === 'fulfilled') {
+      setHistory(histRes.value);
+    } else {
+      failures.push('history');
+    }
+
+    if (failures.length > 0) {
+      setError(
+        failures.length === 3
+          ? 'Could not load your billing details.'
+          : `Could not load: ${failures.join(', ')}. The rest is up to date.`,
+      );
+    }
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -271,7 +292,12 @@ export const BillingTab: React.FC = () => {
               <p className="font-mono text-[11px] mt-0.5">
                 {formatCredits(sweep.credits)} needed for {sweep.keywords}{' '}
                 keyword{sweep.keywords === 1 ? '' : 's'} across{' '}
-                {sweep.channels.map((c) => CHANNEL_LABEL[c] ?? c).join(', ')} ·{' '}
+                {/* channels is guarded rather than assumed. The actionQuote
+                    response and the fallbacks built from a partial fetch can
+                    both produce a sweep object without it, and .map on undefined
+                    threw inside render — which took down the whole billing tab,
+                    including the balance that had loaded fine. */}
+                {(sweep.channels ?? []).map((c) => CHANNEL_LABEL[c] ?? c).join(', ')} ·{' '}
                 {formatCredits(sweep.shortfall)} short
               </p>
             </div>
@@ -303,7 +329,12 @@ export const BillingTab: React.FC = () => {
               )}
               <div className="flex items-baseline justify-between">
                 <span className="text-lg font-mono font-medium text-[#141414]">
-                  {formatUsd(p.gross_usd, { decimals: 0 })}
+                  {/* Not rounded to whole dollars. Every seeded package happens to be a round
+                    number, so the rounding is invisible today — and then a $24.99
+                    package shows as "$25" here and "$24.99" in the payments
+                    table twenty lines below, which is two prices for one
+                    product on one screen. */}
+                    {formatUsd(p.gross_usd)}
                 </span>
                 {p.bonus_credits > 0 && (
                   <span className="text-[9px] font-mono px-1.5 py-0.5 bg-[#141414] text-white uppercase">

@@ -59,15 +59,4 @@ export interface MonitoredPost {
   created_at: string;
 }
 
-export interface SweepRun {
-  id: string;
-  started_at: string;
-  finished_at: string | null;
-  users_processed: number;
-  posts_inserted: number;
-  errors: any[];
-}
-
 export type DashboardTab = 'feed' | 'keywords' | 'settings' | 'billing';
-
-export const APP_NAME = 'Echo';

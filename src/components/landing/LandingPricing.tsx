@@ -1,5 +1,6 @@
 import React from 'react';
 import { ArrowRight } from 'lucide-react';
+import { formatCredits, formatUsd } from '../../lib/billing';
 
 /**
  * Pricing, built like a plan picker.
@@ -112,13 +113,18 @@ export const LandingPricing: React.FC<LandingPricingProps> = ({
 
                   <div className="flex items-baseline gap-1.5 mt-3">
                     <span className="text-4xl font-bold tracking-tight text-[#141414]">
-                      ${p.gross_usd}
+                      {/* Through the shared formatter rather than a bare
+                          interpolation. `${p.gross_usd}` printed whatever the JSON
+                          happened to contain, so a package stored as 10.50 showed
+                          "10.5" here and "$10.50" on the billing page — one
+                          product, two prices, depending on where you looked. */}
+                      {formatUsd(p.gross_usd)}
                     </span>
                     <span className="text-xs font-mono text-[#8a8a86]">one-off</span>
                   </div>
 
                   <p className="text-sm font-mono text-[#141414] mt-2">
-                    {total.toLocaleString()} credits
+                    {formatCredits(total)} credits
                     {p.bonus_credits > 0 && (
                       <span className="ml-2 text-[10px] px-1.5 py-0.5 bg-emerald-100 text-emerald-900 uppercase align-middle">
                         +{p.bonus_credits} bonus
@@ -136,7 +142,7 @@ export const LandingPricing: React.FC<LandingPricingProps> = ({
                   </div>
 
                   <p className="text-[11px] text-[#8a8a86] font-mono mt-3">
-                    ${Number(perSearchPrice).toFixed(2)} per credit
+                    {formatUsd(perSearchPrice)} per credit
                   </p>
 
                   {/* What it actually buys, at both ends of the channel mix. */}

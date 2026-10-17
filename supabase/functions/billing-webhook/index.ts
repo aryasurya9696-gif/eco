@@ -229,8 +229,15 @@ Deno.serve(async (req) => {
   const eventType = String(event?.type ?? 'unknown');
 
   // Record the delivery before acting on it. The unique constraint on
-  // webhook_id is the actual replay guard: if a duplicate arrives, this insert
-  // fails and we stop, rather than granting credits a second time.
+  // webhook_id is what makes a redelivery recognisable as one.
+  //
+  // A duplicate is not automatically "already handled". The first attempt
+  // inserts the row and only then processes, so a delivery that failed
+  // afterwards is still sitting here in 'received' or 'failed' — and the
+  // payment provider will retry it, which is the only way that customer ever
+  // gets their credits. Short-circuiting on the duplicate used to swallow
+  // every retry, so a transient failure turned into "paid, no credits, and the
+  // provider was told 200".
   const { error: recordError } = await admin
     .from('webhook_events')
     .insert({
@@ -243,13 +250,28 @@ Deno.serve(async (req) => {
     });
 
   if (recordError) {
-    // 23505 = unique violation, i.e. this exact delivery was already seen.
     if (recordError.code === '23505') {
-      console.warn(`[webhook] duplicate ${webhookId} (${eventType}) ignored`);
-      return json({ ok: true, duplicate: true });
+      // Already seen. Reprocess only if the earlier attempt did not finish.
+      const { data: prior } = await admin
+        .from('webhook_events')
+        .select('status, attempts')
+        .eq('webhook_id', webhookId)
+        .maybeSingle();
+
+      if (prior?.status === 'processed' || prior?.status === 'ignored') {
+        console.log(`[webhook] ${webhookId} (${eventType}) already ${prior.status} - ignoring`);
+        return json({ ok: true, duplicate: true, status: prior.status });
+      }
+
+      await admin.from('webhook_events')
+        .update({ status: 'received', attempts: (prior?.attempts ?? 1) + 1 })
+        .eq('webhook_id', webhookId);
+      console.warn(`[webhook] ${webhookId} retrying after prior ${prior?.status ?? 'unknown'}`);
+      // Falls through to processing.
+    } else {
+      console.error('[webhook] could not record event:', recordError.message);
+      return json({ ok: false, error: 'record_failed' }, 500);
     }
-    console.error('[webhook] could not record event:', recordError.message);
-    return json({ ok: false, error: 'record_failed' }, 500);
   }
 
   try {
@@ -258,17 +280,19 @@ Deno.serve(async (req) => {
     if (eventType === 'payment.succeeded') {
       const providerRef = data?.payment_id ?? data?.id ?? null;
 
-      // The order was created by our own checkout call, so match on the id we
-      // were given. Falling back to the provider reference covers orders
-      // created elsewhere.
+      // The reliable join is the metadata we put on the checkout session
+      // ourselves. The alternative — matching provider_order_id against the
+      // payment id — compares two different identifiers, because checkout stored
+      // a checkout-session id there, and could therefore never match. Both are
+      // tried; the metadata is simply the one that works.
       let orderId = data?.metadata?.order_id ?? null;
       if (!orderId && providerRef) {
         const { data: found } = await admin
           .from('payment_orders')
           .select('id')
-          .eq('provider_order_id', providerRef)
-          .maybeSingle();
-        orderId = found?.id ?? null;
+          .or(`provider_order_id.eq.${providerRef},provider_ref.eq.${providerRef}`)
+          .limit(1);
+        orderId = found?.[0]?.id ?? null;
       }
 
       if (!orderId) {
@@ -306,36 +330,50 @@ Deno.serve(async (req) => {
         const { data: found } = await admin
           .from('payment_orders')
           .select('id')
-          .eq('provider_order_id', providerRef)
-          .maybeSingle();
-        orderId = found?.id ?? null;
+          .or(`provider_order_id.eq.${providerRef},provider_ref.eq.${providerRef}`)
+          .limit(1);
+        orderId = found?.[0]?.id ?? null;
       }
 
-      if (orderId) {
-        await admin.from('payment_orders').update({ status: 'refunded' }).eq('id', orderId);
+      // Revoke before marking the order refunded, and treat a failure as a
+      // failure. Doing it the other way round — mark first, then try — meant a
+      // revoke that errored left the order looking refunded with the credits
+      // still there, and the provider was answered 200 so it never came back.
+      let revokeFailures = 0;
 
-        // Take back the unspent portion of whatever the purchase granted.
-        // Credits already spent were consumed, so the service was delivered and
-        // that money is not recoverable.
+      if (orderId) {
         const { data: grants } = await admin
           .from('credit_grants')
           .select('id')
           .eq('payment_order_id', orderId);
 
         for (const g of grants ?? []) {
-          const { data: revoked, error } = await admin.rpc('wallet_revoke_grant', {
+          const { error } = await admin.rpc('wallet_revoke_grant', {
             p_grant_id: g.id,
             p_reason: 'refund',
           });
-          if (error) console.error('[webhook] revoke failed:', error.message);
-          else console.log(`[webhook] revoked grant ${g.id}: ${JSON.stringify(revoked)}`);
+          if (error) {
+            revokeFailures++;
+            console.error('[webhook] revoke failed:', error.message);
+          }
         }
+
+        if (revokeFailures > 0) {
+          // 500 so the provider retries, and the order is left untouched so a
+          // human can see it still needs finishing.
+          await admin.from('webhook_events')
+            .update({ status: 'failed', last_error: `${revokeFailures} grant revocation(s) failed` })
+            .eq('webhook_id', webhookId);
+          return json({ ok: false, error: 'revoke_failed' }, 500);
+        }
+
+        await admin.from('payment_orders').update({ status: 'refunded' }).eq('id', orderId);
       }
 
       await admin.from('webhook_events')
         .update({ status: 'processed', processed_at: new Date().toISOString() })
         .eq('webhook_id', webhookId);
-      return json({ ok: true, refunded: true });
+      return json({ ok: true, refunded: !!orderId });
     }
 
     if (eventType === 'payment.failed' || eventType === 'dispute.created' || eventType === 'dispute.opened') {
@@ -343,7 +381,7 @@ Deno.serve(async (req) => {
       if (providerRef) {
         await admin.from('payment_orders')
           .update({ status: 'failed' })
-          .eq('provider_order_id', providerRef);
+          .or(`provider_order_id.eq.${providerRef},provider_ref.eq.${providerRef}`);
       }
       await admin.from('webhook_events')
         .update({ status: 'processed', processed_at: new Date().toISOString() })

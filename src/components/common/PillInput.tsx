@@ -108,7 +108,10 @@ export const PillInput: React.FC<PillInputProps> = ({
       {/* Limit warning */}
       {isAtLimit && (
         <p className="text-xs text-[#8a8a86] font-mono tracking-tight">
-          You've reached the 10 keyword limit — remove one to add another.
+          {/* From the prop rather than a literal. This component is rendered with
+              a max of 8 elsewhere, so a hardcoded 10 here told people the limit
+              was ten while the database quietly refused the ninth. */}
+          You&apos;ve reached the {max} keyword limit — remove one to add another.
         </p>
       )}
 
