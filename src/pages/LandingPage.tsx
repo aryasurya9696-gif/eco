@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { BrandLogo } from '../components/common/BrandLogo';
 import { PlatformBadge } from '../components/common/PlatformBadge';
 import { supabase, isConfigured } from '../lib/supabase';
+import { LandingPricing } from '../components/landing/LandingPricing';
 import {
   ArrowRight,
   Check,
@@ -138,6 +139,16 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [selectedPlatform, setSelectedPlatform] = useState<string>('all');
   const [openFaq, setOpenFaq] = useState<number | null>(null);
   const [packages, setPackages] = useState(FALLBACK_PACKAGES);
+
+  /**
+   * What one credit is worth, taken from the live package list rather than a
+   * constant. If a price changes, the "about N web searches" figures follow it
+   * instead of quietly becoming optimistic.
+   */
+  const perSearchPrice =
+    packages.length > 0 && packages[0].credits > 0
+      ? packages[0].gross_usd / packages[0].credits
+      : 0.05;
 
   // Prices come from topup_packages, the same table checkout charges from. The
   // fallback above only applies where nothing is deployed. A landing page that
@@ -527,126 +538,13 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </div>
         </section>
 
-      {/* PRICING */}
-      <section id="pricing" className="py-20 px-6 border-t border-[#e3e3de] bg-[#fbfbfa]">
-        <div className="max-w-4xl mx-auto">
-          <div className="text-center mb-14">
-            <h2 className="text-3xl md:text-4xl font-bold tracking-tight text-[#141414] mb-4">
-              Pay for searches, not for a subscription
-            </h2>
-            <p className="text-[#4a4a47] max-w-xl mx-auto leading-relaxed">
-              Buy credits once and spend them down as searches run. There is no
-              monthly plan, nothing renews, and nothing expires. Stop searching
-              and you simply stop being charged.
-            </p>
-          </div>
-
-          {/* Packages, read from topup_packages */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
-            {packages.map((p) => (
-              <div
-                key={p.code}
-                className="bg-white border border-[#e3e3de] p-6 flex flex-col hover:border-[#141414] transition-colors"
-              >
-                <div className="flex items-baseline gap-1.5">
-                  <span className="text-3xl font-bold tracking-tight text-[#141414]">
-                    ${p.gross_usd}
-                  </span>
-                  <span className="text-xs font-mono text-[#8a8a86]">one-off</span>
-                </div>
-                <p className="text-sm font-mono text-[#141414] mt-2">
-                  {p.credits + p.bonus_credits} credits
-                </p>
-                <p className="text-[11px] text-[#8a8a86] font-mono mt-0.5">
-                  ${(p.gross_usd / p.credits).toFixed(2)} per credit
-                </p>
-                {p.bonus_credits > 0 && (
-                  <p className="text-[10px] font-mono mt-2 inline-flex items-center px-1.5 py-0.5 bg-[#141414] text-white uppercase self-start">
-                    +{p.bonus_credits} bonus
-                  </p>
-                )}
-              </div>
-            ))}
-          </div>
-
-          {/* What a search costs. Without this the credit price is a number
-              nobody can reason about. */}
-          <div className="bg-white border border-[#e3e3de] p-6 md:p-8">
-            <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2 pb-5 border-b border-[#eeeeea]">
-              <p className="text-xs font-mono uppercase tracking-wider text-[#141414] font-bold">
-                What one search costs
-              </p>
-              <span className="inline-flex items-center px-2.5 py-1 bg-[#f6f6f4] border border-[#e3e3de] text-[10px] font-mono text-[#4a4a47]">
-                Start with {WELCOME_CREDITS} free credits
-              </span>
-            </div>
-
-            <ul className="divide-y divide-[#f5f5f2]">
-              {SEARCH_COSTS.map((s) => (
-                <li key={s.channel} className="flex items-center justify-between gap-4 py-2.5">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <Check className="w-4 h-4 text-[#141414] flex-shrink-0" />
-                    <span className="text-sm text-[#141414]">{s.channel}</span>
-                    <span className="text-[11px] text-[#8a8a86] truncate hidden sm:inline">
-                      {s.note}
-                    </span>
-                  </div>
-                  <span className="text-xs font-mono text-[#141414] flex-shrink-0">
-                    {s.credits} credit{s.credits > 1 ? 's' : ''}
-                  </span>
-                </li>
-              ))}
-            </ul>
-
-            <p className="text-[11px] text-[#8a8a86] font-mono mt-4 leading-relaxed">
-              A sweep checks every keyword across every channel you have enabled.
-              A search that finds nothing, or that the provider charges nothing
-              for, is not billed. A channel is charged once per sweep, whether it
-              worked first time or took a fallback.
-            </p>
-          </div>
-
-          {/* Included, unchanged by the move to credits */}
-          <div className="bg-white border border border-[#e3e3de] border-t-0 p-6 md:p-8">
-            <p className="text-xs font-mono uppercase tracking-wider text-[#141414] font-bold mb-4">
-              Every package includes
-            </p>
-            <ul className="grid grid-cols-1 md:grid-cols-2 gap-x-10 gap-y-2.5">
-              {[
-                '8 tracked keywords',
-                '3 channels at once, from 4 to choose',
-                'A sweep every day, at an hour you pick',
-                'A 24 or 48 hour search window',
-                'Intent scoring on every mention',
-                'AI keyword suggestions from your offer',
-                'AI outreach drafts',
-                'Feed retention you control, up to a year',
-                'CSV and JSON export',
-              ].map((feature) => (
-                <li key={feature} className="flex items-start gap-2.5 text-sm text-[#4a4a47]">
-                  <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
-                  <span>{feature}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-
-          <div className="mt-8 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <p className="text-xs font-mono text-[#8a8a86] leading-relaxed max-w-md">
-              Search providers charge us per call, which is why a search has a
-              price. You are not charged for the keywords or channels you have not
-              searched, and the credits you buy are yours until you spend them.
-            </p>
-            <a
-              href="#hero"
-              className="inline-flex items-center justify-center gap-2 px-6 py-3 bg-[#121212] hover:bg-black text-white text-sm font-mono transition-colors shrink-0"
-            >
-              Start with {WELCOME_CREDITS} free credits
-            </a>
-          </div>
-        </div>
-      </section>
-
+      <LandingPricing
+        packages={packages}
+        searchCosts={SEARCH_COSTS}
+        welcomeCredits={WELCOME_CREDITS}
+        perSearchPrice={perSearchPrice}
+        onStart={() => (isLoggedIn ? onNavigateDashboard() : onNavigateAuth())}
+      />
 
         {/* FAQ ACCORDION */}
         <section id="faq" className="py-16 px-6 border-t border-[#e3e3de] bg-[#f6f6f4]">
