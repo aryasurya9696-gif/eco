@@ -1,12 +1,46 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { BrandLogo } from '../components/common/BrandLogo';
 import { PlatformBadge } from '../components/common/PlatformBadge';
+import { supabase, isConfigured } from '../lib/supabase';
 import {
   ArrowRight,
   Check,
   ExternalLink,
   ChevronDown
 } from 'lucide-react';
+
+/**
+ * What one search costs, in credits.
+ *
+ * Shown here so the price list is not a mystery. These match pricing_config,
+ * which is where the charge actually comes from — this copy exists to explain
+ * it, and if the two ever disagree the table wins and this gets corrected.
+ *
+ * Reddit is two credits because its fallback is a second billed provider call.
+ * The customer still pays for one search either way, which is the point of
+ * pricing per operation rather than per call.
+ */
+const SEARCH_COSTS: Array<{ channel: string; credits: number; note: string }> = [
+  { channel: 'X / Twitter', credits: 1, note: 'latest posts, not all-time top' },
+  { channel: 'Reddit', credits: 2, note: 'two providers, one search for you' },
+  { channel: 'Web', credits: 1, note: 'rich results with dates' },
+  { channel: 'Press & news', credits: 1, note: 'every result carries a date' },
+];
+
+/** Credits granted to a new account, matching the welcome grant in the database. */
+const WELCOME_CREDITS = 20;
+
+/**
+ * Fallback prices, used only when Supabase is not configured — the local sandbox
+ * case where nothing is deployed anyway. When the database is reachable it is
+ * the source, so a price change cannot leave this page advertising something the
+ * billing page no longer sells.
+ */
+const FALLBACK_PACKAGES = [
+  { code: 'starter_200', display_name: '200 credits', gross_usd: 10, credits: 200, bonus_credits: 0 },
+  { code: 'standard_500', display_name: '500 credits', gross_usd: 25, credits: 500, bonus_credits: 0 },
+  { code: 'pack_1000', display_name: '1000 credits', gross_usd: 50, credits: 1000, bonus_credits: 0 },
+];
 
 interface LandingPageProps {
   onNavigateAuth: () => void;
@@ -103,6 +137,37 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [selectedKeyword, setSelectedKeyword] = useState<string>('all');
   const [selectedPlatform, setSelectedPlatform] = useState<string>('all');
   const [openFaq, setOpenFaq] = useState<number | null>(null);
+  const [packages, setPackages] = useState(FALLBACK_PACKAGES);
+
+  // Prices come from topup_packages, the same table checkout charges from. The
+  // fallback above only applies where nothing is deployed. A landing page that
+  // quotes its own prices is a page that will eventually be wrong.
+  useEffect(() => {
+    if (!isConfigured || !supabase) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { data, error } = await supabase
+          .from('topup_packages')
+          .select('code, display_name, gross_usd, credits, bonus_credits')
+          .eq('active', true)
+          .order('sort_order');
+        if (!cancelled && !error && data && data.length > 0) {
+          setPackages(data.map((p) => ({
+            code: p.code,
+            display_name: p.display_name,
+            gross_usd: Number(p.gross_usd),
+            credits: Number(p.credits),
+            bonus_credits: Number(p.bonus_credits ?? 0),
+          })));
+        }
+      } catch {
+        // A pricing page that fails to load its prices is still better with the
+        // seeded ones than blank, and these are the real seeded values.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const handleCta = () => {
     if (isLoggedIn) {
@@ -124,8 +189,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       a: 'Every morning at your configured schedule (e.g. 06:00 UTC), Echo sweeps public posts matching your keywords across X, Reddit, the open web and the press. Matches are deduplicated and qualified straight into your feed.',
     },
     {
-      q: 'How does Echo prevent runaway API usage?',
-      a: 'Each sweep strictly caps pagination at 2 pages per keyword per platform, and disabled channels are skipped entirely. API consumption stays bounded and predictable.',
+      q: 'What happens when my credits run out?',
+      a: 'The sweep stops before it starts. Echo reserves the credits a sweep will need before calling any search provider, so if you are short you are told exactly how much and nothing is spent. There is no debt and no negative balance. A search that finds nothing, or that the provider charges nothing for, is not billed.',
+    },
+    {
+      q: 'Do the credits expire?',
+      a: 'No. There is no subscription and nothing renews. Credits you buy stay in your balance until you spend them, however long that takes. New accounts start with 20 free credits.',
     },
     {
       q: 'Are historical duplicates prevented?',
@@ -200,7 +269,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                   onClick={onNavigateAuth}
                   className="px-4 py-2 bg-[#141414] hover:bg-black text-white text-xs font-medium rounded-md transition-all shadow-xs hover:shadow-sm cursor-pointer"
                 >
-                  Start Free Trial
+                  Start Free
                 </button>
               </>
             )}
@@ -255,7 +324,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 onClick={handleCta}
                 className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-7 py-3 bg-[#141414] hover:bg-black text-white text-xs font-medium rounded-md transition-all cursor-pointer shadow-sm hover:shadow-md"
               >
-                <span>{isLoggedIn ? 'Open Your Feed' : 'Start 14-Day Free Trial'}</span>
+                <span>{isLoggedIn ? 'Open Your Feed' : `Start with ${WELCOME_CREDITS} free credits`}</span>
                 <ArrowRight className="w-3.5 h-3.5" />
               </button>
 
@@ -458,72 +527,122 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </div>
         </section>
 
-      {/* WHAT'S INCLUDED */}
+      {/* PRICING */}
       <section id="pricing" className="py-20 px-6 border-t border-[#e3e3de] bg-[#fbfbfa]">
         <div className="max-w-4xl mx-auto">
           <div className="text-center mb-14">
             <h2 className="text-3xl md:text-4xl font-bold tracking-tight text-[#141414] mb-4">
-              Everything, for nothing
+              Pay for searches, not for a subscription
             </h2>
             <p className="text-[#4a4a47] max-w-xl mx-auto leading-relaxed">
-              There is no trial that expires and no card you can be charged. One plan,
-              it costs nothing, and it does not change.
+              Buy credits once and spend them down as searches run. There is no
+              monthly plan, nothing renews, and nothing expires. Stop searching
+              and you simply stop being charged.
             </p>
           </div>
 
-          <div className="bg-white border border-[#141414] p-8 md:p-10">
-            <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-3 pb-6 border-b border-[#eeeeea]">
-              <div>
-                <p className="text-xs font-mono uppercase tracking-wider text-[#141414] font-bold">
-                  Echo
-                </p>
-                <div className="flex items-baseline gap-2 mt-2">
-                  <span className="text-5xl font-bold tracking-tight text-[#141414]">
-                    $0
+          {/* Packages, read from topup_packages */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
+            {packages.map((p) => (
+              <div
+                key={p.code}
+                className="bg-white border border-[#e3e3de] p-6 flex flex-col hover:border-[#141414] transition-colors"
+              >
+                <div className="flex items-baseline gap-1.5">
+                  <span className="text-3xl font-bold tracking-tight text-[#141414]">
+                    ${p.gross_usd}
                   </span>
-                  <span className="text-sm font-mono text-[#8a8a86]">forever</span>
+                  <span className="text-xs font-mono text-[#8a8a86]">one-off</span>
                 </div>
+                <p className="text-sm font-mono text-[#141414] mt-2">
+                  {p.credits + p.bonus_credits} credits
+                </p>
+                <p className="text-[11px] text-[#8a8a86] font-mono mt-0.5">
+                  ${(p.gross_usd / p.credits).toFixed(2)} per credit
+                </p>
+                {p.bonus_credits > 0 && (
+                  <p className="text-[10px] font-mono mt-2 inline-flex items-center px-1.5 py-0.5 bg-[#141414] text-white uppercase self-start">
+                    +{p.bonus_credits} bonus
+                  </p>
+                )}
               </div>
-              <span className="self-start sm:self-auto inline-flex items-center px-3 py-1.5 bg-[#141414] text-white text-[10px] font-mono uppercase tracking-wider">
-                No card required
+            ))}
+          </div>
+
+          {/* What a search costs. Without this the credit price is a number
+              nobody can reason about. */}
+          <div className="bg-white border border-[#e3e3de] p-6 md:p-8">
+            <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2 pb-5 border-b border-[#eeeeea]">
+              <p className="text-xs font-mono uppercase tracking-wider text-[#141414] font-bold">
+                What one search costs
+              </p>
+              <span className="inline-flex items-center px-2.5 py-1 bg-[#f6f6f4] border border-[#e3e3de] text-[10px] font-mono text-[#4a4a47]">
+                Start with {WELCOME_CREDITS} free credits
               </span>
             </div>
 
-            <ul className="grid grid-cols-1 md:grid-cols-2 gap-x-10 gap-y-4 pt-6">
+            <ul className="divide-y divide-[#f5f5f2]">
+              {SEARCH_COSTS.map((s) => (
+                <li key={s.channel} className="flex items-center justify-between gap-4 py-2.5">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <Check className="w-4 h-4 text-[#141414] flex-shrink-0" />
+                    <span className="text-sm text-[#141414]">{s.channel}</span>
+                    <span className="text-[11px] text-[#8a8a86] truncate hidden sm:inline">
+                      {s.note}
+                    </span>
+                  </div>
+                  <span className="text-xs font-mono text-[#141414] flex-shrink-0">
+                    {s.credits} credit{s.credits > 1 ? 's' : ''}
+                  </span>
+                </li>
+              ))}
+            </ul>
+
+            <p className="text-[11px] text-[#8a8a86] font-mono mt-4 leading-relaxed">
+              A sweep checks every keyword across every channel you have enabled.
+              A search that finds nothing, or that the provider charges nothing
+              for, is not billed. A channel is charged once per sweep, whether it
+              worked first time or took a fallback.
+            </p>
+          </div>
+
+          {/* Included, unchanged by the move to credits */}
+          <div className="bg-white border border border-[#e3e3de] border-t-0 p-6 md:p-8">
+            <p className="text-xs font-mono uppercase tracking-wider text-[#141414] font-bold mb-4">
+              Every package includes
+            </p>
+            <ul className="grid grid-cols-1 md:grid-cols-2 gap-x-10 gap-y-2.5">
               {[
                 '8 tracked keywords',
-                '3 channels at once',
-                '4 channels to choose from',
+                '3 channels at once, from 4 to choose',
                 'A sweep every day, at an hour you pick',
                 'A 24 or 48 hour search window',
-                'Press and news monitoring included',
                 'Intent scoring on every mention',
                 'AI keyword suggestions from your offer',
                 'AI outreach drafts',
                 'Feed retention you control, up to a year',
                 'CSV and JSON export',
-                'Daily automatic sweeps, no cron to set up',
               ].map((feature) => (
-                <li key={feature} className="flex items-start gap-3 text-sm text-[#4a4a47]">
+                <li key={feature} className="flex items-start gap-2.5 text-sm text-[#4a4a47]">
                   <Check className="w-4 h-4 text-[#141414] flex-shrink-0 mt-0.5" />
                   <span>{feature}</span>
                 </li>
               ))}
             </ul>
+          </div>
 
-            <div className="mt-8 pt-6 border-t border-[#eeeeea] flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <p className="text-xs font-mono text-[#8a8a86] leading-relaxed max-w-md">
-                Searches run on a metered provider, which is why the keyword and channel
-                caps exist. They are a ceiling on our cost per workspace, not a way to
-                charge you more.
-              </p>
-              <a
-                href="#hero"
-                className="inline-flex items-center justify-center gap-2 px-6 py-3 bg-[#121212] hover:bg-black text-white text-sm font-mono transition-colors shrink-0"
-              >
-                Start tracking
-              </a>
-            </div>
+          <div className="mt-8 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <p className="text-xs font-mono text-[#8a8a86] leading-relaxed max-w-md">
+              Search providers charge us per call, which is why a search has a
+              price. You are not charged for the keywords or channels you have not
+              searched, and the credits you buy are yours until you spend them.
+            </p>
+            <a
+              href="#hero"
+              className="inline-flex items-center justify-center gap-2 px-6 py-3 bg-[#121212] hover:bg-black text-white text-sm font-mono transition-colors shrink-0"
+            >
+              Start with {WELCOME_CREDITS} free credits
+            </a>
           </div>
         </div>
       </section>
