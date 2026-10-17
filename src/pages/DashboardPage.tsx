@@ -5,6 +5,7 @@ import { Sidebar } from '../components/dashboard/Sidebar';
 import { FeedTab } from '../components/dashboard/FeedTab';
 import { KeywordsTab } from '../components/dashboard/KeywordsTab';
 import { SettingsTab } from '../components/dashboard/SettingsTab';
+import { BillingTab } from '../components/dashboard/BillingTab';
 import { OnboardingModal } from '../components/onboarding/OnboardingModal';
 import type { DashboardTab } from '../types';
 import { RefreshCw, Radio } from 'lucide-react';
@@ -82,6 +83,8 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                   ? 'Monitored Mentions Feed'
                   : activeTab === 'keywords'
                   ? 'Keyword Management'
+                  : activeTab === 'billing'
+                  ? 'Credits & Billing'
                   : 'Workspace Settings'}
               </h1>
             </div>
@@ -119,6 +122,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         >
           {activeTab === 'feed' && <FeedTab />}
           {activeTab === 'keywords' && <KeywordsTab />}
+          {activeTab === 'billing' && <BillingTab />}
           {activeTab === 'settings' && <SettingsTab />}
         </main>
       </div>

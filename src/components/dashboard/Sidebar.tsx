@@ -7,6 +7,7 @@ import {
   Inbox,
   Tag,
   Settings,
+  Wallet,
   LogOut,
   PanelLeftClose,
   PanelLeftOpen,
@@ -74,6 +75,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
     {
       group: 'ACCOUNT',
       items: [
+        {
+          id: 'billing' as DashboardTab,
+          label: 'Billing',
+          icon: <Wallet className="w-4 h-4" />,
+        },
         {
           id: 'settings' as DashboardTab,
           label: 'Settings',

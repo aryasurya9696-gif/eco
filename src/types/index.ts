@@ -68,6 +68,6 @@ export interface SweepRun {
   errors: any[];
 }
 
-export type DashboardTab = 'feed' | 'keywords' | 'settings';
+export type DashboardTab = 'feed' | 'keywords' | 'settings' | 'billing';
 
 export const APP_NAME = 'Echo';

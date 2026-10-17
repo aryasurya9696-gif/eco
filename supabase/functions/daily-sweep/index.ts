@@ -417,8 +417,6 @@ async function tregBalanceUsd(): Promise<number | null> {
 }
 
 let usdSpent = 0;
-/** usdSpent sampled before the current workspace starts, so its cost can be attributed. */
-let usdSpentBefore = 0;
 /** Provider calls actually issued, for the spend ledger. */
 let callsMade = 0;
 
@@ -863,7 +861,6 @@ Deno.serve(async (req) => {
   // user's sweep cannot delete the results that sweep just produced.
   const sweepStartedAt = new Date().toISOString();
   usdSpent = 0;
-  usdSpentBefore = 0;
   callsMade = 0;
 
   const { data: runRow } = await supabase.from('sweep_runs').insert({}).select().single();
@@ -953,11 +950,6 @@ Deno.serve(async (req) => {
     }
 
     usersProcessed++;
-
-    // Everything this workspace spends from here on is attributed to it, which
-    // is what makes the per-workspace margin figure real.
-    usdSpentBefore = usdSpent;
-    const callsBefore = callsMade;
 
     const ALL: Platform[] = ['twitter', 'reddit', 'google', 'news'];
     const requested: Platform[] = Array.isArray(settings?.enabled_channels) && settings.enabled_channels.length > 0

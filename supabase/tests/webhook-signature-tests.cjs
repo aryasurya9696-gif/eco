@@ -14,8 +14,6 @@ const crypto = require('crypto');
 const HOOK = process.argv[2];
 const SECRET = process.argv[3];
 
-const enc = (s) => Buffer.from(s, 'utf8');
-
 function secretBytes(secret) {
   const b64 = secret.startsWith('whsec_') ? secret.slice(6) : secret;
   return Buffer.from(b64, 'base64');
