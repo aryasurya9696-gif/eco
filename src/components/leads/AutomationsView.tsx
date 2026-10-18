@@ -16,6 +16,7 @@ import { Button, Input, ScreenAction } from './Screen';
 import { EmptyState, RowSkeleton } from './Empty';
 import { Drawer, SectionLabel } from './Pick';
 import { StatusPill, type PillTone } from './StatusPill';
+import { PriceSummary } from './PriceSummary';
 import { formatCredits } from '../../lib/billing';
 import {
   getAutomations, saveAutomation, pauseAutomation, resumeAutomation, deleteAutomation, runAutomationNow,
@@ -469,7 +470,6 @@ const AutomationEditor: React.FC<{ initial: Automation | null; onClose: () => vo
   const setConfig = (patch: Partial<AutomationDraft['config']>) => setD((x) => ({ ...x, config: { ...x.config, ...patch } }));
   const capsMissing = paid && (!(d.max_credits_per_run > 0) || !(d.max_credits_per_month > 0));
   const capsInverted = paid && d.max_credits_per_run > d.max_credits_per_month;
-  const max = est?.ok && est.estimate ? Number(est.estimate.max_credits) : null;
 
   const save = async () => {
     setBusy(true);
@@ -629,31 +629,31 @@ const AutomationEditor: React.FC<{ initial: Automation | null; onClose: () => vo
           {capsMissing && <p className="text-[11px] font-mono text-warn">Both caps are required: this automation spends credits.</p>}
           {capsInverted && <p className="text-[11px] font-mono text-danger">{errorCopy('run_cap_over_month_cap')}</p>}
 
-          <div className="border border-line bg-surface-2 px-3 py-2.5 text-[11px] font-mono leading-relaxed">
-            {!d.config.saved_search_id ? (
-              <span className="text-muted">Choose a saved search to see what one run can cost.</span>
-            ) : estLoading && !est ? (
-              <span className="text-muted"><Loader2 className="w-3 h-3 inline animate-spin mr-1" />Pricing one run…</span>
-            ) : est && !est.ok ? (
-              <span className="text-danger">{errorCopy(est.error)}</span>
-            ) : est?.estimate ? (
-              <>
-                <div>
-                  One run at {est.rows} people costs up to <strong className="tabular-nums">{formatCredits(est.estimate.max_credits)}</strong> credits
-                  {' '}(about {formatCredits(est.estimate.expected_credits)} expected). A miss is never charged.
-                </div>
-                {max !== null && d.max_credits_per_run > 0 && !est.fits_run_cap && (
-                  <div className="text-warn mt-1">
-                    <AlertTriangle className="w-3 h-3 inline mr-1 -mt-0.5" />
-                    That is over the cap per run, so a run this size will be refused. Raise the cap or lower the number of people.
-                  </div>
-                )}
-                {est.runs_per_month_cap != null && est.fits_run_cap && (
-                  <div className="text-muted mt-1">The monthly cap covers at least {est.runs_per_month_cap} full-size runs.</div>
-                )}
-              </>
-            ) : null}
-          </div>
+          {!d.config.saved_search_id ? (
+            <div className="border border-line bg-surface-2 px-3 py-2.5 text-[11px] font-mono text-muted">
+              Choose a saved search to see what one run can cost.
+            </div>
+          ) : estLoading && !est ? (
+            <div className="border border-line bg-surface-2 px-3 py-2.5 text-[11px] font-mono text-muted">
+              <Loader2 className="w-3 h-3 inline animate-spin mr-1" />Pricing one run…
+            </div>
+          ) : est && !est.ok ? (
+            <div className="border border-line bg-surface-2 px-3 py-2.5 text-[11px] font-mono text-danger">
+              {errorCopy(est.error)}
+            </div>
+          ) : est?.estimate ? (
+            <PriceSummary
+              expected={est.estimate.expected_credits}
+              max={est.estimate.max_credits}
+              rows={est.rows}
+              capPerRun={d.max_credits_per_run}
+              note={
+                est.runs_per_month_cap != null && est.fits_run_cap
+                  ? `The monthly cap covers at least ${est.runs_per_month_cap} full-size runs. A miss is never charged.`
+                  : 'A miss is never charged.'
+              }
+            />
+          ) : null}
         </div>
       ) : (
         <p className="text-[11px] font-mono text-muted">This automation is free: it never starts a priced run.</p>

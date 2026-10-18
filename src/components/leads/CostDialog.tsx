@@ -12,12 +12,13 @@
  * rather than paused halfway.
  */
 import React from 'react';
-import { AlertTriangle, Loader2 } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 import { Button } from './Screen';
 import { Modal } from './Dialogs';
 import { formatCredits } from '../../lib/billing';
 import { errorCopy, skippedCopy, newRequestId, type EnrichEstimate, type StartResult } from '../../lib/leads-db';
 import { fetchBalance } from '../../lib/billing';
+import { PriceSummary } from './PriceSummary';
 
 export const CostDialog: React.FC<{
   title: string;
@@ -130,41 +131,13 @@ export const CostDialog: React.FC<{
               )}
 
               {est.estimate && est.estimate.ok !== false && (
-                <div className="border border-line-soft">
-                  <div className="grid grid-cols-3 divide-x divide-line-soft">
-                    <Cell label="Expected" value={est.estimate.expected_credits} />
-                    <Cell label="At most" value={est.estimate.max_credits} />
-                    <Cell label="Available" value={available} tone={short ? 'bad' : undefined} />
-                  </div>
-                  {est.estimate.breakdown && est.estimate.breakdown.length > 0 && (
-                    <ul className="border-t border-line-soft px-3 py-2 space-y-1">
-                      {est.estimate.breakdown.map((b) => (
-                        <li key={b.label} className="flex justify-between gap-3 text-[11px] font-mono text-ink-2">
-                          <span>
-                            {b.label}
-                            {b.note && <span className="text-muted"> · {b.note}</span>}
-                          </span>
-                          <span className="tabular-nums">{formatCredits(b.credits)}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              )}
-
-              <p className="text-[11px] font-mono text-muted leading-relaxed">
-                Credits are held for the maximum while it runs and only what is found is charged; the rest is
-                released. A lookup that finds nothing costs nothing.
-              </p>
-
-              {short && (
-                <div className="flex items-start gap-2 text-xs font-mono text-warn bg-warn-bg border border-warn-line px-3 py-2">
-                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
-                  <span>
-                    The balance does not cover the maximum.{' '}
-                    <a href="#dashboard/billing" className="underline">Top up</a> or select fewer.
-                  </span>
-                </div>
+                <PriceSummary
+                  expected={est.estimate.expected_credits}
+                  max={est.estimate.max_credits}
+                  available={available}
+                  breakdown={est.estimate.breakdown}
+                  note="Credits are held for the maximum while it runs and only what is found is charged; the rest is released. A lookup that finds nothing costs nothing."
+                />
               )}
             </>
           ) : null}
@@ -173,12 +146,3 @@ export const CostDialog: React.FC<{
     </Modal>
   );
 };
-
-const Cell: React.FC<{ label: string; value: number | null; tone?: 'bad' }> = ({ label, value, tone }) => (
-  <div className="px-3 py-2">
-    <div className="text-[10px] font-mono uppercase tracking-wider text-muted">{label}</div>
-    <div className={`text-sm font-mono tabular-nums ${tone === 'bad' ? 'text-danger' : 'text-ink'}`}>
-      {value === null ? '—' : formatCredits(value)}
-    </div>
-  </div>
-);

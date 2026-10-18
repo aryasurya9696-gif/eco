@@ -12,7 +12,7 @@ import {
 import { startRun, importRows, estimateRun, MAX_RUN_ROWS } from '../../lib/leads';
 import { ColumnMapper, checkMapping, type CleanMode, type FieldKey } from './ColumnMapper';
 import { Figure } from './Screen';
-import { formatUsd } from '../../lib/billing';
+import { PriceSummary } from './PriceSummary';
 
 /**
  * Import a list you already have.
@@ -414,50 +414,36 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
       )}
 
       {/* Price */}
-      <div className="bg-white border border-line px-4 py-3 flex items-center gap-6 flex-wrap">
-        <div>
-          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block leading-none">
-            Likely
-          </span>
-          <span className="text-base font-bold tabular-nums text-ink">
-            {pricing || !estimate ? (
-              <Loader2 className="w-4 h-4 animate-spin text-faint" />
-            ) : (
-              `${estimate.expected_credits} cr`
-            )}
-          </span>
+      {pricing && !estimate ? (
+        <div className="bg-white border border-line px-4 py-3 flex items-center gap-2 text-xs font-mono text-muted">
+          <Loader2 className="w-4 h-4 animate-spin text-faint" /> Pricing…
         </div>
-        <div>
-          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block leading-none">
-            Most it can cost
-          </span>
-          <span className="text-base font-bold tabular-nums text-ink">
-            {estimate ? `${estimate.max_credits} cr` : '—'}
-          </span>
-        </div>
-        {estimate && (
-          <span className="text-[10px] font-mono text-muted">
-            {formatUsd(estimate.min_credits)} – {formatUsd(estimate.max_credits)}
-          </span>
-        )}
-        <button
-          onClick={() => void run()}
-          disabled={busy || usable === 0 || !mappingCheck.ok || pricing || !estimate}
-          className="ml-auto inline-flex items-center gap-2 px-4 py-2 bg-ink hover:bg-black disabled:bg-line disabled:text-muted disabled:cursor-not-allowed text-white text-xs font-mono transition-colors cursor-pointer"
-        >
-          {busy ? (
-            <>
-              <Loader2 className="w-3 h-3 animate-spin" />
-              Importing
-            </>
-          ) : (
-            <>
-              <Check className="w-3 h-3" />
-              Clean {Math.min(usable, MAX_RUN_ROWS).toLocaleString()} rows
-            </>
-          )}
-        </button>
-      </div>
+      ) : estimate ? (
+        <PriceSummary
+          expected={estimate.expected_credits}
+          max={estimate.max_credits}
+          rows={Math.min(usable, MAX_RUN_ROWS)}
+          action={
+            <button
+              onClick={() => void run()}
+              disabled={busy || usable === 0 || !mappingCheck.ok || pricing || !estimate}
+              className="inline-flex items-center gap-2 px-4 py-2 bg-ink hover:bg-black disabled:bg-line disabled:text-muted disabled:cursor-not-allowed text-white text-xs font-mono transition-colors cursor-pointer"
+            >
+              {busy ? (
+                <>
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  Importing
+                </>
+              ) : (
+                <>
+                  <Check className="w-3 h-3" />
+                  Clean {Math.min(usable, MAX_RUN_ROWS).toLocaleString()} rows
+                </>
+              )}
+            </button>
+          }
+        />
+      ) : null}
 
       {!mappingCheck.ok && usable > 0 && (
         <p className="text-[10px] font-mono text-warn">

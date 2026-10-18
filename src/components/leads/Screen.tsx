@@ -222,46 +222,6 @@ export const Segmented: React.FC<{
   </div>
 );
 
-/**
- * The bar under a price.
- *
- * Against the worst case, never the estimate: the estimate is what will probably
- * happen and the maximum is the ceiling the wallet is checked against, so a bar
- * drawn to the estimate would look comfortable right up to the moment the run
- * could not be paid for.
- */
-export const PriceBar: React.FC<{
-  expected: number;
-  max: number;
-  /** The wallet balance, so the bar can show whether the worst case is covered. */
-  balance?: number | null;
-}> = ({ expected, max, balance }) => {
-  const span = Math.max(max, expected, 1);
-  const expectedPct = (expected / span) * 100;
-  // Clipped, so a balance larger than the whole range does not overflow the track.
-  const coveredPct = balance === null || balance === undefined ? null : Math.min(100, (balance / span) * 100);
-
-  return (
-    <div className="w-full">
-      <div className="relative h-1.5 w-full bg-line-soft">
-        <div className="absolute inset-y-0 left-0 bg-ink transition-[width] duration-500" style={{ width: `${expectedPct}%` }} />
-        {coveredPct !== null && coveredPct < 100 && (
-          <div
-            className="absolute inset-y-0 border-r border-warn"
-            style={{ left: `${coveredPct}%` }}
-            title={`Wallet covers ${Math.round(coveredPct)}% of the worst case`}
-          />
-        )}
-      </div>
-      <div className="flex justify-between text-[10px] font-mono text-muted mt-1.5">
-        <span>likely {Math.round(expectedPct)}% of the worst case</span>
-        {coveredPct !== null && coveredPct < expectedPct && (
-          <span className="text-warn">balance covers {Math.round(coveredPct)}%</span>
-        )}
-      </div>
-    </div>
-  );
-};
 
 /**
  * What a screen shows instead of a paragraph in a box.

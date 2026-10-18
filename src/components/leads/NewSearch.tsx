@@ -5,8 +5,9 @@ import {
   getIcp, saveIcp, estimateRun, startRun, MAX_RUN_ROWS,
 } from '../../lib/leads';
 import { useAuth } from '../../context/AuthContext';
-import { formatUsd, formatCredits } from '../../lib/billing';
-import { Screen, Panel, Button, Textarea, Input, Figure, PriceBar } from './Screen';
+import { fetchBalance } from '../../lib/billing';
+import { Screen, Panel, Button, Textarea, Input } from './Screen';
+import { PriceSummary } from './PriceSummary';
 import { ChipRow, ChipChoice } from './ChipRow';
 import {
   SIZE_BANDS, sizeLabelOf, sizeBoundsOf, sizeIsJunk, searchTextOf, isSearchable, mergeSegment,
@@ -76,6 +77,7 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
   // distinguished the two — so a dropped connection left the user looking at a
   // permanently disabled Find button, three empty figures and no reason. The
   // only way out was to reload the page.
+  const [available, setAvailable] = React.useState<number | null>(null);
   const [estimateError, setEstimateError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -85,8 +87,15 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
     let cancelled = false;
     void (async () => {
       try {
-        const icp = await getIcp();
+        const [icp, bal] = await Promise.all([
+          getIcp(),
+          fetchBalance().catch(() => null),
+        ]);
         if (cancelled) return;
+        if (bal?.wallet) {
+          const a = Number(bal.wallet.available ?? bal.wallet.balance - bal.wallet.reserved);
+          setAvailable(Number.isFinite(a) ? a : null);
+        }
         if (icp) {
           setIcpId(icp.id);
           setDoc(icp.json ?? null);
@@ -391,30 +400,19 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
             />
           </div>
 
-          {/* A spinner that never stops is a lie about the state. When there is
-              no price and none is coming, the figures say so rather than
-              implying they are about to arrive. */}
-          <div className="flex gap-10 sm:gap-16">
-            <Figure
-              label="Likely"
-              value={figure(estimate, 'expected_credits', pricing)}
-              sub={estimate ? formatUsd(estimate.min_credits) + ' at the floor' : undefined}
+          {pricing && !estimate ? (
+            <div className="flex items-center gap-2 text-xs font-mono text-muted py-2">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" /> Pricing…
+            </div>
+          ) : estimate ? (
+            <PriceSummary
+              expected={estimate.expected_credits}
+              max={estimate.max_credits}
+              available={available}
+              rows={target}
+              note="The most it can cost is held when the search starts, and whatever it does not spend comes straight back when it ends. You are only charged for what it finds."
             />
-            <Figure
-              label="At most"
-              value={figure(estimate, 'max_credits', pricing)}
-              sub={estimate ? formatUsd(estimate.max_credits) : undefined}
-            />
-            <Figure
-              label="Rows"
-              value={target.toLocaleString()}
-              sub={target >= MAX_RUN_ROWS ? 'the ceiling for one run' : undefined}
-            />
-          </div>
-
-          {estimate && (
-            <PriceBar expected={estimate.expected_credits} max={estimate.max_credits} />
-          )}
+          ) : null}
 
           {estimateError && (
             <div className="flex items-start gap-2 text-[10px] font-mono text-danger-ink leading-relaxed">
@@ -487,19 +485,6 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
             )}
           </div>
 
-          {/* The hold, stated in one sentence.
-              We reserve the worst case before the first provider call and settle
-              down afterwards, and until now the screen said nothing about it. A
-              user who reads "at most 61 credits", watches 61 leave their balance,
-              and is never told otherwise has every reason to think we took the
-              money and did not do the work. This is the line that prevents that. */}
-          {estimate && !pricing && (
-            <p className="text-[11px] font-mono text-muted leading-relaxed pt-4 border-t border-line-soft">
-              The most it can cost is held when the search starts, and whatever it does not spend
-              comes straight back when it ends. You are only charged for what it finds.
-            </p>
-          )}
-
           {error && (
             <div className="flex items-start gap-2 px-3 py-2.5 bg-danger-bg border border-danger-line">
               <CircleAlert className="w-3.5 h-3.5 text-danger-ink mt-0.5 flex-shrink-0" />
@@ -519,24 +504,6 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
 };
 
 // ---------------------------------------------------------------------------
-
-/**
- * One of the two price figures.
- *
- * Three states, and they used to be two: loading showed a spinner and so did
- * "there is no price", so a failed estimate left three spinners turning
- * indefinitely on a screen that was not going to load anything. A dash with the
- * reason two lines below is the honest rendering of "there is no price".
- */
-function figure(
-  estimate: { expected_credits: number; max_credits: number } | null,
-  field: 'expected_credits' | 'max_credits',
-  pricing: boolean,
-) {
-  if (estimate) return formatCredits(estimate[field]);
-  if (pricing) return <Loader2 className="w-5 h-5 animate-spin text-faint" />;
-  return <span className="text-faint">—</span>;
-}
 
 /**
  * A company size that is a real range but not one of the bands.
