@@ -13,37 +13,15 @@ import { startRun, importRows, estimateRun, MAX_RUN_ROWS } from '../../lib/leads
 import { ColumnMapper, checkMapping, type CleanMode, type FieldKey } from './ColumnMapper';
 import { Figure } from './Screen';
 import { PriceSummary } from './PriceSummary';
+import { importContacts, getLists, type LeadList } from '../../lib/leads-db';
 
-/**
- * Import a list you already have.
- *
- * The order is deliberate: file, then mapping, then the price, then the run. The
- * estimate is only asked for once the row count is final — after de-duplication —
- * because de-duplication moves the count, and a price shown against a count that
- * later drops is a price for work that is not being done.
- *
- * The run is created before the rows are sent. That ordering is not arbitrary:
- * `import` refuses a run that does not belong to the caller, so there has to be
- * a run first, and creating the run is what prices and reserves against the
- * wallet. A run whose rows all fail to import is therefore still a run, sitting
- * in the list having cost nothing — visible rather than silently absent.
- */
-
-/**
- * The three clean modes.
- *
- * These used to price differently and behave identically: the worker read
- * lead_runs.mode for nothing, so all three ran the same email waterfall, which
- * meant the cheapest one went out and found replacements for the rows it had
- * promised to leave alone and charged the find price for doing it.
- *
- * They now come from steps.ts, which is the same function the estimator and the
- * tests read, so the price shown and the work done cannot drift apart. Nothing
- * is read from lead_runs.mode in this file — the estimate is asked for the mode
- * and the worker is told it separately, and the two agree because they come from
- * one list of names.
- */
 const MODES: Array<{ id: CleanMode; label: string; body: string; credits: string }> = [
+  {
+    id: 'free_import',
+    label: 'Import to CRM (Free)',
+    body: 'Save all contacts directly to your Leads database and a target list. Free, no credits charged.',
+    credits: '0 credits — Free',
+  },
   {
     id: 'verify_only',
     label: 'Check what I have',
@@ -66,15 +44,16 @@ const MODES: Array<{ id: CleanMode; label: string; body: string; credits: string
 
 interface CleanListProps {
   onOpenRun: (runId: string) => void;
+  onOpenPeople?: () => void;
 }
 
 type Stage = 'pick' | 'map' | 'importing';
 
-export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
+export const CleanList: React.FC<CleanListProps> = ({ onOpenRun, onOpenPeople }) => {
   const [stage, setStage] = React.useState<Stage>('pick');
   const [file, setFile] = React.useState<File | null>(null);
   const [parsed, setParsed] = React.useState<ParseResult | null>(null);
-  const [mode, setMode] = React.useState<CleanMode>('verify_refind');
+  const [mode, setMode] = React.useState<CleanMode>('free_import');
   const [mapping, setMapping] = React.useState<Partial<Record<FieldKey, string>>>({});
   const [passthrough, setPassthrough] = React.useState<string[]>([]);
   const [estimate, setEstimate] = React.useState<LeadEstimate | null>(null);
@@ -83,6 +62,13 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
   const [error, setError] = React.useState<string | null>(null);
   const [progress, setProgress] = React.useState<{ done: number; total: number; skipped: number } | null>(null);
   const [dragging, setDragging] = React.useState(false);
+  const [lists, setLists] = React.useState<LeadList[]>([]);
+  const [targetListId, setTargetListId] = React.useState('');
+  const [importedCount, setImportedCount] = React.useState<number | null>(null);
+
+  React.useEffect(() => {
+    void getLists().then((r) => r.ok && setLists(r.lists.filter((l) => l.kind === 'people'))).catch(() => {});
+  }, []);
 
   const inputRef = React.useRef<HTMLInputElement>(null);
 
@@ -110,14 +96,15 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
   // Asked for whenever the count settles, so the number on the button is the
   // number the run will be started against.
   React.useEffect(() => {
-    if (!clean || usable === 0) {
+    if (mode === 'free_import' || !clean || usable === 0) {
       setEstimate(null);
+      setPricing(false);
       return;
     }
     let cancelled = false;
     setPricing(true);
 
-    estimateRun({ kind: 'clean', target: Math.min(usable, MAX_RUN_ROWS), mode })
+    estimateRun({ kind: 'clean', target: Math.min(usable, MAX_RUN_ROWS), mode: mode as any })
       .then((est) => {
         if (!cancelled) setEstimate(est);
       })
@@ -222,6 +209,30 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
     }
   };
 
+  const runFreeImport = async () => {
+    if (!clean || usable === 0) return;
+    setBusy(true);
+    setError(null);
+    setProgress({ done: 0, total: Math.min(usable, 5000), skipped: 0 });
+
+    try {
+      const toImport = clean.rows
+        .filter((r) => r.email || (r.person_name && r.domain) || r.company_name || r.domain)
+        .slice(0, 5000);
+
+      const res = await importContacts(toImport, targetListId || undefined);
+      if (!res.ok) {
+        throw new Error(res.error || 'Failed to import contacts');
+      }
+      setImportedCount(res.saved);
+    } catch (err) {
+      setError((err as Error)?.message ?? 'The import did not finish.');
+    } finally {
+      setBusy(false);
+      setProgress(null);
+    }
+  };
+
   const reset = () => {
     setStage('pick');
     setFile(null);
@@ -231,7 +242,42 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
     setError(null);
     setProgress(null);
     setEstimate(null);
+    setImportedCount(null);
   };
+
+  if (importedCount !== null) {
+    return (
+      <div className="bg-white border border-line p-8 text-center space-y-4">
+        <div className="w-12 h-12 bg-ok-bg text-ok border border-ok-line rounded-full flex items-center justify-center mx-auto">
+          <Check className="w-6 h-6" />
+        </div>
+        <h3 className="text-sm font-bold text-ink">Import Complete</h3>
+        <p className="text-xs font-mono text-muted max-w-md mx-auto">
+          Successfully imported {importedCount.toLocaleString()} contacts into your Leads directory
+          {targetListId ? ' and added them to your selected list.' : '.'}
+        </p>
+        <div className="flex items-center justify-center gap-3 pt-4">
+          {onOpenPeople && (
+            <button
+              onClick={onOpenPeople}
+              className="px-4 py-2 bg-ink hover:bg-black text-white text-xs font-mono cursor-pointer transition-colors"
+            >
+              View in Leads Directory
+            </button>
+          )}
+          <button
+            onClick={() => {
+              setImportedCount(null);
+              reset();
+            }}
+            className="px-4 py-2 bg-surface hover:bg-surface-2 border border-line text-ink text-xs font-mono cursor-pointer transition-colors"
+          >
+            Import another CSV
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // -------------------------------------------------------------------------
   // 1. Pick a file
@@ -373,6 +419,27 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
         </div>
       </div>
 
+      {mode === 'free_import' && (
+        <div className="bg-white border border-line px-4 py-3 flex items-center justify-between gap-4">
+          <div>
+            <span className="text-[11px] font-mono font-medium text-ink block">Add to List (Optional)</span>
+            <span className="text-[10px] font-mono text-muted">Assign imported contacts to an existing list in your Leads directory</span>
+          </div>
+          <select
+            value={targetListId}
+            onChange={(e) => setTargetListId(e.target.value)}
+            className="text-xs font-mono bg-surface border border-line px-2.5 py-1.5 text-ink focus:outline-none focus:border-ink cursor-pointer"
+          >
+            <option value="">No list (Directory only)</option>
+            {lists.map((l) => (
+              <option key={l.id} value={l.id}>
+                {l.name} ({l.members ?? 0})
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
       <ColumnMapper
         headers={parsed?.headers ?? []}
         sample={parsed?.rows.slice(0, 20) ?? []}
@@ -413,8 +480,34 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
         </div>
       )}
 
-      {/* Price */}
-      {pricing && !estimate ? (
+      {/* Action / Price */}
+      {mode === 'free_import' ? (
+        <div className="bg-white border border-line px-4 py-3 flex items-center justify-between">
+          <div>
+            <span className="text-xs font-mono text-ink font-medium">Free CRM Import</span>
+            <p className="text-[10px] font-mono text-muted mt-0.5">
+              Imports up to 5,000 contacts directly into your CRM. 0 credits charged.
+            </p>
+          </div>
+          <button
+            onClick={() => void runFreeImport()}
+            disabled={busy || usable === 0 || !mappingCheck.ok}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-ink hover:bg-black disabled:bg-line disabled:text-muted disabled:cursor-not-allowed text-white text-xs font-mono transition-colors cursor-pointer"
+          >
+            {busy ? (
+              <>
+                <Loader2 className="w-3 h-3 animate-spin" />
+                Importing…
+              </>
+            ) : (
+              <>
+                <Check className="w-3 h-3" />
+                Import {Math.min(usable, 5000).toLocaleString()} contacts (Free)
+              </>
+            )}
+          </button>
+        </div>
+      ) : pricing && !estimate ? (
         <div className="bg-white border border-line px-4 py-3 flex items-center gap-2 text-xs font-mono text-muted">
           <Loader2 className="w-4 h-4 animate-spin text-faint" /> Pricing…
         </div>

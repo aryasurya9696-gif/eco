@@ -48,11 +48,14 @@ const ORDER: FieldKey[] = [
   'linkedin_url',
 ];
 
-export type CleanMode = 'verify_only' | 'verify_refind' | 'full_enrich';
+export type CleanMode = 'free_import' | 'verify_only' | 'verify_refind' | 'full_enrich';
 
 /** What has to be present before the mode can run at all. */
 function requirements(mode: CleanMode): { need: FieldKey[]; needOneOf: FieldKey[][] } {
   switch (mode) {
+    case 'free_import':
+      // Any record with a name, email, company or domain can be imported
+      return { need: [], needOneOf: [['email'], ['person_name'], ['first_name'], ['company_name'], ['domain']] };
     case 'verify_only':
       // Verifying an address you already hold needs the address.
       return { need: ['email'], needOneOf: [] };

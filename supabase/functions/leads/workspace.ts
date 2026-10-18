@@ -321,6 +321,57 @@ export async function saveSearchResults(db: Db, userId: string, body: any) {
   return { ok: true, saved: saved.length, skipped, contact_ids: saved };
 }
 
+/**
+ * Free import of contacts from mapped CSV rows into the CRM database.
+ * No credits charged.
+ */
+export async function importContacts(db: Db, userId: string, body: any) {
+  const rows = (Array.isArray(body?.rows) ? body.rows : []).slice(0, 5000);
+  const listId = isUuid(body?.list_id) ? body.list_id : null;
+  if (listId && !(await ownsList(db, userId, listId, 'people'))) return { ok: false, error: 'list_not_found' };
+
+  const rules = await rulesFor(db, userId);
+  const saved: string[] = [];
+  let skipped = 0;
+
+  for (const r of rows) {
+    const name = str(r?.person_name || [r?.first_name, r?.last_name].filter(Boolean).join(' '), 200);
+    const domain = bareDomain(r?.domain || r?.website);
+    const email = str(r?.email, 200) || null;
+    if (!name && !domain && !email) {
+      skipped++;
+      continue;
+    }
+    const { data: contact, error } = await db.rpc('lead_contact_merge', {
+      p_user: userId,
+      p_fields: {
+        person_name: name || null,
+        title: str(r?.title, 200) || null,
+        company_name: str(r?.company_name, 200) || null,
+        domain: domain || null,
+        email: email || null,
+        phone: str(r?.phone, 50) || null,
+        linkedin_url: str(r?.linkedin_url, 300) || null,
+        source: 'import',
+        attributes: {
+          extra: r?.extra ?? {},
+          imported_at: new Date().toISOString(),
+        },
+      },
+    });
+    if (error || !contact?.id) {
+      skipped++;
+      continue;
+    }
+    await applyScore(db, contact, rules);
+    saved.push(contact.id);
+  }
+
+  if (listId && saved.length) await addToList(db, userId, listId, saved, 'people');
+
+  return { ok: true, saved: saved.length, skipped, contact_ids: saved };
+}
+
 // ===========================================================================
 // People (lead_contacts)
 // ===========================================================================
@@ -371,6 +422,7 @@ function contactsFilter(db: Db, userId: string, f: any, select: string, opts?: {
   const tags = strs(f?.tags, 20, 40);
   if (tags.length) q = q.contains('tags', tags);
   if (isUuid(f?.company_id)) q = q.eq('company_id', f.company_id);
+  if (isUuid(f?.run_id)) q = q.eq('last_run_id', f.run_id);
   const domain = bareDomain(f?.domain);
   if (domain) q = q.eq('domain', domain);
   if (Number.isFinite(Number(f?.score_min)) && f?.score_min !== null && f?.score_min !== '') q = q.gte('score', Number(f.score_min));

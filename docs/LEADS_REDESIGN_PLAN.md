@@ -15,9 +15,9 @@ Read first: `docs/LEADS_UPGRADE.md` (what Leads does today, backend, billing, te
 |---|---|---|
 | 1. Design foundation | **Complete** | 1.1 tokens **done** (e5fe17f). 1.2 StatusPill **done** (1e952d6). 1.3 dialogs **done** (603db2b). 1.4 Screen frame **done** (e03df97). 1.5 PriceSummary **done**: new `PriceSummary` displays expected, max, available coverage with Top up link when short, rows, capPerRun warnings, notes and breakdown. Used across `CostDialog`, `NewSearch`, `CleanList`, and `AutomationsView`. `PriceBar` removed from `Screen.tsx`. Phase 1 complete. |
 | 2. Navigation (11 tabs → 4) | **Complete** | Consolidated 11 tabs into 4 unified hubs: **Find** (Search, Find by profile, Import CSV), **Leads** (People, Companies with Left Sidebar for Views, Lists, and Saved Searches + Automate shortcut), **Activity** (Runs & Usage summary cards, Automations), and **Settings** (Fit Scoring, Duplicate Review, Opt-outs, Provider Lab). Subnav updated with legacy route redirects, inline dialogs, and responsive layout. |
-| 3. Remove duplicate flows | Not started | Depends on Phases 2 and 4 |
-| 4. Backend support | Not started | Independent of Phase 1; can run in parallel |
-| 5. Verification and docs | Not started | Last |
+| 3. Remove duplicate flows | **Complete** | Eliminated duplicate actions & tables: 1) Run view now has primary CTA "View in Leads Directory" with `{ run_id }` filter and no confusing duplicate bulk buttons. 2) Replaced duplicate export implementations with unified `ExportDialog.tsx` supporting CSV & Excel (.xlsx), verified-only filter, and waterfall attempts audit. 3) Added Free CRM Import in `CleanList.tsx` allowing free CSV saving directly to CRM & list. 4) Left sidebar in Leads hub now has inline Rename/Delete list management with confirmation dialogs. 5) Cleaned up toolbar buttons. |
+| 4. Backend support | **Complete** | Added `run_id` filter to `contactsFilter` in `supabase/functions/leads/workspace.ts`. Added free `contacts_import` endpoint in `workspace.ts` and `index.ts` allowing direct merge of up to 5,000 CSV contacts to `lead_contacts` with auto company linking and scoring (0 credits charged). |
+| 5. Verification and docs | In progress | Verification suites clean: tsc, deno typecheck, vite build, 14 node suites, and check-deploy-all. Browser subagent verified visually. |
 
 Last commit before this plan: `e180346 leads: automations with a spending cap on every run`.
 

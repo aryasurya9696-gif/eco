@@ -3,12 +3,12 @@ import {
   ListChecks, Plus, Search, ArrowLeft,
   AlertTriangle, Play, Pause, Square, X, Users, Building2, Upload, CalendarClock,
   Settings, Sliders, Users2, Bookmark, ChevronLeft, ChevronRight,
-  Filter, Layers,
+  Filter, Layers, Download, Pencil, Trash2,
 } from 'lucide-react';
 import type { LeadsView, LeadRow, LeadRun, LeadAttempt } from '../../types';
 import type { AttemptWithFailure } from '../leads/AttemptHistory';
 import {
-  getRun, bulkAction, isActiveRun, controlRun, addSuppression, providerLabel,
+  getRun, isActiveRun, controlRun, providerLabel,
 } from '../../lib/leads';
 import { fetchBalance, formatUsd } from '../../lib/billing';
 import { supabase } from '../../lib/supabase';
@@ -23,8 +23,7 @@ import { CompositionBar, RunStrip, MeterFigure, ProviderMix } from '../leads/Dat
 import { WaterfallColumn } from '../leads/WaterfallChain';
 import { Button, Screen, Segmented } from '../leads/Screen';
 import { EmptyState } from '../leads/Empty';
-import { ExportMenu } from '../leads/ExportMenu';
-import { CostDialog } from '../leads/CostDialog';
+import { ExportDialog } from '../leads/ExportDialog';
 import { StatusPill } from '../leads/StatusPill';
 import { DialogsProvider, useDialogs } from '../leads/Dialogs';
 import { SearchView } from '../leads/SearchView';
@@ -33,7 +32,7 @@ import { PeopleView } from '../leads/PeopleView';
 import { CompaniesView, UsageView } from '../leads/CompaniesView';
 import { ScoringDialog, DuplicatesDialog } from '../leads/ScoringDialog';
 import type { ContactFilters, LeadList, SavedSearch } from '../../lib/leads-db';
-import { bulkRowsEstimate, bulkRowsStart, getLists, createList, getSavedSearches } from '../../lib/leads-db';
+import { getLists, createList, updateList, deleteList, getSavedSearches } from '../../lib/leads-db';
 import { getWaterfall } from '../../lib/leads';
 import type { LeadStep } from '../../types';
 
@@ -58,16 +57,31 @@ interface LeadsTabProps {
 }
 
 export const LeadsTab: React.FC<LeadsTabProps> = ({ view, subMode, runId, onViewChange, onOpenRun }) => {
+  const [peopleInit, setPeopleInit] = React.useState<{ key: number; filters: ContactFilters } | null>(null);
+
+  const openPeople = (filters: ContactFilters) => {
+    setPeopleInit({ key: Date.now(), filters });
+    onViewChange('leads', 'people');
+  };
+
   return (
     <DialogsProvider>
       {view === 'run' ? (
         <RunView
           runId={runId}
           onBack={() => onViewChange('activity', 'runs')}
-          onOpenRun={onOpenRun}
+          onOpenPeople={openPeople}
         />
       ) : (
-        <LeadsWorkspace view={view} subMode={subMode} onViewChange={onViewChange} onOpenRun={onOpenRun} />
+        <LeadsWorkspace
+          view={view}
+          subMode={subMode}
+          onViewChange={onViewChange}
+          onOpenRun={onOpenRun}
+          peopleInit={peopleInit}
+          setPeopleInit={setPeopleInit}
+          openPeople={openPeople}
+        />
       )}
     </DialogsProvider>
   );
@@ -132,6 +146,39 @@ const LeadsSidebar: React.FC<LeadsSidebarProps> = ({
     if (res && res.ok) {
       await loadData();
       onSelectList(res.list as unknown as LeadList);
+    }
+  };
+
+  const handleRenameList = async (list: LeadList, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const newName = await dialogs.prompt({
+      title: 'Rename List',
+      label: 'List name',
+      initial: list.name,
+      confirmLabel: 'Save',
+    });
+    if (!newName || newName === list.name) return;
+    const res = await updateList(list.id, { name: newName }).catch(() => null);
+    if (res && res.ok) {
+      await loadData();
+    }
+  };
+
+  const handleDeleteList = async (list: LeadList, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const ok = await dialogs.confirm({
+      title: 'Delete List',
+      body: `Delete the list "${list.name}"? Contacts in it are kept in your Leads directory.`,
+      confirmLabel: 'Delete list',
+      danger: true,
+    });
+    if (!ok) return;
+    const res = await deleteList(list.id).catch(() => null);
+    if (res && res.ok) {
+      if (activeListId === list.id) {
+        onSelectList(null);
+      }
+      await loadData();
     }
   };
 
@@ -222,7 +269,7 @@ const LeadsSidebar: React.FC<LeadsSidebarProps> = ({
             {lists.map((l) => {
               const isSelected = activeListId === l.id;
               return (
-                <button
+                <div
                   key={l.id}
                   onClick={() => {
                     onSelectList(l);
@@ -235,20 +282,40 @@ const LeadsSidebar: React.FC<LeadsSidebarProps> = ({
                   }`}
                   title={l.name}
                 >
-                  <span className="truncate flex items-center gap-1.5">
-                    <span className={`text-[9px] px-1 border ${
+                  <span className="truncate flex items-center gap-1.5 flex-1 min-w-0">
+                    <span className={`text-[9px] px-1 border flex-shrink-0 ${
                       isSelected ? 'border-white/40 text-white' : 'border-line text-muted'
                     }`}>
                       {l.kind === 'companies' ? 'C' : 'P'}
                     </span>
                     <span className="truncate">{l.name}</span>
                   </span>
-                  {typeof l.members === 'number' && (
-                    <span className={`text-[10px] tabular-nums ${isSelected ? 'text-white/80' : 'text-muted'}`}>
-                      {l.members}
-                    </span>
-                  )}
-                </button>
+                  <div className="flex items-center gap-1 flex-shrink-0 ml-1">
+                    {typeof l.members === 'number' && (
+                      <span className={`text-[10px] tabular-nums group-hover:hidden ${isSelected ? 'text-white/80' : 'text-muted'}`}>
+                        {l.members}
+                      </span>
+                    )}
+                    <button
+                      onClick={(e) => void handleRenameList(l, e)}
+                      className={`p-0.5 rounded opacity-0 group-hover:opacity-100 hover:text-ink transition-opacity ${
+                        isSelected ? 'text-white/80 hover:text-white' : 'text-muted'
+                      }`}
+                      title="Rename list"
+                    >
+                      <Pencil className="w-3 h-3" />
+                    </button>
+                    <button
+                      onClick={(e) => void handleDeleteList(l, e)}
+                      className={`p-0.5 rounded opacity-0 group-hover:opacity-100 hover:text-danger transition-opacity ${
+                        isSelected ? 'text-white/80 hover:text-danger' : 'text-muted'
+                      }`}
+                      title="Delete list"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  </div>
+                </div>
               );
             })}
           </div>
@@ -332,16 +399,13 @@ const LeadsWorkspace: React.FC<{
   subMode?: string | null;
   onViewChange: (view: LeadsView, subMode?: string | null) => void;
   onOpenRun: (runId: string) => void;
-}> = ({ view, subMode, onViewChange, onOpenRun }) => {
-  const [peopleInit, setPeopleInit] = React.useState<{ key: number; filters: ContactFilters } | null>(null);
+  peopleInit: { key: number; filters: ContactFilters } | null;
+  setPeopleInit: React.Dispatch<React.SetStateAction<{ key: number; filters: ContactFilters } | null>>;
+  openPeople: (filters: ContactFilters) => void;
+}> = ({ view, subMode, onViewChange, onOpenRun, peopleInit, setPeopleInit, openPeople }) => {
   const [companyList, setCompanyList] = React.useState<{ key: number; id: string } | null>(null);
   const [activeList, setActiveList] = React.useState<LeadList | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
-
-  const openPeople = (filters: ContactFilters) => {
-    setPeopleInit({ key: Date.now(), filters });
-    onViewChange('leads', 'people');
-  };
 
   const activeFindMode = (subMode as 'search' | 'profile' | 'upload') || 'search';
   const activeLeadsMode = (subMode as 'people' | 'companies') || 'people';
@@ -394,10 +458,10 @@ const LeadsWorkspace: React.FC<{
           {activeFindMode === 'upload' && (
             <Screen
               title="Import"
-              subtitle="Upload a CSV of people or companies to verify, re-find or enrich. Nothing is spent until you start the run."
+              subtitle="Upload a CSV of people or companies to import for free or verify/enrich with waterfall. Nothing is spent until you start a run."
               icon={<Upload className="w-4 h-4" />}
             >
-              <CleanList onOpenRun={onOpenRun} />
+              <CleanList onOpenRun={onOpenRun} onOpenPeople={() => openPeople({})} />
             </Screen>
           )}
         </div>
@@ -618,14 +682,16 @@ const SubNav: React.FC<{ view: LeadsView; onViewChange: (v: LeadsView) => void }
 // One run — the table, live
 // ---------------------------------------------------------------------------
 
-const RunView: React.FC<{ runId: string | null; onBack: () => void; onOpenRun: (id: string) => void }> = ({
+const RunView: React.FC<{
+  runId: string | null;
+  onBack: () => void;
+  onOpenPeople?: (filters: ContactFilters) => void;
+}> = ({
   runId,
   onBack,
-  onOpenRun,
+  onOpenPeople,
 }) => {
-  // Rows waiting on the re-verify confirmation. Re-verifying is a new priced
-  // run, so it is confirmed with its price like every other paid action.
-  const [reverifyIds, setReverifyIds] = React.useState<string[] | null>(null);
+  const [showExport, setShowExport] = React.useState(false);
   const [run, setRun] = React.useState<LeadRun | null>(null);
   const [rows, setRows] = React.useState<LeadRow[]>([]);
   const [total, setTotal] = React.useState(0);
@@ -912,34 +978,6 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void; onOpenRun: (
     }
   };
 
-  // Bulk suppression. Addresses before domains, and the domains are dropped when
-  // any address at that domain is also being suppressed — suppressing the company
-  // as well is the same protection and one less row on a list the user then has
-  // to maintain.
-  const suppressRows = async (ids: string[]) => {
-    const chosen = rows.filter((r) => ids.includes(r.id));
-    const domains = new Set(chosen.map((r) => r.domain).filter(Boolean) as string[]);
-    const values: string[] = [];
-
-    for (const r of chosen) {
-      if (r.email) {
-        values.push(r.email);
-        if (r.domain) domains.delete(r.domain);
-      }
-    }
-    for (const d of domains) values.push(d);
-
-    if (values.length === 0) {
-      setNotice('Those rows have no address or domain to suppress.');
-      return;
-    }
-
-    for (const v of values) await addSuppression(v, 'suppressed from a run');
-    setNotice(
-      `${values.length} ${values.length === 1 ? 'value' : 'values'} suppressed. They will not be looked up again.`,
-    );
-  };
-
   // Attempt history is fetched per expanded row rather than with the page.
   // One query, because the foreign key now exists.
 //
@@ -1010,7 +1048,14 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
           </p>
         </div>
 
-        <div className="flex items-center gap-3 flex-shrink-0">
+        <div className="flex items-center gap-2.5 flex-wrap flex-shrink-0">
+          {onOpenPeople && runId && (
+            <Button onClick={() => onOpenPeople({ run_id: runId })}>
+              <Users className="w-3.5 h-3.5" />
+              View in Leads Directory ({total.toLocaleString()})
+            </Button>
+          )}
+
           {/* Shown because a table that stopped updating with no indication is
               indistinguishable from a run that stopped. */}
           <StatusPill
@@ -1023,7 +1068,10 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
 
           {run && <RunStrip status={run.status} pauseReason={run.pause_reason} />}
 
-          <ExportMenu runId={runId} rowCount={total} />
+          <Button variant="secondary" onClick={() => setShowExport(true)} disabled={total === 0}>
+            <Download className="w-3.5 h-3.5" />
+            Export
+          </Button>
         </div>
       </div>
 
@@ -1186,25 +1234,13 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
         total={total}
         loading={loading}
         attemptsFor={attemptsFor}
-        onBulk={async (action, ids) => {
-          if (action === 'delete') return bulkAction(runId, ids, action);
-          setReverifyIds(ids);
-          return { ok: true, note: null };
-        }}
-        onSuppress={(ids) => void suppressRows(ids)}
       />
 
-      {reverifyIds && (
-        <CostDialog
-          title={`Re-verify ${reverifyIds.length} addresses`}
-          description="Checks each selected address again with the verifiers, as a new run. This run and its charges are not changed."
-          getEstimate={() => bulkRowsEstimate(runId, reverifyIds, 'reverify')}
-          start={(requestId) => bulkRowsStart(runId, reverifyIds, 'reverify', requestId)}
-          onStarted={(id) => {
-            setReverifyIds(null);
-            onOpenRun(id);
-          }}
-          onClose={() => setReverifyIds(null)}
+      {showExport && runId && (
+        <ExportDialog
+          runId={runId}
+          totalMatching={total}
+          onClose={() => setShowExport(false)}
         />
       )}
     </div>

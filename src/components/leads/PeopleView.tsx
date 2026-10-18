@@ -15,7 +15,7 @@
 import React from 'react';
 import { useDialogs } from './Dialogs';
 import {
-  Search, SlidersHorizontal, Columns3, Download, Users2, Gauge, Trash2, ListPlus, Tag, ChevronLeft, ChevronRight, ArrowUpDown, X,
+  Search, SlidersHorizontal, Columns3, Download, Trash2, ListPlus, Tag, ChevronLeft, ChevronRight, ArrowUpDown, X,
 } from 'lucide-react';
 import { Button } from './Screen';
 import { StatusBadge } from './StatusBadge';
@@ -24,8 +24,8 @@ import { Chip, ScoreBadge } from './Pick';
 import { ContactPanel } from './ContactPanel';
 import { CostDialog } from './CostDialog';
 import { ScoringDialog, DuplicatesDialog } from './ScoringDialog';
-import { downloadCsv, downloadXlsx, type ExportColumn } from '../../lib/leads-csv';
-import { providerLabel, emailStatusLabel } from '../../lib/leads';
+import { ExportDialog } from './ExportDialog';
+import { emailStatusLabel } from '../../lib/leads';
 import {
   queryContacts, updateContacts, deleteContacts, getLists, addToList, createList, getSavedSearches, saveSavedSearch,
   deleteSavedSearch, enrichEstimate, enrichStart, errorCopy, LEAD_STATUSES,
@@ -104,6 +104,7 @@ export const PeopleView: React.FC<{
   const [openId, setOpenId] = React.useState<string | null>(null);
   const [enrich, setEnrich] = React.useState<{ action: EnrichAction; ids: string[] | null } | null>(null);
   const [dialog, setDialog] = React.useState<'scoring' | 'duplicates' | null>(null);
+  const [showExport, setShowExport] = React.useState(false);
 
   React.useEffect(() => {
     void getLists().then((r) => r.ok && setLists(r.lists.filter((l) => l.kind === 'people'))).catch(() => {});
@@ -205,44 +206,6 @@ export const PeopleView: React.FC<{
     }
   };
 
-  const doExport = async (format: 'csv' | 'xlsx') => {
-    setNote('Preparing export…');
-    // Ticked rows, or every row matching the filters, paged in from the server.
-    let out: Contact[] = [];
-    if (!allMatching && ids.length) out = rows.filter((r) => picked.has(r.id));
-    else {
-      for (let p = 0; p < 20; p++) {
-        const r = await queryContacts(filters, sort, p, 500);
-        out = out.concat(r.contacts);
-        if (r.contacts.length < 500) break;
-      }
-    }
-    const columns: ExportColumn[] = [
-      { header: 'Name', value: (c: Contact) => c.person_name },
-      { header: 'Title', value: (c: Contact) => c.title },
-      { header: 'Company', value: (c: Contact) => c.company_name },
-      { header: 'Domain', value: (c: Contact) => c.domain },
-      { header: 'Email', value: (c: Contact) => c.email },
-      { header: 'Email status', value: (c: Contact) => emailStatusLabel(c.email_status).label },
-      { header: 'Email checked', value: (c: Contact) => c.email_checked_at?.slice(0, 10) },
-      { header: 'Email found by', value: (c: Contact) => (c.email_provider ? providerLabel(c.email_provider) : '') },
-      { header: 'Phone', value: (c: Contact) => c.phone },
-      { header: 'Phone found by', value: (c: Contact) => (c.phone_provider ? providerLabel(c.phone_provider) : '') },
-      { header: 'LinkedIn', value: (c: Contact) => c.linkedin_url },
-      { header: 'Location', value: (c: Contact) => c.location },
-      { header: 'Fit score', value: (c: Contact) => c.score },
-      { header: 'Fit', value: (c: Contact) => c.score_label },
-      { header: 'Status', value: (c: Contact) => c.status },
-      { header: 'Tags', value: (c: Contact) => (c.tags ?? []).join('; ') },
-      { header: 'Source', value: (c: Contact) => c.source },
-      { header: 'Updated', value: (c: Contact) => c.updated_at?.slice(0, 10) },
-    ];
-    const name = `leads-${out.length}-${new Date().toISOString().slice(0, 10)}.${format}`;
-    if (format === 'csv') downloadCsv(columns, out, name);
-    else await downloadXlsx(columns, out, name);
-    setNote(`Exported ${out.length} leads.`);
-  };
-
   const saveView = async () => {
     const name = await prompt({
       title: 'Save this view',
@@ -312,9 +275,9 @@ export const PeopleView: React.FC<{
             </div>
           )}
         </div>
-        <Button variant="quiet" onClick={() => setDialog('scoring')}><Gauge className="w-3 h-3" /> Scoring</Button>
-        <Button variant="quiet" onClick={() => setDialog('duplicates')}><Users2 className="w-3 h-3" /> Duplicates</Button>
-        <Button variant="quiet" onClick={() => void doExport('csv')} disabled={total === 0}><Download className="w-3 h-3" /> Export</Button>
+        <Button variant="secondary" onClick={() => setShowExport(true)} disabled={total === 0}>
+          <Download className="w-3.5 h-3.5" /> Export
+        </Button>
       </div>
 
       {showFilters && <FilterPanel filters={filters} lists={lists} onChange={setFilters} />}
@@ -375,8 +338,7 @@ export const PeopleView: React.FC<{
             const t = await prompt({ title: 'Tag leads', label: 'Tag to add', placeholder: 'e.g. icp', confirmLabel: 'Add tag', maxLength: 40 });
             if (t) void doUpdate({ add_tags: [t] }, `Tagged "${t}"`);
           }}><Tag className="w-3 h-3" /> Tag</BulkButton>
-          <BulkButton onClick={() => void doExport('csv')}><Download className="w-3 h-3" /> CSV</BulkButton>
-          <BulkButton onClick={() => void doExport('xlsx')}>Excel</BulkButton>
+          <BulkButton onClick={() => setShowExport(true)}><Download className="w-3 h-3" /> Export</BulkButton>
           <BulkButton onClick={() => void doDelete()}><Trash2 className="w-3 h-3" /> Delete</BulkButton>
         </div>
       )}
@@ -532,6 +494,17 @@ export const PeopleView: React.FC<{
 
       {dialog === 'scoring' && <ScoringDialog onClose={() => setDialog(null)} onSaved={() => { setNote('Scoring rules saved; every lead was rescored.'); refresh(); }} />}
       {dialog === 'duplicates' && <DuplicatesDialog onClose={() => setDialog(null)} onMerged={refresh} />}
+
+      {showExport && (
+        <ExportDialog
+          onClose={() => setShowExport(false)}
+          contactFilters={filters}
+          contactSort={sort}
+          selectedIds={ids}
+          allMatching={allMatching}
+          totalMatching={total}
+        />
+      )}
     </div>
   );
 };
@@ -577,6 +550,7 @@ function filterChips(f: ContactFilters, lists: LeadList[]) {
   for (const t of f.tags ?? []) out.push({ key: `t:${t}`, label: `Tag: ${t}`, clear: (x) => ({ ...x, tags: (x.tags ?? []).filter((y) => y !== t) }) });
   if (f.list_id) out.push({ key: 'list', label: `List: ${lists.find((l) => l.id === f.list_id)?.name ?? '…'}`, clear: (x) => ({ ...x, list_id: undefined }) });
   if (f.company_id) out.push({ key: 'co', label: 'One company', clear: (x) => ({ ...x, company_id: undefined }) });
+  if (f.run_id) out.push({ key: 'run', label: 'From Run', clear: (x) => ({ ...x, run_id: undefined }) });
   if (f.score_min != null) out.push({ key: 'smin', label: `Fit ≥ ${f.score_min}`, clear: (x) => ({ ...x, score_min: null }) });
   if (f.source) out.push({ key: 'src', label: `Source: ${f.source}`, clear: (x) => ({ ...x, source: undefined }) });
   if (f.stale_days) out.push({ key: 'stale', label: `Not checked in ${f.stale_days}d`, clear: (x) => ({ ...x, stale_days: undefined }) });

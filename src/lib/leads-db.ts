@@ -94,6 +94,7 @@ export interface ContactFilters {
   tags?: string[];
   list_id?: string;
   company_id?: string;
+  run_id?: string;
   domain?: string;
   score_min?: number | null;
   score_max?: number | null;
@@ -253,6 +254,8 @@ export const updateContacts = (
 ) => call<Ok<{ updated: number }> | Fail>('contacts_update', { ids, patch });
 
 export const deleteContacts = (ids: string[]) => call<Ok<{ deleted: number }> | Fail>('contacts_delete', { ids });
+export const importContacts = (rows: any[], listId?: string | null) =>
+  call<Ok<{ saved: number; skipped: number; contact_ids: string[] }> | Fail>('contacts_import', { rows, list_id: listId });
 
 export const findDuplicates = () =>
   call<Ok<{ groups: Array<Array<Partial<Contact> & { id: string }>>; total_groups: number }>>('duplicates');

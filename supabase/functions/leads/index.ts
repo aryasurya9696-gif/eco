@@ -440,6 +440,8 @@ Deno.serve(async (req) => {
         return json(await ws.updateContacts(db, userId, body));
       case 'contacts_delete':
         return json(await ws.deleteContacts(db, userId, body));
+      case 'contacts_import':
+        return json(await ws.importContacts(db, userId, body));
       case 'duplicates':
         return json(await ws.findDuplicates(db, userId));
       case 'contacts_merge':
