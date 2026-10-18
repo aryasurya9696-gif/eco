@@ -367,10 +367,17 @@ the free count endpoints; show whichever answers first, with "about".
 
 ## The run button
 
-"Find 50 leads · about 0.92 credits each · est. 46 credits (max 61)", with a
-breakdown on hover: companies, decision makers, emails found (from your hit rates,
-or 70% by default), verification. The button is disabled with a "Top up" link when
-available credits (`balance - reserved`) are below the maximum.
+"Find 50 leads · est. 43 credits (max 61)", with a breakdown on hover: companies,
+decision makers, emails found (from your hit rates, or 70% by default).
+
+The two smaller numbers for that search are 1 credit minimum and 43 expected.
+Minimum is the company line alone, because that is the only line charged whether
+or not anything is found — the row exists because a company search returned that
+domain. The decision-maker line is charged only when the people waterfall returns
+somebody, so it is at the hit rate like the email line rather than unconditional.
+
+The button is disabled with a "Top up" link when available credits
+(`balance - reserved`) are below the maximum.
 
 ## Runs: finding the leads and the waterfall
 

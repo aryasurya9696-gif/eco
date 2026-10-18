@@ -66,6 +66,7 @@ const ALL_COLUMNS: Array<{ id: string; label: string; always?: boolean }> = [
   { id: 'provider', label: 'Found by' },
   { id: 'credits', label: 'Cost' },
   { id: 'title', label: 'Title' },
+  { id: 'phone', label: 'Phone' },
   { id: 'domain', label: 'Domain' },
 ];
 
@@ -144,6 +145,22 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
         header: 'Title',
         cell: (info) => {
           const v = info.getValue();
+          return v ? (
+            <span className="text-[10px] font-mono text-[#8a8a86] truncate">{v}</span>
+          ) : (
+            <Dash />
+          );
+        },
+      }),
+
+      col.accessor('phone', {
+        id: 'phone',
+        header: 'Phone',
+        cell: (info) => {
+          const v = info.getValue();
+          // Not a tel: link. A number that came out of a provider has not been
+          // checked for whether it reaches anyone, and a dialable link on an
+          // unchecked number is a claim the product cannot make.
           return v ? (
             <span className="text-[10px] font-mono text-[#8a8a86] truncate">{v}</span>
           ) : (

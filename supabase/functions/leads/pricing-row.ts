@@ -88,7 +88,18 @@ export function creditsForRow(outcome: Partial<RowOutcome>, prices: LeadPrices, 
     credits += prices.verifyOnly;
   }
 
-  if (o.emailFound) {
+  // The address, gated the same way.
+//
+// This gate was missing and it was the last one a caller could get past. Company
+// and person were already refused on a clean run, so the fix for the original
+// conflation held - until a caller passed emailFound for a row whose plan never
+// went looking for one, and was charged the full find price for an address that
+// was never looked for. On a 2000-row verify_only that is 2000 credits charged
+// for work that by definition did not happen.
+//
+// Every flag is now refused where the plan says the step does not run, so the
+// worst a bug can do is charge less rather than charge outside the mode.
+if (plan.findEmail && o.emailFound) {
     // A catch-all is not the deliverable a verified address is, and is priced
     // accordingly. Charging it the verified price is selling the worse answer at
     // the better price; charging the catch-all price for an address that is in
@@ -97,8 +108,12 @@ export function creditsForRow(outcome: Partial<RowOutcome>, prices: LeadPrices, 
     else credits += prices.emailVerified;
   }
 
-  if (o.phoneFound) credits += prices.phone;
-  if (o.companyEnriched) credits += prices.enrich;
+  // Phone and enrichment are gated the same way. Phone was the last flag a caller
+  // could get past, at eight credits a row - 16000 across a 2000-row run for
+  // numbers that were never looked for. It is a plan field rather than a run
+  // option read in here so there is one description of what a row will do.
+  if (plan.phone && o.phoneFound) credits += prices.phone;
+  if (plan.enrich && o.companyEnriched) credits += prices.enrich;
 
   return round6(credits);
 }

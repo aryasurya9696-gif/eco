@@ -210,10 +210,78 @@ const P = {
 
 {
   // A find run never emits a verify step, because it would be charging for work
-  // the find already did.
+  // the find already did. It does emit the decision-maker step, because that is
+  // how a row that has no person on it gets one: every email endpoint in the
+  // registry is keyed on a name or a profile URL.
   const steps = S.maxStepsFor(S.planSteps(null), false);
   check('a find run never plans a verify step', !steps.includes('verify'));
-  check('a find run plans exactly the email step', JSON.stringify(steps) === JSON.stringify(['email']));
+  check('a find run plans the decision maker then the address', JSON.stringify(steps) === JSON.stringify(['person', 'email']));
+  check('a find run does not re-look-up a person it already has', JSON.stringify(S.maxStepsFor(S.planSteps(null), false, true)) === JSON.stringify(['email']));
+}
+
+{
+  // A clean run's rows came from the user's file with a person already on them,
+  // so no plan may claim it went looking for one. This is the assertion that
+  // keeps a clean run from being billed for a decision-maker lookup.
+  const steps = S.maxStepsFor(S.planSteps('full_enrich'), true);
+  check('a clean run never plans a decision-maker step', !steps.includes('person'));
+  check('a clean run never plans a company step', !steps.includes('company'));
+}
+
+// --- shouldDiscover: when a find run goes looking for companies ------------
+//
+// The bug this guards against is the expensive one. The worker re-invokes
+// itself per chunk, so "discover whenever it looks" makes a 2000-row run make
+// 400 company searches, each asking for the ~1995 rows it has not created yet.
+
+{
+  // The case that used to be broken: rows exist and work is waiting, so nothing
+  // should be discovered even though the target is far from met.
+  check(
+    'a run with rows waiting does not discover',
+    S.shouldDiscover({ kind: 'find', have: 5, waiting: 5, target: 2000 }) === false,
+  );
+
+  check(
+    'a run with one row waiting does not discover',
+    S.shouldDiscover({ kind: 'find', have: 1999, waiting: 1, target: 2000 }) === false,
+  );
+
+  // The case that needs it: the queue has drained and the target is unmet, so
+  // the providers are asked again. Without this a run that found 20 of 50 would
+  // stop at 20 for ever.
+  check(
+    'a drained run below its target discovers',
+    S.shouldDiscover({ kind: 'find', have: 20, waiting: 0, target: 50 }) === true,
+  );
+
+  check(
+    'a brand new run discovers',
+    S.shouldDiscover({ kind: 'find', have: 0, waiting: 0, target: 50 }) === true,
+  );
+
+  // Reaching the target stops it, even with an empty queue - otherwise the
+  // worker searches forever for rows it does not need.
+  check(
+    'a run that met its target does not discover',
+    S.shouldDiscover({ kind: 'find', have: 2000, waiting: 0, target: 2000 }) === false,
+  );
+  check(
+    'a run past its target does not discover',
+    S.shouldDiscover({ kind: 'find', have: 2500, waiting: 0, target: 2000 }) === false,
+  );
+}
+
+{
+  // Never a clean run. Its rows came from the user's file; searching for more
+  // companies would silently turn a clean into a find, which is the exact
+  // conflation steps.ts exists to prevent.
+  check('a clean run never discovers', S.shouldDiscover({ kind: 'clean', have: 0, waiting: 0, target: 50 }) === false);
+  check('a lab run never discovers', S.shouldDiscover({ kind: 'lab', have: 0, waiting: 0, target: 50 }) === false);
+
+  // And a mode on a find run does not change the answer - the kind decides, not
+  // the mode, which is the same rule planSteps follows.
+  check('the mode is not an input', S.shouldDiscover({ kind: 'find', have: 0, waiting: 0, target: 0 }) === true);
 }
 
 // --- worstCasePerRow: matches what the wallet is checked against ---------
@@ -235,8 +303,27 @@ const P = {
 }
 
 {
+  // This is the number that changed twice, and the second time is the bug this
+  // file exists to catch.
+  //
+  // It was 1.00: the find price and nothing else. But a find row is charged
+  // company + person + email by creditsForRow, and the SQL estimator quotes
+  // max = target * (company + person + email) = 1.22. So a five-row chunk held
+  // 5.00 and could settle 6.10, which settle refuses - and the run pauses itself
+  // with 'settlement_failed' and the user loses the credits in between.
+  //
+  // It has to equal the estimator's max, because the estimator's max is what the
+  // wallet was checked against when the run started. One rule, two readers.
   const w = S.worstCasePerRow(S.planSteps(null), P);
-  check('a find run reserves only the find price', Math.abs(w - 1.0) < 1e-9);
+  check('a find run reserves the company and person lines too', Math.abs(w - 1.22) < 1e-9);
+}
+
+{
+  // The guard against the obvious over-correction: adding company + person
+  // unconditionally would reserve for decision-maker lookups on clean runs, whose
+  // rows came from the user's file with a person already on them.
+  const clean = S.worstCasePerRow(S.planSteps('full_enrich'), P);
+  check('a clean run does not reserve the company or person line', Math.abs(clean - 2.1) < 1e-9);
 }
 
 {
@@ -338,10 +425,37 @@ const P = {
 }
 
 {
-  // Phone is opt-in and separate.
-  const plan = S.planSteps(null);
+  // Phone is opt-in, and the opt-in is part of the plan rather than a flag the
+  // caller passes in separately. That is what lets creditsForRow refuse it: a
+  // row from a run that never asked for phones cannot be charged eight credits
+  // for a number nobody looked for, however the flags are set.
+  const plan = S.planSteps(null, { phone: true });
   const c = R.creditsForRow({ emailFound: true, companyFound: true, personFound: true, phoneFound: true }, P, plan);
   check('phone adds its own price', Math.abs(c - 9.22) < 1e-9);
+}
+
+{
+  // The refusal. Same flags, run that did not ask for phones.
+  const plan = S.planSteps(null);
+  const c = R.creditsForRow({ emailFound: true, companyFound: true, personFound: true, phoneFound: true }, P, plan);
+  check('phone is refused when the run did not ask for it', Math.abs(c - 1.22) < 1e-9);
+}
+
+{
+  // And the hold follows the same plan, so a phone run holds the phone money.
+  const withPhone = S.worstCasePerRow(S.planSteps(null, { phone: true }), P);
+  const without = S.worstCasePerRow(S.planSteps(null), P);
+  check('a phone run holds the phone price', Math.abs(withPhone - without - P.phone) < 1e-9);
+  check('a run without phones holds none', Math.abs(without - 1.22) < 1e-9);
+}
+
+{
+  // Phone is in the plan, so it appears in the receipt too. It used to be in
+  // neither, which is why the step list was incomplete for a phone run.
+  const steps = S.maxStepsFor(S.planSteps(null, { phone: true }), false);
+  check('a phone run plans the phone step', steps.includes('phone'));
+  check('phone is planned last', steps[steps.length - 1] === 'phone');
+  check('a run without phones does not plan it', !S.maxStepsFor(S.planSteps(null), false).includes('phone'));
 }
 
 {

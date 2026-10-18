@@ -34,6 +34,9 @@ const MODULES = [
   'registry.ts',
   'treg.ts',
   'read-response.ts',
+  'read-lists.ts',
+  'discover.ts',
+  'choose-person.ts',
   'api-usage.ts',
   'index.ts',
 ];

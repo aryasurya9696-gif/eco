@@ -34,6 +34,7 @@ import type {
   LeadIcp,
   LeadIcpDocument,
   LeadsView,
+  LeadStep,
 } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -254,7 +255,7 @@ export interface WaterfallOrder {
   mode: 'default' | 'smart' | 'custom';
 }
 
-export async function getWaterfall(step: 'email' | 'verify'): Promise<WaterfallOrder> {
+export async function getWaterfall(step: LeadStep): Promise<WaterfallOrder> {
   try {
     const res = await invokeFunction<{ order: string[] | null; mode: string }>('leads', {
       action: 'waterfall_get',
@@ -274,7 +275,7 @@ export async function getWaterfall(step: 'email' | 'verify'): Promise<WaterfallO
 }
 
 export async function setWaterfall(
-  step: 'email' | 'verify',
+  step: LeadStep,
   endpointIds: string[],
 ): Promise<{ ok: boolean; error?: string }> {
   return invokeFunction<{ ok: boolean; error?: string }>('leads', {
@@ -324,7 +325,7 @@ export interface ProviderStatsResult {
  * somebody is on this screen to ask.
  */
 export async function getProviderStats(
-  step: 'email' | 'verify' = 'email',
+  step: LeadStep = 'email',
 ): Promise<ProviderStatsResult | null> {
   try {
     return await invokeFunction<ProviderStatsResult>('leads', { action: 'provider_stats', step });

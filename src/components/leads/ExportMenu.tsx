@@ -41,8 +41,21 @@ const DEFAULTS: ExportOptions = {
   includeAttempts: true,
 };
 
-/** The columns, in the order someone reads them. */
-function columnsFor(opts: ExportOptions, passthrough: string[]): ExportColumn[] {
+/**
+ * The columns, in the order someone reads them.
+ *
+ * `rows` is here so a column can be present only when the run actually produced
+ * it. Phone and the company details are both paid for — a phone number is the
+ * most expensive thing in the registry by an order of magnitude, and enrichment
+ * is a line on the price — so a user who paid for them must not open a CSV that
+ * has neither. Before this they were simply missing: the workers that fill those
+ * two columns did not exist when the export was written, and the export was
+ * never revisited.
+ *
+ * Decided on the whole set rather than per row, because a header that appears on
+ * some rows and not others is a header nobody can filter on.
+ */
+function columnsFor(opts: ExportOptions, passthrough: string[], rows: LeadRow[] = []): ExportColumn[] {
   const cols: ExportColumn[] = [
     { header: 'Email', value: (r: any) => r.email ?? '' },
     { header: 'Status', value: (r: any) => emailStatusLabel(r.email_status).label },
@@ -52,6 +65,29 @@ function columnsFor(opts: ExportOptions, passthrough: string[]): ExportColumn[] 
     { header: 'Domain', value: (r: any) => r.domain ?? '' },
     { header: 'LinkedIn', value: (r: any) => r.linkedin_url ?? '' },
   ];
+
+  // Present only when at least one row has one. A column that is entirely empty
+  // in every export of a run that never asked for phones is noise; a column that
+  // is missing from an export of a run that bought eight credits a row for them
+  // is a refund.
+  if (rows.some((r) => (r as any).phone)) {
+    cols.push({ header: 'Phone', value: (r: any) => r.phone ?? '' });
+  }
+
+  // Firmographics, flattened to a readable string rather than a JSON blob: this
+  // is a spreadsheet, and `{"employees":50,"industry":"Accounting"}` in a cell is
+  // something a user has to unpick by hand.
+  const detailKeys = companyDetailKeys(rows);
+  for (const k of detailKeys) {
+    cols.push({
+      header: k,
+      value: (r: any) => {
+        const v = (r as any).company_data?.[k];
+        if (v === null || v === undefined) return '';
+        return typeof v === 'object' ? JSON.stringify(v) : String(v);
+      },
+    });
+  }
 
   if (opts.includeAttempts) {
     cols.push(
@@ -68,6 +104,38 @@ function columnsFor(opts: ExportOptions, passthrough: string[]): ExportColumn[] 
   }
 
   return cols;
+}
+
+/**
+ * The firmographic keys worth a column, in a stable order.
+ *
+ * Capped and ordered rather than "every key on every row", because enrichment is
+ * a whole company record and providers differ wildly on how much they return: a
+ * handful of fields for most companies and a hundred for a few would give an
+ * export with a thousand columns, which no spreadsheet opens.
+ *
+ * The ordering is the order they first appear across the run rather than
+ * alphabetical, so the column that is full is at the left where a user reads.
+ */
+const COMPANY_DETAIL_LIMIT = 12;
+
+function companyDetailKeys(rows: LeadRow[]): string[] {
+  const seen: string[] = [];
+
+  for (const r of rows) {
+    const data = (r as any).company_data;
+    if (!data || typeof data !== 'object') continue;
+    for (const k of Object.keys(data)) {
+      // Skip the two things that are already their own columns. Repeating them
+      // is how an export ends up with "Domain" twice and the user wondering
+      // which one to trust.
+      if (k === 'domain' || k === 'website') continue;
+      if (!seen.includes(k)) seen.push(k);
+      if (seen.length >= COMPANY_DETAIL_LIMIT) return seen;
+    }
+  }
+
+  return seen;
 }
 
 /** Everything except rows the user said to leave out. */
@@ -143,7 +211,10 @@ export const ExportMenu: React.FC<ExportMenuProps> = ({ runId, rowCount }) => {
         return;
       }
 
-      const cols = columnsFor(opts, [...passthrough].sort());
+      // Decided from every row fetched, not only the ones kept. A run can have a
+      // phone on a row the current filters exclude, and a column that appears
+      // and disappears as the user ticks a box makes the export untrustworthy.
+      const cols = columnsFor(opts, [...passthrough].sort(), all);
       const name = exportFilename(runId, kept.length, format);
 
       if (format === 'csv') {

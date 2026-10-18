@@ -59,6 +59,22 @@ export interface StepPlan {
    * thing being bought, so it is priced on its own.
    */
   chargeVerifySeparately: boolean;
+  /**
+   * Look a phone number up as well.
+   *
+   * The only step that is not decided by the mode: it is opt-in on the run
+   * because at roughly eight times the price of the address find, a step that
+   * was on by default would dominate every invoice without being what anybody
+   * came for.
+   *
+   * It is in the plan rather than left to the worker because creditsForRow has
+   * to be able to refuse it. Gating this one on the plan is what stops a future
+   * caller passing phoneFound for a row from a run that never asked for phones
+   * from charging eight credits a row for a number that was never looked for -
+   * 16000 credits across a 2000-row run, and the same class of bug as the
+   * company and person lines that are already gated.
+   */
+  phone: boolean;
 }
 
 const NOTHING: StepPlan = {
@@ -69,6 +85,7 @@ const NOTHING: StepPlan = {
   refindOnFailure: false,
   enrich: false,
   chargeVerifySeparately: false,
+  phone: false,
 };
 
 /**
@@ -82,8 +99,19 @@ const NOTHING: StepPlan = {
  *
  * The signature used to take it and ignore it, which is worse than either — a
  * caller reading that signature concludes the kind is part of the answer.
+ *
+ * The second argument is a run's opt-in settings, not its identity. Phone is the
+ * one step no mode implies, and a step the plan cannot describe is a step the
+ * price function cannot gate - which is how a phone charge once had nowhere to be
+ * refused.
  */
-export function planSteps(mode: CleanMode | null | undefined): StepPlan {
+export function planSteps(
+  mode: CleanMode | null | undefined,
+  opts?: { phone?: boolean },
+): StepPlan {
+  // Read once here so nothing downstream has to remember it.
+  const wantPhone = opts?.phone === true;
+
   // An unrecognised mode is treated as no mode rather than trusted. Falling back
   // to the full waterfall means the user still gets their leads; silently doing
   // less work because of a typo in a column would be the worse failure.
@@ -99,6 +127,7 @@ export function planSteps(mode: CleanMode | null | undefined): StepPlan {
       refindOnFailure: false,
       enrich: false,
       chargeVerifySeparately: true,
+      phone: wantPhone,
     };
   }
 
@@ -110,6 +139,7 @@ export function planSteps(mode: CleanMode | null | undefined): StepPlan {
       refindOnFailure: true,
       enrich: false,
       chargeVerifySeparately: true,
+      phone: wantPhone,
     };
   }
 
@@ -121,6 +151,7 @@ export function planSteps(mode: CleanMode | null | undefined): StepPlan {
       refindOnFailure: true,
       enrich: true,
       chargeVerifySeparately: true,
+      phone: wantPhone,
     };
   }
 
@@ -128,7 +159,7 @@ export function planSteps(mode: CleanMode | null | undefined): StepPlan {
   // the person, then the address, and leave the verification inside the find —
   // which is why chargeVerifySeparately stays false here and why no verify step
   // appears ahead of the find.
-  return { ...NOTHING, findEmail: true };
+  return { ...NOTHING, findEmail: true, phone: wantPhone };
 }
 
 /**
@@ -144,8 +175,18 @@ export function planSteps(mode: CleanMode | null | undefined): StepPlan {
  * ContactOut, then gave up" is only believable if there was a plan to be honest
  * to, and the receipt shows the plan as well as the result.
  */
-export function maxStepsFor(plan: StepPlan, hasEmail: boolean): LeadStep[] {
+export function maxStepsFor(plan: StepPlan, hasEmail: boolean, hasPerson = false): LeadStep[] {
   const steps: LeadStep[] = [];
+
+  // The decision maker comes before the address, because every email endpoint
+  // here is keyed on a name or a profile URL. Without one there is nothing to
+  // look the address up with, so a find plan that did not list this step was
+  // describing a row that could not be worked.
+  //
+  // 'company' is not in this list. The company was looked up when the row was
+  // created, by the discovery pass, and a step list that opened with a call
+  // nobody makes is a receipt that cannot be read against the log.
+  if (plan.findCompany && !hasPerson) steps.push('person');
 
   // Verification comes first and only ever once up front. If the address the row
   // was given turns out to be good there is nothing else to do.
@@ -159,6 +200,11 @@ export function maxStepsFor(plan: StepPlan, hasEmail: boolean): LeadStep[] {
   if (plan.findEmail && plan.verifyExisting) steps.push('verify');
 
   if (plan.enrich) steps.push('enrich');
+
+  // Phone last of all. It is the most expensive step by an order of magnitude and
+  // the least related to the rest, so putting it anywhere else would imply the
+  // address depends on it.
+  if (plan.phone) steps.push('phone');
 
   return steps;
 }
@@ -191,15 +237,77 @@ export function shouldFindEmail(plan: StepPlan, verificationPassed: boolean | nu
  */
 export function worstCasePerRow(
   plan: StepPlan,
-  prices: { verifyOnly: number; emailVerified: number; enrich: number },
+  prices: {
+    company: number;
+    person: number;
+    verifyOnly: number;
+    emailVerified: number;
+    enrich: number;
+    phone: number;
+  },
 ): number {
   let worst = 0;
+
+  // The company and decision-maker lines are here for one reason: they are what
+  // the row is charged for, so they have to be held.
+  //
+  // This was the price of a find row and nothing else, which under-held it. The
+  // SQL estimator's max for a find is target * (company + person + email), but the
+  // chunk reserved target * email, so a chunk of five rows held 5.00 and could
+  // legitimately settle 6.10. settle refuses to charge more than was held, so
+  // every find run with a company in it failed settlement, paused itself with
+  // pause_reason 'settlement_failed', and left the user with a run that looks
+  // finished and credits that vanished.
+  //
+  // Two numbers for the same row is not a rounding difference. One of them was
+  // wrong, and the fix belongs here rather than in the estimator because the
+  // estimator's version is the one the user was quoted.
+  if (plan.findCompany) worst += prices.company + prices.person;
 
   if (plan.verifyExisting) worst += prices.verifyOnly;
   if (plan.findEmail) worst += prices.emailVerified;
   if (plan.enrich) worst += prices.enrich;
 
+  // Inside the plan rather than added by the caller. The worker used to add the
+  // phone price on top of this number from run.options, which worked and is the
+  // reason the estimate and the hold could disagree without anything noticing:
+  // two files computing one row. A run that asked for phones and got a plan
+  // without them - a refactored call site, a restored mode - would have held
+  // nothing at all for an eight-credit step.
+  if (plan.phone) worst += prices.phone;
+
   return round6(worst);
+}
+
+/**
+ * Whether this run should be sent out to find companies right now.
+ *
+ * Three conditions, and getting the second one wrong is expensive:
+ *
+ *   1. only a find run. A clean run's rows came from the user's file and a lab
+ *      run's from a single hand-picked company; neither has anything to search
+ *      for.
+ *   2. only when the queue is empty. The worker re-invokes itself per chunk, so
+ *      discovering whenever it looked would mean a 2000-row run making 400
+ *      company searches, each one asking for the rows it had not created yet.
+ *      Paid calls, once per chunk, for a single search.
+ *   3. only while the target is still unmet.
+ *
+ * Kept here rather than inline at the call site for the same reason the rest of
+ * this file exists: it is a rule about what a run does, and a rule with a money
+ * consequence in it should be somewhere a test can reach.
+ */
+export function shouldDiscover(input: {
+  kind: string;
+  /** Rows created for this run, of any state. */
+  have: number;
+  /** Rows currently queued or being worked. */
+  waiting: number;
+  target: number;
+}): boolean {
+  if (input.kind !== 'find') return false;
+  if (input.waiting > 0) return false;
+  return input.have < Math.max(1, input.target);
 }
 
 /**

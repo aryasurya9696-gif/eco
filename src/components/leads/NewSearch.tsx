@@ -8,6 +8,9 @@ import { useAuth } from '../../context/AuthContext';
 import { formatUsd, formatCredits } from '../../lib/billing';
 import { Screen, Panel, Button, Textarea, Input, Figure, PriceBar } from './Screen';
 import { ChipRow, ChipChoice } from './ChipRow';
+import {
+  SIZE_BANDS, sizeLabelOf, sizeBoundsOf, sizeIsJunk, searchTextOf, isSearchable, mergeSegment,
+} from '../../lib/leads-segment';
 
 /**
  * The screen people came for.
@@ -33,13 +36,7 @@ interface NewSearchProps {
   onStarted: (runId: string) => void;
 }
 
-const SIZES = [
-  { label: '1–10', value: '1-10' },
-  { label: '11–50', value: '11-50' },
-  { label: '51–200', value: '51-200' },
-  { label: '201–1000', value: '201-1000' },
-  { label: '1000+', value: '1000+' },
-];
+const SIZES = SIZE_BANDS.map((b) => b.label);
 
 const COUNT_PRESETS = [25, 50, 100, 250, 500];
 
@@ -72,6 +69,14 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
   const [target, setTarget] = React.useState(50);
   const [estimate, setEstimate] = React.useState<Awaited<ReturnType<typeof estimateRun>>>(null);
   const [pricing, setPricing] = React.useState(false);
+  // Why there is no price, as distinct from "the price is loading".
+  //
+  // These were the same thing. A failed estimate set the estimate to null, the
+  // button's disabled condition included `!estimate`, and nothing on the screen
+  // distinguished the two — so a dropped connection left the user looking at a
+  // permanently disabled Find button, three empty figures and no reason. The
+  // only way out was to reload the page.
+  const [estimateError, setEstimateError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
@@ -108,10 +113,14 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
     setPricing(true);
     estimateRun({ kind: 'find', target })
       .then((est) => {
-        if (!cancelled) setEstimate(est);
+        if (cancelled) return;
+        setEstimate(est);
+        setEstimateError(null);
       })
       .catch(() => {
-        if (!cancelled) setEstimate(null);
+        if (cancelled) return;
+        setEstimate(null);
+        setEstimateError('Could not price this search. The price comes from a live lookup, so this is usually a connection problem — try again in a moment.');
       })
       .finally(() => {
         if (!cancelled) setPricing(false);
@@ -124,12 +133,23 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
   const patch = (changes: Partial<LeadIcpSegment>) =>
     setSegment((prev) => ({ ...prev, ...changes }));
 
-  const size = SIZES.find((s) => s.value === sizeValueOf(segment.employeeRange));
+  // Which band, if any, the saved range is. Null means it is not one of them —
+  // a custom size, or a range from an older profile — and the chip row then
+  // shows a read-only version of it rather than nothing at all, which is what
+  // happened before: the user had a size set and the screen claimed they did not.
+  const size = sizeLabelOf(segment.employeeRange);
+  const customSize =
+    size === null && segment.employeeRange && !sizeIsJunk(segment.employeeRange)
+      ? customSizeLabel(segment.employeeRange)
+      : null;
+  const junkSize = sizeIsJunk(segment.employeeRange);
 
-  const enoughToSearch =
-    (segment.industries?.length ?? 0) > 0 ||
-    (segment.keywords?.length ?? 0) > 0 ||
-    (segment.name?.trim().length ?? 0) > 0;
+  // The same rule the backend applies, in the same module. They used to differ:
+  // the form treated a name as enough to run and the worker refused it, so the
+  // warning under the price said the search would go ahead and it then failed
+  // with no rows and no clear reason.
+  const enoughToSearch = isSearchable(segment);
+  const searchText = searchTextOf(segment);
 
   // What this search is made of, in the user's terms. Honest about being a
   // description rather than a count: without a provider there is no way to know
@@ -138,7 +158,7 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
   const chosenSummary = [
     segment.industries?.length ? segment.industries.join(', ') : null,
     segment.countries?.length ? segment.countries.join(', ') : null,
-    size ? `${size.label} staff` : null,
+    (size ?? customSize) ? `${size ?? customSize} staff` : null,
   ]
     .filter(Boolean)
     .join(' · ');
@@ -150,12 +170,15 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
       // Saved and approved before the run starts, so the run and the profile that
       // produced it cannot come apart. A run pointing at an ICP that was never
       // written is a run nobody can explain six months later.
-      const next = {
-        ...doc,
-        summary,
-        segments: [segment],
-        primarySegment: 0,
-      };
+      //
+      // The edited segment goes back *into* the document rather than replacing
+      // it. `segments: [segment]` was the old version and it was correct only
+      // for a document with one segment: a profile with three lost the other two
+      // every time someone pressed Find from this screen, with a success toast
+      // and no undo. "Find more" builds the second segment, so the loss was
+      // reachable in ordinary use and not by any unusual sequence.
+      const merged = mergeSegment(doc, segment);
+      const next = { ...doc, summary, ...merged };
       const saved = await saveIcp({
         id: icpId,
         website: profile?.website ?? null,
@@ -311,16 +334,29 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
             />
           </div>
 
-          <ChipChoice
-            label="Company size"
-            options={SIZES.map((s) => s.label)}
-            value={size?.label ?? null}
-            onChange={(v) => {
-              const picked = SIZES.find((s) => s.label === v);
-              if (!picked) return;
-              patch({ employeeRange: sizeBounds(picked.value) });
-            }}
-          />
+          <div>
+            <ChipChoice
+              label="Company size"
+              options={SIZES}
+              value={size ?? customSize}
+              onChange={(v) => patch({ employeeRange: sizeBoundsOf(v) })}
+            />
+            {/* A size the bands do not cover, or one that is not a number. Both
+                used to be invisible: the first left nothing selected with no
+                explanation, the second left nothing selected and then failed the
+                run with a message about the profile rather than the form. */}
+            {customSize && (
+              <p className="text-[10px] font-mono text-[#8a8a86] mt-1.5">
+                {customSize} — not one of the bands above, and it will be searched on as it is.
+              </p>
+            )}
+            {junkSize && (
+              <p className="text-[10px] font-mono text-[#8a2a2a] mt-1.5">
+                The company size on this profile is not a number. Pick a band above to fix it — a
+                search cannot use it as it is.
+              </p>
+            )}
+          </div>
         </div>
       </Panel>
 
@@ -355,15 +391,18 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
             />
           </div>
 
+          {/* A spinner that never stops is a lie about the state. When there is
+              no price and none is coming, the figures say so rather than
+              implying they are about to arrive. */}
           <div className="flex gap-10 sm:gap-16">
             <Figure
               label="Likely"
-              value={pricing || !estimate ? <Loader2 className="w-5 h-5 animate-spin text-[#b5b5ad]" /> : formatCredits(estimate!.expected_credits)}
+              value={figure(estimate, 'expected_credits', pricing)}
               sub={estimate ? formatUsd(estimate.min_credits) + ' at the floor' : undefined}
             />
             <Figure
               label="At most"
-              value={pricing || !estimate ? <Loader2 className="w-5 h-5 animate-spin text-[#b5b5ad]" /> : formatCredits(estimate!.max_credits)}
+              value={figure(estimate, 'max_credits', pricing)}
               sub={estimate ? formatUsd(estimate.max_credits) : undefined}
             />
             <Figure
@@ -377,19 +416,57 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
             <PriceBar expected={estimate.expected_credits} max={estimate.max_credits} />
           )}
 
-          {!enoughToSearch && (
+          {estimateError && (
+            <div className="flex items-start gap-2 text-[10px] font-mono text-[#8a2a2a] leading-relaxed">
+              <CircleAlert className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+              <span>{estimateError}</span>
+            </div>
+          )}
+
+          {/* Two separate things, and they were one message that was wrong about
+              both.
+
+              Not enough to search on is a hard stop: the worker refuses a profile
+              with no name, industry or keyword, so the button says so instead of
+              letting someone press it and watch a run fail with no rows. The old
+              copy said the search "will run without one, and return whatever the
+              providers consider a match", which is not what happens and never
+              was.
+
+              Not enough credits is the same shape of problem — a button that will
+              not do the thing — but the fix is different, so it gets its own
+              line and its own link. */}
+          {!enoughToSearch && !junkSize && (
             <div className="flex items-start gap-2 text-[10px] font-mono text-[#b5801f] leading-relaxed">
               <CircleAlert className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
               <span>
-                Add at least one industry or keyword so the search knows who to look for. It will
-                run without one, and return whatever the providers consider a match.
+                There is nothing to search for yet. Give this search a name, an industry or a
+                keyword — the name you typed is enough on its own — and the search will use it.
               </span>
             </div>
           )}
 
+          {enoughToSearch && searchText && (
+            <p className="text-[10px] font-mono text-[#8a8a86] leading-relaxed">
+              Searching for: <span className="text-[#141414]">{searchText}</span>
+              {segment.targetTitles?.length ? (
+                <> · decision makers with {segment.targetTitles.join(', ')}</>
+              ) : null}
+            </p>
+          )}
+
           <div className="flex items-center gap-4 pt-1 flex-wrap">
             <div className="flex items-stretch">
-              <Button onClick={() => void start()} disabled={busy || pricing || !estimate} className="!px-6">
+              {/* Disabled, and each reason stated above rather than left to be
+                  discovered. A disabled control with no explanation is the one
+                  thing on a pricing screen that guarantees the user cannot tell
+                  whether the product is broken or they are being charged too
+                  much. */}
+              <Button
+                onClick={() => void start()}
+                disabled={busy || pricing || !estimate || !enoughToSearch || junkSize}
+                className="!px-6"
+              >
                 {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
                 Find {target.toLocaleString()} leads
               </Button>
@@ -444,16 +521,53 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
 // ---------------------------------------------------------------------------
 
 /**
- * The price of one lead.
+ * One of the two price figures.
  *
- * Rounded to one decimal because the second one is noise on a screen where the
- * total is sitting two inches above — 16.6 tells you the order of magnitude and
- * whether it is worth it, and 16.63 pretends to a precision the estimate does not
- * have. A hit rate of 70% cannot tell you the price of the eleventh lead.
+ * Three states, and they used to be two: loading showed a spinner and so did
+ * "there is no price", so a failed estimate left three spinners turning
+ * indefinitely on a screen that was not going to load anything. A dash with the
+ * reason two lines below is the honest rendering of "there is no price".
+ */
+function figure(
+  estimate: { expected_credits: number; max_credits: number } | null,
+  field: 'expected_credits' | 'max_credits',
+  pricing: boolean,
+) {
+  if (estimate) return formatCredits(estimate[field]);
+  if (pricing) return <Loader2 className="w-5 h-5 animate-spin text-[#b5b5ad]" />;
+  return <span className="text-[#b5b5ad]">—</span>;
+}
+
+/**
+ * A company size that is a real range but not one of the bands.
  *
- * Zero is shown as "less than one", not as 0. Because that is what it means: the
- * expected total came out under one credit for the whole search, and a rounded
- * "0 each" reads as free when it is merely cheap.
+ * Only ever used when sizeLabelOf declined to answer, so the range is a pair of
+ * finite numbers in the right order — anything else is reported as junk instead.
+ */
+function customSizeLabel(range: LeadIcpSegment['employeeRange']): string {
+  if (!range || range.length !== 2) return '';
+  const lo = Number(range[0]);
+  const hi = Number(range[1]);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return '';
+  // The open-ended band, spelled the way the person would.
+  if (hi >= 999999) return `${lo.toLocaleString()}+`;
+  return `${lo.toLocaleString()}–${hi.toLocaleString()}`;
+}
+ /**
+ * The price of one lead, as it will read on the button.
+ *
+ * Kept separate from the figure above because it answers a different question
+ * from the total: the total is "can I afford this", the per-lead figure is "is
+ * this worth doing". A search that costs 61 credits is affordable and useless at
+ * fifty leads and cheap at five hundred.
+ *
+ * One decimal, because the second is noise on a screen where the total is
+ * sitting two inches above - 16.6 tells you the order of magnitude and whether it
+ * is worth it, and 16.63 pretends to a precision a 70% default cannot have.
+ *
+ * Zero is shown as "less than one" rather than 0. Because that is what it means
+ * - the expected total came out under one credit for the whole search - and a
+ * rounded "0 each" reads as free when it is merely cheap.
  */
 function formatUnitPrice(total: number, count: number): string {
   if (count <= 0) return '—';
@@ -461,21 +575,4 @@ function formatUnitPrice(total: number, count: number): string {
   if (each === 0) return 'less than one';
   if (each < 0.05) return each.toFixed(2);
   return each.toFixed(1);
-}
-
-/** "51-200" to the pair the database stores. */
-function sizeBounds(value: string): [number, number] {
-  const s = SIZES.find((x) => x.value === value);
-  if (!s) return [11, 50];
-  const [a, b] = value.split('-');
-  return [Number(a), b === '+' ? 999999 : Number(b)];
-}
-
-/** The inverse, tolerant of anything the database or an old profile holds. */
-function sizeValueOf(range: LeadIcpSegment['employeeRange']): string | undefined {
-  if (!range || range.length !== 2) return undefined;
-  return SIZES.find((s) => {
-    const [a, b] = sizeBounds(s.value);
-    return a === range[0] && b === range[1];
-  })?.value;
 }
