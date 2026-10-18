@@ -1,7 +1,13 @@
 import React from 'react';
-import { ListChecks, Plus, Search, FlaskConical, ShieldOff, ArrowLeft } from 'lucide-react';
+import {
+  ListChecks, Plus, Search, FlaskConical, ShieldOff, ArrowLeft,
+  AlertTriangle, Play, Pause, Square, X,
+} from 'lucide-react';
 import type { LeadsView, LeadRow, LeadRun, LeadAttempt } from '../../types';
-import { getRun } from '../../lib/leads';
+import {
+  getRun, bulkAction, isActiveRun, controlRun, addSuppression,
+} from '../../lib/leads';
+import { fetchBalance } from '../../lib/billing';
 import { supabase } from '../../lib/supabase';
 import { subscribeToRun, mergeRow, summarise } from '../../lib/leads-live';
 import { RunsList } from '../leads/RunsList';
@@ -10,8 +16,9 @@ import { NewSearch } from '../leads/NewSearch';
 import { ProviderLab } from '../leads/ProviderLab';
 import { OptOuts } from '../leads/OptOuts';
 import { LeadsTable } from '../leads/LeadsTable';
-import { RunStatusPill } from '../leads/StatusBadge';
-import { CreditsMeter, Counter } from '../leads/CreditsMeter';
+import { CompositionBar, RunStrip, MeterFigure } from '../leads/Data';
+import { WaterfallColumn } from '../leads/WaterfallChain';
+import { Button } from '../leads/Screen';
 import { EmptyState } from '../leads/Empty';
 import { ExportMenu } from '../leads/ExportMenu';
 
@@ -115,6 +122,20 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
   const [error, setError] = React.useState<string | null>(null);
   const [live, setLive] = React.useState(false);
 
+  // The real wallet balance. It used to be a hardcoded 1000, so the meter beside
+  // it was drawing a picture of nobody's account — a balance figure that is
+  // confidently wrong is worse than no balance figure, because it is the one
+  // number somebody checks before starting a run.
+  const [balance, setBalance] = React.useState<number | null>(null);
+  const [notice, setNotice] = React.useState<string | null>(null);
+
+  // The eight rows that cost the most to resolve, with their attempt history.
+  //
+  // Eight and not fifty: this panel makes one extra query per row, and a panel
+  // that fetches fifty is a panel nobody opens twice. Eight is enough for the
+  // shape to read and cheap enough to fetch on every load.
+  const [expensive, setExpensive] = React.useState<Array<{ id: string; attempts: LeadAttempt[] }>>([]);
+
   const fetchPage = React.useCallback(async (id: string) => {
     const res = await getRun(id, { limit: 500, offset: 0 });
     if (!res.ok) throw new Error(res.error);
@@ -172,6 +193,116 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
 
   const stats = React.useMemo(() => summarise(rows), [rows]);
 
+  // Status counts for the composition bar, straight off the rows on screen rather
+  // than off the run's denormalised counters. During a run the row list is the
+  // thing being looked at, and the counters are written a chunk at a time, so the
+  // two disagree for minutes at a time and the bar would lag the table beside it.
+  const statusCounts = React.useMemo(() => {
+    const out: Record<string, number> = {
+      verified: 0, catch_all: 0, invalid: 0, unknown: 0, not_found: 0,
+    };
+    for (const r of rows) out[r.email_status] = (out[r.email_status] ?? 0) + 1;
+    return out;
+  }, [rows]);
+
+  // Fetched once. Polling the wallet every three seconds alongside the run would
+  // be a second realtime channel for a number that changes only when the run
+  // spends something, and the run's own figures already show that.
+  React.useEffect(() => {
+    let cancelled = false;
+    fetchBalance()
+      .then((b) => {
+        if (!cancelled) setBalance(b?.wallet?.available ?? null);
+      })
+      .catch(() => {
+        // Left null, which renders a dash. The meter is drawn against the run's
+        // ceiling and does not need the balance to be meaningful.
+        if (!cancelled) setBalance(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Skipped while loading and until there are rows, because the ranking is
+  // only meaningful once something has been worked — a run at 3 rows would
+  // otherwise render a "where the money went" panel from two attempts and
+  // present it as a finding.
+  React.useEffect(() => {
+    if (!runId || loading || !supabase) {
+      if (!rows.length) setExpensive([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    const ranked = [...rows]
+      .filter((r) => r.email || r.credits)
+      .sort((a, b) => (b.credits ?? 0) - (a.credits ?? 0))
+      .slice(0, 8);
+
+    if (ranked.length === 0) {
+      setExpensive([]);
+      return;
+    }
+
+    void (async () => {
+      const out: Array<{ id: string; attempts: LeadAttempt[] }> = [];
+      for (const r of ranked) {
+        if (cancelled) return;
+        const { data } = await supabase
+          .from('lead_attempts')
+          .select('*')
+          .eq('row_id', r.id)
+          .order('created_at', { ascending: true });
+        out.push({ id: r.id, attempts: (data ?? []) as LeadAttempt[] });
+      }
+      if (!cancelled) setExpensive(out);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [runId, rows, loading, supabase]);
+
+  const doControl = async (action: 'pause' | 'resume' | 'cancel') => {
+    try {
+      await controlRun(runId!, action);
+      const res = await getRun(runId!, { limit: 500, offset: 0 });
+      if (res.ok) setRun(res.run);
+    } catch {
+      setNotice('That did not work. Try again in a moment.');
+    }
+  };
+
+  // Bulk suppression. Addresses before domains, and the domains are dropped when
+  // any address at that domain is also being suppressed — suppressing the company
+  // as well is the same protection and one less row on a list the user then has
+  // to maintain.
+  const suppressRows = async (ids: string[]) => {
+    const chosen = rows.filter((r) => ids.includes(r.id));
+    const domains = new Set(chosen.map((r) => r.domain).filter(Boolean) as string[]);
+    const values: string[] = [];
+
+    for (const r of chosen) {
+      if (r.email) {
+        values.push(r.email);
+        if (r.domain) domains.delete(r.domain);
+      }
+    }
+    for (const d of domains) values.push(d);
+
+    if (values.length === 0) {
+      setNotice('Those rows have no address or domain to suppress.');
+      return;
+    }
+
+    for (const v of values) await addSuppression(v, 'suppressed from a run');
+    setNotice(
+      `${values.length} ${values.length === 1 ? 'value' : 'values'} suppressed. They will not be looked up again.`,
+    );
+  };
+
   // Attempt history is fetched per expanded row rather than with the page.
   const attemptsFor = React.useCallback(async (rowId: string): Promise<LeadAttempt[]> => {
     if (!supabase) return [];
@@ -199,65 +330,183 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
   }
 
   return (
-    <div className="space-y-4">
+    <div className="max-w-[1400px] mx-auto px-6 py-8 space-y-5">
       <BackLink onBack={onBack} />
 
-      {/* Header */}
-      <div className="bg-white border border-[#e3e3de] px-4 py-3">
-        <div className="flex items-center gap-4 flex-wrap">
-          <div className="min-w-0">
-            <h2 className="text-sm font-bold tracking-tight text-[#141414] truncate">
-              {run?.name || (run?.target ? `${run.target} leads` : 'Run')}
-            </h2>
-            <span className="text-[10px] font-mono text-[#8a8a86]">
-              {total} {total === 1 ? 'row' : 'rows'}
-              {run?.target ? ` of ${run.target}` : ''}
-            </span>
-          </div>
+      {/* ---- Title ------------------------------------------------------- */}
+      <div className="flex items-start justify-between gap-6">
+        <div className="min-w-0">
+          <h1 className="text-lg font-medium text-[#141414] truncate">
+            {run?.name || (run?.target ? `${run.target} leads` : 'Run')}
+          </h1>
+          <p className="text-xs text-[#8a8a86] font-mono mt-1">
+            {total.toLocaleString()} {total === 1 ? 'row' : 'rows'}
+            {run?.target ? ` of ${run.target.toLocaleString()}` : ''}
+            {run?.started_at ? ` · started ${ago(run.started_at)}` : ''}
+          </p>
+        </div>
 
-          {run && (
-            <RunStatusPill
-              status={run.status}
-              pauseReason={run.pause_reason}
-              done={stats.found}
-              target={run.target}
-            />
-          )}
-
-          {/* Live or polling. Shown because a table that stopped updating with
-              no indication is indistinguishable from a run that stopped. */}
+        <div className="flex items-center gap-3 flex-shrink-0">
+          {/* Shown because a table that stopped updating with no indication is
+              indistinguishable from a run that stopped. */}
           <span
-            className={`text-[10px] font-mono px-1.5 py-0.5 border rounded-none ${
-              live ? 'text-emerald-700 border-emerald-200 bg-emerald-50' : 'text-[#8a8a86] border-[#e3e3de]'
+            className={`text-[10px] font-mono px-1.5 py-0.5 border ${
+              live
+                ? 'text-emerald-700 border-emerald-200 bg-emerald-50'
+                : 'text-[#8a8a86] border-[#e3e3de]'
             }`}
             title={live ? 'Updating over a live connection' : 'Updating every few seconds'}
           >
             {live ? 'live' : 'polling'}
           </span>
 
-          <div className="ml-auto flex items-center gap-6">
-        <ExportMenu runId={runId} rowCount={total} />
-            <Counter label="Found" value={stats.found} />
-            <Counter label="Verified" value={stats.verified} tone={stats.verified ? 'good' : 'default'} />
-            <Counter label="Catch-all" value={stats.catchAll} tone={stats.catchAll ? 'warn' : 'default'} />
-            <Counter label="Spent" value={Math.round(stats.credits * 100) / 100} />
-            <CreditsMeter balance={1000} runMax={run?.max_credits ?? null} compact />
-          </div>
-        </div>
+          {run && <RunStrip status={run.status} pauseReason={run.pause_reason} />}
 
-        {run?.status === 'paused' && run.pause_reason && (
-          <p className="text-[10px] font-mono text-[#b5801f] mt-2 pt-2 border-t border-[#eeeeea]">
-            Paused: {run.pause_reason === 'credits'
-              ? 'out of credits for the worst case. Top up and resume.'
-              : run.pause_reason.replace(/_/g, ' ')}
-          </p>
-        )}
+          <ExportMenu runId={runId} rowCount={total} />
+        </div>
       </div>
 
-      <LeadsTable rows={rows} total={total} loading={loading} attemptsFor={attemptsFor} />
+      {/* ---- Pause ------------------------------------------------------- */}
+      {run?.status === 'paused' && run.pause_reason && (
+        <div className="flex items-start gap-2 px-4 py-3 bg-[#fdf6ec] border border-[#e8d9bd]">
+          <AlertTriangle className="w-3.5 h-3.5 text-[#b45309] mt-0.5 flex-shrink-0" />
+          <p className="text-xs font-mono text-[#b45309] leading-relaxed">
+            {run.pause_reason === 'credits'
+              ? 'Out of credits for the worst case of this run. Top up and it will pick up where it stopped.'
+              : run.pause_reason === 'provider_balance'
+                ? 'The data provider is out of credit, so no lookups can run until it is topped up.'
+                : run.pause_reason.replace(/_/g, ' ')}
+          </p>
+        </div>
+      )}
+
+      {/* ---- What it produced, and what it cost -------------------------- */}
+      <div className="grid grid-cols-1 lg:grid-cols-[1.4fr_1fr] gap-5">
+        <div className="border border-[#e3e3de] bg-white p-5">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-3">
+            What it produced
+          </span>
+          <CompositionBar
+            counts={statusCounts}
+            notFound={statusCounts.not_found ?? 0}
+            height={10}
+          />
+        </div>
+
+        <div className="border border-[#e3e3de] bg-white p-5">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-3">
+            What it cost
+          </span>
+          <div className="flex gap-8">
+            <MeterFigure
+              label="Spent"
+              value={stats.credits}
+              display={round2(stats.credits)}
+              of={run?.max_credits ?? null}
+              tone={
+                run?.max_credits && stats.credits > run.max_credits ? 'warn' : 'default'
+              }
+              sub={run?.max_credits ? `of ${round2(run.max_credits)} at most` : undefined}
+            />
+            <MeterFigure
+              label="Balance"
+              value={balance ?? 0}
+              display={balance === null ? '—' : Math.round(balance)}
+              of={run?.max_credits ?? null}
+              tone={
+                balance !== null && run?.max_credits && balance < run.max_credits
+                  ? 'warn'
+                  : 'default'
+              }
+              sub={
+                balance === null
+                  ? 'not loaded'
+                  : run?.max_credits
+                    ? balance < run.max_credits
+                      ? 'less than this run may still need'
+                      : 'covers the worst case'
+                    : undefined
+              }
+            />
+          </div>
+        </div>
+      </div>
+
+      {notice && (
+        <div className="flex items-start gap-2 px-4 py-2.5 bg-[#f6f6f4] border border-[#e3e3de]">
+          <span className="text-xs font-mono text-[#4a4a47] leading-relaxed">{notice}</span>
+          <button
+            onClick={() => setNotice(null)}
+            className="ml-auto text-[#8a8a86] hover:text-[#141414] cursor-pointer flex-shrink-0"
+            aria-label="Dismiss"
+          >
+            <X className="w-3 h-3" />
+          </button>
+        </div>
+      )}
+
+      {/* ---- Where the money went --------------------------------------- */}
+      {expensive.some((e) => e.attempts.length > 1) && (
+        <div className="border border-[#e3e3de] bg-white p-5">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-1">
+            Where the money went
+          </span>
+          <p className="text-[11px] font-mono text-[#b5b5ad] mb-4 leading-relaxed">
+            The rows that took the most providers to resolve. One dot lit cost the price of one
+            lookup; four dots with the last one filled cost four.
+          </p>
+          <WaterfallColumn rows={expensive} limit={8} />
+        </div>
+      )}
+
+      {/* ---- Controls ---------------------------------------------------- */}
+      {run && isActiveRun(run.status) && (
+        <div className="flex items-center gap-2">
+          {run.status === 'paused' ? (
+            <Button variant="secondary" onClick={() => void doControl('resume')}>
+              <Play className="w-3 h-3" />
+              Resume
+            </Button>
+          ) : (
+            <Button variant="secondary" onClick={() => void doControl('pause')}>
+              <Pause className="w-3 h-3" />
+              Pause
+            </Button>
+          )}
+          <Button variant="secondary" onClick={() => void doControl('cancel')}>
+            <Square className="w-3 h-3" />
+            Cancel run
+          </Button>
+          <span className="text-[10px] font-mono text-[#8a8a86] ml-1">
+            Cancelling keeps every row it already found.
+          </span>
+        </div>
+      )}
+
+      <LeadsTable
+        rows={rows}
+        total={total}
+        loading={loading}
+        attemptsFor={attemptsFor}
+        onBulk={(action, ids) => bulkAction(runId, ids, action)}
+        onSuppress={(ids) => void suppressRows(ids)}
+      />
     </div>
   );
 };
+
+const round2 = (n: number) => Math.round((n ?? 0) * 100) / 100;
+
+function ago(iso: string): string {
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return '';
+  const mins = Math.floor((Date.now() - t) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const h = Math.floor(mins / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
 
 const BackLink: React.FC<{ onBack: () => void }> = ({ onBack }) => (
   <button

@@ -465,6 +465,40 @@ export async function importRows(
 }
 
 // ---------------------------------------------------------------------------
+// Bulk actions on a run's rows
+// ---------------------------------------------------------------------------
+
+export type BulkAction = 'delete' | 'reverify' | 'find_phone';
+
+/**
+ * Acts on several rows at once.
+ *
+ * The server refuses a list of anything that is not a uuid, and refuses an
+ * unknown action, so this cannot be used to smuggle an id past the ownership
+ * check — but it is worth knowing that the client filters anyway, because an
+ * array of nulls in a query string is a confusing failure and one that only
+ * appears in somebody's production logs.
+ */
+export async function bulkAction(
+  runId: string,
+  rowIds: string[],
+  action: BulkAction,
+): Promise<{ ok: boolean; error?: string; deleted?: number; requeued?: number }> {
+  const ids = rowIds.filter((id) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id),
+  );
+
+  if (ids.length === 0) return { ok: false, error: 'Nothing selected.' };
+
+  return invokeFunction<{ ok: boolean; error?: string; deleted?: number; requeued?: number }>('leads', {
+    action: 'bulk',
+    row_ids: ids,
+    bulk: action,
+    run_id: runId,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Controls
 // ---------------------------------------------------------------------------
 
