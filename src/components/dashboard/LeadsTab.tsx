@@ -19,7 +19,7 @@ import { OptOuts } from '../leads/OptOuts';
 import { LeadsTable } from '../leads/LeadsTable';
 import { CompositionBar, RunStrip, MeterFigure, ProviderMix } from '../leads/Data';
 import { WaterfallColumn } from '../leads/WaterfallChain';
-import { Button } from '../leads/Screen';
+import { Button, Screen } from '../leads/Screen';
 import { EmptyState } from '../leads/Empty';
 import { ExportMenu } from '../leads/ExportMenu';
 import { CostDialog } from '../leads/CostDialog';
@@ -97,42 +97,50 @@ const LeadsWorkspace: React.FC<{
         onViewChange(v);
       }} />
 
-      {view === 'search' && <SearchView onOpenRun={onOpenRun} onOpenPeople={() => openPeople({})} />}
+      {view === 'search' && (
+        <Framed view="search"><SearchView onOpenRun={onOpenRun} onOpenPeople={() => openPeople({})} /></Framed>
+      )}
 
       {view === 'people' && (
-        <PeopleView
-          key={peopleInit?.key ?? 'people'}
-          initialFilters={peopleInit?.filters}
-          onOpenRun={onOpenRun}
-          onOpenSearch={() => onViewChange('search')}
-        />
+        <Framed view="people">
+          <PeopleView
+            key={peopleInit?.key ?? 'people'}
+            initialFilters={peopleInit?.filters}
+            onOpenRun={onOpenRun}
+            onOpenSearch={() => onViewChange('search')}
+          />
+        </Framed>
       )}
 
       {view === 'companies' && (
-        <CompaniesView
-          key={companyList?.key ?? 'companies'}
-          initialListId={companyList?.id}
-          onOpenRun={onOpenRun}
-          onOpenPeople={(f) => openPeople(f)}
-          onOpenSearch={() => onViewChange('search')}
-        />
+        <Framed view="companies">
+          <CompaniesView
+            key={companyList?.key ?? 'companies'}
+            initialListId={companyList?.id}
+            onOpenRun={onOpenRun}
+            onOpenPeople={(f) => openPeople(f)}
+            onOpenSearch={() => onViewChange('search')}
+          />
+        </Framed>
       )}
 
       {view === 'lists' && (
-        <ListsView
-          onOpenList={(l) => {
-            if (l.kind === 'people') openPeople({ list_id: l.id });
-            else {
-              setCompanyList({ key: Date.now(), id: l.id });
-              onViewChange('companies');
-            }
-          }}
-        />
+        <Framed view="lists">
+          <ListsView
+            onOpenList={(l) => {
+              if (l.kind === 'people') openPeople({ list_id: l.id });
+              else {
+                setCompanyList({ key: Date.now(), id: l.id });
+                onViewChange('companies');
+              }
+            }}
+          />
+        </Framed>
       )}
 
-      {view === 'usage' && <UsageView onOpenRun={onOpenRun} />}
+      {view === 'usage' && <Framed view="usage"><UsageView onOpenRun={onOpenRun} /></Framed>}
 
-      {view === 'automations' && <AutomationsView onOpenRun={onOpenRun} />}
+      {view === 'automations' && <Framed view="automations"><AutomationsView onOpenRun={onOpenRun} /></Framed>}
 
       {view === 'runs' && (
         <RunsList
@@ -143,12 +151,70 @@ const LeadsWorkspace: React.FC<{
 
       {view === 'new' && <NewSearch onStarted={onOpenRun} />}
 
-      {view === 'clean' && <CleanList onOpenRun={onOpenRun} />}
+      {view === 'clean' && <Framed view="clean"><CleanList onOpenRun={onOpenRun} /></Framed>}
 
       {view === 'lab' && <ProviderLab />}
 
       {view === 'optouts' && <OptOuts />}
     </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// The frame for views that do not draw their own
+// ---------------------------------------------------------------------------
+// Runs, Find by profile, Provider lab and Opt-outs render <Screen> themselves
+// (their headers carry state). The rest get theirs here, so every tab opens
+// with the same title row at the same width.
+
+const FRAMES: Partial<Record<LeadsView, { title: string; subtitle: string; icon: React.ReactNode; wide?: boolean }>> = {
+  search: {
+    title: 'Search people',
+    subtitle: 'Free search by title, seniority, company and location. Save who you find; finding their emails is a separate, priced step.',
+    icon: <Search className="w-4 h-4" />,
+    wide: true,
+  },
+  people: {
+    title: 'People',
+    subtitle: 'Every lead you hold, one record per person, merged across searches, runs and imports.',
+    icon: <Users className="w-4 h-4" />,
+    wide: true,
+  },
+  companies: {
+    title: 'Companies',
+    subtitle: 'Every company where you hold a lead or keep a target account, with what is missing there.',
+    icon: <Building2 className="w-4 h-4" />,
+    wide: true,
+  },
+  lists: {
+    title: 'Lists',
+    subtitle: 'People lists and target account lists. A lead can be in many lists.',
+    icon: <List className="w-4 h-4" />,
+  },
+  usage: {
+    title: 'Usage',
+    subtitle: 'Credits charged by Leads. Searching, counting and saving are free; finding and verifying are charged per result found, at the prices shown before each run. Purchases and the full ledger are on the Billing tab.',
+    icon: <Receipt className="w-4 h-4" />,
+  },
+  automations: {
+    title: 'Automations',
+    subtitle: "Scheduled searches, enrichment and tagging, in UTC. Anything priced only starts if the most it could cost fits the automation's caps.",
+    icon: <CalendarClock className="w-4 h-4" />,
+  },
+  clean: {
+    title: 'Import',
+    subtitle: 'Upload a CSV of people or companies to verify, re-find or enrich. Nothing is spent until you start the run.',
+    icon: <Upload className="w-4 h-4" />,
+  },
+};
+
+const Framed: React.FC<{ view: LeadsView; children: React.ReactNode }> = ({ view, children }) => {
+  const f = FRAMES[view];
+  if (!f) return <>{children}</>;
+  return (
+    <Screen title={f.title} subtitle={f.subtitle} icon={f.icon} wide={f.wide}>
+      {children}
+    </Screen>
   );
 };
 

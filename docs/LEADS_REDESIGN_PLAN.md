@@ -13,7 +13,7 @@ Read first: `docs/LEADS_UPGRADE.md` (what Leads does today, backend, billing, te
 
 | Phase | State | Notes |
 |---|---|---|
-| 1. Design foundation | **In progress** | 1.1 colour tokens **done** (e5fe17f). 1.2 StatusPill **done** (1e952d6). 1.3 dialogs **done**: `Dialogs.tsx` (Modal, DialogsProvider, useDialogs confirm/prompt; provider in LeadsTab); all 11 window.prompt/confirm replaced; CostDialog and ScoringDialog use Modal; Escape over a Drawer closes only the dialog. Checked on a temporary harness page (Enter, Escape, backdrop, inline name_taken error, confirm over drawer). Next: 1.4 Screen frame. |
+| 1. Design foundation | **In progress** | 1.1 tokens **done** (e5fe17f). 1.2 StatusPill **done** (1e952d6). 1.3 dialogs **done** (603db2b). 1.4 Screen frame **done**: `Screen` has `wide` and a header slot (`ScreenAction`) and no padding of its own; LeadsTab frames Search, People, Companies, Lists, Usage, Automations and Import from one `FRAMES` table; Usage's period and Automations' New button moved into the header. Checked on a harness page: every tab has the header, wide tabs 7xl, no horizontal scroll at 375px. Next: 1.5 PriceSummary. |
 | 2. Navigation (11 tabs → 4) | Not started | Depends on Phase 1 |
 | 3. Remove duplicate flows | Not started | Depends on Phases 2 and 4 |
 | 4. Backend support | Not started | Independent of Phase 1; can run in parallel |
@@ -313,6 +313,17 @@ Files: `supabase/functions/leads/workspace.ts`, `index.ts`, tests in `supabase/t
 5. Run `node scripts/typecheck-leads-function.cjs` (add any new module to its list).
 
 ## Phase 5 — Verification and docs
+
+**Browser checks without a login.** The dashboard needs a Supabase session, so
+screens were checked on a temporary page (`leads-harness.html` + `src/leads-harness.tsx`,
+deleted after use) that patches `window.fetch` before importing the app: any
+`/functions/v1/` request returns a canned JSON per `action`, and other remote
+requests return `[]`, so nothing leaves the machine. It renders `LeadsTab`
+directly. The file needs a top-level `import "react";` (otherwise Vite treats it
+as CommonJS), and `NewSearch` needs `AuthProvider`, so wrap the tree in it or skip
+that tab. The app window may be hidden, so screenshots can time out: measure
+through the DOM with `javascript_tool` instead (h1 per tab, widths, overflow at
+375px with `resize_window` preset mobile).
 
 1. Browser pass of every tab at desktop and phone width (375px), against canned
    function responses (the earlier upgrade did this; `docs/LEADS_UPGRADE.md`

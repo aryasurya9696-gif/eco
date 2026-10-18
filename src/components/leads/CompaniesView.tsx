@@ -11,7 +11,7 @@
 import React from 'react';
 import { useDialogs } from './Dialogs';
 import { Search, ChevronLeft, ChevronRight, ExternalLink, Plus, Trash2, Pencil, ArrowUpDown } from 'lucide-react';
-import { Button } from './Screen';
+import { Button, ScreenAction } from './Screen';
 import { EmptyState, RowSkeleton } from './Empty';
 import { Drawer, Field, SectionLabel, ScoreBadge } from './Pick';
 import { StatusBadge } from './StatusBadge';
@@ -430,18 +430,14 @@ export const UsageView: React.FC<{ onOpenRun: (id: string) => void }> = ({ onOpe
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <p className="text-[11px] font-mono text-muted max-w-xl leading-relaxed">
-          Credits charged by Leads. Searching, counting and saving are free; finding and verifying are charged per result
-          found, at the prices shown before each run. Purchases and the full ledger are on the Billing tab.
-        </p>
+      <ScreenAction>
         <select value={days} onChange={(e) => setDays(Number(e.target.value))} className="text-xs font-mono border border-line px-1.5 py-1 bg-white" aria-label="Period">
           <option value={7}>7 days</option>
           <option value={30}>30 days</option>
           <option value={90}>90 days</option>
           <option value={365}>12 months</option>
         </select>
-      </div>
+      </ScreenAction>
       {error && <div className="text-xs font-mono text-danger">{error}</div>}
       {!data ? <RowSkeleton /> : (
         <>

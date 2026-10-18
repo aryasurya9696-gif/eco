@@ -12,7 +12,7 @@
 import React from 'react';
 import { useDialogs } from './Dialogs';
 import { Plus, Pause, Play, Trash2, Pencil, Zap, AlertTriangle, Loader2, History } from 'lucide-react';
-import { Button, Input } from './Screen';
+import { Button, Input, ScreenAction } from './Screen';
 import { EmptyState, RowSkeleton } from './Empty';
 import { Drawer, SectionLabel } from './Pick';
 import { StatusPill, type PillTone } from './StatusPill';
@@ -128,13 +128,9 @@ export const AutomationsView: React.FC<{ onOpenRun: (id: string) => void }> = ({
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <p className="text-[11px] font-mono text-muted max-w-xl leading-relaxed">
-          Automations run on a schedule, in UTC. Searching, saving and tagging are free. Anything that finds or verifies
-          is priced like any other run, and only starts if the most it could cost fits both of the automation's caps.
-        </p>
+      <ScreenAction>
         <Button onClick={() => setEditing('new')}><Plus className="w-3 h-3" /> New automation</Button>
-      </div>
+      </ScreenAction>
 
       {error && <div className="text-xs font-mono text-danger" role="alert">{error}</div>}
 

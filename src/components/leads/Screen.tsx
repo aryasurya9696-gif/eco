@@ -1,4 +1,5 @@
 import React from 'react';
+import { createPortal } from 'react-dom';
 
 /**
  * The frame every Leads sub-view sits in.
@@ -9,6 +10,9 @@ import React from 'react';
  * both open with an h1 and a line of mono underneath, and the cost of Leads not
  * doing so was that it read as a prototype next to them.
  *
+ * No padding of its own: the dashboard's content pane already has it, and a
+ * second layer made framed screens sit further in than the rest.
+ *
  * max-w-5xl rather than the max-w-4xl the other tabs use. The run table has six
  * columns and gets cramped at 896px; 1024 keeps the form screens comfortable
  * while leaving the table room. Consistency within Leads mattered more than
@@ -16,28 +20,50 @@ import React from 'react';
  */
 export const Screen: React.FC<{
   title: string;
-  subtitle?: string;
+  subtitle?: React.ReactNode;
   icon?: React.ReactNode;
   /** A control on the right of the title row: a button, a segmented switch. */
   action?: React.ReactNode;
+  /** max-w-7xl instead of max-w-5xl, for wide tables and two-column layouts. */
+  wide?: boolean;
   children: React.ReactNode;
-}> = ({ title, subtitle, icon, action, children }) => (
-  <div className="max-w-5xl mx-auto px-6 py-8 space-y-6">
-    <header className="flex items-start justify-between gap-6">
-      <div className="min-w-0">
-        <h1 className="text-lg font-medium text-ink flex items-center gap-2">
-          {icon && <span className="text-muted">{icon}</span>}
-          {title}
-        </h1>
-        {subtitle && (
-          <p className="text-xs text-muted font-mono mt-1 leading-relaxed">{subtitle}</p>
-        )}
+}> = ({ title, subtitle, icon, action, wide = false, children }) => {
+  // Where <ScreenAction> renders, so a view can put its primary button in the
+  // header without the frame having to know about it.
+  const [slot, setSlot] = React.useState<HTMLDivElement | null>(null);
+  return (
+    <ScreenSlot.Provider value={slot}>
+      <div className={`${wide ? 'max-w-7xl' : 'max-w-5xl'} mx-auto space-y-6`}>
+        <header className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+          <div className="min-w-0">
+            <h1 className="text-lg font-medium text-ink flex items-center gap-2">
+              {icon && <span className="text-muted">{icon}</span>}
+              {title}
+            </h1>
+            {subtitle && (
+              <p className="text-xs text-muted font-mono mt-1 leading-relaxed max-w-2xl">{subtitle}</p>
+            )}
+          </div>
+          <div ref={setSlot} className="flex flex-wrap items-center gap-2 flex-shrink-0 pt-0.5 empty:hidden">
+            {action}
+          </div>
+        </header>
+        {children}
       </div>
-      {action && <div className="flex-shrink-0 pt-0.5">{action}</div>}
-    </header>
-    {children}
-  </div>
-);
+    </ScreenSlot.Provider>
+  );
+};
+
+const ScreenSlot = React.createContext<HTMLDivElement | null>(null);
+
+/**
+ * Renders its children in the enclosing Screen's header, on the right. Outside
+ * a Screen it renders in place.
+ */
+export const ScreenAction: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const slot = React.useContext(ScreenSlot);
+  return slot ? createPortal(children, slot) : <>{children}</>;
+};
 
 /**
  * A bordered panel with the section label in the same position on every screen,
