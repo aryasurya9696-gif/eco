@@ -32,7 +32,11 @@ const Weight: React.FC<{ value: number; onChange: (n: number) => void; label: st
   </label>
 );
 
-export const ScoringDialog: React.FC<{ onClose: () => void; onSaved: () => void }> = ({ onClose, onSaved }) => {
+export const ScoringDialog: React.FC<{
+  onClose?: () => void;
+  onSaved?: () => void;
+  inline?: boolean;
+}> = ({ onClose, onSaved, inline = false }) => {
   const [rules, setRules] = React.useState<ScoringRules | null>(null);
   const [saved, setSaved] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
@@ -56,8 +60,10 @@ export const ScoringDialog: React.FC<{ onClose: () => void; onSaved: () => void 
     try {
       const r = await putScoring(rules);
       if (r.ok) {
-        onSaved();
-        onClose();
+        onSaved?.();
+        onClose?.();
+      } else {
+        setError(errorCopy(r.error));
       }
     } catch (e) {
       setError((e as Error).message);
@@ -66,18 +72,8 @@ export const ScoringDialog: React.FC<{ onClose: () => void; onSaved: () => void 
     }
   };
 
-  return (
-    <Modal
-      title="Scoring rules"
-      size="lg"
-      onClose={onClose}
-      footer={
-        <>
-          <Button variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
-          <Button onClick={() => void save()} disabled={!rules || busy}>{busy ? 'Rescoring…' : 'Save and rescore'}</Button>
-        </>
-      }
-    >
+  const formContent = (
+    <>
       <p className="text-[11px] font-mono text-muted leading-relaxed">
         A score is how well a lead matches these rules, out of 100. Factors a lead has no data for are left out rather than
         counted against it; with too little data the lead shows "Not enough data" instead of a number.
@@ -154,11 +150,49 @@ export const ScoringDialog: React.FC<{ onClose: () => void; onSaved: () => void 
         </div>
       )}
       {error && <div className="text-xs font-mono text-danger">{error}</div>}
+    </>
+  );
+
+  if (inline) {
+    return (
+      <div className="bg-white border border-line p-5 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line-soft pb-3">
+          <div>
+            <h3 className="text-sm font-medium text-ink font-mono">Fit Scoring Rules</h3>
+            <p className="text-xs text-muted font-mono mt-0.5">What counts towards fit scores, and how much.</p>
+          </div>
+          <Button onClick={() => void save()} disabled={!rules || busy}>
+            {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+            {busy ? 'Rescoring…' : 'Save and rescore leads'}
+          </Button>
+        </div>
+        {formContent}
+      </div>
+    );
+  }
+
+  return (
+    <Modal
+      title="Scoring rules"
+      size="lg"
+      onClose={onClose ?? (() => {})}
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
+          <Button onClick={() => void save()} disabled={!rules || busy}>{busy ? 'Rescoring…' : 'Save and rescore'}</Button>
+        </>
+      }
+    >
+      {formContent}
     </Modal>
   );
 };
 
-export const DuplicatesDialog: React.FC<{ onClose: () => void; onMerged: () => void }> = ({ onClose, onMerged }) => {
+export const DuplicatesDialog: React.FC<{ onClose?: () => void; onMerged?: () => void; inline?: boolean }> = ({
+  onClose,
+  onMerged,
+  inline = false,
+}) => {
   const [groups, setGroups] = React.useState<Array<Array<Partial<Contact> & { id: string }>> | null>(null);
   const [total, setTotal] = React.useState(0);
   const [keep, setKeep] = React.useState<Record<number, string>>({});
@@ -185,21 +219,17 @@ export const DuplicatesDialog: React.FC<{ onClose: () => void; onMerged: () => v
       setError(errorCopy(r && !r.ok ? r.error : undefined));
       return;
     }
-    onMerged();
+    onMerged?.();
     load();
   };
 
-  return (
-    <Modal title="Possible duplicates" onClose={onClose} size="xl">
-      <p className="text-[11px] font-mono text-muted leading-relaxed">
-        Records sharing an email, a LinkedIn profile, or a name at the same domain. Merging keeps the record you pick, fills
-        its empty fields from the others, combines tags and notes, and moves list memberships to it.
-      </p>
+  const listContent = (
+    <>
       {error && <div className="text-xs font-mono text-danger">{error}</div>}
       {!groups ? (
         <div className="text-xs font-mono text-muted flex items-center gap-2"><Loader2 className="w-3 h-3 animate-spin" /> Looking…</div>
       ) : groups.length === 0 ? (
-        <p className="text-xs font-mono text-ink-2">No duplicates found.</p>
+        <p className="text-xs font-mono text-muted py-3">No duplicates found.</p>
       ) : (
         <div className="space-y-3">
           {total > groups.length && <p className="text-[11px] font-mono text-muted">Showing {groups.length} of {total} groups.</p>}
@@ -225,6 +255,31 @@ export const DuplicatesDialog: React.FC<{ onClose: () => void; onMerged: () => v
           ))}
         </div>
       )}
+    </>
+  );
+
+  if (inline) {
+    return (
+      <div className="bg-white border border-line p-5 space-y-4">
+        <div className="border-b border-line-soft pb-3">
+          <h3 className="text-sm font-medium text-ink font-mono">Possible duplicates</h3>
+          <p className="text-[11px] font-mono text-muted leading-relaxed mt-1">
+            Records sharing an email, a LinkedIn profile, or a name at the same domain. Merging keeps the record you pick, fills
+            its empty fields from the others, combines tags and notes, and moves list memberships to it.
+          </p>
+        </div>
+        {listContent}
+      </div>
+    );
+  }
+
+  return (
+    <Modal title="Possible duplicates" onClose={onClose ?? (() => {})} size="xl">
+      <p className="text-[11px] font-mono text-muted leading-relaxed">
+        Records sharing an email, a LinkedIn profile, or a name at the same domain. Merging keeps the record you pick, fills
+        its empty fields from the others, combines tags and notes, and moves list memberships to it.
+      </p>
+      {listContent}
     </Modal>
   );
 };

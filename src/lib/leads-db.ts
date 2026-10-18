@@ -308,7 +308,7 @@ export interface ScoringRules {
 }
 
 export const getScoring = () => call<Ok<{ rules: ScoringRules; saved: boolean }>>('scoring_get');
-export const putScoring = (rules: ScoringRules) => call<Ok<{ rules: ScoringRules; rescored: number }>>('scoring_put', { rules });
+export const putScoring = (rules: ScoringRules) => call<Ok<{ rules: ScoringRules; rescored: number }> | Fail>('scoring_put', { rules });
 
 // ---------------------------------------------------------------------------
 // Paid work on saved leads

@@ -1,7 +1,9 @@
 import React from 'react';
 import {
-  ListChecks, Plus, Search, FlaskConical, ShieldOff, ArrowLeft,
-  AlertTriangle, Play, Pause, Square, X, Users, Building2, List, Upload, Receipt, CalendarClock,
+  ListChecks, Plus, Search, ArrowLeft,
+  AlertTriangle, Play, Pause, Square, X, Users, Building2, Upload, CalendarClock,
+  Settings, Sliders, Users2, Bookmark, ChevronLeft, ChevronRight,
+  Filter, Layers,
 } from 'lucide-react';
 import type { LeadsView, LeadRow, LeadRun, LeadAttempt } from '../../types';
 import type { AttemptWithFailure } from '../leads/AttemptHistory';
@@ -19,223 +21,571 @@ import { OptOuts } from '../leads/OptOuts';
 import { LeadsTable } from '../leads/LeadsTable';
 import { CompositionBar, RunStrip, MeterFigure, ProviderMix } from '../leads/Data';
 import { WaterfallColumn } from '../leads/WaterfallChain';
-import { Button, Screen } from '../leads/Screen';
+import { Button, Screen, Segmented } from '../leads/Screen';
 import { EmptyState } from '../leads/Empty';
 import { ExportMenu } from '../leads/ExportMenu';
 import { CostDialog } from '../leads/CostDialog';
 import { StatusPill } from '../leads/StatusPill';
-import { DialogsProvider } from '../leads/Dialogs';
+import { DialogsProvider, useDialogs } from '../leads/Dialogs';
 import { SearchView } from '../leads/SearchView';
 import { AutomationsView } from '../leads/AutomationsView';
 import { PeopleView } from '../leads/PeopleView';
-import { CompaniesView, ListsView, UsageView } from '../leads/CompaniesView';
-import type { ContactFilters } from '../../lib/leads-db';
-import { bulkRowsEstimate, bulkRowsStart } from '../../lib/leads-db';
+import { CompaniesView, UsageView } from '../leads/CompaniesView';
+import { ScoringDialog, DuplicatesDialog } from '../leads/ScoringDialog';
+import type { ContactFilters, LeadList, SavedSearch } from '../../lib/leads-db';
+import { bulkRowsEstimate, bulkRowsStart, getLists, createList, getSavedSearches } from '../../lib/leads-db';
 import { getWaterfall } from '../../lib/leads';
 import type { LeadStep } from '../../types';
 
 /**
  * The Leads tab.
  *
- * A tab, not an app: same sidebar, same wallet, same login as Feed. The
- * sub-views live in the hash so a run link survives a refresh and a browser Back
- * returns to the list rather than to the feed.
+ * Consolidated into 4 unified hubs:
+ * - Find:      Search, Find by profile (ICP), Import CSV
+ * - Leads:     People & Companies directory with left sidebar for Lists & Saved Searches
+ * - Activity:  Runs & live Credit Usage + Automations
+ * - Settings:  Fit Scoring, Duplicate Review, Opt-outs, Provider Waterfall Lab
  *
  * Routing and data live here; each screen is a leaf that owns its own fetching.
  */
 
 interface LeadsTabProps {
   view: LeadsView;
+  subMode?: string | null;
   runId: string | null;
-  onViewChange: (view: LeadsView) => void;
+  onViewChange: (view: LeadsView, subMode?: string | null) => void;
   onOpenRun: (runId: string) => void;
 }
 
-export const LeadsTab: React.FC<LeadsTabProps> = ({ view, runId, onViewChange, onOpenRun }) => {
-  // A run is a detail screen, so the sub-nav is hidden: five panels above a
-  // table that belongs to none of them only invites the wrong click.
-  // confirm() and prompt() for every screen below.
+export const LeadsTab: React.FC<LeadsTabProps> = ({ view, subMode, runId, onViewChange, onOpenRun }) => {
   return (
     <DialogsProvider>
       {view === 'run' ? (
         <RunView
           runId={runId}
-          onBack={() => onViewChange('runs')}
+          onBack={() => onViewChange('activity', 'runs')}
           onOpenRun={onOpenRun}
         />
       ) : (
-        <LeadsWorkspace view={view} onViewChange={onViewChange} onOpenRun={onOpenRun} />
+        <LeadsWorkspace view={view} subMode={subMode} onViewChange={onViewChange} onOpenRun={onOpenRun} />
       )}
     </DialogsProvider>
   );
 };
 
-/**
- * The sub-views. Kept apart from LeadsTab so the run detail screen above stays
- * an early return, and so "open this list in People" can carry its filter across
- * a view change without living in the hash.
- */
+// ---------------------------------------------------------------------------
+// Left Sidebar for Lists and Saved Searches in the Leads Hub
+// ---------------------------------------------------------------------------
+
+interface LeadsSidebarProps {
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
+  activeListId: string | null;
+  onSelectList: (list: LeadList | null) => void;
+  onSelectSearch: (search: SavedSearch) => void;
+  onAutomateSearch: (search: SavedSearch) => void;
+  activeKind: 'people' | 'companies';
+  onSwitchKind: (kind: 'people' | 'companies') => void;
+}
+
+const LeadsSidebar: React.FC<LeadsSidebarProps> = ({
+  collapsed,
+  onToggleCollapsed,
+  activeListId,
+  onSelectList,
+  onSelectSearch,
+  onAutomateSearch,
+  activeKind,
+  onSwitchKind,
+}) => {
+  const dialogs = useDialogs();
+  const [lists, setLists] = React.useState<LeadList[]>([]);
+  const [searches, setSearches] = React.useState<SavedSearch[]>([]);
+  const [loading, setLoading] = React.useState(true);
+
+  const loadData = React.useCallback(async () => {
+    try {
+      const [lRes, sRes] = await Promise.all([
+        getLists().catch(() => null),
+        getSavedSearches('people_search').catch(() => null),
+      ]);
+      if (lRes && lRes.ok) setLists(lRes.lists);
+      if (sRes && sRes.ok) setSearches(sRes.searches);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  const handleCreateList = async () => {
+    const name = await dialogs.prompt({
+      title: 'New List',
+      label: 'List name',
+      placeholder: activeKind === 'companies' ? 'e.g. Target Accounts Q4' : 'e.g. Enterprise Decision Makers',
+      confirmLabel: 'Create list',
+    });
+    if (!name) return;
+    const res = await createList(name, activeKind).catch(() => null);
+    if (res && res.ok) {
+      await loadData();
+      onSelectList(res.list as unknown as LeadList);
+    }
+  };
+
+  if (collapsed) {
+    return (
+      <button
+        onClick={onToggleCollapsed}
+        className="flex items-center gap-1.5 px-2.5 py-1.5 border border-line bg-white hover:bg-surface text-xs font-mono text-muted hover:text-ink cursor-pointer mb-2 transition-colors"
+        title="Show Lists & Saved Views"
+      >
+        <ChevronRight className="w-3.5 h-3.5" />
+        <span>Lists & Views</span>
+      </button>
+    );
+  }
+
+  return (
+    <aside className="w-full md:w-60 flex-shrink-0 bg-white border border-line p-3.5 space-y-5 text-xs font-mono select-none">
+      <div className="flex items-center justify-between border-b border-line pb-2.5">
+        <span className="text-[10px] uppercase font-bold tracking-wider text-muted flex items-center gap-1.5">
+          <Layers className="w-3.5 h-3.5" /> Views & Lists
+        </span>
+        <button
+          onClick={onToggleCollapsed}
+          className="text-muted hover:text-ink cursor-pointer p-0.5 rounded"
+          title="Collapse sidebar"
+        >
+          <ChevronLeft className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {/* Directory Views */}
+      <div className="space-y-1">
+        <span className="text-[10px] uppercase tracking-wider text-muted block mb-1.5 px-2">
+          Directory
+        </span>
+        <button
+          onClick={() => {
+            onSelectList(null);
+            onSwitchKind('people');
+          }}
+          className={`w-full flex items-center justify-between px-2 py-1.5 text-left cursor-pointer transition-colors ${
+            activeKind === 'people' && !activeListId
+              ? 'bg-ink text-white font-medium'
+              : 'text-ink hover:bg-surface'
+          }`}
+        >
+          <span className="flex items-center gap-1.5">
+            <Users className="w-3.5 h-3.5" /> All People
+          </span>
+        </button>
+        <button
+          onClick={() => {
+            onSelectList(null);
+            onSwitchKind('companies');
+          }}
+          className={`w-full flex items-center justify-between px-2 py-1.5 text-left cursor-pointer transition-colors ${
+            activeKind === 'companies' && !activeListId
+              ? 'bg-ink text-white font-medium'
+              : 'text-ink hover:bg-surface'
+          }`}
+        >
+          <span className="flex items-center gap-1.5">
+            <Building2 className="w-3.5 h-3.5" /> All Companies
+          </span>
+        </button>
+      </div>
+
+      {/* Lists */}
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between px-2">
+          <span className="text-[10px] uppercase tracking-wider text-muted">Lists</span>
+          <button
+            onClick={handleCreateList}
+            className="text-[10px] text-muted hover:text-ink inline-flex items-center gap-1 cursor-pointer"
+            title="Create list"
+          >
+            <Plus className="w-3 h-3" /> New
+          </button>
+        </div>
+
+        {loading ? (
+          <div className="text-[11px] text-muted px-2 py-1">Loading…</div>
+        ) : lists.length === 0 ? (
+          <div className="text-[11px] text-muted px-2 py-1">No lists yet</div>
+        ) : (
+          <div className="space-y-0.5 max-h-48 overflow-y-auto">
+            {lists.map((l) => {
+              const isSelected = activeListId === l.id;
+              return (
+                <button
+                  key={l.id}
+                  onClick={() => {
+                    onSelectList(l);
+                    onSwitchKind(l.kind === 'companies' ? 'companies' : 'people');
+                  }}
+                  className={`w-full flex items-center justify-between px-2 py-1 text-left cursor-pointer transition-colors group ${
+                    isSelected
+                      ? 'bg-ink text-white font-medium'
+                      : 'text-ink hover:bg-surface'
+                  }`}
+                  title={l.name}
+                >
+                  <span className="truncate flex items-center gap-1.5">
+                    <span className={`text-[9px] px-1 border ${
+                      isSelected ? 'border-white/40 text-white' : 'border-line text-muted'
+                    }`}>
+                      {l.kind === 'companies' ? 'C' : 'P'}
+                    </span>
+                    <span className="truncate">{l.name}</span>
+                  </span>
+                  {typeof l.members === 'number' && (
+                    <span className={`text-[10px] tabular-nums ${isSelected ? 'text-white/80' : 'text-muted'}`}>
+                      {l.members}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Saved Searches */}
+      <div className="space-y-1.5 border-t border-line-soft pt-3">
+        <span className="text-[10px] uppercase tracking-wider text-muted block px-2">
+          Saved Searches
+        </span>
+        {searches.length === 0 ? (
+          <div className="text-[11px] text-muted px-2 py-1">No saved searches</div>
+        ) : (
+          <div className="space-y-0.5 max-h-40 overflow-y-auto">
+            {searches.map((s) => (
+              <div
+                key={s.id}
+                className="flex items-center justify-between px-2 py-1 hover:bg-surface group"
+              >
+                <button
+                  onClick={() => onSelectSearch(s)}
+                  className="truncate text-ink hover:text-ink font-normal text-left cursor-pointer flex items-center gap-1.5 flex-1 min-w-0"
+                  title={s.name}
+                >
+                  <Bookmark className="w-3 h-3 text-muted flex-shrink-0" />
+                  <span className="truncate">{s.name}</span>
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onAutomateSearch(s);
+                  }}
+                  className="text-muted hover:text-ink p-1 cursor-pointer opacity-70 group-hover:opacity-100 transition-opacity"
+                  title="Create automation schedule"
+                >
+                  <CalendarClock className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </aside>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Mode options for each hub
+// ---------------------------------------------------------------------------
+
+const FIND_MODES = [
+  { value: 'search', label: 'Search' },
+  { value: 'profile', label: 'Find by profile' },
+  { value: 'upload', label: 'Import CSV' },
+];
+
+const LEADS_MODES = [
+  { value: 'people', label: 'People' },
+  { value: 'companies', label: 'Companies' },
+];
+
+const ACTIVITY_MODES = [
+  { value: 'runs', label: 'Runs & Usage' },
+  { value: 'automations', label: 'Automations' },
+];
+
+const SETTINGS_MODES = [
+  { value: 'scoring', label: 'Fit Scoring' },
+  { value: 'duplicates', label: 'Duplicate Review' },
+  { value: 'optouts', label: 'Opt-outs' },
+  { value: 'lab', label: 'Provider Lab' },
+];
+
+// ---------------------------------------------------------------------------
+// The sub-views workspace
+// ---------------------------------------------------------------------------
+
 const LeadsWorkspace: React.FC<{
   view: LeadsView;
-  onViewChange: (view: LeadsView) => void;
+  subMode?: string | null;
+  onViewChange: (view: LeadsView, subMode?: string | null) => void;
   onOpenRun: (runId: string) => void;
-}> = ({ view, onViewChange, onOpenRun }) => {
-  // A filter handed from another view (a list, a company). The key remounts the
-  // view so it starts from that filter rather than merging into the old one.
+}> = ({ view, subMode, onViewChange, onOpenRun }) => {
   const [peopleInit, setPeopleInit] = React.useState<{ key: number; filters: ContactFilters } | null>(null);
   const [companyList, setCompanyList] = React.useState<{ key: number; id: string } | null>(null);
+  const [activeList, setActiveList] = React.useState<LeadList | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
+
   const openPeople = (filters: ContactFilters) => {
     setPeopleInit({ key: Date.now(), filters });
-    onViewChange('people');
+    onViewChange('leads', 'people');
   };
+
+  const activeFindMode = (subMode as 'search' | 'profile' | 'upload') || 'search';
+  const activeLeadsMode = (subMode as 'people' | 'companies') || 'people';
+  const activeActivityMode = (subMode as 'runs' | 'automations') || 'runs';
+  const activeSettingsMode = (subMode as 'scoring' | 'duplicates' | 'optouts' | 'lab') || 'scoring';
 
   return (
     <div className="space-y-6">
-      <SubNav view={view} onViewChange={(v) => {
-        if (v === 'people') setPeopleInit(null);
-        if (v === 'companies') setCompanyList(null);
-        onViewChange(v);
-      }} />
+      <SubNav
+        view={view}
+        onViewChange={(v) => {
+          if (v === 'leads') {
+            setActiveList(null);
+            setPeopleInit(null);
+            setCompanyList(null);
+          }
+          onViewChange(v);
+        }}
+      />
 
-      {view === 'search' && (
-        <Framed view="search"><SearchView onOpenRun={onOpenRun} onOpenPeople={() => openPeople({})} /></Framed>
+      {/* 1. FIND HUB */}
+      {view === 'find' && (
+        <div className="space-y-5">
+          <div className="flex items-center justify-between border-b border-line pb-3">
+            <Segmented
+              options={FIND_MODES}
+              value={activeFindMode}
+              onChange={(m) => onViewChange('find', m)}
+            />
+          </div>
+
+          {activeFindMode === 'search' && (
+            <Screen
+              title="Search people"
+              subtitle="Free search by title, seniority, company and location. Save who you find; finding their emails is a separate, priced step."
+              icon={<Search className="w-4 h-4" />}
+              wide
+            >
+              <SearchView
+                onOpenRun={onOpenRun}
+                onOpenPeople={() => openPeople({})}
+              />
+            </Screen>
+          )}
+
+          {activeFindMode === 'profile' && (
+            <NewSearch onStarted={onOpenRun} />
+          )}
+
+          {activeFindMode === 'upload' && (
+            <Screen
+              title="Import"
+              subtitle="Upload a CSV of people or companies to verify, re-find or enrich. Nothing is spent until you start the run."
+              icon={<Upload className="w-4 h-4" />}
+            >
+              <CleanList onOpenRun={onOpenRun} />
+            </Screen>
+          )}
+        </div>
       )}
 
-      {view === 'people' && (
-        <Framed view="people">
-          <PeopleView
-            key={peopleInit?.key ?? 'people'}
-            initialFilters={peopleInit?.filters}
-            onOpenRun={onOpenRun}
-            onOpenSearch={() => onViewChange('search')}
-          />
-        </Framed>
-      )}
-
-      {view === 'companies' && (
-        <Framed view="companies">
-          <CompaniesView
-            key={companyList?.key ?? 'companies'}
-            initialListId={companyList?.id}
-            onOpenRun={onOpenRun}
-            onOpenPeople={(f) => openPeople(f)}
-            onOpenSearch={() => onViewChange('search')}
-          />
-        </Framed>
-      )}
-
-      {view === 'lists' && (
-        <Framed view="lists">
-          <ListsView
-            onOpenList={(l) => {
-              if (l.kind === 'people') openPeople({ list_id: l.id });
-              else {
-                setCompanyList({ key: Date.now(), id: l.id });
-                onViewChange('companies');
+      {/* 2. LEADS HUB */}
+      {view === 'leads' && (
+        <div className="flex flex-col md:flex-row items-start gap-6">
+          <LeadsSidebar
+            collapsed={sidebarCollapsed}
+            onToggleCollapsed={() => setSidebarCollapsed(!sidebarCollapsed)}
+            activeListId={activeList?.id ?? null}
+            onSelectList={(list) => {
+              setActiveList(list);
+              if (!list) {
+                setPeopleInit(null);
+                setCompanyList(null);
+              } else if (list.kind === 'companies') {
+                setCompanyList({ key: Date.now(), id: list.id });
+                onViewChange('leads', 'companies');
+              } else {
+                openPeople({ list_id: list.id });
               }
             }}
+            onSelectSearch={(s) => {
+              openPeople(s.filters as ContactFilters);
+            }}
+            onAutomateSearch={(_s) => {
+              onViewChange('activity', 'automations');
+            }}
+            activeKind={activeLeadsMode}
+            onSwitchKind={(k) => onViewChange('leads', k)}
           />
-        </Framed>
+
+          <div className="flex-1 min-w-0 w-full space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line pb-3">
+              <div className="flex items-center gap-3">
+                <Segmented
+                  options={LEADS_MODES}
+                  value={activeLeadsMode}
+                  onChange={(m) => {
+                    setActiveList(null);
+                    onViewChange('leads', m);
+                  }}
+                />
+                {activeList && (
+                  <span className="inline-flex items-center gap-1.5 text-xs font-mono px-2.5 py-1 bg-surface-2 border border-line">
+                    <Filter className="w-3 h-3 text-muted" />
+                    <span>List: <strong className="text-ink">{activeList.name}</strong></span>
+                    <button
+                      onClick={() => {
+                        setActiveList(null);
+                        setPeopleInit(null);
+                        setCompanyList(null);
+                      }}
+                      className="ml-1 text-muted hover:text-ink cursor-pointer"
+                      title="Clear list filter"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {activeLeadsMode === 'people' && (
+              <Screen
+                title="People"
+                subtitle="Every lead you hold, one record per person, merged across searches, runs and imports."
+                icon={<Users className="w-4 h-4" />}
+                wide
+              >
+                <PeopleView
+                  key={peopleInit?.key ?? (activeList ? `list-${activeList.id}` : 'people')}
+                  initialFilters={peopleInit?.filters}
+                  onOpenRun={onOpenRun}
+                  onOpenSearch={() => onViewChange('find', 'search')}
+                />
+              </Screen>
+            )}
+
+            {activeLeadsMode === 'companies' && (
+              <Screen
+                title="Companies"
+                subtitle="Every company where you hold a lead or keep a target account, with what is missing there."
+                icon={<Building2 className="w-4 h-4" />}
+                wide
+              >
+                <CompaniesView
+                  key={companyList?.key ?? (activeList ? `company-list-${activeList.id}` : 'companies')}
+                  initialListId={companyList?.id}
+                  onOpenRun={onOpenRun}
+                  onOpenPeople={(f) => openPeople(f)}
+                  onOpenSearch={() => onViewChange('find', 'search')}
+                />
+              </Screen>
+            )}
+          </div>
+        </div>
       )}
 
-      {view === 'usage' && <Framed view="usage"><UsageView onOpenRun={onOpenRun} /></Framed>}
+      {/* 3. ACTIVITY HUB */}
+      {view === 'activity' && (
+        <div className="space-y-5">
+          <div className="flex items-center justify-between border-b border-line pb-3">
+            <Segmented
+              options={ACTIVITY_MODES}
+              value={activeActivityMode}
+              onChange={(m) => onViewChange('activity', m)}
+            />
+          </div>
 
-      {view === 'automations' && <Framed view="automations"><AutomationsView onOpenRun={onOpenRun} /></Framed>}
+          {activeActivityMode === 'runs' && (
+            <RunsList
+              headerSlot={
+                <div className="mb-6">
+                  <UsageView cardsOnly={true} onOpenRun={onOpenRun} />
+                </div>
+              }
+              onOpenRun={onOpenRun}
+              onNewSearch={() => onViewChange('find', 'profile')}
+            />
+          )}
 
-      {view === 'runs' && (
-        <RunsList
-          onOpenRun={onOpenRun}
-          onNewSearch={() => onViewChange('new')}
-        />
+          {activeActivityMode === 'automations' && (
+            <Screen
+              title="Automations"
+              subtitle="Scheduled searches, enrichment and tagging, in UTC. Anything priced only starts if the most it could cost fits the automation's caps."
+              icon={<CalendarClock className="w-4 h-4" />}
+              wide
+            >
+              <AutomationsView onOpenRun={onOpenRun} />
+            </Screen>
+          )}
+        </div>
       )}
 
-      {view === 'new' && <NewSearch onStarted={onOpenRun} />}
+      {/* 4. SETTINGS HUB */}
+      {view === 'settings' && (
+        <div className="space-y-5">
+          <div className="flex items-center justify-between border-b border-line pb-3">
+            <Segmented
+              options={SETTINGS_MODES}
+              value={activeSettingsMode}
+              onChange={(m) => onViewChange('settings', m)}
+            />
+          </div>
 
-      {view === 'clean' && <Framed view="clean"><CleanList onOpenRun={onOpenRun} /></Framed>}
+          {activeSettingsMode === 'scoring' && (
+            <Screen
+              title="Fit Scoring"
+              subtitle="The workspace's fit rules: what counts, and how much. Saved rules rescore every lead."
+              icon={<Sliders className="w-4 h-4" />}
+              wide
+            >
+              <ScoringDialog inline />
+            </Screen>
+          )}
 
-      {view === 'lab' && <ProviderLab />}
+          {activeSettingsMode === 'duplicates' && (
+            <Screen
+              title="Duplicate Review"
+              subtitle="Groups of records that look like the same person, and a merge that keeps the record you pick."
+              icon={<Users2 className="w-4 h-4" />}
+              wide
+            >
+              <DuplicatesDialog inline />
+            </Screen>
+          )}
 
-      {view === 'optouts' && <OptOuts />}
+          {activeSettingsMode === 'optouts' && <OptOuts />}
+
+          {activeSettingsMode === 'lab' && <ProviderLab />}
+        </div>
+      )}
     </div>
   );
 };
 
 // ---------------------------------------------------------------------------
-// The frame for views that do not draw their own
-// ---------------------------------------------------------------------------
-// Runs, Find by profile, Provider lab and Opt-outs render <Screen> themselves
-// (their headers carry state). The rest get theirs here, so every tab opens
-// with the same title row at the same width.
-
-const FRAMES: Partial<Record<LeadsView, { title: string; subtitle: string; icon: React.ReactNode; wide?: boolean }>> = {
-  search: {
-    title: 'Search people',
-    subtitle: 'Free search by title, seniority, company and location. Save who you find; finding their emails is a separate, priced step.',
-    icon: <Search className="w-4 h-4" />,
-    wide: true,
-  },
-  people: {
-    title: 'People',
-    subtitle: 'Every lead you hold, one record per person, merged across searches, runs and imports.',
-    icon: <Users className="w-4 h-4" />,
-    wide: true,
-  },
-  companies: {
-    title: 'Companies',
-    subtitle: 'Every company where you hold a lead or keep a target account, with what is missing there.',
-    icon: <Building2 className="w-4 h-4" />,
-    wide: true,
-  },
-  lists: {
-    title: 'Lists',
-    subtitle: 'People lists and target account lists. A lead can be in many lists.',
-    icon: <List className="w-4 h-4" />,
-  },
-  usage: {
-    title: 'Usage',
-    subtitle: 'Credits charged by Leads. Searching, counting and saving are free; finding and verifying are charged per result found, at the prices shown before each run. Purchases and the full ledger are on the Billing tab.',
-    icon: <Receipt className="w-4 h-4" />,
-  },
-  automations: {
-    title: 'Automations',
-    subtitle: "Scheduled searches, enrichment and tagging, in UTC. Anything priced only starts if the most it could cost fits the automation's caps.",
-    icon: <CalendarClock className="w-4 h-4" />,
-  },
-  clean: {
-    title: 'Import',
-    subtitle: 'Upload a CSV of people or companies to verify, re-find or enrich. Nothing is spent until you start the run.',
-    icon: <Upload className="w-4 h-4" />,
-  },
-};
-
-const Framed: React.FC<{ view: LeadsView; children: React.ReactNode }> = ({ view, children }) => {
-  const f = FRAMES[view];
-  if (!f) return <>{children}</>;
-  return (
-    <Screen title={f.title} subtitle={f.subtitle} icon={f.icon} wide={f.wide}>
-      {children}
-    </Screen>
-  );
-};
-
-// ---------------------------------------------------------------------------
-// Sub-nav
+// Sub-nav for the 4 Unified Hubs
 // ---------------------------------------------------------------------------
 
-// Two groups: the lead database the user works in, then the jobs and settings
-// that feed it. A divider between them rather than a second menu.
-const SUB_NAV: Array<{ view: LeadsView; label: string; icon: React.ReactNode; divider?: boolean }> = [
-  { view: 'search', label: 'Search', icon: <Search className="w-3.5 h-3.5" /> },
-  { view: 'people', label: 'People', icon: <Users className="w-3.5 h-3.5" /> },
-  { view: 'companies', label: 'Companies', icon: <Building2 className="w-3.5 h-3.5" /> },
-  { view: 'lists', label: 'Lists', icon: <List className="w-3.5 h-3.5" /> },
-  { view: 'runs', label: 'Runs', icon: <ListChecks className="w-3.5 h-3.5" />, divider: true },
-  { view: 'new', label: 'Find by profile', icon: <Plus className="w-3.5 h-3.5" /> },
-  { view: 'clean', label: 'Import', icon: <Upload className="w-3.5 h-3.5" /> },
-  { view: 'automations', label: 'Automations', icon: <CalendarClock className="w-3.5 h-3.5" /> },
-  { view: 'usage', label: 'Usage', icon: <Receipt className="w-3.5 h-3.5" /> },
-  { view: 'lab', label: 'Provider lab', icon: <FlaskConical className="w-3.5 h-3.5" /> },
-  { view: 'optouts', label: 'Opt-outs', icon: <ShieldOff className="w-3.5 h-3.5" /> },
+const SUB_NAV: Array<{ view: LeadsView; label: string; icon: React.ReactNode }> = [
+  { view: 'find', label: 'Find', icon: <Search className="w-3.5 h-3.5" /> },
+  { view: 'leads', label: 'Leads', icon: <Users className="w-3.5 h-3.5" /> },
+  { view: 'activity', label: 'Activity', icon: <ListChecks className="w-3.5 h-3.5" /> },
+  { view: 'settings', label: 'Settings', icon: <Settings className="w-3.5 h-3.5" /> },
 ];
 
 const SubNav: React.FC<{ view: LeadsView; onViewChange: (v: LeadsView) => void }> = ({
@@ -246,9 +596,8 @@ const SubNav: React.FC<{ view: LeadsView; onViewChange: (v: LeadsView) => void }
     {SUB_NAV.map((item) => {
       const active = view === item.view;
       return (
-        <React.Fragment key={item.view}>
-        {item.divider && <span className="w-px h-4 bg-line mx-1.5 flex-shrink-0" aria-hidden="true" />}
         <button
+          key={item.view}
           aria-current={active ? 'page' : undefined}
           onClick={() => onViewChange(item.view)}
           className={`flex items-center gap-1.5 px-3 py-2 text-xs font-mono transition-colors cursor-pointer border-b-2 -mb-px ${
@@ -260,7 +609,6 @@ const SubNav: React.FC<{ view: LeadsView; onViewChange: (v: LeadsView) => void }
           {item.icon}
           {item.label}
         </button>
-        </React.Fragment>
       );
     })}
   </nav>

@@ -64,54 +64,90 @@ export function tabFromHash(hash: string = window.location.hash): string | null 
   return tab && tab in TAB_FROM_SEGMENT ? tab : 'feed';
 }
 
-const DEFAULT_VIEW: LeadsView = 'people';
+const DEFAULT_VIEW: LeadsView = 'find';
 
-const KNOWN_VIEWS: LeadsView[] = [
-  'search', 'people', 'companies', 'lists', 'usage', 'runs', 'new', 'clean', 'lab', 'optouts', 'automations', 'run',
+export const KNOWN_VIEWS: LeadsView[] = [
+  'find', 'leads', 'activity', 'settings', 'run',
 ];
 
-/**
- * Reads the Leads sub-view, and the run id when the view is a run.
- *
- * An unrecognised segment falls back to the run list rather than rendering
- * nothing. A stale or hand-edited hash should land somewhere useful, not on an
- * empty panel that looks like a bug.
- */
-export function leadsRouteFromHash(hash: string = window.location.hash): {
+export interface LeadsRoute {
   view: LeadsView;
+  subMode?: string | null;
   runId: string | null;
-} {
+}
+
+/**
+ * Reads the Leads sub-view, sub-mode, and run id.
+ *
+ * Redirects legacy 11-tab hashes:
+ * - search, new, clean -> find
+ * - people, companies, lists -> leads
+ * - runs, usage, automations -> activity
+ * - lab, optouts -> settings
+ */
+export function leadsRouteFromHash(hash: string = window.location.hash): LeadsRoute {
   const raw = hash.replace(/^#\/?/, '').split('?')[0];
   const segments = raw.split('/').filter(Boolean);
 
   if (segments[0] !== 'dashboard' || segments[1] !== 'leads') {
-    return { view: DEFAULT_VIEW, runId: null };
+    return { view: DEFAULT_VIEW, subMode: null, runId: null };
   }
 
-  const [, , view, id] = segments;
+  const [, , segment, sub] = segments;
 
-  if (view === 'run') {
-    // A run route without an id is not a run. Same reasoning as above.
-    return id ? { view: 'run', runId: id } : { view: DEFAULT_VIEW, runId: null };
+  if (segment === 'run') {
+    return sub ? { view: 'run', subMode: null, runId: sub } : { view: 'activity', subMode: 'runs', runId: null };
   }
 
-  if (view && KNOWN_VIEWS.includes(view as LeadsView)) {
-    return { view: view as LeadsView, runId: null };
+  // Redirect legacy hashes
+  if (segment === 'search') return { view: 'find', subMode: 'search', runId: null };
+  if (segment === 'new') return { view: 'find', subMode: 'profile', runId: null };
+  if (segment === 'clean') return { view: 'find', subMode: 'upload', runId: null };
+
+  if (segment === 'people') return { view: 'leads', subMode: 'people', runId: null };
+  if (segment === 'companies') return { view: 'leads', subMode: 'companies', runId: null };
+  if (segment === 'lists') return { view: 'leads', subMode: 'people', runId: null };
+
+  if (segment === 'runs') return { view: 'activity', subMode: 'runs', runId: null };
+  if (segment === 'usage') return { view: 'activity', subMode: 'runs', runId: null };
+  if (segment === 'automations') return { view: 'activity', subMode: 'automations', runId: null };
+
+  if (segment === 'lab') return { view: 'settings', subMode: 'lab', runId: null };
+  if (segment === 'optouts') return { view: 'settings', subMode: 'optouts', runId: null };
+
+  // Target 4 views
+  if (segment === 'find') {
+    const validModes = ['search', 'profile', 'upload'];
+    return { view: 'find', subMode: validModes.includes(sub) ? sub : 'search', runId: null };
+  }
+  if (segment === 'leads') {
+    const validModes = ['people', 'companies'];
+    return { view: 'leads', subMode: validModes.includes(sub) ? sub : 'people', runId: null };
+  }
+  if (segment === 'activity') {
+    const validModes = ['runs', 'automations'];
+    return { view: 'activity', subMode: validModes.includes(sub) ? sub : 'runs', runId: null };
+  }
+  if (segment === 'settings') {
+    const validModes = ['scoring', 'duplicates', 'optouts', 'lab'];
+    return { view: 'settings', subMode: validModes.includes(sub) ? sub : 'scoring', runId: null };
   }
 
-  return { view: DEFAULT_VIEW, runId: null };
+  return { view: DEFAULT_VIEW, subMode: null, runId: null };
 }
 
 /** The hash for a tab, preserving whatever Leads sub-view is showing. */
-export function hashForTab(tab: string, leadsRoute?: { view: LeadsView; runId: string | null }): string {
+export function hashForTab(tab: string, leadsRoute?: LeadsRoute): string {
   if (tab !== 'leads') return `#dashboard/${tab}`;
-  if (!leadsRoute) return '#dashboard/leads/people';
+  if (!leadsRoute) return '#dashboard/leads/find';
   if (leadsRoute.view === 'run') {
     return leadsRoute.runId
       ? `#dashboard/leads/run/${leadsRoute.runId}`
-      : '#dashboard/leads/runs';
+      : '#dashboard/leads/activity/runs';
   }
-  return `#dashboard/leads/${leadsRoute.view}`;
+  return leadsRoute.subMode
+    ? `#dashboard/leads/${leadsRoute.view}/${leadsRoute.subMode}`
+    : `#dashboard/leads/${leadsRoute.view}`;
 }
 
 /**

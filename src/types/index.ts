@@ -59,19 +59,7 @@ export type LeadStep = 'company' | 'person' | 'email' | 'verify' | 'phone' | 'en
 export type LeadCleanMode = 'verify_only' | 'verify_refind' | 'full_enrich' | 'phone_only' | 'enrich_only';
 
 /** Which panel is showing inside the Leads tab. Mirrors the sub-route in the hash. */
-export type LeadsView =
-  | 'search'
-  | 'people'
-  | 'companies'
-  | 'lists'
-  | 'usage'
-  | 'runs'
-  | 'new'
-  | 'clean'
-  | 'lab'
-  | 'optouts'
-  | 'automations'
-  | 'run';
+export type LeadsView = 'find' | 'leads' | 'activity' | 'settings' | 'run';
 
 export interface LeadIcp {
   id: string;

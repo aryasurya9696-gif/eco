@@ -9,7 +9,7 @@ import { BillingTab } from '../components/dashboard/BillingTab';
 import { LeadsTab } from '../components/dashboard/LeadsTab';
 import { OnboardingModal } from '../components/onboarding/OnboardingModal';
 import type { DashboardTab, LeadsView } from '../types';
-import { leadsRouteFromHash, tabFromHash } from '../lib/leads';
+import { leadsRouteFromHash, tabFromHash, hashForTab, type LeadsRoute } from '../lib/leads';
 import { supabase } from '../lib/supabase';
 import { RefreshCw, Radio } from 'lucide-react';
 
@@ -31,7 +31,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   );
 
   // The Leads sub-view, also from the hash, so a run link survives a refresh.
-  const [leadsRoute, setLeadsRoute] = useState<{ view: LeadsView; runId: string | null }>(
+  const [leadsRoute, setLeadsRoute] = useState<LeadsRoute>(
     () => leadsRouteFromHash(),
   );
 
@@ -137,17 +137,18 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const handleTabChange = (tab: DashboardTab) => {
     setActiveTab(tab);
     if (tab === 'leads') {
-      replaceHash(`#dashboard/leads/${leadsRoute.view}`);
+      replaceHash(hashForTab('leads', leadsRoute));
     } else {
       replaceHash(`#dashboard/${tab}`);
     }
   };
 
-  const handleLeadsViewChange = (view: LeadsView) => {
+  const handleLeadsViewChange = (view: LeadsView, subMode?: string | null) => {
     // Switching away from a run clears the id, so returning to Runs does not
     // leave the previous run id in the hash ready to be reopened by Back.
-    setLeadsRoute({ view, runId: null });
-    replaceHash(`#dashboard/leads/${view}`);
+    const route: LeadsRoute = { view, subMode: subMode ?? null, runId: null };
+    setLeadsRoute(route);
+    replaceHash(hashForTab('leads', route));
   };
 
   // Opening a specific run writes the run id into the hash, so the link works
@@ -231,6 +232,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           {activeTab === 'leads' && (
             <LeadsTab
               view={leadsRoute.view}
+              subMode={leadsRoute.subMode}
               runId={leadsRoute.runId}
               onViewChange={handleLeadsViewChange}
               onOpenRun={handleOpenRun}

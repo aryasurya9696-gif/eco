@@ -419,7 +419,7 @@ export const ListsView: React.FC<{ onOpenList: (l: LeadList) => void }> = ({ onO
   );
 };
 
-export const UsageView: React.FC<{ onOpenRun: (id: string) => void }> = ({ onOpenRun }) => {
+export const UsageView: React.FC<{ onOpenRun?: (id: string) => void; cardsOnly?: boolean }> = ({ onOpenRun, cardsOnly = false }) => {
   const [days, setDays] = React.useState(30);
   const [data, setData] = React.useState<Awaited<ReturnType<typeof usageSummary>> | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -460,10 +460,11 @@ export const UsageView: React.FC<{ onOpenRun: (id: string) => void }> = ({ onOpe
               )}
             </div>
           </div>
-          <div className="bg-white border border-line overflow-x-auto">
-            <table className="w-full text-xs font-mono">
-              <thead>
-                <tr className="h-10 border-b border-line text-left text-[10px] uppercase tracking-wider text-muted">
+          {!cardsOnly && onOpenRun && (
+            <div className="bg-white border border-line overflow-x-auto">
+              <table className="w-full text-xs font-mono">
+                <thead>
+                  <tr className="h-10 border-b border-line text-left text-[10px] uppercase tracking-wider text-muted">
                   <th className="px-4 font-normal">Run</th>
                   <th className="px-3 font-normal">Started</th>
                   <th className="px-3 font-normal">Status</th>
@@ -484,10 +485,11 @@ export const UsageView: React.FC<{ onOpenRun: (id: string) => void }> = ({ onOpe
               </tbody>
             </table>
           </div>
-        </>
-      )}
-    </div>
-  );
+        )}
+      </>
+    )}
+  </div>
+);
 };
 
 const Toggle: React.FC<{ on: boolean; onClick: () => void; children: React.ReactNode }> = ({ on, onClick, children }) => (

@@ -14,7 +14,7 @@ Read first: `docs/LEADS_UPGRADE.md` (what Leads does today, backend, billing, te
 | Phase | State | Notes |
 |---|---|---|
 | 1. Design foundation | **Complete** | 1.1 tokens **done** (e5fe17f). 1.2 StatusPill **done** (1e952d6). 1.3 dialogs **done** (603db2b). 1.4 Screen frame **done** (e03df97). 1.5 PriceSummary **done**: new `PriceSummary` displays expected, max, available coverage with Top up link when short, rows, capPerRun warnings, notes and breakdown. Used across `CostDialog`, `NewSearch`, `CleanList`, and `AutomationsView`. `PriceBar` removed from `Screen.tsx`. Phase 1 complete. |
-| 2. Navigation (11 tabs → 4) | Not started | Depends on Phase 1 |
+| 2. Navigation (11 tabs → 4) | **Complete** | Consolidated 11 tabs into 4 unified hubs: **Find** (Search, Find by profile, Import CSV), **Leads** (People, Companies with Left Sidebar for Views, Lists, and Saved Searches + Automate shortcut), **Activity** (Runs & Usage summary cards, Automations), and **Settings** (Fit Scoring, Duplicate Review, Opt-outs, Provider Lab). Subnav updated with legacy route redirects, inline dialogs, and responsive layout. |
 | 3. Remove duplicate flows | Not started | Depends on Phases 2 and 4 |
 | 4. Backend support | Not started | Independent of Phase 1; can run in parallel |
 | 5. Verification and docs | Not started | Last |

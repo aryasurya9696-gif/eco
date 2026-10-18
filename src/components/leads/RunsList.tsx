@@ -34,6 +34,7 @@ interface RunsListProps {
   onOpenRun: (runId: string) => void;
   onNewSearch: () => void;
   initialRuns?: LeadRun[] | null;
+  headerSlot?: React.ReactNode;
 }
 
 const KIND_LABEL: Record<LeadRun['kind'], string> = {
@@ -42,7 +43,7 @@ const KIND_LABEL: Record<LeadRun['kind'], string> = {
   lab: 'Lab',
 };
 
-export const RunsList: React.FC<RunsListProps> = ({ onOpenRun, onNewSearch, initialRuns }) => {
+export const RunsList: React.FC<RunsListProps> = ({ onOpenRun, onNewSearch, initialRuns, headerSlot }) => {
   const [runs, setRuns] = React.useState<LeadRun[] | null>(initialRuns ?? null);
   const [error, setError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(initialRuns ? false : true);
@@ -127,6 +128,7 @@ export const RunsList: React.FC<RunsListProps> = ({ onOpenRun, onNewSearch, init
       icon={<ListChecks className="w-4 h-4" />}
       action={<Button onClick={onNewSearch}><Plus className="w-3.5 h-3.5" />New search</Button>}
     >
+      {headerSlot}
       {loading ? (
         <div className="border border-line bg-white">
           {[0, 1, 2].map((i) => (
