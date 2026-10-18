@@ -8,7 +8,6 @@ import { useAuth } from '../../context/AuthContext';
 import { formatUsd, formatCredits } from '../../lib/billing';
 import { Screen, Panel, Button, Textarea, Input, Figure, PriceBar } from './Screen';
 import { ChipRow, ChipChoice } from './ChipRow';
-import { AssumptionPanel } from './Assumptions';
 
 /**
  * The screen people came for.
@@ -17,10 +16,11 @@ import { AssumptionPanel } from './Assumptions';
  * ICP to correct, and puts a real call into estimate_lead_run underneath it so
  * the price updates as the count changes.
  *
- * The assumptions panel is the part this used to leave out. A profile written from
- * a website is a set of inferences and the user is about to pay per lookup on the
- * strength of them. Showing them is not a disclaimer — it is the difference
- * between a search they chose and a search that happened to them.
+ * The generator still records what it assumed, and the severity it gave each
+ * one, and none of it is shown here. The data is kept because it is already
+ * stored and it is the thing to reach for if someone asks why a search returned
+ * what it did — but a panel of caveats above a form is a screen arguing with
+ * itself, and the fields below already say what is being searched for.
  *
  * What does not work is reading the site, because that needs the provider and the
  * provider token is not valid. So that one button is present and disabled, with
@@ -236,10 +236,6 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
           </p>
         ) : null}
       </Panel>
-
-      {doc && (
-        <AssumptionPanel doc={doc} />
-      )}
 
       <Panel
         label="Who you are looking for"

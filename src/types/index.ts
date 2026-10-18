@@ -101,11 +101,36 @@ export interface LeadIcpSegment {
   openingAngle?: string;
 }
 
+/**
+ * One thing the generator inferred, and how much a wrong inference would cost.
+ *
+ * The severity is about consequence rather than certainty: being fairly sure
+ * about the wrong country is worse than being unsure about the right one.
+ */
+export interface LeadIcpAssumption {
+  text: string;
+  severity: 'high' | 'medium' | 'low';
+  /** Why it matters if it is wrong. Empty when the model did not say. */
+  why?: string;
+}
+
 export interface LeadIcpDocument {
   summary?: string;
   segments?: LeadIcpSegment[];
   primarySegment?: number;
-  assumptions?: string[];
+  /**
+   * Stored and not displayed.
+   *
+   * The severity is asked for, the model returns it, and the panel that showed it
+   * was removed — the data is the thing to reach for when somebody asks why a
+   * search returned what it did, and re-asking the model for it later is not
+   * reliable enough to depend on.
+   *
+   * Profiles written before the shape changed hold bare strings here, which is why
+   * the field is not simply `LeadIcpAssumption[]`. Anything reading this has to
+   * cope with both.
+   */
+  assumptions?: Array<LeadIcpAssumption | string>;
   confidence?: number;
 }
 
