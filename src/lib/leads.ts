@@ -650,20 +650,21 @@ export function providerStyle(endpointId: string | null | undefined): ProviderSt
  */
 export function emailStatusLabel(status: LeadRow['email_status']): {
   label: string;
-  className: string;
+  /** A StatusPill tone. */
+  tone: 'ok' | 'warn' | 'danger' | 'neutral' | 'outline';
   title: string;
 } {
   switch (status) {
     case 'verified':
       return {
         label: 'Verified',
-        className: 'bg-[#e3f2e9] text-[#1a7f4b]',
+        tone: 'ok',
         title: 'Deliverability confirmed by a verifier.',
       };
     case 'catch_all':
       return {
         label: 'Catch-all',
-        className: 'bg-[#f8eedb] text-[#b5801f]',
+        tone: 'warn',
         title:
           'Valid syntax at a domain that accepts any mailbox. It may not reach this person. ' +
           'Treat it as risky rather than as a found address.',
@@ -671,32 +672,32 @@ export function emailStatusLabel(status: LeadRow['email_status']): {
     case 'invalid':
       return {
         label: 'Invalid',
-        className: 'bg-[#f8e4df] text-[#c0462e]',
+        tone: 'danger',
         title: 'Confirmed dead. Worth re-running the waterfall from the next provider.',
       };
     case 'disposable':
       return {
         label: 'Disposable',
-        className: 'bg-[#f8e4df] text-[#c0462e]',
+        tone: 'danger',
         title: 'A throwaway mailbox, as reported by the verifier. Not a usable work address.',
       };
     case 'unknown':
       return {
         label: 'Unknown',
-        className: 'bg-[#eeeeea] text-[#8a8a86]',
+        tone: 'neutral',
         title: 'A verifier was asked and could not tell either way.',
       };
     case 'unchecked':
       return {
         label: 'Not checked',
-        className: 'bg-white text-[#8a8a86] border border-[#e3e3de]',
+        tone: 'outline',
         title: 'An address nothing has verified yet. Found or imported, not confirmed.',
       };
     case 'not_found':
     default:
       return {
         label: 'Not found',
-        className: 'bg-[#eeeeea] text-[#8a8a86]',
+        tone: 'neutral',
         title: 'No provider produced an email for this person. Nothing was charged for it.',
       };
   }

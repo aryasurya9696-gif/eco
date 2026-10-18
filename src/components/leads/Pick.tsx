@@ -8,6 +8,7 @@
  *              leaving it.
  */
 import React from 'react';
+import { StatusPill } from './StatusPill';
 import { X, Check } from 'lucide-react';
 
 export const OptionPick: React.FC<{
@@ -154,10 +155,10 @@ export const ScoreBadge: React.FC<{ score: number | null; label: string | null }
       </span>
     );
   }
-  const tone = score >= 70 ? 'bg-ok-bg text-ok' : score >= 40 ? 'bg-warn-bg text-warn' : 'bg-line-soft text-ink-2';
+  const tone = score >= 70 ? 'ok' : score >= 40 ? 'warn' : 'neutral';
   return (
-    <span className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-mono tabular-nums ${tone}`} title={`${label ?? ''} - fit with your scoring rules, not a probability`}>
+    <StatusPill tone={tone} numeric title={`${label ?? ''} - fit with your scoring rules, not a probability`}>
       {score}
-    </span>
+    </StatusPill>
   );
 };

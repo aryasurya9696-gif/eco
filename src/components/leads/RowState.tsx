@@ -1,4 +1,5 @@
 import React from 'react';
+import { StatusPill } from './StatusPill';
 import type { LeadRow, LeadEmailStatus, LeadRowState, LeadStep } from '../../types';
 
 /**
@@ -157,12 +158,9 @@ export const CallFailure: React.FC<{ status?: number | null; code?: string | nul
   if (!status && !code) return null;
 
   return (
-    <span
-      className="inline-flex items-center gap-1.5 px-1.5 py-0.5 border border-danger-line bg-danger-bg text-danger-strong text-[9px] font-mono whitespace-nowrap"
-      title={explain(status, code)}
-    >
+    <StatusPill tone="danger" numeric title={explain(status, code)}>
       {status ? `HTTP ${status}` : code}
-    </span>
+    </StatusPill>
   );
 };
 

@@ -23,6 +23,7 @@ import { Button } from '../leads/Screen';
 import { EmptyState } from '../leads/Empty';
 import { ExportMenu } from '../leads/ExportMenu';
 import { CostDialog } from '../leads/CostDialog';
+import { StatusPill } from '../leads/StatusPill';
 import { SearchView } from '../leads/SearchView';
 import { AutomationsView } from '../leads/AutomationsView';
 import { PeopleView } from '../leads/PeopleView';
@@ -594,16 +595,13 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
         <div className="flex items-center gap-3 flex-shrink-0">
           {/* Shown because a table that stopped updating with no indication is
               indistinguishable from a run that stopped. */}
-          <span
-            className={`text-[10px] font-mono px-1.5 py-0.5 border ${
-              live
-                ? 'text-emerald-700 border-emerald-200 bg-emerald-50'
-                : 'text-muted border-line'
-            }`}
+          <StatusPill
+            tone={live ? 'ok' : 'outline'}
+            dot={live ? 'pulse' : undefined}
             title={live ? 'Updating over a live connection' : 'Updating every few seconds'}
           >
             {live ? 'live' : 'polling'}
-          </span>
+          </StatusPill>
 
           {run && <RunStrip status={run.status} pauseReason={run.pause_reason} />}
 

@@ -1,6 +1,7 @@
 import React from 'react';
 import type { LeadEmailStatus, LeadRunStatus } from '../../types';
 import { emailStatusLabel, isActiveRun } from '../../lib/leads';
+import { StatusPill } from './StatusPill';
 
 /**
  * The five email states, which answer two different questions.
@@ -18,16 +19,8 @@ export const StatusBadge: React.FC<{
   status: LeadEmailStatus;
   credits?: number;
 }> = ({ status }) => {
-  const { label, className, title } = emailStatusLabel(status);
-
-  return (
-    <span
-      className={`inline-flex items-center px-1.5 py-0.5 text-[9px] font-mono uppercase tracking-wider rounded-none whitespace-nowrap ${className}`}
-      title={title}
-    >
-      {label}
-    </span>
-  );
+  const { label, tone, title } = emailStatusLabel(status);
+  return <StatusPill tone={tone} title={title}>{label}</StatusPill>;
 };
 
 /**
@@ -51,28 +44,20 @@ export const RunStatusPill: React.FC<{
       : status;
 
   const tone =
-    status === 'done'
-      ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
-      : status === 'paused'
-        ? 'bg-warn-bg text-warn border-warn-line'
-        : status === 'failed'
-          ? 'bg-danger-bg text-danger border-danger-line'
-          : status === 'cancelled'
-            ? 'bg-line-soft text-muted border-line'
-            : 'bg-white text-ink-2 border-line';
+    status === 'done' ? 'ok'
+      : status === 'paused' ? 'warn'
+        : status === 'failed' ? 'danger'
+          : status === 'cancelled' ? 'neutral'
+            : status === 'running' ? 'ok'
+              : 'outline';
 
   return (
-    <span
-      className={`inline-flex items-center gap-1.5 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider border rounded-none whitespace-nowrap ${tone}`}
+    <StatusPill
+      tone={tone}
       title={pauseReason ? `Paused: ${pauseReason.replace(/_/g, ' ')}` : undefined}
+      dot={active ? (status === 'paused' ? 'still' : 'pulse') : undefined}
     >
-      {active && (
-        <span
-          className={`w-1.5 h-1.5 rounded-full ${status === 'paused' ? 'bg-warn' : 'bg-emerald-500 animate-pulse'}`}
-          aria-hidden="true"
-        />
-      )}
       {label}
-    </span>
+    </StatusPill>
   );
 };

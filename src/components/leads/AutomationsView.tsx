@@ -14,6 +14,7 @@ import { Plus, Pause, Play, Trash2, Pencil, Zap, AlertTriangle, Loader2, History
 import { Button, Input } from './Screen';
 import { EmptyState, RowSkeleton } from './Empty';
 import { Drawer, SectionLabel } from './Pick';
+import { StatusPill, type PillTone } from './StatusPill';
 import { formatCredits } from '../../lib/billing';
 import {
   getAutomations, saveAutomation, pauseAutomation, resumeAutomation, deleteAutomation, runAutomationNow,
@@ -62,12 +63,17 @@ const PAUSE_COPY: Record<string, string> = {
   bad_config: 'Paused: its settings are no longer valid',
 };
 
-const RUN_STATUS: Record<string, { label: string; tone: string }> = {
-  running: { label: 'Running', tone: 'text-ink-2' },
-  succeeded: { label: 'Done', tone: 'text-ok' },
-  skipped: { label: 'Nothing to do', tone: 'text-muted' },
-  refused: { label: 'Refused', tone: 'text-warn' },
-  failed: { label: 'Failed', tone: 'text-danger' },
+const RUN_STATUS: Record<string, { label: string; tone: PillTone }> = {
+  running: { label: 'Running', tone: 'outline' },
+  succeeded: { label: 'Done', tone: 'ok' },
+  skipped: { label: 'Nothing to do', tone: 'neutral' },
+  refused: { label: 'Refused', tone: 'warn' },
+  failed: { label: 'Failed', tone: 'danger' },
+};
+
+const RunPill: React.FC<{ status: string | null }> = ({ status }) => {
+  const s = RUN_STATUS[status ?? ''] ?? { label: status ?? '—', tone: 'neutral' as PillTone };
+  return <StatusPill tone={s.tone} dot={status === 'running' ? 'pulse' : undefined}>{s.label}</StatusPill>;
 };
 
 const hh = (h: number) => `${String(h).padStart(2, '0')}:00 UTC`;
@@ -218,12 +224,10 @@ const AutomationCard: React.FC<{
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <span className="text-sm font-mono text-ink truncate">{a.name}</span>
-            <span className="text-[10px] font-mono uppercase tracking-wider text-muted border border-line px-1.5 py-0.5">
-              {KIND_LABEL[a.kind]}
-            </span>
-            <span className={`text-[10px] font-mono uppercase tracking-wider ${active ? 'text-ok' : 'text-warn'}`}>
+            <StatusPill tone="outline">{KIND_LABEL[a.kind]}</StatusPill>
+            <StatusPill tone={active ? 'ok' : 'warn'} dot="still">
               {active ? 'Active' : PAUSE_COPY[a.pause_reason ?? 'user_paused'] ?? 'Paused'}
-            </span>
+            </StatusPill>
           </div>
           <p className="text-[11px] font-mono text-ink-2 mt-1">
             {a.saved_search ? `“${a.saved_search.name}”` : <span className="text-danger">Saved search deleted</span>}
@@ -254,8 +258,8 @@ const AutomationCard: React.FC<{
         </div>
         <div>
           <div className="text-[10px] uppercase tracking-wider text-muted">Last run</div>
-          <div className={RUN_STATUS[a.last_status ?? '']?.tone ?? 'text-ink'}>
-            {a.last_run_at ? `${RUN_STATUS[a.last_status ?? '']?.label ?? a.last_status} · ${whenCopy(a.last_run_at)}` : 'Not yet'}
+          <div className="text-ink flex flex-wrap items-center gap-1.5">
+            {a.last_run_at ? <><RunPill status={a.last_status} /> {whenCopy(a.last_run_at)}</> : 'Not yet'}
           </div>
         </div>
         {paid ? (
@@ -335,13 +339,12 @@ const HistoryTable: React.FC<{
               {runs.map((r) => {
                 const a = byId.get(r.automation_id);
                 const note = r.status === 'refused' || r.status === 'failed' ? refusalCopy(r) : null;
-                const s = RUN_STATUS[r.status] ?? { label: r.status, tone: '' };
                 return (
                   <React.Fragment key={r.id}>
                     <tr className={`h-10 ${note ? '' : 'border-b border-line-soft'}`}>
                       <td className="px-4 text-muted whitespace-nowrap">{whenCopy(r.started_at)}</td>
                       {!automationId && <td className="px-3 truncate max-w-[180px]">{a?.name ?? 'Deleted'}</td>}
-                      <td className={`px-3 ${s.tone}`}>{s.label}</td>
+                      <td className="px-3"><RunPill status={r.status} /></td>
                       <td className="px-3 text-ink-2">{outcomeCopy(r, a?.kind)}</td>
                       <td className="px-3 text-right tabular-nums text-muted">
                         {r.credits_estimated_max == null ? '—' : formatCredits(r.credits_estimated_max)}

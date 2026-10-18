@@ -1,4 +1,5 @@
 import React from 'react';
+import { StatusPill } from './StatusPill';
 import { Plus, X, ShieldOff, Trash2, Loader2 } from 'lucide-react';
 import {
   getSuppressions,
@@ -208,15 +209,9 @@ export const OptOuts: React.FC = () => {
             <ul className="divide-y divide-line-soft -mx-5">
               {items.map((item) => (
                 <li key={item.id ?? item.value} className="flex items-center gap-3 px-5 h-11 group">
-                  <span
-                    className={`inline-flex items-center px-1.5 py-0.5 text-[9px] font-mono uppercase tracking-wider flex-shrink-0 ${
-                      item.kind === 'email'
-                        ? 'bg-info-bg text-info'
-                        : 'bg-fill text-ink-2'
-                    }`}
-                  >
+                  <StatusPill tone={item.kind === 'email' ? 'info' : 'neutral'} className="flex-shrink-0">
                     {item.kind}
-                  </span>
+                  </StatusPill>
                   <span className="text-xs font-mono text-ink truncate flex-1 min-w-0">
                     {item.value}
                   </span>
