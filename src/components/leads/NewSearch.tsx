@@ -1,8 +1,6 @@
 import React from 'react';
-import {
-  Plus, Globe, Loader2, Search, Info, CircleAlert, Sparkles,
-} from 'lucide-react';
-import type { LeadIcpSegment } from '../../types';
+import { Search, Sparkles, Globe, CircleAlert, Loader2, Plus } from 'lucide-react';
+import type { LeadIcpSegment, LeadIcp } from '../../types';
 import {
   getIcp, saveIcp, estimateRun, startRun, MAX_RUN_ROWS,
 } from '../../lib/leads';
@@ -10,33 +8,31 @@ import { useAuth } from '../../context/AuthContext';
 import { formatUsd, formatCredits } from '../../lib/billing';
 import { Screen, Panel, Button, Textarea, Input, Figure, PriceBar } from './Screen';
 import { ChipRow, ChipChoice } from './ChipRow';
+import { AssumptionPanel } from './Assumptions';
 
 /**
  * The screen people came for.
  *
- * It was a paragraph explaining that Echo would read the site, write an ideal
- * customer profile from it, and show a count. All three of those are the point,
- * and two of them work today: the profile is read from what the user already
- * filled in during onboarding, the ICP is theirs to edit, and the price is a real
- * call into estimate_lead_run rather than a number typed into the page.
+ * It reads the profile they already filled in during onboarding, gives them the
+ * ICP to correct, and puts a real call into estimate_lead_run underneath it so
+ * the price updates as the count changes.
+ *
+ * The assumptions panel is the part this used to leave out. A profile written from
+ * a website is a set of inferences and the user is about to pay per lookup on the
+ * strength of them. Showing them is not a disclaimer — it is the difference
+ * between a search they chose and a search that happened to them.
  *
  * What does not work is reading the site, because that needs the provider and the
  * provider token is not valid. So that one button is present and disabled, with
- * the reason on it. Removing it would be worse: the user has been told the
- * product reads their site, and a screen that quietly omits the button reads as
- * a feature that does not exist rather than one that is temporarily unavailable.
- *
- * The estimate is the spine of the screen and everything else is arranged around
- * it. It sits at the bottom, full width, and it updates as the count changes,
- * because "what will this cost" is the question every field above is asking on
- * the user's behalf.
+ * the reason on it. Removing it would be worse: the user has been told the product
+ * reads their site, and a screen that quietly omits the button reads as a feature
+ * that does not exist rather than one that is temporarily unavailable.
  */
 
 interface NewSearchProps {
   onStarted: (runId: string) => void;
 }
 
-/** Counts worth offering, and why they are those. */
 const SIZES = [
   { label: '1–10', value: '1-10' },
   { label: '11–50', value: '11-50' },
@@ -70,6 +66,7 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
   const { profile } = useAuth();
 
   const [icpId, setIcpId] = React.useState<string | null>(null);
+  const [doc, setDoc] = React.useState<LeadIcp['json'] | null>(null);
   const [segment, setSegment] = React.useState<LeadIcpSegment>({ ...EMPTY_SEGMENT });
   const [summary, setSummary] = React.useState('');
   const [target, setTarget] = React.useState(50);
@@ -79,8 +76,6 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
   const [error, setError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
 
-  // --- load ---------------------------------------------------------------
-
   React.useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -89,18 +84,15 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
         if (cancelled) return;
         if (icp) {
           setIcpId(icp.id);
-          // The approved profile's primary segment. Falling back to the first
-          // rather than showing nothing, because a profile with two segments and
-          // no primary is still a profile and picking the first is a far better
-          // answer than an empty form.
-          const doc = icp.json ?? {};
-          const seg = doc.segments?.[doc.primarySegment ?? 0] ?? doc.segments?.[0];
+          setDoc(icp.json ?? null);
+          const d = icp.json ?? {};
+          const seg = d.segments?.[d.primarySegment ?? 0] ?? d.segments?.[0];
           if (seg) setSegment({ ...EMPTY_SEGMENT, ...seg });
-          if (doc.summary) setSummary(doc.summary);
+          if (d.summary) setSummary(d.summary);
         }
       } catch {
         // A blank form and a failed load look the same. Not fatal either way —
-        // the user can fill this in from nothing — so it is not worth an error
+        // the user can fill this in from nothing — so it does not earn an error
         // banner above fields that are all empty.
       } finally {
         if (!cancelled) setLoading(false);
@@ -110,8 +102,6 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
       cancelled = true;
     };
   }, []);
-
-  // --- price --------------------------------------------------------------
 
   React.useEffect(() => {
     let cancelled = false;
@@ -131,8 +121,6 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
     };
   }, [target]);
 
-  // --- edit ---------------------------------------------------------------
-
   const patch = (changes: Partial<LeadIcpSegment>) =>
     setSegment((prev) => ({ ...prev, ...changes }));
 
@@ -143,7 +131,17 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
     (segment.keywords?.length ?? 0) > 0 ||
     (segment.name?.trim().length ?? 0) > 0;
 
-  // --- run ----------------------------------------------------------------
+  // What this search is made of, in the user's terms. Honest about being a
+  // description rather than a count: without a provider there is no way to know
+  // how many companies match, and a number that is not a number is worse than a
+  // sentence that says what it does know.
+  const chosenSummary = [
+    segment.industries?.length ? segment.industries.join(', ') : null,
+    segment.countries?.length ? segment.countries.join(', ') : null,
+    size ? `${size.label} staff` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
 
   const start = async () => {
     setBusy(true);
@@ -152,7 +150,8 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
       // Saved and approved before the run starts, so the run and the profile that
       // produced it cannot come apart. A run pointing at an ICP that was never
       // written is a run nobody can explain six months later.
-      const doc = {
+      const next = {
+        ...doc,
         summary,
         segments: [segment],
         primarySegment: 0,
@@ -161,7 +160,7 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
         id: icpId,
         website: profile?.website ?? null,
         offer: profile?.core_offer ?? null,
-        icp: doc,
+        icp: next,
         approved: true,
       });
       if (!saved.ok) {
@@ -200,7 +199,6 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
       subtitle="Describe who buys from you. Nothing is spent until you press Find."
       icon={<Search className="w-4 h-4" />}
     >
-      {/* ---- Where this starts from -------------------------------------- */}
       <Panel label="From your profile">
         <div className="flex items-start justify-between gap-6">
           <div className="min-w-0 space-y-1.5">
@@ -216,8 +214,8 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
           </div>
 
           {/* Present and disabled, with the reason attached. Omitting it would
-              read as a feature that does not exist; this reads as one that is
-              waiting on a provider, which is what it is. */}
+              read as a feature that does not exist; this reads as one waiting on
+              a provider, which is what it is. */}
           <button
             disabled
             title="Reading your site needs the data provider, which is not connected yet."
@@ -228,15 +226,25 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
           </button>
         </div>
 
-        {loading && (
+        {loading ? (
           <p className="text-[10px] font-mono text-[#b5b5ad] mt-3 pt-3 border-t border-[#eeeeea]">
             looking for a profile you already saved…
           </p>
-        )}
+        ) : doc ? (
+          <p className="text-[10px] font-mono text-[#1a7f4b] mt-3 pt-3 border-t border-[#eeeeea]">
+            Saved profile loaded — everything below is editable, and what you change is what runs.
+          </p>
+        ) : null}
       </Panel>
 
-      {/* ---- Who they are ------------------------------------------------ */}
-      <Panel label="Who you are looking for">
+      {doc && (
+        <AssumptionPanel doc={doc} />
+      )}
+
+      <Panel
+        label="Who you are looking for"
+        hint={chosenSummary || undefined}
+      >
         <div className="space-y-5">
           <div>
             <label className="block text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] mb-1.5">
@@ -314,14 +322,12 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
             onChange={(v) => {
               const picked = SIZES.find((s) => s.label === v);
               if (!picked) return;
-              const bounds = sizeBounds(picked.value);
-              patch({ employeeRange: bounds });
+              patch({ employeeRange: sizeBounds(picked.value) });
             }}
           />
         </div>
       </Panel>
 
-      {/* ---- What it costs ------------------------------------------------ */}
       <Panel label="What this costs">
         <div className="space-y-5">
           <div className="flex items-center gap-4 flex-wrap">
@@ -372,18 +378,15 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
           </div>
 
           {estimate && (
-            <PriceBar
-              expected={estimate.expected_credits}
-              max={estimate.max_credits}
-            />
+            <PriceBar expected={estimate.expected_credits} max={estimate.max_credits} />
           )}
 
           {!enoughToSearch && (
             <div className="flex items-start gap-2 text-[10px] font-mono text-[#b5801f] leading-relaxed">
-              <Info className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+              <CircleAlert className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
               <span>
-                Add at least one industry or keyword so the search knows who to look for. It will run
-                without one, and return whatever the providers consider a match.
+                Add at least one industry or keyword so the search knows who to look for. It will
+                run without one, and return whatever the providers consider a match.
               </span>
             </div>
           )}
@@ -407,9 +410,7 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
             </div>
 
             {estimate && (
-              <span className="text-[10px] font-mono text-[#8a8a86]">
-                a miss costs nothing
-              </span>
+              <span className="text-[10px] font-mono text-[#8a8a86]">a miss costs nothing</span>
             )}
           </div>
 
@@ -418,8 +419,7 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
               down afterwards, and until now the screen said nothing about it. A
               user who reads "at most 61 credits", watches 61 leave their balance,
               and is never told otherwise has every reason to think we took the
-              money and did not do the work. This is the line that prevents that,
-              and it is the cheapest thing on this page. */}
+              money and did not do the work. This is the line that prevents that. */}
           {estimate && !pricing && (
             <p className="text-[11px] font-mono text-[#8a8a86] leading-relaxed pt-4 border-t border-[#eeeeea]">
               The most it can cost is held when the search starts, and whatever it does not spend

@@ -367,6 +367,13 @@ const ICP_SYSTEM_PROMPT = [
   'countries. Prefer one tight segment over a broad one. If the user stated a segment, start',
   'there and refine it. List your assumptions. Return only JSON matching the schema.',
   '',
+  'Severity is about what an assumption would cost the reader if it is wrong, not',
+  'how sure you are that it is true. Use high when a wrong assumption would send',
+  'the search at entirely the wrong people, medium when it would skew it, low',
+  'when it is a caveat about coverage. If an assumption genuinely would not change',
+  'the results, leave it out — a list of three real ones is worth more than ten',
+  'hedges.',
+  '',
   'Schema:',
   '{',
   '  "summary": string,',
@@ -384,7 +391,7 @@ const ICP_SYSTEM_PROMPT = [
   '    "openingAngle": string',
   '  }],',
   '  "primarySegment": number,',
-  '  "assumptions": string[],',
+  '  "assumptions": [{ "text": string, "severity": "high"|"medium"|"low", "why": string }],',
   '  "confidence": number',
   '}',
 ].join('\n');
@@ -480,8 +487,15 @@ interface IcpDocument {
   summary: string;
   segments: IcpSegment[];
   primarySegment: number;
-  assumptions: string[];
+  assumptions: IcpAssumption[];
   confidence: number;
+}
+
+export interface IcpAssumption {
+  text: string;
+  severity: 'high' | 'medium' | 'low';
+  /** Why it matters if it is wrong. Empty when the model did not say. */
+  why: string;
 }
 
 /**
@@ -536,9 +550,53 @@ function normaliseIcp(raw: unknown): IcpDocument | null {
     summary: str(doc.summary, 400),
     segments,
     primarySegment: claimed >= 0 && claimed < segments.length ? claimed : 0,
-    assumptions: asStringList(doc.assumptions, 10),
+    assumptions: asAssumptions(doc.assumptions, 10),
     confidence: clamp01(num(doc.confidence, 0.5)),
   };
+}
+
+/**
+ * Reads the assumptions, whichever shape they arrive in.
+ *
+ * Two shapes, deliberately. The documented one is an object with a severity and a
+ * reason. The one already stored is a bare string, and a reader that accepts only
+ * the new shape would quietly empty every existing profile's assumption list —
+ * which is the sort of thing that looks like the AI getting better and is actually
+ * data being dropped.
+ *
+ * A bare string is recorded at medium rather than high or low. Medium is the
+ * honest default because it is the one that means "look at this", and the reason
+ * is left empty because inventing one would be worse than not having it.
+ */
+function asAssumptions(v: unknown, limit: number): IcpAssumption[] {
+  if (!Array.isArray(v)) return [];
+
+  const out: IcpAssumption[] = [];
+
+  for (const item of v.slice(0, limit)) {
+    if (typeof item === 'string') {
+      const text = item.trim().slice(0, 300);
+      if (text) out.push({ text, severity: 'medium', why: '' });
+      continue;
+    }
+
+    if (!item || typeof item !== 'object') continue;
+    const o = item as Record<string, unknown>;
+
+    const text = str(o.text, 300);
+    if (!text) continue;
+
+    const raw = String(o.severity ?? '').toLowerCase();
+    const severity =
+      raw === 'high' || raw === 'medium' || raw === 'low' ? raw : 'medium';
+
+    out.push({ text, severity, why: str(o.why, 300) });
+  }
+
+  // Worst first. The panel's whole job is to be scannable, and an ordered list of
+  // equal-looking rows is not scannable.
+  const rank = { high: 0, medium: 1, low: 2 } as const;
+  return out.sort((a, b) => rank[a.severity] - rank[b.severity]);
 }
 
 function num(v: unknown, fallback: number): number {
@@ -659,7 +717,15 @@ function fallbackIcpDocument(input: {
     ],
     primarySegment: 0,
     assumptions: [
-      'Built from your own answers because the AI did not respond. Add industries and job titles before running.',
+      {
+        // High, and it is the only assumption in this product that has ever been
+        // high. Nothing else on this panel can cost the reader as much: every
+        // other assumption is a guess about who to search for, and this one is
+        // the profile not having been written by anything at all.
+        text: 'Built from your own answers because the AI did not respond. Add industries and job titles before running.',
+        severity: 'high',
+        why: 'Nothing here was inferred from your site, so this will be a much broader search than a generated profile.',
+      },
     ],
     confidence: 0.2,
   };

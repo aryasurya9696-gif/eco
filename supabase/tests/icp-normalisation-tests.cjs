@@ -27,7 +27,7 @@ const tsPath = path.join(OUT, 'helpers.ts');
 fs.writeFileSync(
   tsPath,
   source.slice(start, end) +
-    `\nexport { parseJsonLoose, normaliseIcp, condensePages, fallbackIcpDocument, regionToCode, sizeToRange, asStringList };\n`,
+    `\nexport { parseJsonLoose, normaliseIcp, condensePages, fallbackIcpDocument, regionToCode, sizeToRange, asStringList, asAssumptions };\n`,
   'utf8',
 );
 
@@ -193,7 +193,157 @@ check(
   'the fallback is marked low confidence and says so',
   (() => {
     const d = M.fallbackIcpDocument({ website: '', offer: 'x', regions: [], sizes: [], pricePoint: '', hypothesis: '', note: '' });
-    return d.confidence < 0.5 && d.assumptions.some((a) => /did not respond/i.test(a));
+    // The text has to survive the shape change, and the severity has to be the
+    // one this document earns: nothing was inferred from the site, which costs the
+    // reader more than any assumption a working model could make.
+    return (
+      d.confidence < 0.5 &&
+      d.assumptions.some((a) => /did not respond/i.test(a.text)) &&
+      d.assumptions.some((a) => a.severity === 'high')
+    );
+  })(),
+);
+
+// --- assumptions: the shape change and the tolerance -------------------
+//
+// Assumptions used to be a flat array of strings and are now objects carrying a
+// severity and a reason. Two things have to hold: the new shape is read properly,
+// and the old one is not thrown away — there are stored documents in it, and a
+// reader that accepts only the new shape empties every existing profile's list
+// while looking like the model got more honest.
+
+const norm = (doc) => M.normaliseIcp(doc);
+
+check(
+  'a documented assumption is read',
+  (() => {
+    const d = norm({
+      segments: [{ name: 'X', keywords: ['a'] }],
+      assumptions: [{ text: 'Only UK companies', severity: 'high', why: 'because of the site copy' }],
+    });
+    return d.assumptions.length === 1 && d.assumptions[0].text === 'Only UK companies';
+  })(),
+);
+
+check(
+  'its severity survives',
+  (() => {
+    const d = norm({
+      segments: [{ name: 'X', keywords: ['a'] }],
+      assumptions: [{ text: 'a', severity: 'high' }],
+    });
+    return d.assumptions[0].severity === 'high';
+  })(),
+);
+
+check(
+  'its reason survives',
+  (() => {
+    const d = norm({
+      segments: [{ name: 'X', keywords: ['a'] }],
+      assumptions: [{ text: 'a', severity: 'low', why: 'thin coverage' }],
+    });
+    return d.assumptions[0].why === 'thin coverage';
+  })(),
+);
+
+check(
+  'the old flat shape is still read, not dropped',
+  (() => {
+    const d = norm({
+      segments: [{ name: 'X', keywords: ['a'] }],
+      assumptions: ['GB is the only target country'],
+    });
+    return d.assumptions.length === 1 && d.assumptions[0].text === 'GB is the only target country';
+  })(),
+);
+
+check(
+  'a bare string is recorded at medium, because medium is what means "look at this"',
+  (() => {
+    const d = norm({
+      segments: [{ name: 'X', keywords: ['a'] }],
+      assumptions: ['something'],
+    });
+    return d.assumptions[0].severity === 'medium' && d.assumptions[0].why === '';
+  })(),
+);
+
+check(
+  'worst first, because an ordered list is scannable and an unordered one is not',
+  (() => {
+    const d = norm({
+      segments: [{ name: 'X', keywords: ['a'] }],
+      assumptions: [
+        { text: 'low one', severity: 'low' },
+        { text: 'high one', severity: 'high' },
+        { text: 'medium one', severity: 'medium' },
+      ],
+    });
+    return d.assumptions.map((a) => a.severity).join() === 'high,medium,low';
+  })(),
+);
+
+check(
+  'the order holds across a mixed old and new list too',
+  (() => {
+    const d = norm({
+      segments: [{ name: 'X', keywords: ['a'] }],
+      assumptions: ['a bare one', { text: 'serious', severity: 'high' }, { text: 'minor', severity: 'low' }],
+    });
+    return d.assumptions.map((a) => a.severity).join() === 'high,medium,low';
+  })(),
+);
+
+check(
+  'an unknown severity word is not trusted — it becomes medium, not high',
+  (() => {
+    const d = norm({
+      segments: [{ name: 'X', keywords: ['a'] }],
+      assumptions: [{ text: 'a', severity: 'catastrophic' }],
+    });
+    return d.assumptions[0].severity === 'medium';
+  })(),
+);
+
+check(
+  'an assumption with no text is dropped rather than shown blank',
+  (() => {
+    const d = norm({
+      segments: [{ name: 'X', keywords: ['a'] }],
+      assumptions: [{ severity: 'high' }, '   ', { text: 'kept', severity: 'low' }],
+    });
+    return d.assumptions.length === 1 && d.assumptions[0].text === 'kept';
+  })(),
+);
+
+check(
+  'assumptions are not unbounded — a runaway model cannot fill the panel',
+  (() => {
+    const many = Array.from({ length: 40 }, (_, i) => ({ text: 'a' + i, severity: 'low' }));
+    const d = norm({ segments: [{ name: 'X', keywords: ['a'] }], assumptions: many });
+    return d.assumptions.length === 10;
+  })(),
+);
+
+check(
+  'a non-array is empty, not a crash',
+  (() => {
+    const d = norm({ segments: [{ name: 'X', keywords: ['a'] }], assumptions: 'not a list' });
+    return Array.isArray(d.assumptions) && d.assumptions.length === 0;
+  })(),
+);
+
+check('a missing key is empty too', (() => {
+  const d = norm({ segments: [{ name: 'X', keywords: ['a'] }] });
+  return Array.isArray(d.assumptions) && d.assumptions.length === 0;
+})());
+
+check(
+  'confidence is still clamped',
+  (() => {
+    const d = norm({ segments: [{ name: 'X', keywords: ['a'] }], confidence: 4 });
+    return d.confidence === 1;
   })(),
 );
 
