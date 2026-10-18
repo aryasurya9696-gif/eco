@@ -318,7 +318,24 @@ node supabase/tests/webhook-signature-tests.cjs <url> <DODO_PAYMENTS_WEBHOOK_KEY
 
 # cron path really reaches the function, in both directions
 node scripts/verify-sweep-cron.cjs
+
+# Leads: no database or network needed. Run after touching supabase/functions/leads.
+for f in supabase/tests/lead*-tests.cjs supabase/tests/icp-*-tests.cjs; do node "$f"; done
+node scripts/typecheck-leads-function.cjs
 ```
+
+`lead-rpc-signature-tests` checks every `.rpc()` call in the leads function
+against the SQL that defines it. PostgREST resolves a function by argument name,
+so a mismatch there is a runtime "function not found", not a type error.
+
+---
+
+## 🎯 Leads
+
+The Leads service — people search, the lead database, enrichment runs, scoring
+and its economics views — is described in
+[`docs/LEADS_UPGRADE.md`](../docs/LEADS_UPGRADE.md), including the migration and
+deploy order (`20261116` → `20261119`, then the `leads` function).
 
 ---
 

@@ -430,15 +430,41 @@ const P = {
   // row from a run that never asked for phones cannot be charged eight credits
   // for a number nobody looked for, however the flags are set.
   const plan = S.planSteps(null, { phone: true });
-  const c = R.creditsForRow({ emailFound: true, companyFound: true, personFound: true, phoneFound: true }, P, plan);
+  const c = R.creditsForRow({ emailFound: true, verified: true, companyFound: true, personFound: true, phoneFound: true }, P, plan);
   check('phone adds its own price', Math.abs(c - 9.22) < 1e-9);
 }
 
 {
   // The refusal. Same flags, run that did not ask for phones.
   const plan = S.planSteps(null);
-  const c = R.creditsForRow({ emailFound: true, companyFound: true, personFound: true, phoneFound: true }, P, plan);
+  const c = R.creditsForRow({ emailFound: true, verified: true, companyFound: true, personFound: true, phoneFound: true }, P, plan);
   check('phone is refused when the run did not ask for it', Math.abs(c - 1.22) < 1e-9);
+}
+
+{
+  // An address is only worth the verified price when a verifier said so. A find
+  // run never verified, and was billing every address it found at 1 credit while
+  // the row said 'unknown'. Now: verified 1, unconfirmed (catch-all, unknown,
+  // never checked) 0.4, rejected 0.
+  const plan = S.planSteps(null);
+  const base = { companyFound: true, personFound: true, emailFound: true };
+  check('found + verified -> verified price', Math.abs(R.creditsForRow({ ...base, verified: true }, P, plan) - 1.22) < 1e-9);
+  check('found + never checked -> catch-all price, not verified', Math.abs(R.creditsForRow(base, P, plan) - 0.62) < 1e-9);
+  check('found + catch-all -> catch-all price', Math.abs(R.creditsForRow({ ...base, catchAll: true }, P, plan) - 0.62) < 1e-9);
+  check('found + invalid -> no email charge', Math.abs(R.creditsForRow({ ...base, invalid: true }, P, plan) - 0.22) < 1e-9);
+  check('found + disposable -> no email charge', Math.abs(R.creditsForRow({ ...base, disposable: true }, P, plan) - 0.22) < 1e-9);
+}
+
+{
+  // The single-purpose modes used by bulk actions on saved leads charge only
+  // their own line.
+  const phoneOnly = S.planSteps('phone_only');
+  check('phone_only charges phone only', Math.abs(R.creditsForRow({ phoneFound: true, emailFound: true, verified: true, companyFound: true }, P, phoneOnly) - 8) < 1e-9);
+  check('phone_only finds no email', phoneOnly.findEmail === false && phoneOnly.verifyExisting === false && phoneOnly.phone === true);
+  const enrichOnly = S.planSteps('enrich_only');
+  check('enrich_only charges enrichment only', Math.abs(R.creditsForRow({ companyEnriched: true, emailFound: true, verified: true }, P, enrichOnly) - 1) < 1e-9);
+  check('enrich_only worst case is the enrich price', Math.abs(S.worstCasePerRow(enrichOnly, P) - 1) < 1e-9);
+  check('phone_only worst case is the phone price', Math.abs(S.worstCasePerRow(phoneOnly, P) - 8) < 1e-9);
 }
 
 {

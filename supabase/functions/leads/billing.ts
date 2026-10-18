@@ -71,6 +71,7 @@ export async function reserveChunk(
   runId: string,
   chunkIndex: number,
   maxCredits: number,
+  nonce = '',
 ): Promise<ChunkHold> {
   const hold = round6(maxCredits);
   if (hold <= 0) return { reservationId: null, reserved: 0, ok: true };
@@ -78,8 +79,11 @@ export async function reserveChunk(
   const { data, error } = await db.rpc('wallet_reserve', {
     p_user_id: userId,
     p_credits: hold,
-    p_idempotency_key: `${FN}:${runId}:chunk:${chunkIndex}`,
-    p_metadata: { run_id: runId, chunk: chunkIndex },
+    p_idempotency_key: `${FN}:${runId}:chunk:${chunkIndex}${nonce ? ":" + nonce : ""}`,
+    // p_context is wallet_reserve's name for it. This was sent as p_metadata,
+    // which PostgREST cannot match to any signature, so every reserve failed with
+    // "function not found" and no chunk of any run could ever be paid for.
+    p_context: { run_id: runId, chunk: chunkIndex, source: 'leads' },
   });
 
   if (error) return { reservationId: null, reserved: 0, ok: false, reason: 'rpc_error', error: error.message };
@@ -125,13 +129,18 @@ export async function settleChunk(
   providerCostUsd: number,
   runId: string,
   chunkIndex: number,
+  nonce = '',
 ): Promise<ChunkSettlement> {
   const { data, error } = await db.rpc('wallet_settle', {
     p_reservation_id: holdId,
     p_credits_charged: round6(Math.max(0, earnedCredits)),
-    p_provider_cost_usd: round6(Math.max(0, providerCostUsd)),
-    p_idempotency_key: `${FN}:${runId}:chunk:${chunkIndex}:settle`,
+    // p_provider_cost, not p_provider_cost_usd: the same signature mismatch as
+    // the reserve above.
+    p_provider_cost: round6(Math.max(0, providerCostUsd)),
+    p_idempotency_key: `${FN}:${runId}:chunk:${chunkIndex}${nonce ? ":" + nonce : ""}:settle`,
     p_note: `leads run ${runId.slice(0, 8)} chunk ${chunkIndex}`,
+    // On the ledger row, so revenue can be attributed to the run it was earned on.
+    p_metadata: { run_id: runId, chunk: chunkIndex, source: 'leads' },
   });
 
   if (error) {
@@ -162,7 +171,8 @@ export async function releaseChunk(
 ): Promise<{ ok: boolean; released: number }> {
   const { data, error } = await db.rpc('wallet_release', {
     p_reservation_id: holdId,
-    p_note: `leads run ${runId.slice(0, 8)}: ${note}`,
+    // p_reason is wallet_release's parameter; p_note does not exist on it.
+    p_reason: `leads run ${runId.slice(0, 8)}: ${note}`,
   });
 
   if (error) return { ok: false, released: 0 };

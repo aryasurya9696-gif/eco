@@ -286,6 +286,39 @@ for (const mode of ['verify_only', 'verify_refind', 'full_enrich']) {
     /revoke execute on function public\.leads_step_hit_rate\(uuid, text\)[\s\S]*?from public, anon, authenticated;/.test(sql));
 }
 
+// --- 20261117: the estimate knows whose estimate it is -----------------------
+//
+// estimate_lead_run read auth.uid(), but it is only ever called by the leads
+// function through the service-role client, where auth.uid() is null. Every
+// estimate returned 'unauthenticated' and no run could start.
+
+{
+  const MIG = path.join(ROOT, 'supabase', 'migrations', '20261117_estimate_for_user.sql');
+  const sql = fs.readFileSync(MIG, 'utf8');
+  const has = (text) => sql.includes(text);
+  check('the estimate takes the user as a parameter', has('p_user        uuid default null'));
+  check('the parameter wins over auth.uid()', has('coalesce(p_user, auth.uid())'));
+  check('the old four-argument signature is dropped',
+    has('drop function if exists public.estimate_lead_run(integer, text, boolean, numeric);'));
+  const revoke = sql.indexOf('revoke execute on function public.estimate_lead_run(integer, text, boolean, numeric, uuid)');
+  check('the new signature is revoked from the browser',
+    revoke > 0 && sql.slice(revoke, revoke + 200).includes('from public, anon, authenticated;'));
+  check('phone_only is not a find run', has("'phone_only', 'enrich_only')"));
+  check('phone_only forces the phone line', /if v_mode = 'phone_only' then\s+v_phone := true;/.test(sql));
+  check('enrich_only prices enrichment', has("v_mode in ('full_enrich', 'enrich_only')"));
+
+  // And every call site passes the user.
+  const countCalls = (file) => {
+    const src = fs.readFileSync(path.join(ROOT, 'supabase', 'functions', 'leads', file), 'utf8');
+    const parts = src.split("rpc('estimate_lead_run', {").slice(1);
+    return { calls: parts.length, withUser: parts.filter((p) => p.slice(0, p.indexOf('}')).includes('p_user: userId')).length };
+  };
+  const a = countCalls('index.ts');
+  check('every estimate call in index.ts passes p_user', a.calls > 0 && a.calls === a.withUser, a);
+  const b = countCalls('workspace.ts');
+  check('every estimate call in workspace.ts passes p_user', b.calls > 0 && b.calls === b.withUser, b);
+}
+
 // ---------------------------------------------------------------------------
 
 console.log('-'.repeat(70));

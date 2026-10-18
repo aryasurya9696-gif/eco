@@ -4535,3 +4535,1194 @@ revoke execute on function public.estimate_lead_run(integer, text, boolean, nume
   from public, anon, authenticated;
 grant  execute on function public.estimate_lead_run(integer, text, boolean, numeric)
   to service_role;
+
+==============================================================================
+ 20261116_leads_worker_lease.sql
+---------------------------------------------------------------------------
+
+-- ============================================================================
+-- Echo Leads: one worker per run, and row claims that actually skip locked rows
+-- ----------------------------------------------------------------------------
+-- Two things the worker needed from the database and was doing through
+-- PostgREST instead.
+--
+-- 1. A run lease. The worker re-invokes itself after every chunk and pg_cron
+--    calls it every minute, so two workers on the same run is the normal case,
+--    not an edge case. Both read the same chunk counter, both reserved under the
+--    same idempotency key, and the second hold came back as a replay of the
+--    first - so the second worker's rows were settled against a hold that was
+--    already closed and were never charged. A lease makes the chunks of one run
+--    strictly sequential.
+--
+-- 2. A row claim with FOR UPDATE SKIP LOCKED. The old claim was an UPDATE ...
+--    LIMIT through PostgREST with no ORDER BY, which PostgREST does not support
+--    as a limited update, and it claimed 25 rows to work 5 - leaving 20 locked
+--    for five minutes and sizing the credit hold for all 25.
+--
+-- Both are service-role only, like every other function that moves work.
+-- ============================================================================
+
+alter table public.lead_runs
+  add column if not exists lease_until timestamptz;
+
+comment on column public.lead_runs.lease_until is
+  'Held by the worker that is processing a chunk of this run. Null or past means free.';
+
+-- ---------------------------------------------------------------------------
+-- lead_claim_run: take the run for p_seconds, or return false
+-- ---------------------------------------------------------------------------
+create or replace function public.lead_claim_run(p_run_id uuid, p_seconds integer)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_id uuid;
+begin
+  update public.lead_runs
+     set lease_until = now() + make_interval(secs => greatest(10, least(p_seconds, 600)))
+   where id = p_run_id
+     and status in ('queued', 'running')
+     and (lease_until is null or lease_until < now())
+  returning id into v_id;
+
+  return v_id is not null;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- lead_release_run: give the lease back early
+-- ---------------------------------------------------------------------------
+create or replace function public.lead_release_run(p_run_id uuid)
+returns void
+language sql
+security definer
+set search_path = public, pg_temp
+as $$
+  update public.lead_runs set lease_until = null where id = p_run_id;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- lead_claim_rows: up to p_limit workable rows, oldest first, skipping held ones
+-- ---------------------------------------------------------------------------
+-- Ordered by (created_at, id) so a run is worked in the order it was found and
+-- two rows created in the same statement still have a stable order. A retried
+-- row reuses its provider idempotency keys, so a call that already happened is
+-- replayed by Treg at no cost rather than bought again.
+create or replace function public.lead_claim_rows(
+  p_run_id uuid,
+  p_limit integer,
+  p_stale_seconds integer default 300
+)
+returns setof public.lead_rows
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  return query
+  with picked as (
+    select r.id
+      from public.lead_rows r
+     where r.run_id = p_run_id
+       -- 'trying' too: a row left mid-step by a worker that died is only ever
+       -- in that state, and without it the run could never finish. The stale
+       -- lock below is what keeps a row another worker is on from being taken.
+       and r.state in ('queued', 'miss', 'trying')
+       and (r.locked_at is null
+            or r.locked_at < now() - make_interval(secs => greatest(30, p_stale_seconds)))
+     order by r.created_at, r.id
+     limit greatest(1, least(p_limit, 100))
+     for update skip locked
+  )
+  update public.lead_rows r
+     set locked_at = now(),
+         locked_by = 'worker'
+    from picked
+   where r.id = picked.id
+  returning r.*;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- lead_run_add_totals: add a chunk's charge and cost to the run, atomically
+-- ---------------------------------------------------------------------------
+-- An increment in SQL rather than "snapshot + amount" from the worker. The
+-- worker's copy of the run was read before it took the lease, so writing
+-- snapshot + amount overwrote whatever another worker had settled meanwhile.
+create or replace function public.lead_run_add_totals(
+  p_run_id uuid,
+  p_credits numeric,
+  p_cost_usd numeric,
+  p_chunks integer default 0
+)
+returns void
+language sql
+security definer
+set search_path = public, pg_temp
+as $
+  update public.lead_runs
+     set charged_credits = charged_credits + greatest(coalesce(p_credits, 0), 0),
+         treg_cost_usd   = treg_cost_usd + greatest(coalesce(p_cost_usd, 0), 0),
+         started_at      = coalesce(started_at, now()),
+         counters        = jsonb_set(counters, '{chunk}',
+                             to_jsonb(coalesce((counters ->> 'chunk')::integer, 0) + greatest(p_chunks, 0)))
+   where id = p_run_id;
+$;
+
+revoke execute on function public.lead_run_add_totals(uuid, numeric, numeric, integer) from public, anon, authenticated;
+grant  execute on function public.lead_run_add_totals(uuid, numeric, numeric, integer) to service_role;
+
+revoke execute on function public.lead_claim_run(uuid, integer)          from public, anon, authenticated;
+revoke execute on function public.lead_release_run(uuid)                 from public, anon, authenticated;
+revoke execute on function public.lead_claim_rows(uuid, integer, integer) from public, anon, authenticated;
+grant  execute on function public.lead_claim_run(uuid, integer)          to service_role;
+grant  execute on function public.lead_release_run(uuid)                 to service_role;
+grant  execute on function public.lead_claim_rows(uuid, integer, integer) to service_role;
+
+-- Stable paging for get_run: rows seeded in one insert share a created_at, so
+-- the id is the tiebreak and the index covers both.
+create index if not exists lead_rows_run_created_id_idx
+  on public.lead_rows (run_id, created_at, id);
+
+==============================================================================
+ 20261117_estimate_for_user.sql
+---------------------------------------------------------------------------
+
+-- ============================================================================
+-- Echo Leads: the estimate needs to know whose estimate it is
+-- ----------------------------------------------------------------------------
+-- estimate_lead_run read the user from auth.uid(). It is revoked from
+-- authenticated and only ever called by the leads function through the service
+-- role client, where auth.uid() is null - so it returned 'unauthenticated' on
+-- every call, and the start action, which refuses a run without a price, could
+-- never start one.
+--
+-- The user is now a parameter. Safe because only service_role can execute it,
+-- and the function passes the id it resolved from the caller's JWT.
+--
+-- Also two single-purpose modes for bulk actions on leads already held:
+--   phone_only   find a phone number, nothing else
+--   enrich_only  company details, nothing else
+--
+-- The four-argument version is dropped so the old, broken signature cannot be
+-- called by an older deployment of the function and silently fail.
+-- ============================================================================
+
+drop function if exists public.estimate_lead_run(integer, text, boolean, numeric);
+
+create or replace function public.estimate_lead_run(
+  p_target      integer,
+  p_mode        text default null,
+  p_phone       boolean default false,
+  p_hit_rate    numeric default null,
+  p_user        uuid default null
+)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $fn$
+declare
+  v_user        uuid := coalesce(p_user, auth.uid());
+  v_target      integer := greatest(1, least(coalesce(p_target, 50), 2000));
+  v_mode        text := nullif(trim(p_mode), '');
+  v_phone       boolean := coalesce(p_phone, false);
+
+  -- find and lab look the company and the person up. The three clean modes do
+  -- not: their rows came from the user's file with both already on them. Kept as
+  -- booleans rather than re-testing the mode string in six places, because six
+  -- places testing a mode string is how the branches drifted apart in the first
+  -- place. These four are steps.ts's StepPlan, field for field.
+  v_find_company boolean;   -- findCompany
+  v_verify_existing boolean; -- verifyExisting
+  v_find_email    boolean;   -- findEmail
+  v_enrich       boolean;   -- enrich
+
+  v_company     numeric;
+  v_person      numeric;
+  v_email       numeric;
+  v_catch_all   numeric;
+  v_verify      numeric;
+  v_phone_credit numeric;
+  v_enrich_credit numeric;
+
+  v_rate        numeric;
+  v_person_rate numeric;
+  v_enrich_rate numeric;
+  v_phone_rate  numeric;
+  v_rate_used   numeric;
+  v_person_rate_used numeric;
+  v_enrich_rate_used numeric;
+  v_phone_rate_used  numeric;
+  v_rate_source text;
+  v_person_source text;
+  v_enrich_source text;
+  v_phone_source  text;
+
+  v_attempts    integer;
+  v_hits        integer;
+
+  v_min         numeric;
+  v_expected    numeric;
+  v_max         numeric;
+  v_breakdown   jsonb;
+begin
+  if v_user is null then
+    return jsonb_build_object('ok', false, 'error', 'unauthenticated');
+  end if;
+
+  v_find_company   := v_mode is null
+                      or v_mode not in ('verify_only', 'verify_refind', 'full_enrich', 'phone_only', 'enrich_only');
+  v_verify_existing := coalesce(v_mode in ('verify_only', 'verify_refind', 'full_enrich'), false);
+  v_find_email      := v_find_company or coalesce(v_mode in ('verify_refind', 'full_enrich'), false);
+  v_enrich          := coalesce(v_mode in ('full_enrich', 'enrich_only'), false);
+  -- phone_only exists to find numbers for leads already held; the flag is the mode.
+  if v_mode = 'phone_only' then
+    v_phone := true;
+  end if;
+
+  -- Prices come from the table, never from constants here. A row that is
+  -- disabled or missing means the operation is not being sold, and the estimate
+  -- has to say so rather than quote a price nothing charges.
+  select
+    max(case when operation = 'leads.company.found'  then credits end),
+    max(case when operation = 'leads.person.found'   then credits end),
+    max(case when operation = 'leads.email.verified' then credits end),
+    max(case when operation = 'leads.email.catch_all' then credits end),
+    max(case when operation = 'leads.verify.only'     then credits end),
+    max(case when operation = 'leads.phone.found'     then credits end),
+    max(case when operation = 'leads.company.enrich'  then credits end)
+  into v_company, v_person, v_email, v_catch_all, v_verify, v_phone_credit, v_enrich_credit
+  from public.pricing_config
+  where operation in (
+    'leads.company.found', 'leads.person.found', 'leads.email.verified',
+    'leads.email.catch_all', 'leads.verify.only', 'leads.phone.found',
+    'leads.company.enrich'
+  ) and enabled;
+
+  if v_company is null or v_person is null or v_email is null or v_verify is null then
+    return jsonb_build_object('ok', false, 'error', 'leads_not_priced');
+  end if;
+
+  -- Enrichment is priced only for the mode that sells it, so a missing row there
+  -- is an error for that mode and not for any other. Refusing all three clean
+  -- modes because enrichment is unpriced would break verify_only, which never
+  -- enriches anything.
+  if v_enrich and v_enrich_credit is null then
+    return jsonb_build_object('ok', false, 'error', 'leads_not_priced');
+  end if;
+
+  select count(*), count(*) filter (where hit)
+  into v_attempts, v_hits
+  from public.lead_attempts
+  where user_id = v_user and step = 'email';
+
+  -- The caller may pin the email rate; the other steps are always measured here.
+  -- A pinned rate is for a quote being reproduced, not a way to move the others.
+  if p_hit_rate is not null then
+    v_rate       := p_hit_rate;
+    v_rate_source := 'pinned';
+  elsif coalesce(v_attempts, 0) >= 50 then
+    v_rate        := (v_hits::numeric + 1) / (v_attempts::numeric + 2);
+    v_rate_source := 'your history';
+  else
+    v_rate        := 0.7;
+    v_rate_source := 'default';
+  end if;
+
+  v_rate_used       := v_rate;
+  v_person_rate     := public.leads_step_hit_rate(v_user, 'person');
+  v_enrich_rate     := public.leads_step_hit_rate(v_user, 'enrich');
+  v_phone_rate      := public.leads_step_hit_rate(v_user, 'phone');
+  v_person_rate_used := v_person_rate;
+  v_enrich_rate_used := v_enrich_rate;
+  v_phone_rate_used  := v_phone_rate;
+  v_person_source  := case when v_person_rate = 0.7 then 'default' else 'your history' end;
+  v_enrich_source := case when v_enrich_rate = 0.7 then 'default' else 'your history' end;
+  v_phone_source  := case when v_phone_rate  = 0.7 then 'default' else 'your history' end;
+
+  -- --- totals -------------------------------------------------------------
+  -- Every line below is charged only when the work happened, which is what
+  -- creditsForRow does. The company is the exception and is charged per row
+  -- because the row exists because that company was found.
+  v_min := 0;
+  v_expected := 0;
+  v_max := 0;
+
+  -- company
+  if v_find_company then
+    v_min      := v_target * v_company;
+    v_expected := v_min;
+    -- person only. The email line below adds its own worst case, and adding it
+    -- here as well is how max_credits came back at 2.22 per row for a row whose
+    -- worst case is 1.22 - a 8200 credit over-reservation on a 2000-row search,
+    -- which refuses runs the user can afford.
+    v_max      := v_min + v_target * v_person;
+  end if;
+
+  -- decision maker
+  if v_find_company then
+    v_expected := v_expected + v_target * v_person_rate * v_person;
+  end if;
+
+  -- verification
+  if v_verify_existing then
+    v_min      := v_min + v_target * v_verify;
+    v_expected := v_expected + v_target * v_verify;
+    v_max      := v_max + v_target * v_verify;
+  end if;
+
+  -- address
+  if v_find_email then
+    v_expected := v_expected + v_target * v_rate * v_email;
+    v_max      := v_max + v_target * v_email;
+  end if;
+
+  -- enrichment
+  if v_enrich then
+    v_expected := v_expected + v_target * v_enrich_rate * v_enrich_credit;
+    v_max      := v_max + v_target * v_enrich_credit;
+  end if;
+
+  -- phone
+  if v_phone then
+    if v_phone_credit is null then
+      return jsonb_build_object('ok', false, 'error', 'leads_not_priced');
+    end if;
+    v_expected := v_expected + v_target * v_phone_rate * v_phone_credit;
+    v_max      := v_max + v_target * v_phone_credit;
+  end if;
+
+  -- --- the lines behind those totals --------------------------------------
+  -- The invariant this file exists to protect: the lines add up to
+  -- expected_credits. Built from the same conditionals as the totals above
+  -- rather than from the mode string, because the previous version tested the
+  -- mode one way for the lines and another for the total.
+  v_breakdown := '[]'::jsonb;
+
+  if v_find_company then
+    v_breakdown := v_breakdown || jsonb_build_array(
+      jsonb_build_object('label', 'Companies', 'credits', round(v_target * v_company, 6)),
+      jsonb_build_object(
+        'label', 'Decision makers',
+        'credits', round(v_target * v_person_rate_used * v_person, 6),
+        'note', 'at ' || round(v_person_rate_used * 100, 1) || '% from ' || v_person_source
+      )
+    );
+  end if;
+
+  if v_verify_existing then
+    v_breakdown := v_breakdown || jsonb_build_array(
+      jsonb_build_object('label', 'Verifications', 'credits', round(v_target * v_verify, 6))
+    );
+  end if;
+
+  if v_find_email then
+    v_breakdown := v_breakdown || jsonb_build_array(
+      jsonb_build_object(
+        'label', case when v_find_company then 'Emails found' else 'Replacements found' end,
+        'credits', round(v_target * v_rate_used * v_email, 6),
+        'note', 'at ' || round(v_rate_used * 100, 1) || '% from ' || v_rate_source
+      )
+    );
+  end if;
+
+  if v_enrich then
+    v_breakdown := v_breakdown || jsonb_build_array(
+      jsonb_build_object(
+        'label', 'Company details',
+        'credits', round(v_target * v_enrich_rate_used * v_enrich_credit, 6),
+        'note', 'at ' || round(v_enrich_rate_used * 100, 1) || '% from ' || v_enrich_source
+      )
+    );
+  end if;
+
+  if v_phone then
+    v_breakdown := v_breakdown || jsonb_build_array(
+      jsonb_build_object(
+        'label', 'Phone numbers',
+        'credits', round(v_target * v_phone_rate_used * v_phone_credit, 6),
+        'note', 'at ' || round(v_phone_rate_used * 100, 1) || '% from ' || v_phone_source
+      )
+    );
+  end if;
+
+  return jsonb_build_object(
+    'ok', true,
+    'min_credits',     round(v_min, 6),
+    'expected_credits', round(v_expected, 6),
+    'max_credits',     round(v_max, 6),
+    'target',          v_target,
+    'hit_rate',        round(v_rate_used, 4),
+    'hit_rate_source', v_rate_source,
+    'attempts_behind_hit_rate', v_attempts,
+    'breakdown',       v_breakdown
+  );
+end;
+$fn$;
+
+revoke execute on function public.estimate_lead_run(integer, text, boolean, numeric, uuid)
+  from public, anon, authenticated;
+grant  execute on function public.estimate_lead_run(integer, text, boolean, numeric, uuid)
+  to service_role;
+
+==============================================================================
+ 20261118_lead_database.sql
+---------------------------------------------------------------------------
+
+-- ============================================================================
+-- Echo Leads: a lead database, not a pile of run results
+-- ----------------------------------------------------------------------------
+-- Until now every lead lived on the run that found it. The same person found by
+-- two runs was two rows; nothing could be tagged, noted, listed or qualified;
+-- and there was nowhere for "enrich these five again" to write its answer.
+--
+-- This adds the records a sales workflow is built on:
+--
+--   lead_companies      one per workspace and domain
+--   lead_contacts       one per workspace and person, merged from run rows by
+--                       email, then LinkedIn URL, then name + domain
+--   lead_lists          people or company lists, with lead_list_members
+--   lead_saved_searches saved filter sets for the search and the database views
+--   lead_search_log     what was searched, for history
+--   lead_scoring        the workspace's scoring rules
+--
+-- Runs are unchanged: a run still owns its rows, its receipt and its charges.
+-- When a row finishes, lead_contact_upsert_from_row merges it into the contact
+-- and company it belongs to. The merge never overwrites a value with null and
+-- never replaces a checked address with an unchecked one.
+--
+-- Same tenancy as every other lead_* table: user_id on every row, RLS select-own,
+-- no client write policies - all writes go through the leads function.
+--
+-- Email statuses gain two values:
+--   unchecked   an address nothing has verified (imports, unverified finds).
+--               Previously stored as 'unknown', which also meant "a verifier
+--               tried and could not tell" - two different claims in one word.
+--   disposable  a throwaway mailbox, which verifiers report separately
+-- ============================================================================
+
+-- ---------------------------------------------------------------------------
+-- lead_rows: the new statuses, freshness, and a re-check generation
+-- ---------------------------------------------------------------------------
+alter table public.lead_rows
+  drop constraint if exists lead_rows_email_status_check;
+alter table public.lead_rows
+  add constraint lead_rows_email_status_check
+  check (email_status in ('verified', 'catch_all', 'invalid', 'unknown', 'not_found', 'unchecked', 'disposable'));
+
+alter table public.lead_rows
+  add column if not exists email_checked_at timestamptz,
+  add column if not exists email_verifier   text,
+  -- Part of every provider idempotency key, so a deliberate re-check is a new
+  -- call rather than a replay of the old answer.
+  add column if not exists generation       integer not null default 0;
+
+-- Imported addresses that nothing has ever verified were stored as 'unknown'.
+-- A row with no verify attempt at all was not checked; say so.
+update public.lead_rows r
+   set email_status = 'unchecked'
+ where r.email_status = 'unknown'
+   and not exists (
+     select 1 from public.lead_attempts a where a.row_id = r.id and a.step = 'verify'
+   );
+
+-- ---------------------------------------------------------------------------
+-- Normalisation used for matching
+-- ---------------------------------------------------------------------------
+create or replace function public.lead_norm_email(p text)
+returns text language sql immutable as $$
+  select nullif(lower(trim(p)), '');
+$$;
+
+create or replace function public.lead_norm_linkedin(p text)
+returns text language sql immutable as $$
+  -- https://www.linkedin.com/in/Jane-Doe/?x=1 -> in/jane-doe. Anything that is
+  -- not a personal profile URL does not identify a person and is null.
+  select nullif(substring(lower(trim(coalesce(p, ''))) from 'linkedin.com/(in/[^/?#]+)'), '');
+$$;
+
+create or replace function public.lead_norm_name(p text)
+returns text language sql immutable as $$
+  select nullif(regexp_replace(lower(trim(coalesce(p, ''))), '\s+', ' ', 'g'), '');
+$$;
+
+create or replace function public.lead_norm_domain(p text)
+returns text language sql immutable as $$
+  -- Idempotent: normalising a normalised value changes nothing, which the check
+  -- constraint on lead_companies.domain relies on. All whitespace, any number of
+  -- leading "www.", and any port or path are dropped.
+  select nullif(
+    regexp_replace(
+      regexp_replace(lower(regexp_replace(coalesce(p, ''), '\s+', '', 'g')), '^(https?://)?(www\.)*', ''),
+      '[/?#:].*$', ''
+    ),
+    ''
+  );
+$$;
+
+-- ---------------------------------------------------------------------------
+-- lead_companies
+-- ---------------------------------------------------------------------------
+create table if not exists public.lead_companies (
+  id           uuid primary key default gen_random_uuid(),
+  user_id      uuid not null references auth.users (id) on delete cascade,
+  domain       text not null,
+  name         text,
+  logo_url     text,
+  -- Provider-reported firmographics, normalised by endpoints.ts. `source` names
+  -- the endpoint; `enriched_at` is when it was fetched.
+  data         jsonb not null default '{}'::jsonb,
+  enriched_at  timestamptz,
+  tags         text[] not null default '{}',
+  notes        text,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  constraint lead_companies_domain_norm check (domain = public.lead_norm_domain(domain)),
+  constraint lead_companies_user_domain_key unique (user_id, domain)
+);
+
+-- ---------------------------------------------------------------------------
+-- lead_contacts
+-- ---------------------------------------------------------------------------
+create table if not exists public.lead_contacts (
+  id               uuid primary key default gen_random_uuid(),
+  user_id          uuid not null references auth.users (id) on delete cascade,
+  company_id       uuid references public.lead_companies (id) on delete set null,
+
+  person_name      text,
+  title            text,
+  linkedin_url     text,
+  location         text,
+  company_name     text,
+  domain           text,
+
+  email            text,
+  email_status     text not null default 'not_found',
+  email_checked_at timestamptz,
+  email_verifier   text,
+  email_provider   text,
+
+  phone            text,
+  phone_provider   text,
+
+  -- Matching keys, kept in step with the fields above by the upsert.
+  email_norm       text,
+  linkedin_norm    text,
+  name_norm        text,
+
+  -- Provider attributes that are not columns: seniority, department, the
+  -- LeadsForge id, the company snapshot a search returned. Never user input.
+  attributes       jsonb not null default '{}'::jsonb,
+
+  -- The user's own fields.
+  tags             text[] not null default '{}',
+  notes            text,
+  status           text not null default 'new',
+  custom           jsonb not null default '{}'::jsonb,
+
+  score            integer,
+  score_label      text,
+  score_reasons    jsonb not null default '[]'::jsonb,
+  scored_at        timestamptz,
+
+  source           text not null default 'run',
+  last_run_id      uuid references public.lead_runs (id) on delete set null,
+  last_row_id      uuid references public.lead_rows (id) on delete set null,
+  last_enriched_at timestamptz,
+
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
+
+  constraint lead_contacts_email_status_check
+    check (email_status in ('verified', 'catch_all', 'invalid', 'unknown', 'not_found', 'unchecked', 'disposable')),
+  constraint lead_contacts_email_implies_address
+    check (email_status = 'not_found' or email is not null),
+  constraint lead_contacts_status_check
+    check (status in ('new', 'qualified', 'contacted', 'nurture', 'disqualified')),
+  constraint lead_contacts_score_range check (score is null or (score between 0 and 100)),
+  constraint lead_contacts_source_check check (source in ('run', 'search', 'import')),
+  constraint lead_contacts_identity
+    check (email_norm is not null or linkedin_norm is not null or (name_norm is not null and domain is not null))
+);
+
+create index if not exists lead_contacts_user_updated_idx on public.lead_contacts (user_id, updated_at desc, id);
+create index if not exists lead_contacts_user_email_idx   on public.lead_contacts (user_id, email_norm) where email_norm is not null;
+create index if not exists lead_contacts_user_li_idx      on public.lead_contacts (user_id, linkedin_norm) where linkedin_norm is not null;
+create index if not exists lead_contacts_user_name_idx    on public.lead_contacts (user_id, name_norm, domain) where name_norm is not null;
+create index if not exists lead_contacts_user_domain_idx  on public.lead_contacts (user_id, domain);
+create index if not exists lead_contacts_user_score_idx   on public.lead_contacts (user_id, score desc nulls last);
+create index if not exists lead_contacts_company_idx      on public.lead_contacts (company_id);
+create index if not exists lead_contacts_tags_idx         on public.lead_contacts using gin (tags);
+
+-- ---------------------------------------------------------------------------
+-- Lists
+-- ---------------------------------------------------------------------------
+create table if not exists public.lead_lists (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null references auth.users (id) on delete cascade,
+  name        text not null,
+  kind        text not null default 'people',
+  description text,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now(),
+  constraint lead_lists_kind_check check (kind in ('people', 'companies')),
+  constraint lead_lists_name_len check (char_length(trim(name)) between 1 and 80),
+  constraint lead_lists_user_name_key unique (user_id, kind, name)
+);
+
+create table if not exists public.lead_list_members (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null references auth.users (id) on delete cascade,
+  list_id     uuid not null references public.lead_lists (id) on delete cascade,
+  contact_id  uuid references public.lead_contacts (id) on delete cascade,
+  company_id  uuid references public.lead_companies (id) on delete cascade,
+  added_at    timestamptz not null default now(),
+  constraint lead_list_members_one_target check ((contact_id is null) <> (company_id is null))
+);
+
+create unique index if not exists lead_list_members_contact_key on public.lead_list_members (list_id, contact_id) where contact_id is not null;
+create unique index if not exists lead_list_members_company_key on public.lead_list_members (list_id, company_id) where company_id is not null;
+create index if not exists lead_list_members_contact_idx on public.lead_list_members (contact_id);
+create index if not exists lead_list_members_company_idx on public.lead_list_members (company_id);
+
+-- ---------------------------------------------------------------------------
+-- Saved searches, search history, scoring
+-- ---------------------------------------------------------------------------
+create table if not exists public.lead_saved_searches (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null references auth.users (id) on delete cascade,
+  name        text not null,
+  -- people_search: provider filters. people_view / companies_view: database filters.
+  kind        text not null,
+  filters     jsonb not null default '{}'::jsonb,
+  last_total  integer,
+  last_run_at timestamptz,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now(),
+  constraint lead_saved_searches_kind_check check (kind in ('people_search', 'people_view', 'companies_view')),
+  constraint lead_saved_searches_name_len check (char_length(trim(name)) between 1 and 80),
+  constraint lead_saved_searches_user_name_key unique (user_id, kind, name)
+);
+
+create table if not exists public.lead_search_log (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null references auth.users (id) on delete cascade,
+  filters     jsonb not null,
+  total       integer,
+  created_at  timestamptz not null default now()
+);
+create index if not exists lead_search_log_user_idx on public.lead_search_log (user_id, created_at desc);
+
+create table if not exists public.lead_scoring (
+  user_id     uuid primary key references auth.users (id) on delete cascade,
+  rules       jsonb not null,
+  updated_at  timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------------------------
+-- RLS: select-own, no client writes
+-- ---------------------------------------------------------------------------
+alter table public.lead_companies      enable row level security;
+alter table public.lead_contacts       enable row level security;
+alter table public.lead_lists          enable row level security;
+alter table public.lead_list_members   enable row level security;
+alter table public.lead_saved_searches enable row level security;
+alter table public.lead_search_log     enable row level security;
+alter table public.lead_scoring        enable row level security;
+
+do $$
+declare t text;
+begin
+  foreach t in array array['lead_companies', 'lead_contacts', 'lead_lists', 'lead_list_members',
+                           'lead_saved_searches', 'lead_search_log', 'lead_scoring']
+  loop
+    execute format('drop policy if exists %I on public.%I', t || '_select_own', t);
+    execute format(
+      'create policy %I on public.%I for select to authenticated using ((select auth.uid()) = user_id)',
+      t || '_select_own', t
+    );
+  end loop;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- lead_company_upsert: one company per workspace and domain
+-- ---------------------------------------------------------------------------
+create or replace function public.lead_company_upsert(
+  p_user uuid, p_domain text, p_name text, p_logo text, p_data jsonb
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_domain text := public.lead_norm_domain(p_domain);
+  v_id uuid;
+  v_has_data boolean := p_data is not null and p_data <> '{}'::jsonb;
+  v_at timestamptz := nullif(p_data ->> 'enriched_at', '')::timestamptz;
+begin
+  if v_domain is null then
+    return null;
+  end if;
+
+  insert into public.lead_companies (user_id, domain, name, logo_url, data, enriched_at)
+  values (p_user, v_domain, nullif(trim(p_name), ''), nullif(trim(p_logo), ''),
+          case when v_has_data then p_data else '{}'::jsonb end,
+          case when v_has_data then coalesce(v_at, now()) end)
+  on conflict (user_id, domain) do update
+     set name     = coalesce(public.lead_companies.name, excluded.name),
+         logo_url = coalesce(public.lead_companies.logo_url, excluded.logo_url),
+         -- Newer provider data replaces older; nothing replaces data with nothing.
+         data = case
+                  when v_has_data and (public.lead_companies.enriched_at is null
+                                       or excluded.enriched_at >= public.lead_companies.enriched_at)
+                    then public.lead_companies.data || p_data
+                  else public.lead_companies.data
+                end,
+         enriched_at = case
+                  when v_has_data and (public.lead_companies.enriched_at is null
+                                       or excluded.enriched_at >= public.lead_companies.enriched_at)
+                    then excluded.enriched_at
+                  else public.lead_companies.enriched_at
+                end,
+         updated_at = now()
+  returning id into v_id;
+
+  return v_id;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- lead_contact_merge: fold one set of person fields into the workspace's record
+-- ---------------------------------------------------------------------------
+-- Matching order: an explicit contact id (a run made from saved contacts), then
+-- email, then LinkedIn URL, then name + domain. Returns the contact as jsonb with
+-- its company's data, so the caller can score it without a second read.
+create or replace function public.lead_contact_merge(p_user uuid, p_fields jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_email   text := public.lead_norm_email(p_fields ->> 'email');
+  v_li      text := public.lead_norm_linkedin(p_fields ->> 'linkedin_url');
+  v_name    text := public.lead_norm_name(p_fields ->> 'person_name');
+  v_domain  text := public.lead_norm_domain(p_fields ->> 'domain');
+  v_status  text := coalesce(nullif(p_fields ->> 'email_status', ''), 'not_found');
+  v_checked timestamptz := nullif(p_fields ->> 'email_checked_at', '')::timestamptz;
+  -- Only a real uuid is a hint. extra can carry a CSV's own "contact_id" column,
+  -- and casting "12345" would fail the merge (and the backfill with it).
+  v_hint    uuid := case
+                      when p_fields ->> 'contact_id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                        then (p_fields ->> 'contact_id')::uuid
+                    end;
+  v_company uuid;
+  v_id      uuid;
+  c         public.lead_contacts;
+  v_take_email boolean;
+begin
+  if v_email is null and v_li is null and (v_name is null or v_domain is null) then
+    return null; -- nothing that identifies a person
+  end if;
+
+  v_company := public.lead_company_upsert(p_user, v_domain, p_fields ->> 'company_name', p_fields ->> 'logo_url',
+                                          coalesce(p_fields -> 'company_data', '{}'::jsonb));
+
+  if v_hint is not null then
+    select * into c from public.lead_contacts where id = v_hint and user_id = p_user;
+  end if;
+  if c.id is null and v_email is not null then
+    select * into c from public.lead_contacts where user_id = p_user and email_norm = v_email
+      order by created_at limit 1;
+  end if;
+  if c.id is null and v_li is not null then
+    select * into c from public.lead_contacts where user_id = p_user and linkedin_norm = v_li
+      order by created_at limit 1;
+  end if;
+  if c.id is null and v_name is not null and v_domain is not null then
+    select * into c from public.lead_contacts where user_id = p_user and name_norm = v_name and domain = v_domain
+      order by created_at limit 1;
+  end if;
+
+  if c.id is null then
+    insert into public.lead_contacts (
+      user_id, company_id, person_name, title, linkedin_url, location, company_name, domain,
+      email, email_status, email_checked_at, email_verifier, email_provider, phone, phone_provider,
+      email_norm, linkedin_norm, name_norm, attributes, source, last_run_id, last_row_id, last_enriched_at
+    ) values (
+      p_user, v_company, nullif(p_fields ->> 'person_name', ''), nullif(p_fields ->> 'title', ''), nullif(p_fields ->> 'linkedin_url', ''),
+      nullif(p_fields ->> 'location', ''), nullif(p_fields ->> 'company_name', ''), v_domain,
+      case when v_email is not null then v_email end,
+      case when v_email is not null then v_status else 'not_found' end,
+      v_checked, nullif(p_fields ->> 'email_verifier', ''), nullif(p_fields ->> 'email_provider', ''),
+      nullif(p_fields ->> 'phone', ''), nullif(p_fields ->> 'phone_provider', ''),
+      v_email, v_li, v_name, coalesce(p_fields -> 'attributes', '{}'::jsonb),
+      coalesce(nullif(p_fields ->> 'source', ''), 'run'),
+      nullif(p_fields ->> 'run_id', '')::uuid, nullif(p_fields ->> 'row_id', '')::uuid,
+      case when v_checked is not null or p_fields ? 'company_data' then now() end
+    )
+    returning id into v_id;
+  else
+    -- Take the incoming address when:
+    --   none is held;
+    --   it is the same address with a newer check, i.e. a fresher verdict on it;
+    --   it is a different address a verifier accepted, replacing one that failed
+    --   or was never confirmed (or a verified one checked longer ago).
+    -- Never: an unchecked copy of the same address over a known verdict - a
+    -- phone run carries the address unchecked and must not clear "invalid" - and
+    -- never a rejected or unchecked address over a different one.
+    v_take_email := v_email is not null and (
+         c.email_norm is null
+      or (v_email = c.email_norm and v_checked is not null
+          and (c.email_checked_at is null or v_checked > c.email_checked_at))
+      or (v_email <> c.email_norm and v_status in ('verified', 'catch_all')
+          and (c.email_status not in ('verified', 'catch_all')
+               or (v_status = 'verified' and v_checked is not null
+                   and (c.email_checked_at is null or v_checked > c.email_checked_at))))
+    );
+
+    update public.lead_contacts set
+      company_id     = coalesce(v_company, company_id),
+      person_name    = coalesce(person_name, nullif(p_fields ->> 'person_name', '')),
+      title          = coalesce(nullif(p_fields ->> 'title', ''), title),
+      linkedin_url   = coalesce(linkedin_url, nullif(p_fields ->> 'linkedin_url', '')),
+      linkedin_norm  = coalesce(linkedin_norm, v_li),
+      location       = coalesce(nullif(p_fields ->> 'location', ''), location),
+      company_name   = coalesce(company_name, nullif(p_fields ->> 'company_name', '')),
+      domain         = coalesce(domain, v_domain),
+      name_norm      = coalesce(name_norm, v_name),
+      email          = case when v_take_email then v_email else email end,
+      email_norm     = case when v_take_email then v_email else email_norm end,
+      email_status   = case when v_take_email then v_status else email_status end,
+      email_checked_at = case when v_take_email then v_checked else email_checked_at end,
+      email_verifier = case when v_take_email then nullif(p_fields ->> 'email_verifier', '') else email_verifier end,
+      email_provider = case when v_take_email then coalesce(nullif(p_fields ->> 'email_provider', ''), email_provider) else email_provider end,
+      phone          = coalesce(nullif(p_fields ->> 'phone', ''), phone),
+      phone_provider = case when nullif(p_fields ->> 'phone', '') is not null then nullif(p_fields ->> 'phone_provider', '') else phone_provider end,
+      attributes     = attributes || coalesce(p_fields -> 'attributes', '{}'::jsonb),
+      last_run_id    = coalesce(nullif(p_fields ->> 'run_id', '')::uuid, last_run_id),
+      last_row_id    = coalesce(nullif(p_fields ->> 'row_id', '')::uuid, last_row_id),
+      last_enriched_at = case when v_checked is not null or p_fields ? 'company_data' then now() else last_enriched_at end,
+      updated_at     = now()
+    where id = c.id
+    returning id into v_id;
+  end if;
+
+  return (
+    select to_jsonb(ct) || jsonb_build_object('company', coalesce(to_jsonb(co.data), '{}'::jsonb))
+    from public.lead_contacts ct
+    left join public.lead_companies co on co.id = ct.company_id
+    where ct.id = v_id
+  );
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- lead_contact_upsert_from_row: what the worker calls when a row finishes
+-- ---------------------------------------------------------------------------
+create or replace function public.lead_contact_upsert_from_row(p_row_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  r public.lead_rows;
+begin
+  select * into r from public.lead_rows where id = p_row_id;
+  if r.id is null or r.state <> 'done' then
+    return null;
+  end if;
+
+  -- A row with a company and no person still records the company.
+  if r.person_name is null and r.email is null and r.linkedin_url is null then
+    perform public.lead_company_upsert(r.user_id, r.domain, r.company_name, r.logo_url, r.company_data);
+    return null;
+  end if;
+
+  return public.lead_contact_merge(r.user_id, jsonb_strip_nulls(jsonb_build_object(
+    'contact_id',       r.extra ->> 'contact_id',
+    'person_name',      r.person_name,
+    'title',            r.title,
+    'linkedin_url',     r.linkedin_url,
+    'company_name',     r.company_name,
+    'domain',           r.domain,
+    'logo_url',         r.logo_url,
+    'email',            r.email,
+    'email_status',     r.email_status,
+    'email_checked_at', r.email_checked_at,
+    'email_verifier',   r.email_verifier,
+    'email_provider',   r.email_provider,
+    'phone',            r.phone,
+    'phone_provider',   r.phone_provider,
+    'company_data',     case when r.company_data <> '{}'::jsonb then r.company_data end,
+    'attributes',       case when r.extra ? 'leadsforge_id'
+                             then jsonb_build_object('leadsforge_id', r.extra ->> 'leadsforge_id') end,
+    'source',           case when (select kind from public.lead_runs where id = r.run_id) = 'clean'
+                               and not (r.extra ? 'contact_id') then 'import' else 'run' end,
+    'run_id',           r.run_id,
+    'row_id',           r.id
+  )));
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- lead_contacts_merge: fold duplicates into one record the user chose
+-- ---------------------------------------------------------------------------
+create or replace function public.lead_contacts_merge(p_user uuid, p_keep uuid, p_drop uuid[])
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  k public.lead_contacts;
+  d public.lead_contacts;
+  n integer := 0;
+begin
+  select * into k from public.lead_contacts where id = p_keep and user_id = p_user for update;
+  if k.id is null then
+    raise exception 'keep_not_found';
+  end if;
+
+  for d in
+    select * from public.lead_contacts
+     where user_id = p_user and id = any(p_drop) and id <> p_keep
+     for update
+  loop
+    update public.lead_contacts set
+      person_name  = coalesce(person_name, d.person_name),
+      title        = coalesce(title, d.title),
+      linkedin_url = coalesce(linkedin_url, d.linkedin_url),
+      linkedin_norm = coalesce(linkedin_norm, d.linkedin_norm),
+      location     = coalesce(location, d.location),
+      company_id   = coalesce(company_id, d.company_id),
+      company_name = coalesce(company_name, d.company_name),
+      domain       = coalesce(domain, d.domain),
+      phone        = coalesce(phone, d.phone),
+      phone_provider = case when phone is null then d.phone_provider else phone_provider end,
+      -- The kept record's address wins unless it has none.
+      email        = coalesce(email, d.email),
+      email_norm   = coalesce(email_norm, d.email_norm),
+      email_status = case when email is null then d.email_status else email_status end,
+      email_checked_at = case when email is null then d.email_checked_at else email_checked_at end,
+      tags         = (select array(select distinct unnest(tags || d.tags))),
+      notes        = nullif(concat_ws(E'\n\n', notes, d.notes), ''),
+      custom       = d.custom || custom,
+      attributes   = d.attributes || attributes,
+      updated_at   = now()
+    where id = p_keep;
+
+    -- List memberships move to the kept record; a duplicate membership is dropped.
+    insert into public.lead_list_members (user_id, list_id, contact_id, added_at)
+      select user_id, list_id, p_keep, added_at
+        from public.lead_list_members
+       where contact_id = d.id
+      on conflict do nothing;
+
+    delete from public.lead_contacts where id = d.id;
+    n := n + 1;
+  end loop;
+
+  return n;
+end;
+$$;
+
+revoke execute on function public.lead_company_upsert(uuid, text, text, text, jsonb) from public, anon, authenticated;
+revoke execute on function public.lead_contact_merge(uuid, jsonb)                      from public, anon, authenticated;
+revoke execute on function public.lead_contact_upsert_from_row(uuid)                  from public, anon, authenticated;
+revoke execute on function public.lead_contacts_merge(uuid, uuid, uuid[])             from public, anon, authenticated;
+grant  execute on function public.lead_company_upsert(uuid, text, text, text, jsonb) to service_role;
+grant  execute on function public.lead_contact_merge(uuid, jsonb)                      to service_role;
+grant  execute on function public.lead_contact_upsert_from_row(uuid)                  to service_role;
+grant  execute on function public.lead_contacts_merge(uuid, uuid, uuid[])             to service_role;
+
+-- ---------------------------------------------------------------------------
+-- Backfill: every finished row into the database, oldest first
+-- ---------------------------------------------------------------------------
+do $$
+declare r record;
+begin
+  for r in select id from public.lead_rows where state = 'done' order by created_at, id loop
+    perform public.lead_contact_upsert_from_row(r.id);
+  end loop;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- lead_companies_summary: a company with what the workspace holds at it
+-- ---------------------------------------------------------------------------
+-- Read by the leads function only. A view runs as its owner and would bypass
+-- RLS, so it is revoked from every client role and always filtered by user_id.
+create or replace view public.lead_companies_summary as
+select
+  co.*,
+  count(ct.id)::integer                                                    as contacts,
+  count(ct.id) filter (where ct.email_status = 'verified')::integer         as verified_emails,
+  count(ct.id) filter (where ct.email is null)::integer                    as missing_emails,
+  count(ct.id) filter (where ct.score is not null and ct.score >= 70)::integer as strong_fits,
+  max(ct.score)                                                            as best_score
+from public.lead_companies co
+left join public.lead_contacts ct on ct.company_id = co.id
+group by co.id;
+
+revoke all on public.lead_companies_summary from public, anon, authenticated;
+grant select on public.lead_companies_summary to service_role;
+
+-- updated_at upkeep for the new tables, with the trigger function the other
+-- lead_* tables already use.
+do $$
+declare t text;
+begin
+  foreach t in array array['lead_companies', 'lead_contacts', 'lead_lists', 'lead_saved_searches']
+  loop
+    execute format('drop trigger if exists %I on public.%I', t || '_set_updated_at', t);
+    execute format(
+      'create trigger %I before update on public.%I for each row execute function public.set_updated_at()',
+      t || '_set_updated_at', t
+    );
+  end loop;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- The free people search is logged to api_usage like every other provider
+-- call, under its own operation, so its traffic shows in the margin views. It is
+-- sold at 0 credits: the provider does not charge for it either.
+-- ---------------------------------------------------------------------------
+insert into public.pricing_config
+  (operation, display_name, credits, provider_endpoint, provider_cost_usd, cost_source, cost_verified, enabled)
+values
+  ('leads.search', 'People search', 0, 'leadsforge.people.search', 0, 'catalog', false, true)
+on conflict (operation) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- One run per paid request
+-- ---------------------------------------------------------------------------
+-- Bulk actions send a request id so a double click or a retried request gets
+-- the run it already started instead of a second one. The function checks for a
+-- prior run first, but two requests arriving together both pass that check;
+-- this index is what makes the second insert fail, and the function then
+-- returns the run that won.
+create unique index if not exists lead_runs_user_request_key
+  on public.lead_runs (user_id, (options ->> 'request_id'))
+  where options ? 'request_id';
+
+==============================================================================
+ 20261119_leads_economics.sql
+---------------------------------------------------------------------------
+
+-- ============================================================================
+-- Echo Leads: what a run earned, what it cost, and what each provider costs
+-- ----------------------------------------------------------------------------
+-- v_margin_by_operation reads api_usage, and a Leads provider call carries no
+-- revenue there: Leads is charged per chunk through wallet_settle, so revenue
+-- lands on credit_ledger. Read alone, that view shows every leads.* operation as
+-- pure cost. These two views put the halves together.
+--
+--   v_leads_run_economics       one row per run
+--     credits_charged            what the wallet settled
+--     revenue_usd                recognised on the ledger at settle, FIFO from
+--                                the grants consumed - free credits are $0
+--     provider_cost_usd          the X-Treg-Cost-Micro charges recorded in
+--                                api_usage for the run, discovery included
+--     gross_profit_usd / gross_margin_pct
+--     verified_emails, emails_found, phones_found
+--     cost_per_verified_usd      provider cost / verified addresses
+--     miss_cost_usd              provider cost of attempts that found nothing
+--
+--   v_leads_endpoint_economics  one row per provider endpoint and step
+--     attempts, hits, hit_rate, provider_cost_usd, miss_cost_usd,
+--     cost_per_hit_usd - the number smart order ranks on, as measured
+--
+-- Revenue is attributed by the run_id the worker writes into the settle
+-- metadata (billing.ts). Both views are service-role only: provider cost is our
+-- number, not the customer's.
+-- ============================================================================
+
+create index if not exists idx_api_usage_leads_run
+  on public.api_usage ((metadata ->> 'run_id'))
+  where metadata ? 'run_id';
+
+create index if not exists idx_credit_ledger_leads_run
+  on public.credit_ledger ((metadata ->> 'run_id'))
+  where metadata ? 'run_id';
+
+create or replace view public.v_leads_run_economics as
+select
+  r.id                                   as run_id,
+  r.user_id,
+  r.kind,
+  r.mode,
+  r.status,
+  r.created_at,
+  r.est_credits,
+  r.max_credits,
+  r.charged_credits                      as credits_charged,
+  coalesce(rev.revenue_usd, 0)           as revenue_usd,
+  coalesce(cost.provider_cost_usd, 0)    as provider_cost_usd,
+  coalesce(rev.revenue_usd, 0) - coalesce(cost.provider_cost_usd, 0) as gross_profit_usd,
+  round(100 * (coalesce(rev.revenue_usd, 0) - coalesce(cost.provider_cost_usd, 0))
+        / nullif(rev.revenue_usd, 0), 1)  as gross_margin_pct,
+  rows_.total_rows,
+  rows_.emails_found,
+  rows_.verified_emails,
+  rows_.phones_found,
+  round(coalesce(cost.provider_cost_usd, 0) / nullif(rows_.verified_emails, 0), 6) as cost_per_verified_usd,
+  coalesce(att.miss_cost_usd, 0)         as miss_cost_usd,
+  coalesce(cost.uncertain_calls, 0)      as uncertain_calls
+from public.lead_runs r
+left join lateral (
+  select sum(l.revenue_usd) as revenue_usd
+  from public.credit_ledger l
+  where l.kind = 'usage' and l.metadata ->> 'run_id' = r.id::text
+) rev on true
+left join lateral (
+  select sum(u.provider_cost_usd) as provider_cost_usd,
+         count(*) filter (where u.outcome = 'uncertain') as uncertain_calls
+  from public.api_usage u
+  where u.metadata ->> 'run_id' = r.id::text
+) cost on true
+left join lateral (
+  select count(*)                                                    as total_rows,
+         count(*) filter (where x.email is not null)                 as emails_found,
+         count(*) filter (where x.email_status = 'verified')         as verified_emails,
+         count(*) filter (where x.phone is not null)                 as phones_found
+  from public.lead_rows x
+  where x.run_id = r.id
+) rows_ on true
+left join lateral (
+  select sum(a.cost_usd) filter (where not a.hit) as miss_cost_usd
+  from public.lead_attempts a
+  where a.run_id = r.id
+) att on true;
+
+create or replace view public.v_leads_endpoint_economics as
+select
+  a.endpoint_id,
+  a.step,
+  count(*)                                              as attempts,
+  count(*) filter (where a.hit)                         as hits,
+  round(count(*) filter (where a.hit)::numeric / nullif(count(*), 0), 4) as hit_rate,
+  coalesce(sum(a.cost_usd), 0)                          as provider_cost_usd,
+  coalesce(sum(a.cost_usd) filter (where not a.hit), 0) as miss_cost_usd,
+  round(coalesce(sum(a.cost_usd), 0) / nullif(count(*) filter (where a.hit), 0), 6) as cost_per_hit_usd,
+  max(a.created_at)                                     as last_attempt
+from public.lead_attempts a
+group by a.endpoint_id, a.step;
+
+revoke all on public.v_leads_run_economics      from public, anon, authenticated;
+revoke all on public.v_leads_endpoint_economics from public, anon, authenticated;
+grant select on public.v_leads_run_economics      to service_role;
+grant select on public.v_leads_endpoint_economics to service_role;
+
+comment on view public.v_leads_run_economics is
+  'Per Leads run: credits charged, revenue recognised at settle, measured provider cost, margin, cost per verified lead, cost of misses.';
+comment on view public.v_leads_endpoint_economics is
+  'Per provider endpoint: attempts, hits, measured cost, cost of misses, cost per hit.';

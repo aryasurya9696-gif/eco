@@ -143,7 +143,10 @@ function keepRow(r: LeadRow, opts: ExportOptions): boolean {
   if (r.state !== 'done' && r.state !== 'skipped' && r.state !== 'failed') return false;
   if (!r.email) return false;
   if (opts.verifiedOnly) return r.email_status === 'verified';
-  if (!opts.includeCatchAll && (r.email_status === 'catch_all' || r.email_status === 'unknown')) {
+  if (
+    !opts.includeCatchAll &&
+    (r.email_status === 'catch_all' || r.email_status === 'unknown' || r.email_status === 'unchecked')
+  ) {
     return false;
   }
   return true;

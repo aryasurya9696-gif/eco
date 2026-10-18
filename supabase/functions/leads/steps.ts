@@ -22,7 +22,7 @@ export type LeadStep = 'company' | 'person' | 'email' | 'verify' | 'phone' | 'en
 
 export type RunKind = 'find' | 'clean' | 'lab';
 
-export type CleanMode = 'verify_only' | 'verify_refind' | 'full_enrich';
+export type CleanMode = 'verify_only' | 'verify_refind' | 'full_enrich' | 'phone_only' | 'enrich_only';
 
 export interface StepPlan {
   /**
@@ -116,6 +116,15 @@ export function planSteps(
   // to the full waterfall means the user still gets their leads; silently doing
   // less work because of a typo in a column would be the worse failure.
   const m = (mode ?? '').trim() as CleanMode;
+
+  // Single-purpose modes for bulk actions on leads already held. Nothing is
+  // found or verified that was not asked for.
+  if (m === 'phone_only') {
+    return { ...NOTHING, findCompany: false, phone: true };
+  }
+  if (m === 'enrich_only') {
+    return { ...NOTHING, findCompany: false, enrich: true, phone: wantPhone };
+  }
 
   if (m === 'verify_only') {
     return {

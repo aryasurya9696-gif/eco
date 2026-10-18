@@ -39,6 +39,8 @@ export type LeadEmailStatus =
   | 'catch_all'
   | 'invalid'
   | 'unknown'
+  | 'unchecked'
+  | 'disposable'
   | 'not_found';
 
 /** Where a row is in the pipeline, so a reconnecting browser resumes the animation. */
@@ -54,10 +56,15 @@ export type LeadRowState =
 /** The stage that owns the row right now. */
 export type LeadStep = 'company' | 'person' | 'email' | 'verify' | 'phone' | 'enrich';
 
-export type LeadCleanMode = 'verify_only' | 'verify_refind' | 'full_enrich';
+export type LeadCleanMode = 'verify_only' | 'verify_refind' | 'full_enrich' | 'phone_only' | 'enrich_only';
 
 /** Which panel is showing inside the Leads tab. Mirrors the sub-route in the hash. */
 export type LeadsView =
+  | 'search'
+  | 'people'
+  | 'companies'
+  | 'lists'
+  | 'usage'
   | 'runs'
   | 'new'
   | 'clean'

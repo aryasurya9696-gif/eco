@@ -173,9 +173,10 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
       // Capped to the same number the estimate was priced for. The surplus is
       // reported rather than dropped quietly — a file of 5,000 becoming a run of
       // 2,000 with no mention reads as data loss.
-      const toImport = clean.rows.filter(
-        (r) => r.email || (r.person_name && r.domain) || r.company_name || r.domain,
-      );
+      // Sliced to the cap the run is priced for; the server refuses rows past it.
+      const toImport = clean.rows
+        .filter((r) => r.email || (r.person_name && r.domain) || r.company_name || r.domain)
+        .slice(0, MAX_RUN_ROWS);
 
       const started = await startRun({
         kind: 'clean',
@@ -206,7 +207,7 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
 
       for (let i = 0; i < toImport.length; i += 1000) {
         const batch = toImport.slice(i, i + 1000);
-        const res = await importRows(runId, batch as MappedRow[]);
+        const res = await importRows(runId, batch as MappedRow[], i + 1000 >= toImport.length);
         if (!res.ok) throw new Error(res.error);
         done += res.inserted;
         skipped += res.skipped;

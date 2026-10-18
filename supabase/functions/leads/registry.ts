@@ -6,39 +6,39 @@
  * in the run logic moves.
  *
  * ---------------------------------------------------------------------------
- * NOT VERIFIED — read this before trusting a single line of the price column
+ * Verified against the catalog, not yet against a live call
  * ---------------------------------------------------------------------------
- * Every entry below carries `verified: false`. These ids, parameters and prices
- * come from a catalog snapshot, and none of them has been checked against
- * catalog_get or against a real response. A `false` here is the whole point of
- * the flag: the seed prices in pricing_config are also marked cost_verified =
- * false for the same reason, and an unverified price presented as a measured one
- * is the exact failure the rest of the billing design refuses to commit.
+ * Every entry was checked on 18 Oct 2026 against the public catalog API
+ * (GET https://treg.to/catalog/endpoints/{id}): the id exists and is not
+ * superseded, and the price, cost type (per call / per hit / per row) and miss
+ * policy are the catalog's. Request shapes and response readers live in
+ * endpoints.ts, written from each entry's documented inputs and example
+ * response, and are tested against those examples.
  *
- * Two consequences while they stay unverified:
+ * What is still not verified: a real call from this codebase. No Treg token is
+ * available to the build, so the first live run is the remaining check, and
+ * pricing_config keeps cost_verified = false until api_usage shows real costs.
+ * The X-Treg-Cost-Micro header, never this table, is what is recorded as cost.
  *
- *   - `readHit` is a guess at where the answer sits in the body. It is written
- *     per endpoint from the shape each provider is documented to use, and the
- *     first real call is the only thing that confirms it. A wrong guess produces
- *     a miss, which costs nothing on a per-success provider — but on an endpoint
- *     that bills misses it would charge for a call that never looked.
- *   - `priceUsd` is what the *snapshot* said. The row cap is what actually
- *     protects the balance, because it is enforced by the provider rather than by
- *     our arithmetic.
- *
- * To verify: read each endpoint's parameters, price and response shape with
- * catalog_get, fill in `verified: true` and `verifiedAt`, and correct readHit.
+ * `readHit` is documentation only now; the readers in endpoints.ts are what run.
  */
 
-export type LeadStep = 'company' | 'person' | 'email' | 'verify' | 'phone' | 'enrich';
+export type LeadStep = 'company' | 'person' | 'email' | 'verify' | 'phone' | 'enrich' | 'search';
 
 export interface EndpointEntry {
   id: string;
   /** Short name for the chip. */
   label: string;
   step: LeadStep;
-  /** What the catalog snapshot said this costs per hit, in USD. */
+  /** The catalog price per unit (call, hit or row), in USD. */
   priceUsd: number;
+  /**
+   * The most one call can cost. Equal to priceUsd for per-call and per-hit
+   * endpoints; for endpoints billed per row returned it is the price times the
+   * page size endpoints.ts asks for. Sent as X-Treg-Route-Max-Cost and used for
+   * the row cap, because the unit price alone understates a ten-row page tenfold.
+   */
+  maxCallUsd: number;
   /**
    * True when a miss costs nothing. This is the entire economic idea behind the
    * waterfall: a lead pays only for the provider that found it, so the order runs
@@ -59,300 +59,68 @@ export interface EndpointEntry {
   verifiedAt: string | null;
 }
 
-/** Format the verified flag stamps once, so every entry reads the same way. */
-const UNVERIFIED = { verified: false, verifiedAt: null } as const;
+/**
+ * Stamped on every entry checked against the catalog on 18 Oct 2026: id exists,
+ * not superseded, price, cost type, inputs and example response read from
+ * GET https://treg.to/catalog/endpoints/{id}. Not a live call from this codebase.
+ */
+const CATALOG_2026_10_18 = { verified: true, verifiedAt: '2026-10-18' } as const;
+
+type Entry = Omit<EndpointEntry, 'verified' | 'verifiedAt' | 'maxCallUsd'> & { maxCallUsd?: number };
+const e = (x: Entry): EndpointEntry => ({ ...x, maxCallUsd: x.maxCallUsd ?? x.priceUsd, ...CATALOG_2026_10_18 });
 
 export const REGISTRY: Record<string, EndpointEntry> = {
   // --- read the site -------------------------------------------------------
-  'treg.web.extract': {
-    id: 'treg.web.extract',
-    label: 'Web',
-    step: 'company',
-    priceUsd: 0.005,
-    missIsFree: false, // routed: a miss can bill
-    freeRoute: true,
-    requires: [],
-    readHit: 'markdown',
-    ...UNVERIFIED,
-  },
-  'branddev.web.scrape': {
-    id: 'branddev.web.scrape',
-    label: 'BrandDev',
-    step: 'company',
-    priceUsd: 0.0025,
-    missIsFree: false,
-    freeRoute: false,
-    requires: [],
-    readHit: 'markdown',
-    ...UNVERIFIED,
-  },
-  'branddev.brand.retrieve': {
-    id: 'branddev.brand.retrieve',
-    label: 'BrandDev',
-    step: 'company',
-    priceUsd: 0.025,
-    missIsFree: false,
-    freeRoute: false,
-    requires: [],
-    readHit: 'brand',
-    ...UNVERIFIED,
-  },
+  // treg.web.extract is routed: misses on billing children are charged.
+  'treg.web.extract': e({ id: 'treg.web.extract', label: 'Web', step: 'company', priceUsd: 0.005, missIsFree: false, freeRoute: false, requires: [], readHit: 'markdown' }),
+  'branddev.web.scrape': e({ id: 'branddev.web.scrape', label: 'BrandDev', step: 'company', priceUsd: 0.002534, missIsFree: true, freeRoute: false, requires: [], readHit: 'markdown' }),
+  'branddev.brand.retrieve': e({ id: 'branddev.brand.retrieve', label: 'BrandDev', step: 'company', priceUsd: 0.0253, missIsFree: false, freeRoute: false, requires: [], readHit: 'brand' }),
 
-  // --- free counts, shown before anything is spent -------------------------
-  'icypeas.companies.search.count': {
-    id: 'icypeas.companies.search.count',
-    label: 'Icypeas',
-    step: 'company',
-    priceUsd: 0,
-    missIsFree: true,
-    freeRoute: true,
-    requires: [],
-    readHit: 'count',
-    ...UNVERIFIED,
-  },
-  'companyenrich.companies.search.count': {
-    id: 'companyenrich.companies.search.count',
-    label: 'CompanyEnrich',
-    step: 'company',
-    priceUsd: 0,
-    missIsFree: true,
-    freeRoute: true,
-    requires: [],
-    readHit: 'count',
-    ...UNVERIFIED,
-  },
-  'icypeas.people.search.count': {
-    id: 'icypeas.people.search.count',
-    label: 'Icypeas',
-    step: 'person',
-    priceUsd: 0,
-    missIsFree: true,
-    freeRoute: true,
-    requires: [],
-    readHit: 'count',
-    ...UNVERIFIED,
-  },
+  // --- free counts and the free people search ------------------------------
+  'icypeas.companies.search.count': e({ id: 'icypeas.companies.search.count', label: 'Icypeas', step: 'company', priceUsd: 0, missIsFree: true, freeRoute: true, requires: [], readHit: 'total' }),
+  'companyenrich.companies.search.count': e({ id: 'companyenrich.companies.search.count', label: 'CompanyEnrich', step: 'company', priceUsd: 0, missIsFree: true, freeRoute: true, requires: [], readHit: 'total' }),
+  'icypeas.people.search.count': e({ id: 'icypeas.people.search.count', label: 'Icypeas', step: 'person', priceUsd: 0, missIsFree: true, freeRoute: true, requires: [], readHit: 'total' }),
+  'leadsforge.people.search': e({ id: 'leadsforge.people.search', label: 'LeadsForge', step: 'search', priceUsd: 0, missIsFree: true, freeRoute: true, requires: [], readHit: 'leads' }),
+  'leadsforge.people.search.count': e({ id: 'leadsforge.people.search.count', label: 'LeadsForge', step: 'search', priceUsd: 0, missIsFree: true, freeRoute: true, requires: [], readHit: 'totalCount' }),
 
   // --- companies -----------------------------------------------------------
-  'tomba.companies.search.reveal': {
-    id: 'tomba.companies.search.reveal',
-    label: 'Tomba',
-    step: 'company',
-    priceUsd: 0.000178,
-    missIsFree: false,
-    freeRoute: false,
-    requires: [],
-    readHit: 'companies',
-    ...UNVERIFIED,
-  },
-  'icypeas.companies.search': {
-    id: 'icypeas.companies.search',
-    label: 'Icypeas',
-    step: 'company',
-    priceUsd: 0.00038,
-    missIsFree: false,
-    freeRoute: false,
-    requires: [],
-    readHit: 'companies',
-    ...UNVERIFIED,
-  },
-  'crustdata.companies.identify': {
-    id: 'crustdata.companies.identify',
-    label: 'Crustdata',
-    step: 'company',
-    priceUsd: 0,
-    missIsFree: true,
-    freeRoute: true,
-    requires: ['company'],
-    readHit: 'domain',
-    ...UNVERIFIED,
-  },
+  // Tomba bills one call for up to 50 rows; icypeas bills per row returned.
+  'tomba.companies.search.reveal': e({ id: 'tomba.companies.search.reveal', label: 'Tomba', step: 'company', priceUsd: 0.000178, missIsFree: false, freeRoute: false, requires: [], readHit: 'data.companies' }),
+  'icypeas.companies.search': e({ id: 'icypeas.companies.search', label: 'Icypeas', step: 'company', priceUsd: 0.00038, maxCallUsd: 0.00038 * 200, missIsFree: true, freeRoute: false, requires: [], readHit: 'leads' }),
+  'crustdata.companies.identify': e({ id: 'crustdata.companies.identify', label: 'Crustdata', step: 'company', priceUsd: 0, missIsFree: true, freeRoute: true, requires: ['company'], readHit: 'matches' }),
 
-  // --- decision makers ------------------------------------------------------
-  'icypeas.people.search': {
-    id: 'icypeas.people.search',
-    label: 'Icypeas',
-    step: 'person',
-    priceUsd: 0.00038,
-    missIsFree: false,
-    freeRoute: false,
-    requires: ['domain'],
-    readHit: 'people',
-    ...UNVERIFIED,
-  },
-  'findymail.search.employees': {
-    id: 'findymail.search.employees',
-    label: 'Findymail',
-    step: 'person',
-    priceUsd: 0.0198,
-    missIsFree: false,
-    freeRoute: false,
-    requires: ['domain'],
-    readHit: 'people',
-    ...UNVERIFIED,
-  },
-  'leadmagic.people.search': {
-    id: 'leadmagic.people.search',
-    label: 'LeadMagic',
-    step: 'person',
-    priceUsd: 0.025,
-    missIsFree: false,
-    freeRoute: false,
-    requires: ['domain'],
-    readHit: 'people',
-    ...UNVERIFIED,
-  },
+  // --- decision makers (per person returned; page sizes set in endpoints.ts)
+  'icypeas.people.search': e({ id: 'icypeas.people.search', label: 'Icypeas', step: 'person', priceUsd: 0.00038, maxCallUsd: 0.00038 * 10, missIsFree: true, freeRoute: false, requires: ['domain'], readHit: 'leads' }),
+  'findymail.search.employees': e({ id: 'findymail.search.employees', label: 'Findymail', step: 'person', priceUsd: 0.0198, missIsFree: true, freeRoute: false, requires: ['domain'], readHit: '[]' }),
+  'leadmagic.people.search': e({ id: 'leadmagic.people.search', label: 'LeadMagic', step: 'person', priceUsd: 0.025, maxCallUsd: 0.025 * 3, missIsFree: true, freeRoute: false, requires: ['domain'], readHit: 'people' }),
 
-  // --- the email waterfall, cheapest first --------------------------------
-  'quickenrich.people.email.find': {
-    id: 'quickenrich.people.email.find',
-    label: 'QuickEnrich',
-    step: 'email',
-    priceUsd: 0.0048,
-    missIsFree: true,
-    freeRoute: false,
-    requires: ['full_name'],
-    readHit: 'email',
-    ...UNVERIFIED,
-  },
-  'trykitt.people.email.find': {
-    id: 'trykitt.people.email.find',
-    label: 'Kitt',
-    step: 'email',
-    priceUsd: 0.005,
-    missIsFree: true,
-    freeRoute: false,
-    requires: ['full_name', 'domain'],
-    readHit: 'email',
-    ...UNVERIFIED,
-  },
-  'aiark.people.email.find': {
-    id: 'aiark.people.email.find',
-    label: 'AI Ark',
-    step: 'email',
-    priceUsd: 0.0053,
-    missIsFree: true,
-    freeRoute: false,
-    requires: ['linkedin_url'],
-    readHit: 'email',
-    ...UNVERIFIED,
-  },
-  'tomba.people.email.find': {
-    id: 'tomba.people.email.find',
-    label: 'Tomba',
-    step: 'email',
-    priceUsd: 0.0089,
-    missIsFree: true,
-    freeRoute: false,
-    requires: ['full_name', 'domain'],
-    readHit: 'email',
-    ...UNVERIFIED,
-  },
-  'leadsforge.people.email.find': {
-    id: 'leadsforge.people.email.find',
-    label: 'LeadsForge',
-    step: 'email',
-    priceUsd: 0.0245,
-    missIsFree: true,
-    freeRoute: false,
-    requires: [],
-    readHit: 'email',
-    ...UNVERIFIED,
-  },
+  // --- the email waterfall, cheapest first; every miss is free ------------
+  'quickenrich.people.email.find': e({ id: 'quickenrich.people.email.find', label: 'QuickEnrich', step: 'email', priceUsd: 0.004834, missIsFree: true, freeRoute: false, requires: [], readHit: 'data.email' }),
+  'trykitt.people.email.find': e({ id: 'trykitt.people.email.find', label: 'Kitt', step: 'email', priceUsd: 0.005, missIsFree: true, freeRoute: false, requires: ['full_name', 'domain'], readHit: 'email' }),
+  'aiark.people.email.find': e({ id: 'aiark.people.email.find', label: 'AI Ark', step: 'email', priceUsd: 0.005267, missIsFree: true, freeRoute: false, requires: ['linkedin_url'], readHit: 'data.email.output' }),
+  'tomba.people.email.find': e({ id: 'tomba.people.email.find', label: 'Tomba', step: 'email', priceUsd: 0.0089, missIsFree: true, freeRoute: false, requires: ['full_name', 'domain'], readHit: 'data.email' }),
+  'leadsforge.people.email.find': e({ id: 'leadsforge.people.email.find', label: 'LeadsForge', step: 'email', priceUsd: 0.0245, missIsFree: true, freeRoute: false, requires: [], readHit: 'email' }),
 
   // --- verification --------------------------------------------------------
-  'contactout.people.email.verify': {
-    id: 'contactout.people.email.verify',
-    label: 'ContactOut',
-    step: 'verify',
-    priceUsd: 0,
-    missIsFree: true,
-    freeRoute: true,
-    requires: ['email'],
-    readHit: 'verdict',
-    ...UNVERIFIED,
-  },
-  'trykitt.people.email.verify': {
-    id: 'trykitt.people.email.verify',
-    label: 'Kitt',
-    step: 'verify',
-    priceUsd: 0.0015,
-    missIsFree: false,
-    freeRoute: false,
-    requires: ['email'],
-    readHit: 'verdict',
-    ...UNVERIFIED,
-  },
-  'millionverifier.people.email.verify': {
-    id: 'millionverifier.people.email.verify',
-    label: 'MillionVerifier',
-    step: 'verify',
-    priceUsd: 0.00178,
-    missIsFree: false,
-    freeRoute: false,
-    requires: ['email'],
-    readHit: 'verdict',
-    ...UNVERIFIED,
-  },
+  // Kitt bills every completed check, invalid included. MillionVerifier bills
+  // a definite answer and refunds unknown / catch-all.
+  'contactout.people.email.verify': e({ id: 'contactout.people.email.verify', label: 'ContactOut', step: 'verify', priceUsd: 0, missIsFree: true, freeRoute: true, requires: ['email'], readHit: 'data.status' }),
+  'trykitt.people.email.verify': e({ id: 'trykitt.people.email.verify', label: 'Kitt', step: 'verify', priceUsd: 0.0015, missIsFree: false, freeRoute: false, requires: ['email'], readHit: 'validity' }),
+  'millionverifier.people.email.verify': e({ id: 'millionverifier.people.email.verify', label: 'MillionVerifier', step: 'verify', priceUsd: 0.00178, missIsFree: false, freeRoute: false, requires: ['email'], readHit: 'result' }),
 
-  // --- phone, opt-in only --------------------------------------------------
-  'aiark.people.phone.find': {
-    id: 'aiark.people.phone.find',
-    label: 'AI Ark',
-    step: 'phone',
-    priceUsd: 0.026,
-    missIsFree: false,
-    freeRoute: false,
-    requires: [],
-    readHit: 'phone',
-    ...UNVERIFIED,
-  },
-  'dropleads.people.phone.find': {
-    id: 'dropleads.people.phone.find',
-    label: 'Dropleads',
-    step: 'phone',
-    priceUsd: 0.054,
-    missIsFree: false,
-    freeRoute: false,
-    requires: [],
-    readHit: 'phone',
-    ...UNVERIFIED,
-  },
-  'leadmagic.people.phone.find': {
-    id: 'leadmagic.people.phone.find',
-    label: 'LeadMagic',
-    step: 'phone',
-    priceUsd: 0.125,
-    missIsFree: false,
-    freeRoute: false,
-    requires: [],
-    readHit: 'phone',
-    ...UNVERIFIED,
-  },
-  'hlrlookup.people.phone.network': {
-    id: 'hlrlookup.people.phone.network',
-    label: 'HLR Lookup',
-    step: 'phone',
-    priceUsd: 0.0033,
-    missIsFree: false,
-    freeRoute: false,
-    requires: ['phone'],
-    readHit: 'live',
-    ...UNVERIFIED,
-  },
+  // --- phone, opt-in only; every finder below bills only a found number ---
+  'blitzapi.people.phone.find': e({ id: 'blitzapi.people.phone.find', label: 'BlitzAPI', step: 'phone', priceUsd: 0.000495, missIsFree: true, freeRoute: false, requires: ['linkedin_url'], readHit: 'phone' }),
+  'quickenrich.people.phone.find': e({ id: 'quickenrich.people.phone.find', label: 'QuickEnrich', step: 'phone', priceUsd: 0.004834, missIsFree: true, freeRoute: false, requires: [], readHit: 'data.employee_phone' }),
+  'aiark.people.phone.find': e({ id: 'aiark.people.phone.find', label: 'AI Ark', step: 'phone', priceUsd: 0.026335, missIsFree: true, freeRoute: false, requires: [], readHit: 'data.data' }),
+  'dropleads.people.phone.find': e({ id: 'dropleads.people.phone.find', label: 'Dropleads', step: 'phone', priceUsd: 0.054, missIsFree: true, freeRoute: false, requires: ['linkedin_url'], readHit: 'mobile_number' }),
+  'leadmagic.people.phone.find': e({ id: 'leadmagic.people.phone.find', label: 'LeadMagic', step: 'phone', priceUsd: 0.125, missIsFree: true, freeRoute: false, requires: [], readHit: 'mobile_number' }),
+  // A line-status check on a number already held, not a finder. Kept out of the
+  // phone chain: at the end of it, it could only ever be skipped (a row with no
+  // phone cannot supply one).
+  'hlrlookup.people.phone.network': e({ id: 'hlrlookup.people.phone.network', label: 'HLR Lookup', step: 'phone', priceUsd: 0.003304, missIsFree: true, freeRoute: false, requires: ['phone'], readHit: 'results' }),
 
   // --- company data, on demand --------------------------------------------
-  'prospeo.companies.enrich': {
-    id: 'prospeo.companies.enrich',
-    label: 'Prospeo',
-    step: 'enrich',
-    priceUsd: 0.0245,
-    missIsFree: false,
-    freeRoute: false,
-    requires: ['domain'],
-    readHit: 'company',
-    ...UNVERIFIED,
-  },
+  'prospeo.companies.enrich': e({ id: 'prospeo.companies.enrich', label: 'Prospeo', step: 'enrich', priceUsd: 0.0245, missIsFree: true, freeRoute: false, requires: [], readHit: 'company' }),
 };
 
 // ---------------------------------------------------------------------------
@@ -377,8 +145,15 @@ export const DEFAULT_ORDER: Record<LeadStep, string[]> = {
     'trykitt.people.email.verify',
     'millionverifier.people.email.verify',
   ],
-  phone: ['aiark.people.phone.find', 'dropleads.people.phone.find', 'leadmagic.people.phone.find', 'hlrlookup.people.phone.network'],
+  phone: [
+    'blitzapi.people.phone.find',
+    'quickenrich.people.phone.find',
+    'aiark.people.phone.find',
+    'dropleads.people.phone.find',
+    'leadmagic.people.phone.find',
+  ],
   enrich: ['prospeo.companies.enrich'],
+  search: [],
 };
 
 /**

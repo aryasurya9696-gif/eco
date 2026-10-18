@@ -23,7 +23,7 @@
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { tregCallWithRetry, tregConfig, resolveToken, type TregConfig } from './treg.ts';
-import { orderFor, canRunWith, REGISTRY, DEFAULT_ORDER, type LeadStep } from './registry.ts';
+import { orderFor, REGISTRY, DEFAULT_ORDER, type LeadStep, type EndpointEntry } from './registry.ts';
 import {
   reserveChunk,
   settleChunk,
@@ -33,9 +33,25 @@ import {
 } from './billing.ts';
 import { planSteps, shouldFindEmail, worstCasePerRow, shouldDiscover } from './steps.ts';
 import { creditsForRow, round6 } from './pricing-row.ts';
-import { readEmail, readVerdict, type Verdict } from './read-response.ts';
 import { foldAttempts } from './attribution.ts';
-import { readPeople, readPhone, readCompanyRecord, type PersonHit } from './read-lists.ts';
+import {
+  emailFindRequest,
+  readEmailHit,
+  verifyRequest,
+  readVerifyVerdict,
+  phoneRequest,
+  readPhoneHit,
+  companyEnrichRequest,
+  readCompanyEnrich,
+  personAtCompanyRequest,
+  readPeopleAtCompany,
+  type CallShape,
+  type EmailHit,
+  type PersonHit,
+  type RowInput,
+  type Verdict,
+  statusFor,
+} from './endpoints.ts';
 import { scoreTitle, describeChoice } from './choose-person.ts';
 import {
   discoverCompanies,
@@ -46,6 +62,7 @@ import {
   type DiscoveryAttempt,
 } from './discover.ts';
 import { billingOutcome, errorCodeFor } from './api-usage.ts';
+import * as ws from './workspace.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? '';
 const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
@@ -155,6 +172,23 @@ function admin() {
   return createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 }
 
+/** Steps whose provider order a user can see and change. */
+const ORDERABLE_STEPS: LeadStep[] = ['company', 'person', 'email', 'verify', 'phone', 'enrich'];
+
+/** Actions that can start paid work. */
+const PAID_ACTIONS = new Set(['start', 'resume', 'bulk', 'enrich_start', 'import']);
+/** Actions that call a provider for free. */
+const SEARCH_ACTIONS = new Set(['search_people', 'search_count', 'filter_values']);
+
+/** What workspace.ts needs from this module, without importing it. */
+function wsCtx(db: any): ws.WorkspaceCtx {
+  return {
+    tregCfg: async () => tregConfig({ user: 'search' }, await resolveToken(db)),
+    createRun: (userId, o) => createRun(db, userId, o),
+    kickWorker,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -197,9 +231,13 @@ Deno.serve(async (req) => {
   const userId = await requireUserId(req);
   if (!userId) return fail('Unauthorized', 401);
 
-  // 60 leads calls / hour / user. Generous enough for a provider lab and a clean,
-  // tight enough that a leaked session cannot run the wallet dry.
-  if (!rateLimit('leads:' + userId, 60, 60 * 60 * 1000)) {
+  // Three tiers. Anything that can start paid work: 60 an hour, so a leaked
+  // session cannot run the wallet dry. Provider searches (free, but upstream
+  // traffic): 300. Database reads and edits: 2000 - the old flat 60 was used up
+  // by a few minutes of filtering a table.
+  const tier = PAID_ACTIONS.has(action) ? 'paid' : SEARCH_ACTIONS.has(action) ? 'search' : 'read';
+  const limit = tier === 'paid' ? 60 : tier === 'search' ? 300 : 2000;
+  if (!rateLimit(`leads:${tier}:` + userId, limit, 60 * 60 * 1000)) {
     return fail('Too many requests. Please try again later.', 429);
   }
 
@@ -226,6 +264,7 @@ Deno.serve(async (req) => {
           p_mode: asString(body?.mode, 40) || null,
           p_phone: asBool(body?.phone),
           p_hit_rate: body?.hit_rate == null ? null : num(body?.hit_rate, 0.7),
+          p_user: userId,
         });
         if (error) throw error;
         // Nested: the database owns the number and the client reads it whole.
@@ -299,6 +338,8 @@ Deno.serve(async (req) => {
 
       case 'waterfall_get': {
         const step = asString(body?.step, 20) as LeadStep;
+        // 'search' is a registry grouping, not a waterfall step with an order.
+        if (!ORDERABLE_STEPS.includes(step)) return fail('Unknown step');
         const { data, error } = await db
           .from('lead_waterfall_orders')
           .select('step, endpoint_ids, mode')
@@ -329,6 +370,8 @@ Deno.serve(async (req) => {
 
       case 'waterfall_put': {
         const step = asString(body?.step, 20) as LeadStep;
+        // 'search' is a registry grouping, not a waterfall step with an order.
+        if (!ORDERABLE_STEPS.includes(step)) return fail('Unknown step');
         const ids = Array.isArray(body?.endpoint_ids)
           ? body.endpoint_ids.filter((x: unknown) => typeof x === 'string').map(String)
           : [];
@@ -357,6 +400,71 @@ Deno.serve(async (req) => {
 
       case 'bulk':
         return json(await bulkAction(db, userId, body));
+
+      // ---- search (free provider calls) ------------------------------------
+      case 'search_people':
+        return json(await ws.searchPeople(db, wsCtx(db), userId, body));
+      case 'search_count':
+        return json(await ws.countPeople(db, wsCtx(db), userId, body));
+      case 'filter_values':
+        return json(await ws.filterValues(db, wsCtx(db), body));
+      case 'search_save':
+        return json(await ws.saveSearchResults(db, userId, body));
+      case 'search_history':
+        return json(await ws.searchHistory(db, userId));
+
+      // ---- the lead database ----------------------------------------------
+      case 'contacts_query':
+        return json(await ws.queryContacts(db, userId, body));
+      case 'contact_get':
+        return json(await ws.getContact(db, userId, body));
+      case 'contacts_update':
+        return json(await ws.updateContacts(db, userId, body));
+      case 'contacts_delete':
+        return json(await ws.deleteContacts(db, userId, body));
+      case 'duplicates':
+        return json(await ws.findDuplicates(db, userId));
+      case 'contacts_merge':
+        return json(await ws.mergeContacts(db, userId, body));
+      case 'companies_query':
+        return json(await ws.queryCompanies(db, userId, body));
+      case 'company_get':
+        return json(await ws.getCompany(db, userId, body));
+      case 'companies_update':
+        return json(await ws.updateCompanies(db, userId, body));
+
+      case 'lists':
+        return json(await ws.listLists(db, userId));
+      case 'list_create':
+        return json(await ws.createList(db, userId, body));
+      case 'list_update':
+        return json(await ws.updateList(db, userId, body));
+      case 'list_delete':
+        return json(await ws.deleteList(db, userId, body));
+      case 'list_add':
+        return json(await ws.listMembers(db, userId, body, false));
+      case 'list_remove':
+        return json(await ws.listMembers(db, userId, body, true));
+
+      case 'saved_searches':
+        return json(await ws.listSavedSearches(db, userId, body));
+      case 'saved_search_save':
+        return json(await ws.saveSearch(db, userId, body));
+      case 'saved_search_delete':
+        return json(await ws.deleteSavedSearch(db, userId, body));
+
+      case 'scoring_get':
+        return json(await ws.getScoring(db, userId));
+      case 'scoring_put':
+        return json(await ws.putScoring(db, userId, body));
+
+      case 'enrich_estimate':
+        return json(await ws.enrichEstimate(db, userId, body));
+      case 'enrich_start':
+        return json(await ws.enrichStart(db, wsCtx(db), userId, body));
+
+      case 'usage':
+        return json(await ws.usageSummary(db, userId, body));
 
       default:
         return fail('Unknown action', 400);
@@ -405,11 +513,14 @@ async function getRun(db: any, userId: string, body: any) {
   const { data: rows, error: rowsErr } = await db
     .from('lead_rows')
     .select(
-      'id, company_name, domain, logo_url, person_name, title, linkedin_url, email, email_status, email_provider, phone, phone_provider, credits, state, step, current_provider, company_data, extra',
+      'id, company_name, domain, logo_url, person_name, title, linkedin_url, email, email_status, email_provider, email_checked_at, email_verifier, phone, phone_provider, credits, state, step, current_provider, company_data, extra, updated_at',
     )
     .eq('user_id', userId)
     .eq('run_id', runId)
+    // Rows seeded by one insert share a created_at; without the id the pages
+    // could repeat or skip rows.
     .order('created_at', { ascending: true })
+    .order('id', { ascending: true })
     .range(offset, offset + limit - 1);
 
   if (rowsErr) throw rowsErr;
@@ -714,13 +825,71 @@ async function startRun(db: any, userId: string, body: any) {
   const kind = ['find', 'clean', 'lab'].includes(body?.kind) ? body.kind : 'find';
   const target = Math.max(1, Math.min(2000, num(body?.target, 50)));
 
-  // No run starts without a price on screen. The estimate is recomputed here
-  // rather than trusted from the client, so what was shown and what is checked
-  // are the same call against the same prices.
+  // The titles this run is chasing, snapshotted onto the run so editing the
+  // profile mid-run does not change what the remaining rows look for.
+  //
+  // Scoped to the caller. This read used the service role with no user filter,
+  // so any ICP id - including another workspace's - was accepted, its titles
+  // copied onto the run, and its segment searched with this user's credits.
+  let targetTitles: string[] = [];
+  let icpId: string | null = null;
+  if (body?.icp_id != null) {
+    if (!isUuid(body.icp_id)) return { ok: false, error: 'bad_icp_id' };
+    const { data: icp } = await db
+      .from('lead_icps')
+      .select('id, json')
+      .eq('user_id', userId)
+      .eq('id', body.icp_id)
+      .maybeSingle();
+    if (!icp) return { ok: false, error: 'icp_not_found' };
+    icpId = icp.id;
+    const seg = primarySegmentOf(icp.json);
+    targetTitles = (seg?.targetTitles ?? []).filter((t: unknown) => typeof t === 'string' && String(t).trim() !== '');
+  }
+
+  return createRun(db, userId, {
+    kind,
+    target,
+    mode: asString(body?.mode, 40) || null,
+    phone: asBool(body?.phone),
+    icpId,
+    name: asString(body?.name, 120) || null,
+    rowCapUsd: body?.row_cap_usd,
+    targetTitles,
+    // A clean run's rows arrive after it is created, in batches. Held until the
+    // last batch is in, or the worker finds an empty run and finishes it.
+    hold: kind === 'clean' ? 'importing' : null,
+  });
+}
+
+/**
+ * Prices a run, checks the wallet can cover its worst case, creates it, and
+ * starts the worker unless the run is being held for rows still to arrive.
+ */
+async function createRun(
+  db: any,
+  userId: string,
+  o: {
+    kind: string;
+    target: number;
+    mode: string | null;
+    phone: boolean;
+    icpId: string | null;
+    name: string | null;
+    rowCapUsd?: unknown;
+    targetTitles?: string[];
+    hold: string | null;
+    extraOptions?: Record<string, unknown>;
+  },
+) {
+  // No run starts without a price on screen, recomputed here rather than
+  // trusted from the client.
   const { data: est, error: estErr } = await db.rpc('estimate_lead_run', {
-    p_target: target,
-    p_mode: asString(body?.mode, 40) || null,
-    p_phone: asBool(body?.phone),
+    p_target: o.target,
+    p_mode: o.mode,
+    p_phone: o.phone,
+    p_hit_rate: null,
+    p_user: userId,
   });
   if (estErr) throw estErr;
   if (!est || (est as any).ok !== true) {
@@ -729,23 +898,8 @@ async function startRun(db: any, userId: string, body: any) {
 
   const maxCredits = num((est as any).max_credits);
 
-  // The titles this run is chasing, snapshotted onto the run.
-  //
-  // The people waterfall needs them once per row, and reading them from the ICP
-  // each time would be one query per row for a value that cannot change while the
-  // run is going. Snapshotting also fixes the meaning: a run chases the profile
-  // as it was when they pressed the button, so editing the profile mid-run does
-  // not quietly change what the remaining rows are looking for - which would
-  // leave a run that is half one search and half another.
-  let targetTitles: string[] = [];
-  if (isUuid(body?.icp_id)) {
-    const { data: icp } = await db.from('lead_icps').select('json').eq('id', body.icp_id).maybeSingle();
-    const seg = primarySegmentOf(icp?.json);
-    targetTitles = (seg?.targetTitles ?? []).filter((t: unknown) => typeof t === 'string' && String(t).trim() !== '');
-  }
-
-  // Can they actually pay the worst case? A run that cannot be paid for in full
-  // must not start, which is why this is checked against max and not expected.
+  // A run that cannot be paid for in full must not start, so this is checked
+  // against the maximum, not the expected figure.
   const { data: wallet } = await db
     .from('wallet')
     .select('balance, reserved')
@@ -757,51 +911,73 @@ async function startRun(db: any, userId: string, body: any) {
     return {
       ok: false,
       error: 'insufficient_credits',
-      shortfall: Math.round((maxCredits - available) * 1e6) / 1e6,
+      available: round6(available),
+      shortfall: round6(maxCredits - available),
       max_credits: maxCredits,
-      message: 'Not enough credits for the worst case. Top up to run this search.',
+      message: 'Not enough credits for the worst case. Top up to run this.',
     };
   }
+
+  const phone = o.phone || o.mode === 'phone_only';
+  // Clamped server-side; see rowCapOf.
+  const cap = Math.min(0.5, Math.max(0.01, num(o.rowCapUsd, phone ? 0.25 : 0.05)));
 
   const { data: run, error } = await db
     .from('lead_runs')
     .insert({
       user_id: userId,
-      icp_id: isUuid(body?.icp_id) ? body.icp_id : null,
-      name: asString(body?.name, 120) || null,
-      kind,
-      target,
-      mode: asString(body?.mode, 40) || null,
+      icp_id: o.icpId,
+      name: o.name,
+      kind: o.kind,
+      target: o.target,
+      mode: o.mode,
       options: {
-        phone: asBool(body?.phone),
-        company_data: asBool(body?.company_data),
-        row_cap_usd: num(body?.row_cap_usd, 0.05),
-        target_titles: targetTitles,
+        phone,
+        row_cap_usd: cap,
+        target_titles: o.targetTitles ?? [],
+        ...(o.extraOptions ?? {}),
       },
-      status: 'queued',
+      status: o.hold ? 'paused' : 'queued',
+      pause_reason: o.hold,
       est_credits: num((est as any).expected_credits),
       max_credits: maxCredits,
     })
     .select('*')
     .single();
 
-  if (error) throw error;
+  if (error) {
+    // The same paid request arriving twice at once: the unique index on the
+    // request id refused the second insert, so return the run the first made.
+    const requestId = o.extraOptions?.request_id;
+    if (error.code === '23505' && typeof requestId === 'string') {
+      const { data: prior } = await db
+        .from('lead_runs')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('options->>request_id', requestId)
+        .maybeSingle();
+      if (prior) return { ok: true, run: prior, replayed: true };
+    }
+    throw error;
+  }
 
-  // The worker is kicked without awaiting it. A find run has no rows yet, so the
-  // first chunk has to make them; the cron safety net would otherwise leave the
-  // user looking at a queued run for up to a minute after pressing the button.
+  if (!o.hold) kickWorker(run.id);
+
+  return { ok: true, run, estimate: est };
+}
+
+/** Starts a chunk now rather than at the next cron tick. Not awaited. */
+function kickWorker(runId: string): void {
   void fetch(SUPABASE_URL + '/functions/v1/leads', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'x-leads-worker-secret': WORKER_SECRET ?? '',
     },
-    body: JSON.stringify({ action: 'work', run_id: run.id }),
+    body: JSON.stringify({ action: 'work', run_id: runId }),
   }).catch(() => {
     /* the cron tick picks it up */
   });
-
-  return { ok: true, run, estimate: est };
 }
 
 async function controlRun(db: any, userId: string, action: string, body: any) {
@@ -843,7 +1019,6 @@ async function controlRun(db: any, userId: string, action: string, body: any) {
 
 const CHUNK_ROWS = 5;
 const TIME_BUDGET_MS = 50_000;
-const CLAIM_ROWS = 25;
 
 /**
  * Processes runs in chunks, spending from a held balance.
@@ -1048,13 +1223,20 @@ async function workRun(db: any, body: any) {
     };
   }
 
-  const { data: runs, error } = await db
+  // Queued and running, both. This used to filter `.eq('status', 'queued')` on
+  // top of the `.in(...)`, and the first chunk sets a run to 'running' - so every
+  // run worked exactly one chunk of five rows and was never selected again. A
+  // paused run is never worked: pausing is the user's decision and only resume
+  // (which re-queues) undoes it.
+  let query = db
     .from('lead_runs')
     .select('*')
-    .in('status', body?.run_id ? ['queued', 'running', 'paused'] : ['queued', 'running'])
-    .eq('status', 'queued')
+    .in('status', ['queued', 'running'])
     .order('created_at', { ascending: true })
     .limit(5);
+  if (isUuid(body?.run_id)) query = query.eq('id', body.run_id);
+
+  const { data: runs, error } = await query;
 
   if (error) throw error;
   if (!runs || runs.length === 0) return { ok: true, runs: 0, note: 'nothing queued' };
@@ -1066,9 +1248,72 @@ async function workRun(db: any, body: any) {
 
   const deadline = Date.now() + TIME_BUDGET_MS;
   let worked = 0;
+  const more: string[] = [];
 
   for (const run of runs) {
     if (Date.now() > deadline) break;
+
+    // One worker per run. The self re-invocation and the cron tick overlap all
+    // the time, and two workers on one run used to reserve under the same chunk
+    // key - the second hold was a replay of the first, so its rows were never
+    // charged. Fail closed: without the lease function nothing is worked.
+    const { data: leased, error: leaseError } = await db.rpc('lead_claim_run', {
+      p_run_id: run.id,
+      p_seconds: Math.ceil(TIME_BUDGET_MS / 1000) + 30,
+    });
+    if (leaseError) {
+      console.error('leads: lead_claim_run failed - is migration 20261116 applied? ' + leaseError.message);
+      return { ok: false, error: 'lease_unavailable' };
+    }
+    if (leased !== true) continue;
+
+    try {
+      // Re-read under the lease. The copy selected above can be a chunk or more
+      // out of date by now - another worker may have settled in between - and
+      // the status may have been changed by the user.
+      const { data: fresh } = await db.from('lead_runs').select('*').eq('id', run.id).maybeSingle();
+      if (!fresh || !['queued', 'running'].includes(fresh.status)) continue;
+      const r = await workOneRun(db, cfg, fresh, prices, deadline);
+      worked += r.worked;
+      if (r.more) more.push(run.id);
+    } finally {
+      await db.rpc('lead_release_run', { p_run_id: run.id });
+    }
+  }
+
+  // Re-invoke after the leases are released, or the next worker finds the run
+  // still held and skips it, and the run waits for the cron tick.
+  for (const runId of more) {
+    void fetch(SUPABASE_URL + '/functions/v1/leads', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-leads-worker-secret': WORKER_SECRET ?? '',
+      },
+      body: JSON.stringify({ action: 'work', run_id: runId }),
+    }).catch(() => {
+      /* cron safety net */
+    });
+  }
+
+  return { ok: true, runs: runs.length, rows_worked: worked };
+}
+
+/**
+ * Works one chunk of one run, under that run's lease.
+ *
+ * Returns whether the run has more to do, so the caller can re-invoke once the
+ * lease is released.
+ */
+async function workOneRun(
+  db: any,
+  cfg: TregConfig,
+  run: any,
+  prices: LeadPrices,
+  deadline: number,
+): Promise<{ worked: number; more: boolean }> {
+  let worked = 0;
+  {
 
     // --- the rows, before any of them are claimed -------------------------
     //
@@ -1119,8 +1364,9 @@ async function workRun(db: any, body: any) {
           await db
             .from('lead_runs')
             .update({ status: 'paused', pause_reason: 'discovery_failed', last_error: String(seedErr) })
-            .eq('id', run.id);
-          continue;
+            .eq('id', run.id)
+            .in('status', ['queued', 'running']);
+          return { worked, more: false };
         }
       }
     }
@@ -1130,15 +1376,14 @@ async function workRun(db: any, body: any) {
     // line, so there is no unreserved *credit* exposure here - only provider
     // cost, which discoverCompanies bounds before it starts calling.
     if (seeded.costUsd > 0) {
-      await db
-        .from('lead_runs')
-        .update({ treg_cost_usd: num(run.treg_cost_usd) + seeded.costUsd })
-        .eq('id', run.id);
-      run.treg_cost_usd = num(run.treg_cost_usd) + seeded.costUsd;
+      await db.rpc('lead_run_add_totals', { p_run_id: run.id, p_credits: 0, p_cost_usd: seeded.costUsd, p_chunks: 0 });
     }
 
     const chunkIndex = Number(run.counters?.chunk ?? 0);
-    const claimed = await claimRows(db, run, CLAIM_ROWS);
+    // Exactly one chunk's worth. Claiming 25 to work 5 left 20 rows locked for
+    // five minutes and sized the credit hold for all 25, so a user who could pay
+    // for five rows was paused for "insufficient credits".
+    const claimed = await claimRows(db, run, CHUNK_ROWS);
 
     if (claimed.length === 0) {
       // No rows, and none made. Either the search genuinely found nothing, or it
@@ -1152,12 +1397,13 @@ async function workRun(db: any, body: any) {
         await db
           .from('lead_runs')
           .update({ last_error: seeded.error, status: 'failed' })
-          .eq('id', run.id);
-        continue;
+          .eq('id', run.id)
+          .in('status', ['queued', 'running']);
+        return { worked, more: false };
       }
 
       await finishRun(db, run.id);
-      continue;
+      return { worked, more: false };
     }
 
     // Worst case for this chunk, from the run's own plan rather than a fixed
@@ -1172,9 +1418,29 @@ async function workRun(db: any, body: any) {
     const perRowWorst = worstCasePerRow(plan, prices);
     const maxForChunk = claimed.length * perRowWorst;
 
-    const hold = await reserveChunk(db, run.user_id, run.id, chunkIndex, maxForChunk);
+    // The hold key carries a per-chunk nonce as well as the index. The index
+    // alone repeats whenever the totals write below fails, and a repeated key is
+    // an idempotent replay of a hold that is already settled - the new rows
+    // would be worked and never charged. Nothing retries a reserve, so the nonce
+    // costs no protection.
+    // Never hold past what the user approved. Rows are capped at the target, so
+    // this should not trigger; it is the last stop if something adds rows the
+    // estimate did not cover.
+    if (num(run.max_credits) > 0 && num(run.charged_credits) + maxForChunk > num(run.max_credits) + 1e-6) {
+      await unlockRows(db, claimed.map((r: any) => r.id));
+      await db
+        .from('lead_runs')
+        .update({ status: 'paused', pause_reason: 'approved_maximum_reached' })
+        .eq('id', run.id)
+        .in('status', ['queued', 'running']);
+      return { worked, more: false };
+    }
+
+    const holdNonce = crypto.randomUUID().slice(0, 8);
+    const hold = await reserveChunk(db, run.user_id, run.id, chunkIndex, maxForChunk, holdNonce);
 
     if (!hold.ok) {
+      await unlockRows(db, claimed.map((r: any) => r.id));
       // The only refusal that stops a run rather than retrying it.
       if (hold.reason === 'insufficient_credits') {
         // If the write does not land the run stays queued and the reserve is
@@ -1182,16 +1448,17 @@ async function workRun(db: any, body: any) {
         const { error: pauseError } = await db
           .from('lead_runs')
           .update({ status: 'paused', pause_reason: 'credits' })
-          .eq('id', run.id);
+          .eq('id', run.id)
+          .in('status', ['queued', 'running']);
         if (pauseError) {
           console.error(
             'leads: could not pause a run that ran out of credits — retried every minute. run=' +
               run.id + ' error=' + pauseError.message,
           );
         }
-        continue;
+        return { worked, more: false };
       }
-      continue;
+      return { worked, more: false };
     }
 
     let earned = 0;
@@ -1201,11 +1468,16 @@ async function workRun(db: any, body: any) {
     // later row throws, so the release below can never take credits the user has
     // already been charged for.
     let chunkThrew = false;
+    // Loaded once per chunk rather than once per row.
+    const blocked = await loadSuppressions(db, run.user_id);
+
+    const processed = new Set<string>();
     try {
-      for (const row of claimed.slice(0, CHUNK_ROWS)) {
+      for (const row of claimed) {
         if (Date.now() > deadline) break;
 
-        const outcome = await processRow(db, run, row, prices);
+        processed.add(row.id);
+        const outcome = await processRow(db, run, row, prices, blocked);
         earned += outcome.credits;
         providerCost += outcome.costUsd;
         worked++;
@@ -1218,6 +1490,10 @@ async function workRun(db: any, body: any) {
       // the two states that look fine and are both wrong.
       console.error('leads: chunk aborted', err);
     }
+
+    // Rows the deadline left untouched go back now, rather than sitting locked
+    // until the five-minute stale timeout and holding up the end of the run.
+    await unlockRows(db, claimed.filter((r: any) => !processed.has(r.id)).map((r: any) => r.id));
 
     if (hold.reservationId) {
       // A chunk that threw before completing a single row has delivered nothing,
@@ -1237,11 +1513,12 @@ async function workRun(db: any, body: any) {
         await db
           .from('lead_runs')
           .update({ status: 'paused', pause_reason: 'row_error' })
-          .eq('id', run.id);
-        continue;
+          .eq('id', run.id)
+          .in('status', ['queued', 'running']);
+        return { worked, more: false };
       }
 
-      const settled = await settleChunk(db, hold.reservationId, earned, providerCost, run.id, chunkIndex);
+      const settled = await settleChunk(db, hold.reservationId, earned, providerCost, run.id, chunkIndex, holdNonce);
       if (!settled.ok) {
         // A failed settle is left to the reaper rather than guessed at. The rows
         // are done and their cost is known, so the honest thing is to say so
@@ -1255,7 +1532,8 @@ async function workRun(db: any, body: any) {
         const { error: settlePauseError } = await db
           .from('lead_runs')
           .update({ status: 'paused', pause_reason: 'settlement_failed' })
-          .eq('id', run.id);
+          .eq('id', run.id)
+          .in('status', ['queued', 'running']);
         if (settlePauseError) {
           console.error(
             'leads: a settlement failed AND the run could not be paused — it will be claimed again ' +
@@ -1263,20 +1541,20 @@ async function workRun(db: any, body: any) {
               run.id + ' error=' + settlePauseError.message,
           );
         }
-        continue;
+        return { worked, more: false };
       }
 
-      const { error: totalsError } = await db
-        .from('lead_runs')
-        .update({
-          status: chunkThrew ? 'paused' : 'running',
-          pause_reason: chunkThrew ? 'row_error' : null,
-          started_at: run.started_at ?? new Date().toISOString(),
-          charged_credits: num(run.charged_credits) + settled.charged,
-          treg_cost_usd: num(run.treg_cost_usd) + providerCost,
-          counters: { ...(run.counters ?? {}), chunk: chunkIndex + 1 },
-        })
-        .eq('id', run.id);
+      // Totals and status are two writes on purpose. They used to be one, which
+      // set status back to 'running' at the end of every chunk - so a user who
+      // pressed Pause or Cancel mid-chunk had it silently undone. The totals are
+      // always true; the status only moves if the user has not moved it.
+      // An increment in SQL, not snapshot + amount: see lead_run_add_totals.
+      const { error: totalsError } = await db.rpc('lead_run_add_totals', {
+        p_run_id: run.id,
+        p_credits: settled.charged,
+        p_cost_usd: providerCost,
+        p_chunks: 1,
+      });
 
       if (totalsError) {
         console.error(
@@ -1284,24 +1562,19 @@ async function workRun(db: any, body: any) {
             'the run will under-report from here. run=' + run.id + ' error=' + totalsError.message,
         );
       }
+
+      await db
+        .from('lead_runs')
+        .update({
+          status: chunkThrew ? 'paused' : 'running',
+          pause_reason: chunkThrew ? 'row_error' : null,
+        })
+        .eq('id', run.id)
+        .in('status', ['queued', 'running']);
     }
 
-    // Re-invoke for the next chunk, so a long run does not wait for cron.
-    if (Date.now() < deadline) {
-      void fetch(SUPABASE_URL + '/functions/v1/leads', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-leads-worker-secret': WORKER_SECRET ?? '',
-        },
-        body: JSON.stringify({ action: 'work', run_id: run.id }),
-      }).catch(() => {
-        /* cron safety net */
-      });
-    }
+    return { worked, more: Date.now() < deadline };
   }
-
-  return { ok: true, runs: runs.length, rows_worked: worked };
 }
 
 /**
@@ -1311,25 +1584,41 @@ async function workRun(db: any, body: any) {
  * net skips a row another is holding instead of processing the same row twice.
  */
 async function claimRows(db: any, run: any, limit: number) {
-  const { data, error } = await db
-    .from('lead_rows')
-    .update({ locked_at: new Date().toISOString(), locked_by: 'worker' })
-    .eq('run_id', run.id)
-    .in('state', ['queued', 'miss'])
-    .or('locked_at.is.null,locked_at.lt.' + new Date(Date.now() - 5 * 60_000).toISOString())
-    .select('*')
-    .limit(limit);
+  // FOR UPDATE SKIP LOCKED, in SQL. The PostgREST version was an UPDATE with a
+  // LIMIT and no ORDER BY, which is not a limited update PostgREST supports.
+  const { data, error } = await db.rpc('lead_claim_rows', {
+    p_run_id: run.id,
+    p_limit: limit,
+    p_stale_seconds: 300,
+  });
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []) as any[];
+}
+
+/** Releases claimed rows that were not worked, so the next chunk can take them. */
+async function unlockRows(db: any, ids: string[]): Promise<void> {
+  if (!ids.length) return;
+  await db.from('lead_rows').update({ locked_at: null, locked_by: null }).in('id', ids);
+}
+
+/** The user's opt-out values, lower-cased, for one chunk. */
+async function loadSuppressions(db: any, userId: string): Promise<Set<string>> {
+  const { data } = await db.from('lead_suppressions').select('value').eq('user_id', userId);
+  return new Set((data ?? []).map((s: any) => String(s.value).toLowerCase()));
 }
 
 async function finishRun(db: any, runId: string) {
-  const { data: remaining } = await db
+  // `count`, not `data`. With head: true the body is empty, so `data` was always
+  // null, num(null) was 0, and every run with an empty claim was marked done -
+  // including runs whose rows were still locked by another worker.
+  const { count: remaining, error: countError } = await db
     .from('lead_rows')
     .select('id', { count: 'exact', head: true })
     .eq('run_id', runId)
     .in('state', ['queued', 'trying', 'miss']);
+
+  if (countError) return;
 
   if (num(remaining) === 0) {
     // Self-healing rather than fatal — cron picks the run up again next minute
@@ -1339,7 +1628,8 @@ async function finishRun(db: any, runId: string) {
     const { error } = await db
       .from('lead_runs')
       .update({ status: 'done', finished_at: new Date().toISOString() })
-      .eq('id', runId);
+      .eq('id', runId)
+      .in('status', ['queued', 'running']);
     if (error) {
       console.error(
         'leads: could not mark a finished run as done — retried every minute. run=' +
@@ -1355,12 +1645,81 @@ async function finishRun(db: any, runId: string) {
 // ===========================================================================
 
 /**
- * The email waterfall, unchanged in shape from the version that has been running.
+ * Whether a call produced an answer worth reading.
  *
- * Split out of processRow so the verify step can sit beside it rather than being
- * threaded through the same loop with a flag. A loop that can do two unrelated
- * things is a loop whose price is only correct for one of them, which is how the
- * clean modes came to cost the find price.
+ * 'free' counts. It used to be ignored, and three things arrive as 'free': a
+ * genuinely free endpoint (ContactOut's verifier, first in the chain, so every
+ * verification paid for the second verifier), an idempotent replay, and a
+ * per-hit provider's miss - which simply reads as nothing.
+ */
+function answered(result: { ok: boolean; outcome: string }): boolean {
+  return result.ok && (result.outcome === 'success' || result.outcome === 'free');
+}
+
+/** What every step call returns to the loop that drives it. */
+interface StepCall {
+  result: Awaited<ReturnType<typeof tregCallWithRetry>>;
+  stop: boolean;
+}
+
+/**
+ * One provider call for one row and step: progress marker, the call, the log,
+ * and the 402 pause. The step functions differ only in how they build the
+ * request and read the answer, which endpoints.ts owns.
+ */
+async function stepCall(
+  db: any,
+  callCfg: TregConfig,
+  run: any,
+  row: any,
+  step: LeadStep,
+  entry: EndpointEntry,
+  shape: CallShape,
+  hitOf: (body: unknown) => boolean,
+): Promise<StepCall & { hit: boolean }> {
+  // Progress marker, unchecked on purpose: a missed one only delays the
+  // animation by a frame.
+  await db.from('lead_rows').update({ state: 'trying', step, current_provider: entry.id }).eq('id', row.id);
+
+  const result = await tregCallWithRetry(callCfg, {
+    endpointId: entry.id,
+    method: shape.method,
+    params: shape.params,
+    // The generation is part of the key so a deliberate re-check of a row is a
+    // new call rather than a 24-hour replay of the old answer.
+    idempotencyKey: `leads:${run.id}:${row.id}:${step}:${entry.id}:${num(row.generation)}`,
+    maxCostUsd: entry.maxCallUsd,
+  });
+
+  const hit = answered(result) && hitOf(result.body);
+  await logAttempt(db, run, row, entry.id, step, result, hit);
+
+  const stop = result.outcome === 'error' && result.error === 'route_max_cost_or_balance';
+  if (stop) await pauseForProvider(db, run.id);
+  return { result, stop, hit };
+}
+
+/** Row fields an endpoint can be asked with, including a carried LeadsForge id. */
+function rowInput(row: any): RowInput {
+  return {
+    person_name: row.person_name,
+    title: row.title,
+    company_name: row.company_name,
+    domain: row.domain,
+    linkedin_url: row.linkedin_url,
+    email: row.email,
+    phone: row.phone,
+    leadsforge_id: typeof row.extra?.leadsforge_id === 'string' ? row.extra.leadsforge_id : null,
+  };
+}
+
+/**
+ * The email waterfall.
+ *
+ * A finder that also checks the address (Kitt, Tomba, AI Ark) hands back its
+ * verdict with the email. An address its own finder calls undeliverable is
+ * treated as a miss and the next provider is tried; the per-hit price on these
+ * endpoints means it was not charged for anyway.
  */
 async function runEmailStep(
   db: any,
@@ -1368,62 +1727,41 @@ async function runEmailStep(
   run: any,
   row: any,
   rowCapUsd: number,
-): Promise<{ email: string | null; provider: string | null; costUsd: number }> {
-  // Entries, not ids. orderFor resolves the ids itself so it can rank by this
-  // user's own hit rates, and what it hands back is the registry entries.
+): Promise<{ email: string | null; provider: string | null; verdict: Verdict | null; costUsd: number }> {
   const chain = await stepChain(db, run, 'email');
+  const input = rowInput(row);
 
   let costUsd = 0;
 
   for (const entry of chain) {
-    const id = entry.id;
-    if (!canRunWith(row, entry)) continue;
-    if (costUsd + entry.priceUsd > rowCapUsd) break;
+    const shape = emailFindRequest(entry.id, input);
+    if (!shape) continue;
+    if (costUsd + entry.maxCallUsd > rowCapUsd) break;
 
-    // Progress markers, unchecked on purpose. These are what the table animates
-    // while a row is being worked; if one is missed the row shows the previous
-    // state for a moment and nothing else changes. Every other write in this file
-    // is checked, and the one that matters most throws.
-    await db.from('lead_rows').update({ state: 'trying', step: 'email', current_provider: id }).eq('id', row.id);
-
-    const result = await tregCallWithRetry(callCfg, {
-      endpointId: id,
-      params: {
-        full_name: row.person_name ?? undefined,
-        domain: row.domain ?? undefined,
-        linkedin_url: row.linkedin_url ?? undefined,
-      },
-      idempotencyKey: `leads:${run.id}:${row.id}:email:${id}`,
-      maxCostUsd: entry.priceUsd,
+    let hit: EmailHit | null = null;
+    const c = await stepCall(db, callCfg, run, row, 'email', entry, shape, (b) => {
+      hit = readEmailHit(entry.id, b);
+      return Boolean(hit && hit.verdict !== 'undeliverable' && hit.verdict !== 'disposable');
     });
+    costUsd += c.result.costUsd;
+    if (c.stop) return { email: null, provider: null, verdict: null, costUsd };
 
-    costUsd += result.costUsd;
-
-    const email = result.outcome === 'success' ? readEmail(result.body, entry.readHit) : null;
-    await logAttempt(db, run, row, id, 'email', result, Boolean(email));
-
-    if (result.outcome === 'error' && result.error === 'route_max_cost_or_balance') {
-      await pauseForProvider(db, run.id);
-      return { email: null, provider: null, costUsd };
-    }
-
-    if (email) return { email, provider: id, costUsd };
+    const h = hit as EmailHit | null;
+    if (c.hit && h) return { email: h.email, provider: entry.id, verdict: h.verdict, costUsd };
 
     await db.from('lead_rows').update({ state: 'miss' }).eq('id', row.id);
   }
 
-  return { email: null, provider: null, costUsd };
+  return { email: null, provider: null, verdict: null, costUsd };
 }
 
 /**
  * The verification waterfall.
  *
- * Three verifiers, cheapest first. The first one that answers is believed; the
- * rest are not asked, because a second opinion on an address the user is about to
- * email costs money to produce a less useful answer than the first.
- *
- * `answered` is separate from `verdict` on purpose. A provider that returns
- * something unreadable is not an "invalid" — it is silence, and it earns nothing.
+ * The first verifier with a definite verdict is believed. 'unknown' is an answer
+ * but not a definite one, so the next verifier is asked; if none is definite the
+ * row keeps 'unknown'. Silence from every verifier is null - not checked - and is
+ * never charged.
  */
 async function runVerifyStep(
   db: any,
@@ -1432,74 +1770,44 @@ async function runVerifyStep(
   row: any,
   target: { email: string },
   rowCapUsd: number,
-): Promise<{
-  verdict: Verdict | null;
-  provider: string | null;
-  costUsd: number;
-  answered: boolean;
-}> {
+): Promise<{ verdict: Verdict | null; provider: string | null; costUsd: number; answered: boolean }> {
   const chain = await stepChain(db, run, 'verify');
 
   let costUsd = 0;
+  let fallback: { verdict: Verdict; provider: string } | null = null;
 
   for (const entry of chain) {
-    const id = entry.id;
-    if (!canRunWith(target, entry)) continue;
-    if (costUsd + entry.priceUsd > rowCapUsd) break;
+    const shape = verifyRequest(entry.id, target.email);
+    if (!shape) continue;
+    if (costUsd + entry.maxCallUsd > rowCapUsd) break;
 
-    await db.from('lead_rows').update({ state: 'trying', step: 'verify', current_provider: id }).eq('id', row.id);
-
-    const result = await tregCallWithRetry(callCfg, {
-      endpointId: id,
-      params: { email: target.email },
-      idempotencyKey: `leads:${run.id}:${row.id}:verify:${id}`,
-      maxCostUsd: entry.priceUsd,
+    let verdict: Verdict | null = null;
+    // A hit for the lab means a real mailbox: a 200 that says "invalid" is a
+    // successful call and a failed lead.
+    const c = await stepCall(db, callCfg, run, row, 'verify', entry, shape, (b) => {
+      verdict = readVerifyVerdict(entry.id, b);
+      return verdict === 'deliverable' || verdict === 'catch_all';
     });
+    costUsd += c.result.costUsd;
+    if (c.stop) return { verdict: null, provider: null, costUsd, answered: false };
 
-    costUsd += result.costUsd;
-
-    const verdict = result.outcome === 'success' ? readVerdict(result.body) : null;
-
-    // A hit here means the verifier said the address is a real mailbox. A 200
-    // carrying "invalid" is a successful call and a failed lead, and counting it
-    // as a hit would rank this provider above one that actually finds addresses.
-    await logAttempt(
-      db,
-      run,
-      row,
-      id,
-      'verify',
-      result,
-      verdict === 'deliverable' || verdict === 'catch_all',
-    );
-
-    if (result.outcome === 'error' && result.error === 'route_max_cost_or_balance') {
-      await pauseForProvider(db, run.id);
-      return { verdict: null, provider: null, costUsd, answered: false };
-    }
-
-    if (verdict) {
-      return { verdict, provider: id, costUsd, answered: true };
-    }
+    const v = answered(c.result) ? (verdict as Verdict | null) : null;
+    if (v && v !== 'unknown') return { verdict: v, provider: entry.id, costUsd, answered: true };
+    if (v === 'unknown' && !fallback) fallback = { verdict: v, provider: entry.id };
 
     await db.from('lead_rows').update({ state: 'miss' }).eq('id', row.id);
   }
 
+  if (fallback) return { ...fallback, costUsd, answered: true };
   return { verdict: null, provider: null, costUsd, answered: false };
 }
 
 /**
- * The decision-maker waterfall.
+ * The decision-maker waterfall, for a find row that has a domain and no person.
  *
- * Runs before the email step, because every email endpoint in the registry is
- * keyed on a name or a profile URL. A find row created by the company search has
- * a domain and nothing else, so without this step the email waterfall is asked
- * for an address for a person who does not exist yet, and every provider in the
- * chain answers with a miss that was never a miss - it was a malformed request.
- *
- * The row cap is deliberately tighter than the email step's share. A people
- * search that returns nothing costs a fraction of what the next waterfall costs
- * and has no way to recover, so it is worth two attempts and not five.
+ * Half the row cap: a people miss cannot be recovered from, so it is not worth
+ * the whole budget. Every provider here bills per person returned and none bills
+ * an empty answer.
  */
 async function runPersonStep(
   db: any,
@@ -1508,85 +1816,42 @@ async function runPersonStep(
   row: any,
   rowCapUsd: number,
 ): Promise<{ person: PersonHit | null; provider: string | null; costUsd: number; considered: number }> {
-  // Nothing to search for. A row with no domain cannot be searched for staff,
-  // and asking anyway would spend a call to learn that.
   if (!row.domain) return { person: null, provider: null, costUsd: 0, considered: 0 };
 
   const chain = await stepChain(db, run, 'person');
-  if (chain.length === 0) return { person: null, provider: null, costUsd: 0, considered: 0 };
-
-  // Half the email step's budget. See above: a people miss cannot be recovered
-  // from, so spending the whole cap on it would be spending the row's budget on
-  // the step with the least to gain.
   const cap = Math.max(0.01, rowCapUsd * 0.5);
+  const wanted = targetTitlesOf(run);
 
   let costUsd = 0;
   let best: { hit: PersonHit; provider: string } | null = null;
-  // How many people the best answer came from. Not the total seen across
-  // providers - that number is not meaningful to anyone - but the size of the
-  // list the chosen person was picked out of, which is what makes the choice
-  // explicable.
   let considered = 0;
 
   for (const entry of chain) {
-    if (costUsd + entry.priceUsd > cap) break;
-    if (!canRunWith(row, entry)) continue;
+    const shape = personAtCompanyRequest(entry.id, row.domain, wanted);
+    if (!shape) continue;
+    if (costUsd + entry.maxCallUsd > cap) break;
 
-    await db
-      .from('lead_rows')
-      .update({ state: 'trying', step: 'person', current_provider: entry.id })
-      .eq('id', row.id);
-
-    const result = await tregCallWithRetry(callCfg, {
-      endpointId: entry.id,
-      params: {
-        domain: row.domain,
-        company: row.company_name ?? undefined,
-        limit: 25,
-      },
-      idempotencyKey: `leads:${run.id}:${row.id}:person:${entry.id}`,
-      maxCostUsd: entry.priceUsd,
+    let people: PersonHit[] = [];
+    const c = await stepCall(db, callCfg, run, row, 'person', entry, shape, (b) => {
+      people = readPeopleAtCompany(entry.id, b);
+      return people.length > 0;
     });
+    costUsd += c.result.costUsd;
+    if (c.stop) return { person: null, provider: null, costUsd, considered: 0 };
+    if (!answered(c.result)) continue;
 
-    costUsd += result.costUsd;
-
-    const people = result.outcome === 'success' ? readPeople(result.body) : [];
-    await logAttempt(db, run, row, entry.id, 'person', result, people.length > 0);
-
-    if (result.outcome === 'error' && result.error === 'route_max_cost_or_balance') {
-      await pauseForProvider(db, run.id);
-      return { person: null, provider: null, costUsd, considered: 0 };
-    }
-
-    // Keep the best from every provider, not just the first that answered.
-    // Providers rank people differently and two of them disagreeing is the only
-    // signal available about which one is right.
-    const wanted = targetTitlesOf(run);
     considered = Math.max(considered, people.length);
     for (const p of people) {
       const incumbent = best ? scoreTitle(best.hit.title, wanted) : -Infinity;
       if (scoreTitle(p.title, wanted) > incumbent) best = { hit: p, provider: entry.id };
     }
-
     if (best) break;
   }
 
-  return {
-    person: best?.hit ?? null,
-    provider: best?.provider ?? null,
-    costUsd,
-    considered,
-  };
+  return { person: best?.hit ?? null, provider: best?.provider ?? null, costUsd, considered };
 }
 
-/**
- * The phone waterfall.
- *
- * Opt-in per run, and off by default. It is the most expensive step in the
- * registry by a wide margin - an order of magnitude above the address find - so
- * it is never part of a plan and only ever runs because a run's options asked
- * for it.
- */
+/** The phone waterfall. Opt-in per run; every finder bills only a found number. */
 async function runPhoneStep(
   db: any,
   callCfg: TregConfig,
@@ -1594,48 +1859,24 @@ async function runPhoneStep(
   row: any,
   rowCapUsd: number,
 ): Promise<{ phone: string | null; provider: string | null; costUsd: number }> {
-  // Every phone endpoint here is keyed on a person. A domain with no name has
-  // nobody to ask for, and a company switchboard is not a lead's phone number.
-  if (!row.person_name && !row.linkedin_url) {
-    return { phone: null, provider: null, costUsd: 0 };
-  }
-
   const chain = await stepChain(db, run, 'phone');
-  if (chain.length === 0) return { phone: null, provider: null, costUsd: 0 };
+  const input = rowInput(row);
 
   let costUsd = 0;
 
   for (const entry of chain) {
-    if (costUsd + entry.priceUsd > rowCapUsd) break;
-    if (!canRunWith(row, entry)) continue;
+    const shape = phoneRequest(entry.id, input);
+    if (!shape) continue;
+    if (costUsd + entry.maxCallUsd > rowCapUsd) break;
 
-    await db
-      .from('lead_rows')
-      .update({ state: 'trying', step: 'phone', current_provider: entry.id })
-      .eq('id', row.id);
-
-    const result = await tregCallWithRetry(callCfg, {
-      endpointId: entry.id,
-      params: {
-        full_name: row.person_name ?? undefined,
-        domain: row.domain ?? undefined,
-        linkedin_url: row.linkedin_url ?? undefined,
-      },
-      idempotencyKey: `leads:${run.id}:${row.id}:phone:${entry.id}`,
-      maxCostUsd: entry.priceUsd,
+    let phone: string | null = null;
+    const c = await stepCall(db, callCfg, run, row, 'phone', entry, shape, (b) => {
+      phone = readPhoneHit(entry.id, b);
+      return Boolean(phone);
     });
-
-    costUsd += result.costUsd;
-
-    const phone = result.outcome === 'success' ? readPhone(result.body) : null;
-    await logAttempt(db, run, row, entry.id, 'phone', result, Boolean(phone));
-
-    if (result.outcome === 'error' && result.error === 'route_max_cost_or_balance') {
-      await pauseForProvider(db, run.id);
-      return { phone: null, provider: null, costUsd };
-    }
-
-    if (phone) return { phone, provider: entry.id, costUsd };
+    costUsd += c.result.costUsd;
+    if (c.stop) return { phone: null, provider: null, costUsd };
+    if (c.hit && phone) return { phone, provider: entry.id, costUsd };
 
     await db.from('lead_rows').update({ state: 'miss' }).eq('id', row.id);
   }
@@ -1644,11 +1885,8 @@ async function runPhoneStep(
 }
 
 /**
- * The enrichment step: the company's own details, keyed on its domain.
- *
- * Runs last, and only for a mode that asked for it. It is the one step whose
- * answer is about the company rather than the contact, so doing it first would
- * spend it on rows that turn out to have no contact at all.
+ * The company's own details. Skipped when the row already carries them and they
+ * are fresh, so nothing is paid for twice.
  */
 async function runEnrichStep(
   db: any,
@@ -1657,46 +1895,26 @@ async function runEnrichStep(
   row: any,
   rowCapUsd: number,
 ): Promise<{ companyData: Record<string, unknown> | null; provider: string | null; costUsd: number }> {
-  // Already enriched. An import may carry a company_data the user paid for
-  // elsewhere, and re-fetching it would be billed again for the same fields.
-  if (row.company_data && Object.keys(row.company_data).length > 0) {
-    return { companyData: null, provider: null, costUsd: 0 };
-  }
-
-  if (!row.domain) return { companyData: null, provider: null, costUsd: 0 };
-
   const chain = await stepChain(db, run, 'enrich');
-  if (chain.length === 0) return { companyData: null, provider: null, costUsd: 0 };
+  const input = rowInput(row);
 
   let costUsd = 0;
 
   for (const entry of chain) {
-    if (costUsd + entry.priceUsd > rowCapUsd) break;
-    if (!canRunWith(row, entry)) continue;
+    const shape = companyEnrichRequest(entry.id, input);
+    if (!shape) continue;
+    if (costUsd + entry.maxCallUsd > rowCapUsd) break;
 
-    await db
-      .from('lead_rows')
-      .update({ state: 'trying', step: 'enrich', current_provider: entry.id })
-      .eq('id', row.id);
-
-    const result = await tregCallWithRetry(callCfg, {
-      endpointId: entry.id,
-      params: { domain: row.domain },
-      idempotencyKey: `leads:${run.id}:${row.id}:enrich:${entry.id}`,
-      maxCostUsd: entry.priceUsd,
+    let data: Record<string, unknown> | null = null;
+    const c = await stepCall(db, callCfg, run, row, 'enrich', entry, shape, (b) => {
+      data = readCompanyEnrich(entry.id, b);
+      return Boolean(data);
     });
-
-    costUsd += result.costUsd;
-
-    const companyData = result.outcome === 'success' ? readCompanyRecord(result.body) : null;
-    await logAttempt(db, run, row, entry.id, 'enrich', result, Boolean(companyData));
-
-    if (result.outcome === 'error' && result.error === 'route_max_cost_or_balance') {
-      await pauseForProvider(db, run.id);
-      return { companyData: null, provider: null, costUsd };
+    costUsd += c.result.costUsd;
+    if (c.stop) return { companyData: null, provider: null, costUsd };
+    if (c.hit && data) {
+      return { companyData: { ...(data as Record<string, unknown>), enriched_at: new Date().toISOString() }, provider: entry.id, costUsd };
     }
-
-    if (companyData) return { companyData, provider: entry.id, costUsd };
 
     await db.from('lead_rows').update({ state: 'miss' }).eq('id', row.id);
   }
@@ -1767,7 +1985,8 @@ async function pauseForProvider(db: any, runId: string): Promise<void> {
   const { error } = await db
     .from('lead_runs')
     .update({ status: 'paused', pause_reason: 'provider_balance' })
-    .eq('id', runId);
+    .eq('id', runId)
+    .in('status', ['queued', 'running']);
   if (error) {
     console.error(
       'leads: could not pause a run whose provider balance is exhausted — it will keep calling. run=' +
@@ -1781,57 +2000,42 @@ async function pauseForProvider(db: any, runId: string): Promise<void> {
 // ===========================================================================
 
 /**
- * Works one row to completion.
+ * The per-row spend cap, from the run's options, clamped.
  *
- * The shape here used to be a single email waterfall with the run's mode ignored,
- * so "check what I have" went out and found replacements for the rows it had
- * promised to leave alone, and every clean run was charged the find price. The
- * mode is now read once, at the top, and turned into a plan by steps.ts — the
- * same function the estimator and the tests use, so the three cannot disagree.
+ * It was taken from the request body as-is, so a client could send any number
+ * and the waterfall would keep going as long as it fit.
+ */
+function rowCapOf(run: any): number {
+  const fallback = run.options?.phone ? 0.25 : 0.05;
+  const n = num(run.options?.row_cap_usd, fallback);
+  return Math.min(0.5, Math.max(0.01, n));
+}
+
+/**
+ * Works one row through whatever its plan calls for.
  *
- * Order matters and is not arbitrary. Verification comes first because it is
- * cheaper than a find and because its answer decides whether a find is worth
- * doing: verify_only never finds, verify_refind finds only for the rows that
- * failed, and a find run does not verify at all because an address it finds is
- * verified as part of being found.
- *
- * What a replacement address is worth is settled the same way as the original.
- * Finding one and not checking it is how a row ends up holding an address that
- * nothing ever looked at, which is the precise thing the verified badge exists
- * to rule out.
+ * Order: decision maker (find runs), verify what the row carries (clean modes),
+ * find an address when the plan allows and the verdict permits, check a found
+ * address unless its finder already gave a definite verdict, then phone and
+ * company details when asked for.
  */
 async function processRow(
   db: any,
   run: any,
   row: any,
   prices: LeadPrices,
+  blocked: Set<string>,
 ): Promise<{ credits: number; costUsd: number }> {
   const plan = planSteps(run.mode, { phone: run.options?.phone === true });
 
-  const meta = { user: run.user_id, run: run.id, step: 'verify', row: row.id };
-  const callCfg = tregConfig(meta, await resolveToken(db));
-
+  const callCfg = tregConfig({ user: run.user_id, run: run.id, row: row.id }, await resolveToken(db));
   if (!callCfg) return { credits: 0, costUsd: 0 };
 
-  // Opt-outs are checked before any paid call. A suppressed row is never looked
-  // up at all, so suppressing someone costs nothing and means their data is not
-  // even fetched.
-  const { data: suppressed } = await db
-    .from('lead_suppressions')
-    .select('value')
-    .eq('user_id', run.user_id);
-
-  const blocked = new Set((suppressed ?? []).map((s: any) => String(s.value).toLowerCase()));
-  if (row.domain && blocked.has(String(row.domain).toLowerCase())) {
-    // Thrown, because a suppressed row that cannot be marked is a row the run can
-    // never finish. finishRun counts anything still in queued, trying or miss, so
-    // if this write does not land the row is claimed again next chunk, suppressed
-    // again, marked again, fails again — and the run stays 'running' with nothing
-    // left to do, forever.
-    //
-    // No money is at stake here so it goes to the chunk handler rather than
-    // anywhere sharper: the chunk settles what it earned and the run pauses, which
-    // is visible and recoverable.
+  // Opt-outs before any paid call, by domain and by address.
+  const isBlocked = (v: unknown) => typeof v === 'string' && v !== '' && blocked.has(v.toLowerCase());
+  if (isBlocked(row.domain) || isBlocked(row.email)) {
+    // Thrown when it cannot be written: a suppressed row that stays queued is
+    // claimed and skipped forever and the run never finishes.
     const { error: skipError } = await db
       .from('lead_rows')
       .update({ state: 'skipped', step: null, locked_at: null })
@@ -1840,34 +2044,22 @@ async function processRow(
     return { credits: 0, costUsd: 0 };
   }
 
-  const rowCapUsd = num(run.options?.row_cap_usd, 0.05);
+  const rowCapUsd = rowCapOf(run);
 
   let costUsd = 0;
   let email: string | null = row.email ?? null;
   let emailProvider: string | null = row.email_provider ?? null;
-
-  // Did the waterfall go and get an address, as opposed to being handed one?
-  // The two are priced differently and only the first is charged for finding.
   let emailFound = false;
 
   let verdict: Verdict | null = null;
   let verdictProvider: string | null = null;
-  // Whether any verifier answered at all. Kept apart from verdict because
-  // silence is not a verdict, and charging for it would bill the user for our
-  // outage.
   let answered = false;
+  // Whether a verifier - not a finder grading its own answer - gave a verdict.
+  // Only that is charged as a verification.
+  let verifierAnswered = false;
   let lastStep: LeadStep | null = null;
 
-  // --- 0. the decision maker, before anything that needs one ---------------
-  //
-  // First because everything after it is keyed on it. A find row arrives with a
-  // domain and no person, and every email endpoint in the registry takes a name
-  // or a profile URL, so running the email waterfall first would ask every
-  // provider in the chain the same malformed question and log each answer as a
-  // miss.
-  //
-  // Skipped when the row already carries a person, which is the case for every
-  // clean run and for a find row that a previous chunk already gave one to.
+  // --- 0. the decision maker ----------------------------------------------
   let personName: string | null = row.person_name ?? null;
   let personTitle: string | null = row.title ?? null;
   let linkedinUrl: string | null = row.linkedin_url ?? null;
@@ -1879,7 +2071,6 @@ async function processRow(
     const p = await runPersonStep(db, callCfg, run, row, rowCapUsd);
     costUsd += p.costUsd;
     peopleConsidered = p.considered;
-
     if (p.person) {
       personName = p.person.name;
       personTitle = p.person.title;
@@ -1890,85 +2081,65 @@ async function processRow(
     }
   }
 
+  const workRow = { ...row, person_name: personName, title: personTitle, linkedin_url: linkedinUrl };
+
   // --- 1. verify what the row already carries -----------------------------
   if (plan.verifyExisting && email) {
-    const v = await runVerifyStep(db, callCfg, run, row, { email }, rowCapUsd);
+    const v = await runVerifyStep(db, callCfg, run, row, { email }, rowCapUsd - costUsd);
     costUsd += v.costUsd;
     if (v.answered) {
       verdict = v.verdict;
       verdictProvider = v.provider;
       answered = true;
+      verifierAnswered = true;
       lastStep = 'verify';
     }
   }
 
   // --- 2. find, when the plan allows and the verdict permits --------------
-  //
-  // Three outcomes decide this, and each is different:
-  //   good address        no find, for verify_refind. The answer is already known.
-  //   bad address         find. That is the mode's entire purpose.
-  //   no answer           find anyway. An unreachable verifier is a reason to try
-  //                       harder, not a reason to hand back a row with nothing.
   const passed = verdict === 'deliverable' || verdict === 'catch_all';
 
-  if (shouldFindEmail(plan, answered ? passed : null)) {
-    // The row as it stands now rather than as it was claimed. A find row's person
-    // was found in step 0 and is held in a local, so passing the original row
-    // would send the email waterfall out with the same null person_name it had
-    // before the people search - which is the request that finds nothing, and
-    // would have logged every provider as a miss rather than as a bad question.
-    const workRow = {
-      ...row,
-      person_name: personName,
-      title: personTitle,
-      linkedin_url: linkedinUrl,
-    };
-
-    const f = await runEmailStep(db, callCfg, run, workRow, rowCapUsd);
+  if (shouldFindEmail(plan, answered && verdict !== 'unknown' ? passed : null)) {
+    const f = await runEmailStep(db, callCfg, run, workRow, rowCapUsd - costUsd);
     costUsd += f.costUsd;
 
-    if (f.email) {
+    if (f.email && isBlocked(f.email)) {
+      // Found, and on the opt-out list. Not kept and not charged; the provider
+      // cost stays recorded against the row.
+    } else if (f.email) {
       email = f.email;
       emailProvider = f.provider;
       emailFound = true;
       lastStep = 'email';
+      verdict = f.verdict;
+      verdictProvider = f.verdict ? f.provider : null;
+      answered = f.verdict !== null;
 
-      // --- 3. check the replacement, on the same terms as the original ----
-      // Skipped for a find run, where the find itself returns a deliverable
-      // address and a second pass would be charging twice for one piece of work.
-      if (plan.verifyExisting) {
-        const v2 = await runVerifyStep(db, callCfg, run, row, { email: f.email }, rowCapUsd);
+      // --- 3. check the address, unless its finder already did ------------
+      // A find run used to skip this, so every address it found was stored as
+      // 'unknown' and billed at the verified price.
+      if (!f.verdict || f.verdict === 'unknown') {
+        const v2 = await runVerifyStep(db, callCfg, run, workRow, { email: f.email }, rowCapUsd - costUsd);
         costUsd += v2.costUsd;
         if (v2.answered) {
           verdict = v2.verdict;
           verdictProvider = v2.provider;
           answered = true;
+          verifierAnswered = true;
           lastStep = 'verify';
         }
       }
     }
   }
 
-  // --- 4. phone, when the run's options asked for it ----------------------
-  //
-  // Not part of any plan, and never will be: at roughly eight times the price of
-  // the address find, a step that is on by default would dominate every invoice
-  // without being what the user came for. It runs only because the run's options
-  // carry the flag, and the estimate quotes it separately for the same reason.
+  // --- 4. phone, only when the run asked for it ---------------------------
   let phone: string | null = row.phone ?? null;
   let phoneProvider: string | null = row.phone_provider ?? null;
   let phoneFound = false;
 
-  if (run.options?.phone && !phone && (personName || linkedinUrl)) {
-    const ph = await runPhoneStep(
-      db,
-      callCfg,
-      run,
-      { ...row, person_name: personName, linkedin_url: linkedinUrl },
-      rowCapUsd,
-    );
+  if (plan.phone && !phone && (personName || linkedinUrl)) {
+    const ph = await runPhoneStep(db, callCfg, run, { ...workRow, email }, Math.max(rowCapUsd - costUsd, 0));
     costUsd += ph.costUsd;
-
     if (ph.phone) {
       phone = ph.phone;
       phoneProvider = ph.provider;
@@ -1977,14 +2148,13 @@ async function processRow(
     }
   }
 
-  // --- 5. the company's own details, for the mode that asked --------------
+  // --- 5. company details, for the modes that asked -----------------------
   let companyData = row.company_data ?? null;
   let companyEnriched = false;
 
-  if (plan.enrich && row.domain && (!companyData || Object.keys(companyData).length === 0)) {
-    const en = await runEnrichStep(db, callCfg, run, row, rowCapUsd);
+  if (plan.enrich && (row.domain || row.company_name) && !freshCompanyData(companyData)) {
+    const en = await runEnrichStep(db, callCfg, run, row, Math.max(rowCapUsd - costUsd, 0));
     costUsd += en.costUsd;
-
     if (en.companyData) {
       companyData = en.companyData;
       companyEnriched = true;
@@ -1992,46 +2162,19 @@ async function processRow(
     }
   }
 
-  // --- 6. the status, and what it is worth -------------------------------
-  //
-  // Five states and each says something different. 'unknown' is not a hedge: it
-  // is the honest label for an address that exists and that nothing has checked,
-  // and it is the one a row imported with an email in it starts life as.
-  const status: string = !email
-    ? 'not_found'
-    : verdict === 'deliverable'
-      ? 'verified'
-      : verdict === 'catch_all'
-        ? 'catch_all'
-        : verdict === 'undeliverable'
-          ? 'invalid'
-          : 'unknown';
+  // --- 6. the status, and what it is worth --------------------------------
+  const status = statusFor(email, email ? verdict : null);
 
   const credits = creditsForRow(
     {
-      // The company is charged per row because it is true per row: the row exists
-      // because a company search returned that domain, and that search is what
-      // the price is for. Discovery creates the row and this line is where the
-      // credit lands, which is one company one charge however many pages of
-      // results it took to find it.
-      //
-      // The person is different, and this is the line that was wrong. It was
-      // `plan.findCompany`, a constant, so it charged the decision-maker price on
-      // every row of every find run whether or not a person was ever found - and
-      // no person was ever found, because nothing looked for one. The user was
-      // billed 440 credits across a 2000-row search for lookups that had not
-      // happened. It is now the actual outcome of the people waterfall, and it is
-      // zero when the waterfall found nobody.
       companyFound: plan.findCompany && Boolean(row.domain),
       personFound,
       emailFound,
       verified: verdict === 'deliverable',
       catchAll: verdict === 'catch_all',
       invalid: verdict === 'undeliverable',
-      // Asked, and got nothing usable back. Not charged, and not reported as a
-      // result — otherwise a broken verifier is indistinguishable from a strict
-      // one on both the invoice and the row.
-      unreadable: plan.verifyExisting && !answered,
+      disposable: verdict === 'disposable',
+      unreadable: plan.verifyExisting && !verifierAnswered,
       phoneFound,
       companyEnriched,
     },
@@ -2039,59 +2182,30 @@ async function processRow(
     plan,
   );
 
-  // One write, so credits and cost can never disagree. Two writes would leave a
-  // window in which a row is charged but not costed, or costed but not charged,
-  // and neither is visible from the outside — the user sees one number and the
-  // margin report sees the other.
-  // Thrown on failure, deliberately, and this is the only place in the worker
-  // where a database error is escalated rather than logged.
-  //
-  // If this write does not land the row is still 'trying' with locked_at set, and
-  // claimRows picks up anything in queued, trying or miss on the next chunk. So
-  // the provider is called again, the user is charged again, and the wallet is
-  // settled for work that was already done — once per chunk, until the credits
-  // run out. Nothing records it: the attempts say the first call happened and the
-  // wallet says the user paid, and both are true.
-  //
-  // Throwing loses the credits for this one row, because the caller adds them to
-  // the chunk total only on return. That is the right way round. Under-charging a
-  // user by one row is a support ticket; double-charging them until their wallet
-  // empties is a company.
+  // One write, so credits and cost cannot disagree. Thrown on failure: a row
+  // left 'trying' is claimed again and charged again.
+  const now = new Date().toISOString();
   const { error: doneError } = await db
     .from('lead_rows')
     .update({
       state: 'done',
       step: lastStep,
-      // The provider that produced the row's headline result, in the order the
-      // user cares about: a verified address beats the person who was found, and
-      // the person beats the phone nobody asked for.
-      current_provider:
-        verdictProvider ?? emailProvider ?? personProvider ?? phoneProvider ?? null,
+      current_provider: verdictProvider ?? emailProvider ?? personProvider ?? phoneProvider ?? null,
       email,
       email_provider: emailFound ? emailProvider : (row.email_provider ?? null),
       email_status: status,
-      // Written only where this run is what put them there. A row that arrived
-      // from the user's file keeps its own name, title and LinkedIn URL: they
-      // are the user's data, they may be the reason they imported it, and
-      // overwriting them with a worse answer from a provider is not this
-      // pipeline's job.
+      email_checked_at: answered && email ? now : (row.email_checked_at ?? null),
+      email_verifier: answered && email ? verdictProvider : (row.email_verifier ?? null),
       person_name: personFound ? personName : (row.person_name ?? null),
       title: personFound ? personTitle : (row.title ?? null),
       linkedin_url: linkedinUrl ?? row.linkedin_url ?? null,
       phone: phoneFound ? phone : (row.phone ?? null),
       phone_provider: phoneFound ? phoneProvider : (row.phone_provider ?? null),
       company_data: companyEnriched ? companyData : (row.company_data ?? {}),
-      // How the decision maker was arrived at, in words. The alternative is a
-      // person on the row with no way to tell whether they were chosen or
-      // whether they are simply the first the provider returned.
       extra: personFound
         ? {
             ...(row.extra ?? {}),
-            person_choice: describeChoice(
-              { name: personName, title: personTitle },
-              peopleConsidered,
-              targetTitlesOf(run),
-            ),
+            person_choice: describeChoice({ name: personName, title: personTitle }, peopleConsidered, targetTitlesOf(run)),
           }
         : (row.extra ?? {}),
       credits,
@@ -2104,8 +2218,28 @@ async function processRow(
     throw new Error(`row_write_failed: ${doneError.message}`);
   }
 
+  // Into the workspace's lead database. Not thrown: the row and its charge are
+  // already right, and a missed merge is repaired by the next run that touches
+  // the same person, or by the backfill.
+  const { data: merged, error: mergeError } = await db.rpc('lead_contact_upsert_from_row', { p_row_id: row.id });
+  if (mergeError) {
+    console.error('leads: contact merge failed. row=' + row.id + ' error=' + mergeError.message);
+  } else if (merged) {
+    await ws.scoreMerged(db, merged).catch((e: unknown) => console.error('leads: scoring failed', e));
+  }
+
   return { credits, costUsd };
 }
+
+/** Company details count as fresh for 90 days; older ones may be refreshed. */
+function freshCompanyData(d: unknown): boolean {
+  if (!d || typeof d !== 'object' || Object.keys(d as object).length === 0) return false;
+  const at = Date.parse(String((d as Record<string, unknown>).enriched_at ?? ''));
+  // Imported company data with no date is the user's own and is kept.
+  if (!Number.isFinite(at)) return true;
+  return Date.now() - at < 90 * 24 * 3600 * 1000;
+}
+
 /**
  * Writes the attempt and the api_usage row together.
  *
@@ -2239,11 +2373,21 @@ async function importRows(db: any, userId: string, body: any) {
 
   const { data: run } = await db
     .from('lead_runs')
-    .select('id')
+    .select('id, status, pause_reason, target')
     .eq('user_id', userId)
     .eq('id', body.run_id)
     .maybeSingle();
   if (!run) return { ok: false, error: 'run_not_found' };
+  if (TERMINAL.has(run.status)) return { ok: false, error: 'run_already_finished' };
+
+  // No more rows than the run was priced for. The estimate and the wallet check
+  // covered `target` rows; rows past it would be worked and charged beyond what
+  // the user approved.
+  const { count: existing } = await db
+    .from('lead_rows')
+    .select('id', { count: 'exact', head: true })
+    .eq('run_id', run.id);
+  const room = Math.max(0, num(run.target) - num(existing));
 
   const { data: suppressed } = await db.from('lead_suppressions').select('value').eq('user_id', userId);
   const blocked = new Set((suppressed ?? []).map((s: any) => String(s.value).toLowerCase()));
@@ -2251,7 +2395,9 @@ async function importRows(db: any, userId: string, body: any) {
   const inserted: unknown[] = [];
   let skipped = 0;
 
-  for (const raw of (body.rows as any[]).slice(0, 1000)) {
+  const offered = (body.rows as any[]).slice(0, 1000);
+  const overTarget = Math.max(0, offered.length - room);
+  for (const raw of offered.slice(0, room)) {
     const email = asString(raw?.email, 200).toLowerCase();
     const domain = asString(raw?.domain, 200).toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
 
@@ -2271,10 +2417,10 @@ async function importRows(db: any, userId: string, body: any) {
       title: asString(raw?.title, 200) || null,
       linkedin_url: asString(raw?.linkedin_url, 300) || null,
       email: email || null,
-      // An imported address is unverified until a verifier says otherwise, and
-      // the database refuses an address with any other status.
-      email_status: email ? 'unknown' : 'not_found',
-      extra: (raw?.extra ?? {}) as Record<string, unknown>,
+      // Not checked yet - which is a different claim from 'unknown', the answer
+      // a verifier gives when it tried and could not tell.
+      email_status: email ? 'unchecked' : 'not_found',
+      extra: passthrough(raw?.extra),
       state: 'queued',
     });
   }
@@ -2284,7 +2430,32 @@ async function importRows(db: any, userId: string, body: any) {
     if (error) throw error;
   }
 
-  return { ok: true, inserted: inserted.length, skipped };
+  // The last batch releases a run created on hold for its import.
+  if (body?.last === true && run.status === 'paused' && run.pause_reason === 'importing') {
+    await db
+      .from('lead_runs')
+      .update({ status: 'queued', pause_reason: null })
+      .eq('id', run.id)
+      .eq('status', 'paused');
+    kickWorker(run.id);
+  }
+
+  return { ok: true, inserted: inserted.length, skipped, over_target: overTarget };
+}
+
+/**
+ * A CSV's extra columns, minus the keys Leads itself reads from `extra`. A
+ * file with its own "contact_id" column would otherwise be read as a pointer to
+ * a lead in this workspace.
+ */
+function passthrough(v: unknown): Record<string, unknown> {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
+  const out: Record<string, unknown> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>).slice(0, 50)) {
+    if (['contact_id', 'company_id', 'leadsforge_id', 'person_choice'].includes(k)) out['csv_' + k] = val;
+    else out[k] = val;
+  }
+  return out;
 }
 
 async function bulkAction(db: any, userId: string, body: any) {
@@ -2301,16 +2472,48 @@ async function bulkAction(db: any, userId: string, body: any) {
   }
 
   if (action === 'reverify' || action === 'find_phone') {
-    // Re-queued rather than actioned here: the work needs the waterfall and the
-    // wallet, which belong to the worker.
-    const step = action === 'reverify' ? 'verify' : 'phone';
-    const { error } = await db
+    // A new, priced run over copies of the selected rows - not the old run.
+    //
+    // This used to flag the rows 'queued' on their finished run. A finished run
+    // is never worked, so nothing happened; and had it been worked, the run's
+    // own plan would have run again and charged the company and the address a
+    // second time without verifying anything. It also could not have been
+    // charged at all past the run's approved maximum.
+    const requestId = asString(body?.request_id, 64);
+    if (!/^[a-zA-Z0-9-]{8,64}$/.test(requestId)) return { ok: false, error: 'request_id_required' };
+    const prior = await ws.priorRequest(db, userId, requestId);
+    if (prior) return { ok: true, run: prior, replayed: true };
+
+    const { data: src, error } = await db
       .from('lead_rows')
-      .update({ state: 'queued', step, locked_at: null, current_provider: null })
+      .select('person_name, title, linkedin_url, company_name, domain, email, phone, extra')
       .eq('user_id', userId)
       .in('id', ids);
     if (error) throw error;
-    return { ok: true, requeued: ids.length, step };
+
+    const rows = (src ?? [])
+      .filter((r: any) => (action === 'reverify' ? Boolean(r.email) : !r.phone && (r.person_name || r.linkedin_url)))
+      .map((r: any) => ({
+        ...r,
+        extra: r.extra?.leadsforge_id ? { leadsforge_id: r.extra.leadsforge_id } : {},
+      }));
+    if (!rows.length) return { ok: false, error: 'nothing_to_do' };
+
+    if (body?.estimate_only === true) {
+      const mode = action === 'reverify' ? 'verify_only' : 'phone_only';
+      const { data: est, error: estErr } = await db.rpc('estimate_lead_run', {
+        p_target: rows.length, p_mode: mode, p_phone: mode === 'phone_only', p_hit_rate: null, p_user: userId,
+      });
+      if (estErr) throw estErr;
+      return { ok: true, eligible: rows.length, selected: ids.length, estimate: est };
+    }
+
+    return ws.runFromRows(
+      db, wsCtx(db), userId,
+      action === 'reverify' ? 'verify' : 'phone',
+      action === 'reverify' ? 'verify_only' : 'phone_only',
+      rows, requestId,
+    );
   }
 
   return { ok: false, error: 'unknown_bulk_action' };

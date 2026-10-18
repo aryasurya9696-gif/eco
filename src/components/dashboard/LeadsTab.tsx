@@ -1,7 +1,7 @@
 import React from 'react';
 import {
   ListChecks, Plus, Search, FlaskConical, ShieldOff, ArrowLeft,
-  AlertTriangle, Play, Pause, Square, X,
+  AlertTriangle, Play, Pause, Square, X, Users, Building2, List, Upload, Receipt,
 } from 'lucide-react';
 import type { LeadsView, LeadRow, LeadRun, LeadAttempt } from '../../types';
 import type { AttemptWithFailure } from '../leads/AttemptHistory';
@@ -22,6 +22,12 @@ import { WaterfallColumn } from '../leads/WaterfallChain';
 import { Button } from '../leads/Screen';
 import { EmptyState } from '../leads/Empty';
 import { ExportMenu } from '../leads/ExportMenu';
+import { CostDialog } from '../leads/CostDialog';
+import { SearchView } from '../leads/SearchView';
+import { PeopleView } from '../leads/PeopleView';
+import { CompaniesView, ListsView, UsageView } from '../leads/CompaniesView';
+import type { ContactFilters } from '../../lib/leads-db';
+import { bulkRowsEstimate, bulkRowsStart } from '../../lib/leads-db';
 import { getWaterfall } from '../../lib/leads';
 import type { LeadStep } from '../../types';
 
@@ -50,13 +56,75 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ view, runId, onViewChange, o
       <RunView
         runId={runId}
         onBack={() => onViewChange('runs')}
+        onOpenRun={onOpenRun}
       />
     );
   }
 
+  return <LeadsWorkspace view={view} onViewChange={onViewChange} onOpenRun={onOpenRun} />;
+};
+
+/**
+ * The sub-views. Kept apart from LeadsTab so the run detail screen above stays
+ * an early return, and so "open this list in People" can carry its filter across
+ * a view change without living in the hash.
+ */
+const LeadsWorkspace: React.FC<{
+  view: LeadsView;
+  onViewChange: (view: LeadsView) => void;
+  onOpenRun: (runId: string) => void;
+}> = ({ view, onViewChange, onOpenRun }) => {
+  // A filter handed from another view (a list, a company). The key remounts the
+  // view so it starts from that filter rather than merging into the old one.
+  const [peopleInit, setPeopleInit] = React.useState<{ key: number; filters: ContactFilters } | null>(null);
+  const [companyList, setCompanyList] = React.useState<{ key: number; id: string } | null>(null);
+  const openPeople = (filters: ContactFilters) => {
+    setPeopleInit({ key: Date.now(), filters });
+    onViewChange('people');
+  };
+
   return (
     <div className="space-y-6">
-      <SubNav view={view} onViewChange={onViewChange} />
+      <SubNav view={view} onViewChange={(v) => {
+        if (v === 'people') setPeopleInit(null);
+        if (v === 'companies') setCompanyList(null);
+        onViewChange(v);
+      }} />
+
+      {view === 'search' && <SearchView onOpenRun={onOpenRun} onOpenPeople={() => openPeople({})} />}
+
+      {view === 'people' && (
+        <PeopleView
+          key={peopleInit?.key ?? 'people'}
+          initialFilters={peopleInit?.filters}
+          onOpenRun={onOpenRun}
+          onOpenSearch={() => onViewChange('search')}
+        />
+      )}
+
+      {view === 'companies' && (
+        <CompaniesView
+          key={companyList?.key ?? 'companies'}
+          initialListId={companyList?.id}
+          onOpenRun={onOpenRun}
+          onOpenPeople={(f) => openPeople(f)}
+          onOpenSearch={() => onViewChange('search')}
+        />
+      )}
+
+      {view === 'lists' && (
+        <ListsView
+          onOpenList={(l) => {
+            if (l.kind === 'people') openPeople({ list_id: l.id });
+            else {
+              setCompanyList({ key: Date.now(), id: l.id });
+              onViewChange('companies');
+            }
+          }}
+        />
+      )}
+
+      {view === 'usage' && <UsageView onOpenRun={onOpenRun} />}
 
       {view === 'runs' && (
         <RunsList
@@ -80,10 +148,17 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ view, runId, onViewChange, o
 // Sub-nav
 // ---------------------------------------------------------------------------
 
-const SUB_NAV: Array<{ view: LeadsView; label: string; icon: React.ReactNode }> = [
-  { view: 'runs', label: 'Runs', icon: <ListChecks className="w-3.5 h-3.5" /> },
-  { view: 'new', label: 'New search', icon: <Plus className="w-3.5 h-3.5" /> },
-  { view: 'clean', label: 'Clean a list', icon: <Search className="w-3.5 h-3.5" /> },
+// Two groups: the lead database the user works in, then the jobs and settings
+// that feed it. A divider between them rather than a second menu.
+const SUB_NAV: Array<{ view: LeadsView; label: string; icon: React.ReactNode; divider?: boolean }> = [
+  { view: 'search', label: 'Search', icon: <Search className="w-3.5 h-3.5" /> },
+  { view: 'people', label: 'People', icon: <Users className="w-3.5 h-3.5" /> },
+  { view: 'companies', label: 'Companies', icon: <Building2 className="w-3.5 h-3.5" /> },
+  { view: 'lists', label: 'Lists', icon: <List className="w-3.5 h-3.5" /> },
+  { view: 'runs', label: 'Runs', icon: <ListChecks className="w-3.5 h-3.5" />, divider: true },
+  { view: 'new', label: 'Find by profile', icon: <Plus className="w-3.5 h-3.5" /> },
+  { view: 'clean', label: 'Import', icon: <Upload className="w-3.5 h-3.5" /> },
+  { view: 'usage', label: 'Usage', icon: <Receipt className="w-3.5 h-3.5" /> },
   { view: 'lab', label: 'Provider lab', icon: <FlaskConical className="w-3.5 h-3.5" /> },
   { view: 'optouts', label: 'Opt-outs', icon: <ShieldOff className="w-3.5 h-3.5" /> },
 ];
@@ -92,12 +167,14 @@ const SubNav: React.FC<{ view: LeadsView; onViewChange: (v: LeadsView) => void }
   view,
   onViewChange,
 }) => (
-  <div className="flex items-center gap-1 border-b border-[#e3e3de] -mt-2">
+  <nav className="flex items-center gap-1 border-b border-[#e3e3de] -mt-2 overflow-x-auto" aria-label="Leads sections">
     {SUB_NAV.map((item) => {
       const active = view === item.view;
       return (
+        <React.Fragment key={item.view}>
+        {item.divider && <span className="w-px h-4 bg-[#e3e3de] mx-1.5 flex-shrink-0" aria-hidden="true" />}
         <button
-          key={item.view}
+          aria-current={active ? 'page' : undefined}
           onClick={() => onViewChange(item.view)}
           className={`flex items-center gap-1.5 px-3 py-2 text-xs font-mono transition-colors cursor-pointer border-b-2 -mb-px ${
             active
@@ -108,16 +185,24 @@ const SubNav: React.FC<{ view: LeadsView; onViewChange: (v: LeadsView) => void }
           {item.icon}
           {item.label}
         </button>
+        </React.Fragment>
       );
     })}
-  </div>
+  </nav>
 );
 
 // ---------------------------------------------------------------------------
 // One run — the table, live
 // ---------------------------------------------------------------------------
 
-const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId, onBack }) => {
+const RunView: React.FC<{ runId: string | null; onBack: () => void; onOpenRun: (id: string) => void }> = ({
+  runId,
+  onBack,
+  onOpenRun,
+}) => {
+  // Rows waiting on the re-verify confirmation. Re-verifying is a new priced
+  // run, so it is confirmed with its price like every other paid action.
+  const [reverifyIds, setReverifyIds] = React.useState<string[] | null>(null);
   const [run, setRun] = React.useState<LeadRun | null>(null);
   const [rows, setRows] = React.useState<LeadRow[]>([]);
   const [total, setTotal] = React.useState(0);
@@ -531,7 +616,9 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
               ? 'Out of credits for the worst case of this run. Top up and it will pick up where it stopped.'
               : run.pause_reason === 'provider_balance'
                 ? 'The data provider is out of credit, so no lookups can run until it is topped up.'
-                : run.pause_reason.replace(/_/g, ' ')}
+                : run.pause_reason === 'importing'
+                  ? 'Waiting for the rows to finish uploading. If the upload was interrupted, Resume works the rows that arrived.'
+                  : run.pause_reason.replace(/_/g, ' ')}
           </p>
         </div>
       )}
@@ -679,9 +766,27 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
         total={total}
         loading={loading}
         attemptsFor={attemptsFor}
-        onBulk={(action, ids) => bulkAction(runId, ids, action)}
+        onBulk={async (action, ids) => {
+          if (action === 'delete') return bulkAction(runId, ids, action);
+          setReverifyIds(ids);
+          return { ok: true, note: null };
+        }}
         onSuppress={(ids) => void suppressRows(ids)}
       />
+
+      {reverifyIds && (
+        <CostDialog
+          title={`Re-verify ${reverifyIds.length} addresses`}
+          description="Checks each selected address again with the verifiers, as a new run. This run and its charges are not changed."
+          getEstimate={() => bulkRowsEstimate(runId, reverifyIds, 'reverify')}
+          start={(requestId) => bulkRowsStart(runId, reverifyIds, 'reverify', requestId)}
+          onStarted={(id) => {
+            setReverifyIds(null);
+            onOpenRun(id);
+          }}
+          onClose={() => setReverifyIds(null)}
+        />
+      )}
     </div>
   );
 };

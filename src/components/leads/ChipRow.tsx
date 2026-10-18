@@ -23,7 +23,12 @@ export const ChipRow: React.FC<{
   /** Industries map through a provider's own vocabulary; some do not. */
   mapped?: boolean;
   disabled?: boolean;
-}> = ({ label, values, onChange, suggestions = [], placeholder = 'Add…', mapped = true, disabled = false }) => {
+  /**
+   * A visible, bordered input with its placeholder always shown. For filter
+   * panels, where an empty row with no box reads as nothing being there to fill.
+   */
+  boxed?: boolean;
+}> = ({ label, values, onChange, suggestions = [], placeholder = 'Add…', mapped = true, disabled = false, boxed = false }) => {
   const [draft, setDraft] = React.useState('');
 
   const commit = (raw: string) => {
@@ -57,7 +62,7 @@ export const ChipRow: React.FC<{
         )}
       </div>
 
-      <div className="flex flex-wrap items-center gap-1.5">
+      <div className={`flex flex-wrap items-center gap-1.5 ${boxed ? 'border border-[#e3e3de] px-1.5 py-1 focus-within:ring-1 focus-within:ring-[#141414]' : ''}`}>
         {values.map((v) => (
           <span
             key={v}
@@ -90,7 +95,8 @@ export const ChipRow: React.FC<{
               }
             }}
             onBlur={() => commit(draft)}
-            placeholder={values.length === 0 && suggestions.length ? placeholder : ''}
+            placeholder={values.length === 0 && (suggestions.length || boxed) ? placeholder : ''}
+            aria-label={label}
             className="min-w-[6rem] flex-1 bg-transparent text-[10px] font-mono text-[#141414] placeholder:text-[#b5b5ad] focus:outline-none py-0.5"
           />
         )}

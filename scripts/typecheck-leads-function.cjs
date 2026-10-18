@@ -33,12 +33,13 @@ const MODULES = [
   'billing.ts',
   'registry.ts',
   'treg.ts',
-  'read-response.ts',
-  'read-lists.ts',
   'discover.ts',
   'choose-person.ts',
   'attribution.ts',
   'api-usage.ts',
+  'endpoints.ts',
+  'scoring.ts',
+  'workspace.ts',
   'index.ts',
 ];
 

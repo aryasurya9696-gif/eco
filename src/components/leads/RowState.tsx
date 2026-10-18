@@ -34,7 +34,9 @@ const ADDRESS_LABEL: Record<LeadEmailStatus, RowStateLabel> = {
   verified: { text: 'Verified', tone: 'good' },
   catch_all: { text: 'Catch-all', tone: 'warn' },
   invalid: { text: 'No mailbox', tone: 'bad' },
-  unknown: { text: 'Unchecked', tone: 'default' },
+  unknown: { text: 'Verifier unsure', tone: 'default' },
+  unchecked: { text: 'Not checked', tone: 'default' },
+  disposable: { text: 'Disposable', tone: 'bad' },
   not_found: { text: 'No address', tone: 'default' },
 };
 

@@ -45,7 +45,11 @@ interface LeadsTableProps {
   total: number;
   loading?: boolean;
   attemptsFor?: (rowId: string) => Promise<AttemptWithFailure[]>;
-  onBulk?: (action: 'delete' | 'reverify', rowIds: string[]) => Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Delete acts at once. Re-verify opens the caller's priced confirmation and
+   * resolves with a note (or none) - it starts a new run, it does not edit this one.
+   */
+  onBulk?: (action: 'delete' | 'reverify', rowIds: string[]) => Promise<{ ok: boolean; error?: string; note?: string | null }>;
   /** Suppressed on selection, because that is an opt-out not a bulk edit. */
   onSuppress?: (rowIds: string[]) => void;
 }
@@ -431,12 +435,12 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
         setNote(res.error ?? 'That did not work.');
         return;
       }
-      setNote(
-        action === 'delete'
-          ? `${selectedIds.length} rows removed.`
-          : `${selectedIds.length} rows queued for another check.`,
-      );
-      setPicked(new Set());
+      if (action === 'delete') {
+        setNote(`${selectedIds.length} rows removed.`);
+        setPicked(new Set());
+      } else {
+        setNote(res.note ?? null);
+      }
     } finally {
       setBusy(null);
     }

@@ -33,6 +33,8 @@ export interface RowOutcome {
   catchAll: boolean;
   /** A verifier said this address does not exist. */
   invalid: boolean;
+  /** A verifier said this is a throwaway mailbox. A failed lead, like invalid. */
+  disposable: boolean;
   /** A verifier was asked and could not be read. Not a result, and not charged. */
   unreadable: boolean;
   phoneFound: boolean;
@@ -46,6 +48,7 @@ const NOTHING: RowOutcome = {
   verified: false,
   catchAll: false,
   invalid: false,
+  disposable: false,
   unreadable: false,
   phoneFound: false,
   companyEnriched: false,
@@ -83,7 +86,7 @@ export function creditsForRow(outcome: Partial<RowOutcome>, prices: LeadPrices, 
   // Verification is a separate line only where the plan says so. On a find run an
   // address is verified as part of being found, so charging both would charge
   // twice for one piece of work.
-  const verdictGiven = o.verified || o.catchAll || o.invalid;
+  const verdictGiven = o.verified || o.catchAll || o.invalid || o.disposable;
   if (plan.chargeVerifySeparately && verdictGiven && !o.unreadable) {
     credits += prices.verifyOnly;
   }
@@ -100,12 +103,15 @@ export function creditsForRow(outcome: Partial<RowOutcome>, prices: LeadPrices, 
 // Every flag is now refused where the plan says the step does not run, so the
 // worst a bug can do is charge less rather than charge outside the mode.
 if (plan.findEmail && o.emailFound) {
-    // A catch-all is not the deliverable a verified address is, and is priced
-    // accordingly. Charging it the verified price is selling the worse answer at
-    // the better price; charging the catch-all price for an address that is in
-    // fact deliverable undercharges by more than half.
-    if (o.catchAll && !o.verified) credits += prices.emailCatchAll;
-    else credits += prices.emailVerified;
+    // The verified price is for a verified address and nothing else. One nobody
+    // could confirm - catch-all, unknown, never checked - is the lower catch-all
+    // price, and one a verifier rejected is not charged at all.
+    //
+    // It used to be the verified price unless a verifier said catch-all, and a
+    // find run never verified, so every address it found was billed as verified
+    // while the row said 'unknown'.
+    if (o.verified) credits += prices.emailVerified;
+    else if (!o.invalid && !o.disposable) credits += prices.emailCatchAll;
   }
 
   // Phone and enrichment are gated the same way. Phone was the last flag a caller

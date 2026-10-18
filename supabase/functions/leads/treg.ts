@@ -142,8 +142,15 @@ export function tregConfig(meta: Record<string, string>, token: string | null): 
 
 export interface TregCallSpec {
   endpointId: string;
-  /** POST body. Catalog entries marked strict_query take no body at all. */
+  /**
+   * The endpoint's inputs. Sent as the JSON body for POST and as the query string
+   * for GET - the catalog says which, per endpoint, and endpoints.ts carries it.
+   */
   params: Record<string, unknown>;
+  /** Defaults to POST, which is what every endpoint here used to be sent. */
+  method?: 'GET' | 'POST';
+  /** Extra query params on a POST, e.g. LeadsForge's paging cursor. */
+  query?: Record<string, unknown>;
   /**
    * One key per logical attempt, not per HTTP request. A retry sends the same
    * key so the replay is free; genuinely new work gets a new key.
@@ -165,16 +172,18 @@ export async function tregCall(cfg: TregConfig, spec: TregCallSpec): Promise<Tre
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
 
   try {
-    const res = await fetch(`${cfg.baseUrl}/call/${spec.endpointId}`, {
-      method: 'POST',
+    const method = spec.method ?? 'POST';
+    const qs = toQuery(method === 'GET' ? { ...(spec.params ?? {}), ...(spec.query ?? {}) } : (spec.query ?? {}));
+    const res = await fetch(`${cfg.baseUrl}/call/${spec.endpointId}${qs}`, {
+      method,
       headers: {
         'X-Treg-Token': cfg.token,
-        'Content-Type': 'application/json',
+        ...(method === 'GET' ? {} : { 'Content-Type': 'application/json' }),
         'X-Treg-Route-Max-Cost': String(spec.maxCostUsd ?? cfg.maxCostUsd),
         'Idempotency-Key': spec.idempotencyKey,
         'X-Treg-Meta': Object.entries(cfg.meta).map(([k, v]) => `${k}=${v}`).join(','),
       },
-      body: JSON.stringify(spec.params ?? {}),
+      body: method === 'GET' ? undefined : JSON.stringify(spec.params ?? {}),
       signal: controller.signal,
     });
 
@@ -264,6 +273,17 @@ export async function tregCall(cfg: TregConfig, spec: TregCallSpec): Promise<Tre
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Scalars only; null and undefined are dropped rather than sent as "null". */
+export function toQuery(params: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(params)) {
+    if (v === null || v === undefined || v === '') continue;
+    if (typeof v === 'object') continue;
+    parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(v)));
+  }
+  return parts.length ? '?' + parts.join('&') : '';
 }
 
 async function safeJson(res: Response): Promise<unknown> {

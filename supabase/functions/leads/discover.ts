@@ -16,7 +16,7 @@
 
 import { type LeadStep, type EndpointEntry } from './registry.ts';
 import { tregCallWithRetry, type TregConfig, type LeadOutcome } from './treg.ts';
-import { readCompanies, type CompanyHit } from './read-lists.ts';
+import { companySearchRequest, readCompanySearch, type CompanyHit, type SegmentFilters } from './endpoints.ts';
 import { round6 } from './pricing-row.ts';
 
 /** One company search call and what it produced. */
@@ -56,65 +56,6 @@ export interface SearchableSegment {
   targetTitles?: string[] | null;
   employeeRange?: [number, number] | null;
   name?: string | null;
-}
-
-/**
- * The query for a company search.
- *
- * A guess at the parameter names, because no endpoint in the registry has been
- * called against a live response. Sending several spellings of the same filter is
- * deliberate: an endpoint that ignores an unknown key costs nothing extra, and an
- * endpoint that only understands `limit` would otherwise return its default page
- * of twenty and the run would fill with whatever was at the top of it.
- *
- * Keywords are the query. An industry taxonomy is not a string and the providers
- * disagree about what they accept for one, so industries go as their own field
- * and the keywords do the work of narrowing.
- */
-export function companyQuery(seg: SearchableSegment, want: number): Record<string, unknown> {
-  const industries = (seg.industries ?? []).filter(Boolean);
-  const keywords = (seg.keywords ?? []).filter(Boolean);
-  const [lo, hi] = seg.employeeRange ?? [];
-
-  // Both, because a user who filled in one often means the other and a search
-  // that drops half the form silently is a search that returns the wrong people.
-  let text = [...keywords, ...industries].join(' ').trim();
-
-  // The name, only when there is nothing else to search with.
-  //
-  // This was a refusal instead: a profile with a name and no keywords was treated
-  // as unsearchable and the run failed with "add an industry or keyword". But the
-  // name is what the user typed to describe their buyer - "UK accounting firms" -
-  // and a screen that refuses to search for the description the user gave is
-  // worse than one that searches for it.
-  //
-  // Kept as a fallback rather than always included, because the name is a label
-  // for the segment ("Series A founders") and not always a query. Keywords are
-  // the query when there are any; the name only stands in when there are none.
-  const name = (seg.name ?? '').trim();
-  if (!text && name) text = name;
-
-  const country = (seg.countries ?? [])[0] ?? null;
-
-  return {
-    query: text,
-    q: text,
-    search: text,
-    industry: industries[0] ?? null,
-    industries: industries.join(',') || null,
-    country,
-    country_code: country,
-    countryCode: country,
-    employees_min: Number.isFinite(lo) ? lo : null,
-    employees_max: Number.isFinite(hi) ? hi : null,
-    employee_count_min: Number.isFinite(lo) ? lo : null,
-    employee_count_max: Number.isFinite(hi) ? hi : null,
-    size_min: Number.isFinite(lo) ? lo : null,
-    size_max: Number.isFinite(hi) ? hi : null,
-    // A page bigger than asked for would be billed for and then discarded, since
-    // the row cap is the user's decision and not the provider's.
-    limit: Math.max(1, Math.min(want, 200)),
-  };
 }
 
 /**
@@ -223,21 +164,29 @@ export async function discoverCompanies(
     if (costUsd >= ceiling) break;
 
     const need = want - out.length;
+    // Each provider has its own filter shape (endpoints.ts). One that cannot be
+    // asked with any filter it understands is skipped, not called.
+    const shape = companySearchRequest(id, seg as SegmentFilters, need);
+    if (!shape) continue;
     const idempotencyKey = `leads:${runId}:company:${id}:${attempts.length}`;
 
     const result = await tregCallWithRetry(cfg, {
       endpointId: id,
-      params: companyQuery(seg, need),
+      method: shape.method,
+      params: shape.params,
       // Keyed on the attempt index as well as the endpoint, because the same
       // provider may legitimately be asked twice when the first page missed and
       // the next provider is the same vendor under a different id.
       idempotencyKey,
-      maxCostUsd: Math.min(entry.priceUsd * Math.max(1, need), ceiling - costUsd),
+      maxCostUsd: Math.max(0, Math.min(entry.maxCallUsd, ceiling - costUsd)),
     });
 
     costUsd += result.costUsd;
 
-    const found = result.outcome === 'success' ? readCompanies(result.body) : [];
+    const found =
+      result.ok && (result.outcome === 'success' || result.outcome === 'free')
+        ? readCompanySearch(id, result.body)
+        : [];
     attempts.push({
       endpointId: id,
       step: 'company',

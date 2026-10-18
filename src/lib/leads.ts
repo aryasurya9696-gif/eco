@@ -64,9 +64,11 @@ export function tabFromHash(hash: string = window.location.hash): string | null 
   return tab && tab in TAB_FROM_SEGMENT ? tab : 'feed';
 }
 
-const DEFAULT_VIEW: LeadsView = 'runs';
+const DEFAULT_VIEW: LeadsView = 'people';
 
-const KNOWN_VIEWS: LeadsView[] = ['runs', 'new', 'clean', 'lab', 'optouts', 'run'];
+const KNOWN_VIEWS: LeadsView[] = [
+  'search', 'people', 'companies', 'lists', 'usage', 'runs', 'new', 'clean', 'lab', 'optouts', 'run',
+];
 
 /**
  * Reads the Leads sub-view, and the run id when the view is a run.
@@ -103,7 +105,7 @@ export function leadsRouteFromHash(hash: string = window.location.hash): {
 /** The hash for a tab, preserving whatever Leads sub-view is showing. */
 export function hashForTab(tab: string, leadsRoute?: { view: LeadsView; runId: string | null }): string {
   if (tab !== 'leads') return `#dashboard/${tab}`;
-  if (!leadsRoute) return '#dashboard/leads/runs';
+  if (!leadsRoute) return '#dashboard/leads/people';
   if (leadsRoute.view === 'run') {
     return leadsRoute.runId
       ? `#dashboard/leads/run/${leadsRoute.runId}`
@@ -484,9 +486,14 @@ export async function importRows(
     linkedin_url?: string;
     extra?: Record<string, string>;
   }>,
+  /**
+   * True on the final batch. A clean run is created on hold so the worker does
+   * not find it empty and finish it; the last batch releases it.
+   */
+  last = false,
 ): Promise<ImportResult> {
   if (rows.length > 1000) throw new Error('importRows takes at most 1000 rows');
-  return invokeFunction<ImportResult>('leads', { action: 'import', run_id: runId, rows });
+  return invokeFunction<ImportResult>('leads', { action: 'import', run_id: runId, rows, last });
 }
 
 // ---------------------------------------------------------------------------
@@ -667,11 +674,23 @@ export function emailStatusLabel(status: LeadRow['email_status']): {
         className: 'bg-[#f8e4df] text-[#c0462e]',
         title: 'Confirmed dead. Worth re-running the waterfall from the next provider.',
       };
+    case 'disposable':
+      return {
+        label: 'Disposable',
+        className: 'bg-[#f8e4df] text-[#c0462e]',
+        title: 'A throwaway mailbox, as reported by the verifier. Not a usable work address.',
+      };
     case 'unknown':
       return {
         label: 'Unknown',
         className: 'bg-[#eeeeea] text-[#8a8a86]',
-        title: 'The verifier did not answer. Not the same as a confirmed result.',
+        title: 'A verifier was asked and could not tell either way.',
+      };
+    case 'unchecked':
+      return {
+        label: 'Not checked',
+        className: 'bg-white text-[#8a8a86] border border-[#e3e3de]',
+        title: 'An address nothing has verified yet. Found or imported, not confirmed.',
       };
     case 'not_found':
     default:
