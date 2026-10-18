@@ -15,6 +15,20 @@
 
 const FN = 'leads';
 
+// Written out rather than imported, for the same reason round6 is duplicated
+// below: pricing-row.ts imports a type from steps.ts using a .ts extension, which
+// Deno needs and Node cannot resolve. A type-only import with inline structural
+// duplication is not worth a build step that runs in both runtimes.
+export interface LeadPrices {
+  company: number;
+  person: number;
+  emailVerified: number;
+  emailCatchAll: number;
+  verifyOnly: number;
+  phone: number;
+  enrich: number;
+}
+
 export interface WalletApi {
   rpc(name: string, args: Record<string, unknown>): Promise<{ data: unknown; error: { message: string } | null }>;
 }
@@ -144,7 +158,6 @@ export async function releaseChunk(
   db: WalletApi,
   holdId: string,
   runId: string,
-  chunkIndex: number,
   note: string,
 ): Promise<{ ok: boolean; released: number }> {
   const { data, error } = await db.rpc('wallet_release', {
@@ -159,56 +172,19 @@ export async function releaseChunk(
 }
 
 /**
- * Turns a successful result into the credits it earned.
+ * numeric(20,6) has six decimals; sending more is noise and can be rejected.
  *
- * Which price applies depends on what was found, and the difference is large: a
- * verified address is a real deliverable and a catch-all is not, so charging them
- * the same would be selling the worse answer at the better price. A row that
- * found nothing earns nothing, which is what makes a miss free end to end.
+ * Duplicated from pricing-row.ts rather than imported, because that module
+ * imports a type from steps.ts with a .ts extension, which Deno requires and
+ * Node does not resolve. Two four-line helpers is a smaller problem than one
+ * file that only compiles in one runtime.
  */
-export function creditsForResult(
-  result: { emailFound: boolean; verified: boolean; catchAll: boolean; phoneFound: boolean; companyEnriched: boolean },
-  prices: {
-    company: number;
-    person: number;
-    emailVerified: number;
-    emailCatchAll: number;
-    phone: number;
-    enrich: number;
-  },
-  personFound = true,
-  companyFound = true,
-): number {
-  let credits = 0;
-  if (companyFound) credits += prices.company;
-  if (personFound) credits += prices.person;
-
-  if (result.emailFound) {
-    if (result.verified) credits += prices.emailVerified;
-    else if (result.catchAll) credits += prices.emailCatchAll;
-    // Found but neither verified nor catch-all: unknown. Charged as the verified
-    // price would overcharge, and as the catch-all price would undercharge. It is
-    // charged as verified because an address in hand is the deliverable the user
-    // paid for, and the verification column tells them not to trust it.
-    else credits += prices.emailVerified;
-  }
-
-  if (result.phoneFound) credits += prices.phone;
-  if (result.companyEnriched) credits += prices.enrich;
-
-  return round6(credits);
+function round6(n: number): number {
+  return Math.round(n * 1e6) / 1e6;
 }
 
 /** Reads the leads prices the wallet needs, from pricing_config. */
-export async function loadLeadPrices(db: WalletApi): Promise<{
-  company: number;
-  person: number;
-  emailVerified: number;
-  emailCatchAll: number;
-  verifyOnly: number;
-  phone: number;
-  enrich: number;
-} | null> {
+export async function loadLeadPrices(db: WalletApi): Promise<LeadPrices | null> {
   // Read through PostgREST rather than an RPC: pricing_config is a plain table
   // and the service role can select it directly.
   const { data: rows } = await (db as unknown as {
@@ -247,9 +223,4 @@ export async function loadLeadPrices(db: WalletApi): Promise<{
     phone: byOp.get('leads.phone.found') ?? 0,
     enrich: byOp.get('leads.company.enrich') ?? 0,
   };
-}
-
-/** numeric(20,6) has six decimals; sending more is noise and can be rejected. */
-function round6(n: number): number {
-  return Math.round(n * 1e6) / 1e6;
 }

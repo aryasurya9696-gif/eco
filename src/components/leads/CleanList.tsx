@@ -30,18 +30,18 @@ import { formatUsd } from '../../lib/billing';
  */
 
 /**
- * The three clean modes, priced differently and behaving identically.
+ * The three clean modes.
  *
- * The worker reads `lead_runs.mode` for nothing. It runs the same email waterfall
- * for all three, which means "check what I have" would go and find replacements
- * for the rows that fail — exactly what it says it will not do — and would charge
- * the find price for them. The estimate prices the three apart correctly, so at
- * present the selector picks which price is shown rather than which work is done.
+ * These used to price differently and behave identically: the worker read
+ * lead_runs.mode for nothing, so all three ran the same email waterfall, which
+ * meant the cheapest one went out and found replacements for the rows it had
+ * promised to leave alone and charged the find price for doing it.
  *
- * The copy below therefore describes what each mode is for rather than asserting
- * what the worker will do, and the banner under the picker says which of the two
- * is in force. Implementing the gate is the fix: see the missing verify step in
- * processRow, and the fact that it writes email_status 'unknown' after a hit.
+ * They now come from steps.ts, which is the same function the estimator and the
+ * tests read, so the price shown and the work done cannot drift apart. Nothing
+ * is read from lead_runs.mode in this file — the estimate is asked for the mode
+ * and the worker is told it separately, and the two agree because they come from
+ * one list of names.
  */
 const MODES: Array<{ id: CleanMode; label: string; body: string; credits: string }> = [
   {
@@ -329,14 +329,12 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
         </button>
       </div>
 
-      {/* Which of the two the modes really are. Said once, here, rather than as
-          hedged copy inside all three descriptions — the difference between the
-          price and the work is precisely what a user would be misled by. */}
-      <div className="bg-[#f8eedb] border border-[#f0e0bd] px-4 py-2.5">
-        <p className="text-[10px] font-mono text-[#b5801f] leading-relaxed">
-          These three price differently but run the same lookups right now, so all of them will cost
-          what the middle one costs. The worker does not act on the mode yet: verification is not
-          charged on its own, and an address that is found is not marked verified by the check.
+      {/* Worth knowing before choosing, because it decides the bill. */}
+      <div className="bg-white border border-[#e3e3de] px-4 py-2.5">
+        <p className="text-[10px] font-mono text-[#8a8a86] leading-relaxed">
+          Verification is charged per row whatever the answer turns out to be — you are buying the
+          check, not the result. A replacement is charged on top, and only for the rows whose address
+          did not survive.
         </p>
       </div>
 
