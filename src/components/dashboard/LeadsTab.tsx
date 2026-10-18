@@ -522,7 +522,7 @@ const LeadsWorkspace: React.FC<{
                   key={peopleInit?.key ?? (activeList ? `list-${activeList.id}` : 'people')}
                   initialFilters={peopleInit?.filters}
                   onOpenRun={onOpenRun}
-                  onOpenSearch={() => onViewChange('find', 'search')}
+                  onOpenSearch={() => onViewChange('find', 'profile')}
                 />
               </Screen>
             )}
@@ -539,7 +539,7 @@ const LeadsWorkspace: React.FC<{
                   initialListId={companyList?.id}
                   onOpenRun={onOpenRun}
                   onOpenPeople={(f) => openPeople(f)}
-                  onOpenSearch={() => onViewChange('find', 'search')}
+                  onOpenSearch={() => onViewChange('find', 'profile')}
                 />
               </Screen>
             )}
@@ -1069,7 +1069,13 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
             {stats.found} <span className="text-xs font-normal text-muted">of {run?.target || total}</span>
           </div>
           <span className="text-[10px] font-mono text-muted block mt-1">
-            {total > stats.found ? 'Resolving people' : 'people completed'}
+            {run?.status === 'running'
+              ? stats.found === 0
+                ? 'Starting waterfall…'
+                : 'Resolving people…'
+              : total > 0 && stats.found >= total
+                ? 'Completed'
+                : 'Finished'}
           </span>
         </div>
 

@@ -14,6 +14,7 @@ import { ColumnMapper, checkMapping, type CleanMode, type FieldKey } from './Col
 import { Figure } from './Screen';
 import { PriceSummary } from './PriceSummary';
 import { importContacts, getLists, type LeadList } from '../../lib/leads-db';
+import { fetchBalance } from '../../lib/billing';
 
 const MODES: Array<{ id: CleanMode; label: string; body: string; credits: string }> = [
   {
@@ -65,9 +66,18 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun, onOpenPeople })
   const [lists, setLists] = React.useState<LeadList[]>([]);
   const [targetListId, setTargetListId] = React.useState('');
   const [importedCount, setImportedCount] = React.useState<number | null>(null);
+  const [available, setAvailable] = React.useState<number | null>(null);
 
   React.useEffect(() => {
-    void getLists().then((r) => r.ok && setLists(r.lists.filter((l) => l.kind === 'people'))).catch(() => {});
+    void Promise.all([
+      getLists().then((r) => r.ok && setLists(r.lists.filter((l) => l.kind === 'people'))).catch(() => {}),
+      fetchBalance().then((b) => {
+        if (b?.wallet) {
+          const a = Number(b.wallet.available ?? b.wallet.balance - b.wallet.reserved);
+          setAvailable(Number.isFinite(a) ? a : null);
+        }
+      }).catch(() => {}),
+    ]);
   }, []);
 
   const inputRef = React.useRef<HTMLInputElement>(null);
@@ -515,11 +525,20 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun, onOpenPeople })
         <PriceSummary
           expected={estimate.expected_credits}
           max={estimate.max_credits}
+          available={available}
           rows={Math.min(usable, MAX_RUN_ROWS)}
+          note="The worst-case maximum is held while rows are processed. Only resolved hits are charged; the unused part is released back to your balance when the run finishes."
           action={
             <button
               onClick={() => void run()}
-              disabled={busy || usable === 0 || !mappingCheck.ok || pricing || !estimate}
+              disabled={
+                busy ||
+                usable === 0 ||
+                !mappingCheck.ok ||
+                pricing ||
+                !estimate ||
+                (available !== null && available < estimate.max_credits)
+              }
               className="inline-flex items-center gap-2 px-4 py-2 bg-ink hover:bg-black disabled:bg-line disabled:text-muted disabled:cursor-not-allowed text-white text-xs font-mono transition-colors cursor-pointer"
             >
               {busy ? (

@@ -7,6 +7,9 @@ import {
 import { useAuth } from '../../context/AuthContext';
 import { fetchBalance } from '../../lib/billing';
 import { mergeSegment, isSearchable } from '../../lib/leads-segment';
+import { Modal } from './Dialogs';
+import { Button } from './Screen';
+import { PriceSummary } from './PriceSummary';
 
 interface NewSearchProps {
   onStarted: (runId: string) => void;
@@ -88,6 +91,7 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
   const [error, setError] = React.useState<string | null>(null);
   const [note, setNote] = React.useState('');
   const [regenerating, setRegenerating] = React.useState(false);
+  const [showConfirm, setShowConfirm] = React.useState(false);
 
   // Load saved ICP, Balance, and Active run count on mount
   React.useEffect(() => {
@@ -160,7 +164,7 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
 
   const enoughToSearch = isSearchable(segment);
 
-  const start = async () => {
+  const confirmStart = async () => {
     setBusy(true);
     setError(null);
     try {
@@ -197,6 +201,7 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
         return;
       }
 
+      setShowConfirm(false);
       // Automatically transitions to live Lead list (Photo 3)
       onStarted(res.run.id);
     } catch {
@@ -403,7 +408,7 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
 
             {/* Prominent Button with about 16.6 credits each */}
             <button
-              onClick={() => void start()}
+              onClick={() => setShowConfirm(true)}
               disabled={busy || pricing || !enoughToSearch}
               className="w-full flex items-center justify-between px-5 py-3.5 bg-ink hover:bg-black disabled:bg-line disabled:text-muted disabled:cursor-not-allowed text-white text-sm font-mono cursor-pointer transition-colors shadow-sm"
             >
@@ -470,6 +475,47 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
           </div>
         </div>
       </div>
+
+      {/* Confirmation Modal */}
+      {showConfirm && (
+        <Modal
+          title={`Find ${target} leads`}
+          busy={busy}
+          onClose={() => !busy && setShowConfirm(false)}
+          footer={
+            <div className="flex items-center justify-end gap-2.5">
+              <Button variant="secondary" onClick={() => setShowConfirm(false)} disabled={busy}>
+                Cancel
+              </Button>
+              <Button
+                onClick={() => void confirmStart()}
+                disabled={busy || (available !== null && available < maxCredits)}
+              >
+                {busy && <Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" />}
+                Confirm & Start run
+              </Button>
+            </div>
+          }
+        >
+          <div className="space-y-4">
+            <p className="text-xs font-mono text-muted leading-relaxed">
+              You are about to launch a search for <strong className="text-ink">{segment.name || 'your ideal customer'}</strong>.
+            </p>
+            <PriceSummary
+              expected={expectedCredits}
+              max={maxCredits}
+              available={available}
+              rows={target}
+              note="The maximum is held when the run starts. As providers resolve contacts, only hits are charged; the unused part comes back to your balance when the run finishes."
+            />
+            {error && (
+              <div className="text-xs font-mono text-danger px-3 py-2 bg-danger-bg border border-danger-line">
+                {error}
+              </div>
+            )}
+          </div>
+        </Modal>
+      )}
     </div>
   );
 };
