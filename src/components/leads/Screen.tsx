@@ -141,11 +141,19 @@ export const Figure: React.FC<{
   sub?: React.ReactNode;
   tone?: 'default' | 'good' | 'warn' | 'bad';
   size?: 'sm' | 'lg';
-}> = ({ label, value, sub, tone = 'default', size = 'lg' }) => {
+  /**
+   * The explanation of what the number means, on hover.
+   *
+   * Kept because it carries something the sub-label cannot: why a figure is what
+   * it is. "Duplicates 3" does not say whether they were removed before the run
+   * and are therefore free, which is the part a user is checking.
+   */
+  title?: string;
+}> = ({ label, value, sub, tone = 'default', size = 'lg', title }) => {
   const toneClass =
     tone === 'good' ? 'text-[#1a7f4b]' : tone === 'warn' ? 'text-[#b45309]' : tone === 'bad' ? 'text-[#b03a20]' : 'text-[#141414]';
   return (
-    <div className="min-w-0">
+    <div className="min-w-0" title={title}>
       <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block">{label}</span>
       <span
         className={`${size === 'lg' ? 'text-2xl' : 'text-sm'} font-mono font-medium tabular-nums leading-tight ${toneClass}`}

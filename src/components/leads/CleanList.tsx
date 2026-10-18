@@ -11,7 +11,7 @@ import {
 } from '../../lib/leads-csv';
 import { startRun, importRows, estimateRun, MAX_RUN_ROWS } from '../../lib/leads';
 import { ColumnMapper, checkMapping, type CleanMode, type FieldKey } from './ColumnMapper';
-import { Counter } from './CreditsMeter';
+import { Figure } from './Screen';
 import { formatUsd } from '../../lib/billing';
 
 /**
@@ -382,20 +382,22 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
 
       {/* What survived */}
       <div className="bg-white border border-[#e3e3de] px-4 py-3 flex items-center gap-6 flex-wrap">
-        <Counter label="In file" value={parsed?.rows.length ?? 0} />
-        <Counter
+        <Figure size="sm" label="In file" value={parsed?.rows.length ?? 0} />
+        <Figure
+          size="sm"
           label="Duplicates"
           value={clean?.removed ?? 0}
           tone={clean?.removed ? 'warn' : 'default'}
           title="The same address twice, or the same name at the same domain twice. Removed before the run, so you are not billed for them."
         />
-        <Counter
+        <Figure
+          size="sm"
           label="No address"
           value={clean?.unusable ?? 0}
           tone={clean?.unusable ? 'bad' : 'default'}
           title="Rows with nothing to look anyone up with — no address, no name, no company. They are kept in the file and skipped by the run."
         />
-        <Counter label="To work" value={usable} tone={usable ? 'default' : 'bad'} />
+        <Figure size="sm" label="To work" value={usable} tone={usable ? 'default' : 'bad'} />
       </div>
 
       {overCap && (

@@ -832,10 +832,18 @@ async function workRun(db: any, body: any) {
     if (!hold.ok) {
       // The only refusal that stops a run rather than retrying it.
       if (hold.reason === 'insufficient_credits') {
-        await db
+        // If the write does not land the run stays queued and the reserve is
+        // refused again on every cron tick, indefinitely, with nothing to show.
+        const { error: pauseError } = await db
           .from('lead_runs')
           .update({ status: 'paused', pause_reason: 'credits' })
           .eq('id', run.id);
+        if (pauseError) {
+          console.error(
+            'leads: could not pause a run that ran out of credits — retried every minute. run=' +
+              run.id + ' error=' + pauseError.message,
+          );
+        }
         continue;
       }
       continue;
@@ -895,14 +903,25 @@ async function workRun(db: any, body: any) {
         // loudly rather than report a charge that may not have happened. Releasing
         // here instead would hand back credits the user has genuinely been
         // charged for, which is worse than waiting.
-        await db
+        //
+        // Checked, because this write is the only thing between a failed settle and
+        // the next cron tick claiming the same run and working it again against a
+        // hold that is already spent.
+        const { error: settlePauseError } = await db
           .from('lead_runs')
           .update({ status: 'paused', pause_reason: 'settlement_failed' })
           .eq('id', run.id);
+        if (settlePauseError) {
+          console.error(
+            'leads: a settlement failed AND the run could not be paused — it will be claimed again ' +
+              'next minute against a hold that is already spent. run=' +
+              run.id + ' error=' + settlePauseError.message,
+          );
+        }
         continue;
       }
 
-      await db
+      const { error: totalsError } = await db
         .from('lead_runs')
         .update({
           status: chunkThrew ? 'paused' : 'running',
@@ -913,6 +932,13 @@ async function workRun(db: any, body: any) {
           counters: { ...(run.counters ?? {}), chunk: chunkIndex + 1 },
         })
         .eq('id', run.id);
+
+      if (totalsError) {
+        console.error(
+          'leads: chunk settled but the run totals were not written — the wallet is correct and ' +
+            'the run will under-report from here. run=' + run.id + ' error=' + totalsError.message,
+        );
+      }
     }
 
     // Re-invoke for the next chunk, so a long run does not wait for cron.
@@ -961,10 +987,20 @@ async function finishRun(db: any, runId: string) {
     .in('state', ['queued', 'trying', 'miss']);
 
   if (num(remaining) === 0) {
-    await db
+    // Self-healing rather than fatal — cron picks the run up again next minute
+    // and calls this again. But it is a write that silently did nothing for as
+    // long as the worker has been running, and a run stuck short of 'done' is a
+    // run whose rows count towards the sidebar badge indefinitely.
+    const { error } = await db
       .from('lead_runs')
       .update({ status: 'done', finished_at: new Date().toISOString() })
       .eq('id', runId);
+    if (error) {
+      console.error(
+        'leads: could not mark a finished run as done — retried every minute. run=' +
+          runId + ' error=' + error.message,
+      );
+    }
   }
 }
 
@@ -1020,6 +1056,10 @@ async function runEmailStep(
     if (!canRunWith(row, entry)) continue;
     if (costUsd + entry.priceUsd > rowCapUsd) break;
 
+    // Progress markers, unchecked on purpose. These are what the table animates
+    // while a row is being worked; if one is missed the row shows the previous
+    // state for a moment and nothing else changes. Every other write in this file
+    // is checked, and the one that matters most throws.
     await db.from('lead_rows').update({ state: 'trying', step: 'email', current_provider: id }).eq('id', row.id);
 
     const result = await tregCallWithRetry(callCfg, {
@@ -1145,9 +1185,27 @@ async function runVerifyStep(
   return { verdict: null, provider: null, costUsd, answered: false };
 }
 
+/**
+ * Stops a run whose provider account has run out of credit.
+ *
+ * Logged rather than ignored. This is the only thing between a 402 and a worker
+ * that keeps calling a provider which has already refused, so a silent failure
+ * means the run keeps spending against a balance that is gone.
+ */
 async function pauseForProvider(db: any, runId: string): Promise<void> {
-  await db.from('lead_runs').update({ status: 'paused', pause_reason: 'provider_balance' }).eq('id', runId);
-}// ===========================================================================
+  const { error } = await db
+    .from('lead_runs')
+    .update({ status: 'paused', pause_reason: 'provider_balance' })
+    .eq('id', runId);
+  if (error) {
+    console.error(
+      'leads: could not pause a run whose provider balance is exhausted — it will keep calling. run=' +
+        runId + ' error=' + error.message,
+    );
+  }
+}
+
+// ===========================================================================
 // One row, through whatever steps its plan calls for
 // ===========================================================================
 
@@ -1194,10 +1252,20 @@ async function processRow(
 
   const blocked = new Set((suppressed ?? []).map((s: any) => String(s.value).toLowerCase()));
   if (row.domain && blocked.has(String(row.domain).toLowerCase())) {
-    await db
+    // Thrown, because a suppressed row that cannot be marked is a row the run can
+    // never finish. finishRun counts anything still in queued, trying or miss, so
+    // if this write does not land the row is claimed again next chunk, suppressed
+    // again, marked again, fails again — and the run stays 'running' with nothing
+    // left to do, forever.
+    //
+    // No money is at stake here so it goes to the chunk handler rather than
+    // anywhere sharper: the chunk settles what it earned and the run pauses, which
+    // is visible and recoverable.
+    const { error: skipError } = await db
       .from('lead_rows')
       .update({ state: 'skipped', step: null, locked_at: null })
       .eq('id', row.id);
+    if (skipError) throw new Error('suppression_write_failed: ' + skipError.message);
     return { credits: 0, costUsd: 0 };
   }
 
@@ -1306,7 +1374,21 @@ async function processRow(
   // window in which a row is charged but not costed, or costed but not charged,
   // and neither is visible from the outside — the user sees one number and the
   // margin report sees the other.
-  await db
+  // Thrown on failure, deliberately, and this is the only place in the worker
+  // where a database error is escalated rather than logged.
+  //
+  // If this write does not land the row is still 'trying' with locked_at set, and
+  // claimRows picks up anything in queued, trying or miss on the next chunk. So
+  // the provider is called again, the user is charged again, and the wallet is
+  // settled for work that was already done — once per chunk, until the credits
+  // run out. Nothing records it: the attempts say the first call happened and the
+  // wallet says the user paid, and both are true.
+  //
+  // Throwing loses the credits for this one row, because the caller adds them to
+  // the chunk total only on return. That is the right way round. Under-charging a
+  // user by one row is a support ticket; double-charging them until their wallet
+  // empties is a company.
+  const { error: doneError } = await db
     .from('lead_rows')
     .update({
       state: 'done',
@@ -1320,6 +1402,10 @@ async function processRow(
       locked_at: null,
     })
     .eq('id', row.id);
+
+  if (doneError) {
+    throw new Error(`row_write_failed: ${doneError.message}`);
+  }
 
   return { credits, costUsd };
 }
