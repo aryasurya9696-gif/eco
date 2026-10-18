@@ -13,6 +13,7 @@
  * on a click.
  */
 import React from 'react';
+import { useDialogs } from './Dialogs';
 import {
   Search, SlidersHorizontal, Columns3, Download, Users2, Gauge, Trash2, ListPlus, Tag, ChevronLeft, ChevronRight, ArrowUpDown, X,
 } from 'lucide-react';
@@ -80,6 +81,7 @@ export const PeopleView: React.FC<{
   initialFilters?: ContactFilters;
   onOpenCompany?: (id: string) => void;
 }> = ({ onOpenRun, onOpenSearch, initialFilters, onOpenCompany }) => {
+  const { confirm, prompt } = useDialogs();
   const [filters, setFilters] = React.useState<ContactFilters>(initialFilters ?? {});
   const [q, setQ] = React.useState(initialFilters?.q ?? '');
   const [sort, setSort] = React.useState<Sort>({ field: 'updated', dir: 'desc' });
@@ -162,14 +164,19 @@ export const PeopleView: React.FC<{
   const doAddToList = async (listId: string) => {
     let id = listId;
     if (listId === '__new') {
-      const name = window.prompt('New list name');
-      if (!name?.trim()) return;
-      const c = await createList(name.trim(), 'people');
-      if (!c.ok) {
-        setError(errorCopy(c.error));
-        return;
-      }
-      id = c.list.id;
+      const made = { id: '' };
+      const name = await prompt({
+        title: 'New people list',
+        label: 'List name',
+        confirmLabel: 'Create list',
+        submit: async (v) => {
+          const c = await createList(v, 'people');
+          if (!c.ok) return errorCopy(c.error);
+          made.id = c.list.id;
+        },
+      });
+      if (!name || !made.id) return;
+      id = made.id;
       void getLists().then((r) => r.ok && setLists(r.lists.filter((l) => l.kind === 'people')));
     }
     const r = await addToList(id, allMatching ? [] : ids, allMatching ? filters : undefined);
@@ -182,7 +189,14 @@ export const PeopleView: React.FC<{
       setError('Deleting applies to ticked rows only.');
       return;
     }
-    if (!window.confirm(`Delete ${ids.length} leads from your database? This cannot be undone. Runs keep their own rows.`)) return;
+    const noun = ids.length === 1 ? 'lead' : 'leads';
+    const ok = await confirm({
+      title: `Delete ${ids.length} ${noun}`,
+      body: `Delete ${ids.length} ${noun} from your database? This cannot be undone. Runs keep their own rows.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     const r = await deleteContacts(ids);
     if (r.ok) {
       setNote(`${r.deleted} deleted.`);
@@ -230,11 +244,16 @@ export const PeopleView: React.FC<{
   };
 
   const saveView = async () => {
-    const name = window.prompt('Name this view');
-    if (!name?.trim()) return;
-    const r = await saveSavedSearch({ name: name.trim(), kind: 'people_view', filters: { ...filters, _sort: sort } });
-    if (!r.ok) setError(errorCopy(r.error));
-    else void getSavedSearches('people_view').then((x) => x.ok && setViews(x.searches));
+    const name = await prompt({
+      title: 'Save this view',
+      label: 'View name',
+      placeholder: 'e.g. Verified marketing leads',
+      submit: async (v) => {
+        const r = await saveSavedSearch({ name: v, kind: 'people_view', filters: { ...filters, _sort: sort } });
+        return r.ok ? null : errorCopy(r.error);
+      },
+    });
+    if (name) void getSavedSearches('people_view').then((x) => x.ok && setViews(x.searches));
   };
 
   const chips = filterChips(filters, lists);
@@ -352,9 +371,9 @@ export const PeopleView: React.FC<{
               {LEAD_STATUSES.map((s) => <option key={s.value} value={s.value} className="text-black">{s.label}</option>)}
             </select>
           </label>
-          <BulkButton onClick={() => {
-            const t = window.prompt('Tag to add');
-            if (t?.trim()) void doUpdate({ add_tags: [t.trim()] }, `Tagged "${t.trim()}"`);
+          <BulkButton onClick={async () => {
+            const t = await prompt({ title: 'Tag leads', label: 'Tag to add', placeholder: 'e.g. icp', confirmLabel: 'Add tag', maxLength: 40 });
+            if (t) void doUpdate({ add_tags: [t] }, `Tagged "${t}"`);
           }}><Tag className="w-3 h-3" /> Tag</BulkButton>
           <BulkButton onClick={() => void doExport('csv')}><Download className="w-3 h-3" /> CSV</BulkButton>
           <BulkButton onClick={() => void doExport('xlsx')}>Excel</BulkButton>

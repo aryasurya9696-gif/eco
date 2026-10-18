@@ -8,7 +8,8 @@
  *                 merge that keeps the record the user picks.
  */
 import React from 'react';
-import { X, Loader2 } from 'lucide-react';
+import { Modal } from './Dialogs';
+import { Loader2 } from 'lucide-react';
 import { Button } from './Screen';
 import { ChipRow } from './ChipRow';
 import { StatusBadge } from './StatusBadge';
@@ -19,20 +20,6 @@ import {
 
 const SENIORITIES = ['c_suite', 'founder', 'owner', 'partner', 'vp', 'head', 'director', 'manager', 'senior', 'entry'];
 
-const Modal: React.FC<{ title: string; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode; wide?: boolean }> = ({
-  title, onClose, children, footer, wide,
-}) => (
-  <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4" role="dialog" aria-modal="true" aria-label={title}>
-    <div className={`w-full ${wide ? 'max-w-2xl' : 'max-w-lg'} max-h-[90vh] flex flex-col bg-white border border-line shadow-xl`}>
-      <div className="flex items-center justify-between px-5 py-3 border-b border-line-soft">
-        <h2 className="text-sm font-medium text-ink">{title}</h2>
-        <button onClick={onClose} className="text-muted hover:text-ink cursor-pointer" aria-label="Close"><X className="w-4 h-4" /></button>
-      </div>
-      <div className="flex-1 overflow-y-auto p-5 space-y-4">{children}</div>
-      {footer && <div className="flex justify-end gap-2 px-5 py-3 border-t border-line-soft">{footer}</div>}
-    </div>
-  </div>
-);
 
 const Weight: React.FC<{ value: number; onChange: (n: number) => void; label: string }> = ({ value, onChange, label }) => (
   <label className="flex items-center gap-2 text-[11px] font-mono text-muted">
@@ -82,6 +69,7 @@ export const ScoringDialog: React.FC<{ onClose: () => void; onSaved: () => void 
   return (
     <Modal
       title="Scoring rules"
+      size="lg"
       onClose={onClose}
       footer={
         <>
@@ -202,7 +190,7 @@ export const DuplicatesDialog: React.FC<{ onClose: () => void; onMerged: () => v
   };
 
   return (
-    <Modal title="Possible duplicates" onClose={onClose} wide>
+    <Modal title="Possible duplicates" onClose={onClose} size="xl">
       <p className="text-[11px] font-mono text-muted leading-relaxed">
         Records sharing an email, a LinkedIn profile, or a name at the same domain. Merging keeps the record you pick, fills
         its empty fields from the others, combines tags and notes, and moves list memberships to it.

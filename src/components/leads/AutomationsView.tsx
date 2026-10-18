@@ -10,6 +10,7 @@
  * says so rather than leaving a silent gap.
  */
 import React from 'react';
+import { useDialogs } from './Dialogs';
 import { Plus, Pause, Play, Trash2, Pencil, Zap, AlertTriangle, Loader2, History } from 'lucide-react';
 import { Button, Input } from './Screen';
 import { EmptyState, RowSkeleton } from './Empty';
@@ -99,6 +100,7 @@ function outcomeCopy(r: AutomationRun, kind?: AutomationKind): string {
 }
 
 export const AutomationsView: React.FC<{ onOpenRun: (id: string) => void }> = ({ onOpenRun }) => {
+  const { confirm } = useDialogs();
   const [items, setItems] = React.useState<Automation[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [editing, setEditing] = React.useState<Automation | 'new' | null>(null);
@@ -153,8 +155,14 @@ export const AutomationsView: React.FC<{ onOpenRun: (id: string) => void }> = ({
               onPause={() => void act(pauseAutomation(a.id))}
               onResume={() => void act(resumeAutomation(a.id))}
               onRunNow={() => void act(runAutomationNow(a.id))}
-              onDelete={() => {
-                if (!window.confirm(`Delete "${a.name}"? Leads and runs it created are kept.`)) return;
+              onDelete={async () => {
+                const ok = await confirm({
+                  title: 'Delete automation',
+                  body: `Delete "${a.name}"? Leads and runs it created are kept.`,
+                  confirmLabel: 'Delete',
+                  danger: true,
+                });
+                if (!ok) return;
                 if (historyFor === a.id) setHistoryFor(null);
                 void act(deleteAutomation(a.id));
               }}

@@ -93,7 +93,8 @@ export const Drawer: React.FC<{ title: React.ReactNode; onClose: () => void; chi
 }) => {
   const pressedOutside = React.useRef(false);
   React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    // A decision dialog opened over the drawer takes Escape for itself.
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && !document.querySelector('[data-leads-modal]') && onClose();
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);

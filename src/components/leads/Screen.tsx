@@ -109,7 +109,8 @@ export const Button: React.FC<{
 };
 
 /** A single-line text input in the app's voice. */
-export const Input: React.FC<React.InputHTMLAttributes<HTMLInputElement>> = ({
+// ComponentProps rather than InputHTMLAttributes so a ref passes through (React 19).
+export const Input: React.FC<React.ComponentProps<'input'>> = ({
   className = '',
   ...rest
 }) => (

@@ -24,6 +24,7 @@ import { EmptyState } from '../leads/Empty';
 import { ExportMenu } from '../leads/ExportMenu';
 import { CostDialog } from '../leads/CostDialog';
 import { StatusPill } from '../leads/StatusPill';
+import { DialogsProvider } from '../leads/Dialogs';
 import { SearchView } from '../leads/SearchView';
 import { AutomationsView } from '../leads/AutomationsView';
 import { PeopleView } from '../leads/PeopleView';
@@ -53,17 +54,20 @@ interface LeadsTabProps {
 export const LeadsTab: React.FC<LeadsTabProps> = ({ view, runId, onViewChange, onOpenRun }) => {
   // A run is a detail screen, so the sub-nav is hidden: five panels above a
   // table that belongs to none of them only invites the wrong click.
-  if (view === 'run') {
-    return (
-      <RunView
-        runId={runId}
-        onBack={() => onViewChange('runs')}
-        onOpenRun={onOpenRun}
-      />
-    );
-  }
-
-  return <LeadsWorkspace view={view} onViewChange={onViewChange} onOpenRun={onOpenRun} />;
+  // confirm() and prompt() for every screen below.
+  return (
+    <DialogsProvider>
+      {view === 'run' ? (
+        <RunView
+          runId={runId}
+          onBack={() => onViewChange('runs')}
+          onOpenRun={onOpenRun}
+        />
+      ) : (
+        <LeadsWorkspace view={view} onViewChange={onViewChange} onOpenRun={onOpenRun} />
+      )}
+    </DialogsProvider>
+  );
 };
 
 /**

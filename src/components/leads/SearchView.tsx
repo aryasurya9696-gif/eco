@@ -12,6 +12,7 @@
  * details: those come from the enrichment run.
  */
 import React from 'react';
+import { useDialogs } from './Dialogs';
 import { Search, Save, Bookmark, History, Loader2, Check, Database } from 'lucide-react';
 import { Button } from './Screen';
 import { ChipRow } from './ChipRow';
@@ -65,6 +66,7 @@ function activeChips(f: PeopleSearchFilters, vocab: Partial<Record<VocabKind, Ma
 const hasFilters = (f: PeopleSearchFilters) => activeChips(f, {}).length > 0;
 
 export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeople: () => void }> = ({ onOpenRun, onOpenPeople }) => {
+  const { prompt } = useDialogs();
   const [filters, setFilters] = React.useState<PeopleSearchFilters>(EMPTY);
   const [vocab, setVocab] = React.useState<Partial<Record<VocabKind, Array<{ value: string; label: string }>>>>({});
   const [vocabLoading, setVocabLoading] = React.useState(true);
@@ -184,12 +186,17 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
   };
 
   const saveAsSearch = async () => {
-    const name = window.prompt('Name this search', '');
-    if (!name?.trim()) return;
-    const r = await saveSavedSearch({ name: name.trim(), kind: 'people_search', filters, last_total: count });
-    if (!r.ok) setError(errorCopy(r.error));
-    else {
-      setNote(`Saved "${name.trim()}".`);
+    const name = await prompt({
+      title: 'Save this search',
+      label: 'Search name',
+      placeholder: 'e.g. CMOs at SaaS, 50-500',
+      submit: async (v) => {
+        const r = await saveSavedSearch({ name: v, kind: 'people_search', filters, last_total: count });
+        return r.ok ? null : errorCopy(r.error);
+      },
+    });
+    if (name) {
+      setNote(`Saved "${name}".`);
       void refreshSaved();
     }
   };

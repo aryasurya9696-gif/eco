@@ -13,7 +13,7 @@ Read first: `docs/LEADS_UPGRADE.md` (what Leads does today, backend, billing, te
 
 | Phase | State | Notes |
 |---|---|---|
-| 1. Design foundation | **In progress** | 1.1 colour tokens **done** (e5fe17f). 1.2 StatusPill **done**: `StatusPill.tsx`; email status, run status, fit score, opt-out kind, live/polling, HTTP failure and Automations pills all use it (`emailStatusLabel` now returns a `tone`). Not checked visually (dashboard needs a login). Next: 1.3 dialogs. |
+| 1. Design foundation | **In progress** | 1.1 colour tokens **done** (e5fe17f). 1.2 StatusPill **done** (1e952d6). 1.3 dialogs **done**: `Dialogs.tsx` (Modal, DialogsProvider, useDialogs confirm/prompt; provider in LeadsTab); all 11 window.prompt/confirm replaced; CostDialog and ScoringDialog use Modal; Escape over a Drawer closes only the dialog. Checked on a temporary harness page (Enter, Escape, backdrop, inline name_taken error, confirm over drawer). Next: 1.4 Screen frame. |
 | 2. Navigation (11 tabs → 4) | Not started | Depends on Phase 1 |
 | 3. Remove duplicate flows | Not started | Depends on Phases 2 and 4 |
 | 4. Backend support | Not started | Independent of Phase 1; can run in parallel |

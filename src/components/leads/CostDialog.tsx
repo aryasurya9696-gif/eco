@@ -12,8 +12,9 @@
  * rather than paused halfway.
  */
 import React from 'react';
-import { X, AlertTriangle, Loader2 } from 'lucide-react';
+import { AlertTriangle, Loader2 } from 'lucide-react';
 import { Button } from './Screen';
+import { Modal } from './Dialogs';
 import { formatCredits } from '../../lib/billing';
 import { errorCopy, skippedCopy, newRequestId, type EnrichEstimate, type StartResult } from '../../lib/leads-db';
 import { fetchBalance } from '../../lib/billing';
@@ -88,16 +89,19 @@ export const CostDialog: React.FC<{
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4" role="dialog" aria-modal="true" aria-labelledby="cost-dialog-title">
-      <div className="w-full max-w-md bg-white border border-line shadow-xl">
-        <div className="flex items-center justify-between px-5 py-3 border-b border-line-soft">
-          <h2 id="cost-dialog-title" className="text-sm font-medium text-ink">{title}</h2>
-          <button onClick={onClose} disabled={busy} className="text-muted hover:text-ink cursor-pointer" aria-label="Close">
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        <div className="p-5 space-y-4">
+    <Modal
+      title={title}
+      busy={busy}
+      onClose={onClose}
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
+          <Button onClick={() => void go()} disabled={loading || busy || !est?.ok || nothing || short}>
+            {busy ? 'Starting…' : max !== null ? `Start · up to ${formatCredits(max)} credits` : 'Start'}
+          </Button>
+        </>
+      }
+    >
           <p className="text-xs font-mono text-ink-2 leading-relaxed">{description}</p>
 
           {loading ? (
@@ -166,16 +170,7 @@ export const CostDialog: React.FC<{
           ) : null}
 
           {error && <div className="text-xs font-mono text-danger">{error}</div>}
-        </div>
-
-        <div className="flex justify-end gap-2 px-5 py-3 border-t border-line-soft">
-          <Button variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
-          <Button onClick={() => void go()} disabled={loading || busy || !est?.ok || nothing || short}>
-            {busy ? 'Starting…' : max !== null ? `Start · up to ${formatCredits(max)} credits` : 'Start'}
-          </Button>
-        </div>
-      </div>
-    </div>
+    </Modal>
   );
 };
 

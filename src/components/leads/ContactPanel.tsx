@@ -6,6 +6,7 @@
  * email's status is the verifier's word, with when and which verifier.
  */
 import React from 'react';
+import { useDialogs } from './Dialogs';
 import { ExternalLink, Trash2 } from 'lucide-react';
 import { Drawer, Field, SectionLabel, ScoreBadge } from './Pick';
 import { StatusBadge } from './StatusBadge';
@@ -26,6 +27,7 @@ export const ContactPanel: React.FC<{
   onEnrich: (action: EnrichAction, ids: string[]) => void;
   onOpenCompany?: (id: string) => void;
 }> = ({ id, onClose, onChanged, onEnrich, onOpenCompany }) => {
+  const { confirm } = useDialogs();
   const [data, setData] = React.useState<{ contact: Contact; company: Company | null; lists: Array<{ id: string; name: string }> } | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [notes, setNotes] = React.useState('');
@@ -88,7 +90,13 @@ export const ContactPanel: React.FC<{
               variant="quiet"
               className="ml-auto !text-danger"
               onClick={async () => {
-                if (!window.confirm('Delete this lead from your database? Runs that found it keep their own rows.')) return;
+                const ok = await confirm({
+                  title: 'Delete lead',
+                  body: 'Delete this lead from your database? Runs that found it keep their own rows.',
+                  confirmLabel: 'Delete',
+                  danger: true,
+                });
+                if (!ok) return;
                 const r = await deleteContacts([c.id]);
                 if (r.ok) {
                   onChanged();

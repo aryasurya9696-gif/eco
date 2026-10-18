@@ -9,6 +9,7 @@
  * UsageView      credits spent, by run and by kind of work.
  */
 import React from 'react';
+import { useDialogs } from './Dialogs';
 import { Search, ChevronLeft, ChevronRight, ExternalLink, Plus, Trash2, Pencil, ArrowUpDown } from 'lucide-react';
 import { Button } from './Screen';
 import { EmptyState, RowSkeleton } from './Empty';
@@ -32,6 +33,7 @@ export const CompaniesView: React.FC<{
   onOpenSearch: () => void;
   initialListId?: string;
 }> = ({ onOpenRun, onOpenPeople, onOpenSearch, initialListId }) => {
+  const { prompt } = useDialogs();
   const [q, setQ] = React.useState('');
   const [query, setQuery] = React.useState('');
   const [flags, setFlags] = React.useState<{ enriched?: boolean; missing_emails?: boolean; list_id?: string }>(
@@ -84,11 +86,19 @@ export const CompaniesView: React.FC<{
   const addToTargets = async (listId: string) => {
     let id = listId;
     if (listId === '__new') {
-      const name = window.prompt('New target account list');
-      if (!name?.trim()) return;
-      const c = await createList(name.trim(), 'companies');
-      if (!c.ok) return setError(errorCopy(c.error));
-      id = c.list.id;
+      const made = { id: '' };
+      const name = await prompt({
+        title: 'New target account list',
+        label: 'List name',
+        confirmLabel: 'Create list',
+        submit: async (v) => {
+          const c = await createList(v, 'companies');
+          if (!c.ok) return errorCopy(c.error);
+          made.id = c.list.id;
+        },
+      });
+      if (!name || !made.id) return;
+      id = made.id;
       void getLists().then((r) => r.ok && setLists(r.lists.filter((l) => l.kind === 'companies')));
     }
     const r = await addToList(id, ids);
@@ -320,6 +330,7 @@ const CompanyPanel: React.FC<{ id: string; onClose: () => void; onEnrich: () => 
 };
 
 export const ListsView: React.FC<{ onOpenList: (l: LeadList) => void }> = ({ onOpenList }) => {
+  const { confirm, prompt } = useDialogs();
   const [lists, setLists] = React.useState<LeadList[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const load = React.useCallback(() => {
@@ -328,11 +339,17 @@ export const ListsView: React.FC<{ onOpenList: (l: LeadList) => void }> = ({ onO
   React.useEffect(load, [load]);
 
   const create = async (kind: 'people' | 'companies') => {
-    const name = window.prompt(kind === 'people' ? 'Name the list (e.g. "Marketing decision-makers")' : 'Name the target account list');
-    if (!name?.trim()) return;
-    const r = await createList(name.trim(), kind);
-    if (!r.ok) setError(errorCopy(r.error));
-    load();
+    const name = await prompt({
+      title: kind === 'people' ? 'New people list' : 'New target account list',
+      label: 'List name',
+      placeholder: kind === 'people' ? 'e.g. Marketing decision-makers' : 'e.g. Q1 target accounts',
+      confirmLabel: 'Create list',
+      submit: async (v) => {
+        const r = await createList(v, kind);
+        return r.ok ? null : errorCopy(r.error);
+      },
+    });
+    if (name) load();
   };
 
   const groups: Array<{ kind: 'people' | 'companies'; title: string; hint: string }> = [
@@ -366,15 +383,27 @@ export const ListsView: React.FC<{ onOpenList: (l: LeadList) => void }> = ({ onO
                     <span className="flex items-center gap-3 text-[11px] font-mono text-muted">
                       <span className="tabular-nums">{l.members} {l.kind === 'people' ? 'leads' : 'companies'}</span>
                       <button aria-label={`Rename ${l.name}`} className="hover:text-ink cursor-pointer" onClick={async () => {
-                        const name = window.prompt('Rename list', l.name);
-                        if (name?.trim() && name.trim() !== l.name) {
-                          const r = await updateList(l.id, { name: name.trim() });
-                          if (!r.ok) setError(errorCopy(r.error));
-                          load();
-                        }
+                        const name = await prompt({
+                          title: 'Rename list',
+                          label: 'List name',
+                          initial: l.name,
+                          confirmLabel: 'Rename',
+                          submit: async (v) => {
+                            if (v === l.name) return null;
+                            const r = await updateList(l.id, { name: v });
+                            return r.ok ? null : errorCopy(r.error);
+                          },
+                        });
+                        if (name) load();
                       }}><Pencil className="w-3 h-3" /></button>
                       <button aria-label={`Delete ${l.name}`} className="hover:text-danger cursor-pointer" onClick={async () => {
-                        if (!window.confirm(`Delete the list "${l.name}"? The leads in it are kept.`)) return;
+                        const ok = await confirm({
+                          title: 'Delete list',
+                          body: `Delete the list "${l.name}"? The ${l.kind === 'people' ? 'leads' : 'companies'} in it are kept.`,
+                          confirmLabel: 'Delete list',
+                          danger: true,
+                        });
+                        if (!ok) return;
                         await deleteList(l.id);
                         load();
                       }}><Trash2 className="w-3 h-3" /></button>
