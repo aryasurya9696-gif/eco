@@ -85,6 +85,7 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
 }) => {
   const [sorting, setSorting] = React.useState<SortingState>([]);
   const [query, setQuery] = React.useState('');
+  const [statusFilter, setStatusFilter] = React.useState<string>('all');
   const [expanded, setExpanded] = React.useState<string | null>(null);
   // How tall the expanded panel actually is.
   //
@@ -336,8 +337,21 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
     [columns, hidden],
   );
 
+  const filteredRows = React.useMemo(() => {
+    if (statusFilter === 'all') return rows;
+    return rows.filter((r) => {
+      if (statusFilter === 'verified') return r.email_status === 'verified';
+      if (statusFilter === 'catch_all') return r.email_status === 'catch_all';
+      if (statusFilter === 'trying') return r.state === 'trying';
+      if (statusFilter === 'queued') return r.state === 'queued';
+      if (statusFilter === 'invalid') return r.email_status === 'invalid';
+      if (statusFilter === 'not_found') return r.email_status === 'not_found' || r.state === 'miss';
+      return true;
+    });
+  }, [rows, statusFilter]);
+
   const table = useReactTable({
-    data: rows,
+    data: filteredRows,
     columns: visible,
     state: { sorting, globalFilter: query },
     onSortingChange: setSorting,
@@ -478,6 +492,21 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
           placeholder="Search company, person or email"
           className="flex-1 min-w-0 bg-transparent text-[11px] font-mono text-ink placeholder:text-faint focus:outline-none"
         />
+
+        {/* Status Dropdown Filter */}
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+          className="bg-surface text-[10px] font-mono text-ink border border-line px-2 py-1 cursor-pointer focus:outline-none flex-shrink-0"
+        >
+          <option value="all">All statuses</option>
+          <option value="verified">Verified</option>
+          <option value="catch_all">Catch-all</option>
+          <option value="trying">Finding person</option>
+          <option value="queued">Queued</option>
+          <option value="invalid">Invalid</option>
+          <option value="not_found">Not found</option>
+        </select>
 
         <span className="text-[10px] font-mono text-muted tabular-nums flex-shrink-0">
           {model.length === rows.length ? `${rows.length}` : `${model.length} of ${rows.length}`}

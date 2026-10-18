@@ -10,7 +10,7 @@ import type { AttemptWithFailure } from '../leads/AttemptHistory';
 import {
   getRun, isActiveRun, controlRun, providerLabel,
 } from '../../lib/leads';
-import { fetchBalance, formatUsd } from '../../lib/billing';
+import { formatUsd } from '../../lib/billing';
 import { supabase } from '../../lib/supabase';
 import { subscribeToRun, mergeRow, summarise } from '../../lib/leads-live';
 import { RunsList } from '../leads/RunsList';
@@ -19,14 +19,13 @@ import { NewSearch } from '../leads/NewSearch';
 import { ProviderLab } from '../leads/ProviderLab';
 import { OptOuts } from '../leads/OptOuts';
 import { LeadsTable } from '../leads/LeadsTable';
-import { CompositionBar, RunStrip, MeterFigure, ProviderMix } from '../leads/Data';
+import { RunStrip, ProviderMix } from '../leads/Data';
 import { WaterfallColumn } from '../leads/WaterfallChain';
 import { Button, Screen, Segmented } from '../leads/Screen';
 import { EmptyState } from '../leads/Empty';
 import { ExportDialog } from '../leads/ExportDialog';
 import { StatusPill } from '../leads/StatusPill';
 import { DialogsProvider, useDialogs } from '../leads/Dialogs';
-import { SearchView } from '../leads/SearchView';
 import { AutomationsView } from '../leads/AutomationsView';
 import { PeopleView } from '../leads/PeopleView';
 import { CompaniesView, UsageView } from '../leads/CompaniesView';
@@ -368,8 +367,7 @@ const LeadsSidebar: React.FC<LeadsSidebarProps> = ({
 // ---------------------------------------------------------------------------
 
 const FIND_MODES = [
-  { value: 'search', label: 'Search' },
-  { value: 'profile', label: 'Find by profile' },
+  { value: 'profile', label: 'Ideal customer' },
   { value: 'upload', label: 'Import CSV' },
 ];
 
@@ -407,7 +405,7 @@ const LeadsWorkspace: React.FC<{
   const [activeList, setActiveList] = React.useState<LeadList | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
 
-  const activeFindMode = (subMode as 'search' | 'profile' | 'upload') || 'search';
+  const activeFindMode = (subMode as 'profile' | 'upload') || 'profile';
   const activeLeadsMode = (subMode as 'people' | 'companies') || 'people';
   const activeActivityMode = (subMode as 'runs' | 'automations') || 'runs';
   const activeSettingsMode = (subMode as 'scoring' | 'duplicates' | 'optouts' | 'lab') || 'scoring';
@@ -436,20 +434,6 @@ const LeadsWorkspace: React.FC<{
               onChange={(m) => onViewChange('find', m)}
             />
           </div>
-
-          {activeFindMode === 'search' && (
-            <Screen
-              title="Search people"
-              subtitle="Free search by title, seniority, company and location. Save who you find; finding their emails is a separate, priced step."
-              icon={<Search className="w-4 h-4" />}
-              wide
-            >
-              <SearchView
-                onOpenRun={onOpenRun}
-                onOpenPeople={() => openPeople({})}
-              />
-            </Screen>
-          )}
 
           {activeFindMode === 'profile' && (
             <NewSearch onStarted={onOpenRun} />
@@ -699,12 +683,6 @@ const RunView: React.FC<{
   const [error, setError] = React.useState<string | null>(null);
   const [live, setLive] = React.useState(false);
 
-  // The real wallet balance. It used to be a hardcoded 1000, so the meter beside
-  // it was drawing a picture of nobody's account — a balance figure that is
-  // confidently wrong is worse than no balance figure, because it is the one
-  // number somebody checks before starting a run.
-  const [balance, setBalance] = React.useState<number | null>(null);
-  const [reserved, setReserved] = React.useState<number | null>(null);
   const [notice, setNotice] = React.useState<string | null>(null);
 
   // The eight rows that cost the most to resolve, with their attempt history.
@@ -889,30 +867,6 @@ const RunView: React.FC<{
       .sort((a, b) => b.found - a.found || b.costUsd - a.costUsd);
   }, [rows, attemptsByRow]);
 
-  // Fetched once. Polling the wallet every three seconds alongside the run would
-  // be a second realtime channel for a number that changes only when the run
-  // spends something, and the run's own figures already show that.
-  React.useEffect(() => {
-    let cancelled = false;
-    fetchBalance()
-      .then((b) => {
-        if (cancelled) return;
-        setBalance(b?.wallet?.available ?? null);
-        // What is held right now is one chunk's worst case, not the run's ceiling.
-        // Conflating the two is precisely what makes a balance look wrong to
-        // somebody reading it: the ceiling is checked once, at the start.
-        setReserved(b?.wallet?.reserved ?? 0);
-      })
-      .catch(() => {
-        // Left null, which renders a dash. The meter is drawn against the run's
-        // ceiling and does not need the balance to be meaningful.
-        if (!cancelled) setBalance(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   // Skipped while loading and until there are rows, because the ranking is
   // only meaningful once something has been worked — a run at 3 rows would
   // otherwise render a "where the money went" panel from two attempts and
@@ -1091,79 +1045,6 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
         </div>
       )}
 
-      {/* ---- What it produced, and what it cost -------------------------- */}
-      <div className="grid grid-cols-1 lg:grid-cols-[1.4fr_1fr] gap-5">
-        <div className="border border-line bg-white p-5">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-3">
-            What it produced
-          </span>
-          <CompositionBar
-            counts={statusCounts}
-            notFound={statusCounts.not_found ?? 0}
-            height={10}
-          />
-        </div>
-
-        <div className="border border-line bg-white p-5 flex flex-col">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-3">
-            What it cost
-          </span>
-
-          <div className="flex gap-8">
-            <MeterFigure
-              label="Spent"
-              value={stats.credits}
-              display={`${round2(stats.credits)} cr`}
-              of={run?.max_credits ?? null}
-              tone={run?.max_credits && stats.credits > run.max_credits ? 'warn' : 'default'}
-              sub={providerUsd > 0 ? `${formatUsd(providerUsd, { decimals: 4 })} at providers` : undefined}
-            />
-
-            <MeterFigure
-              label="Held now"
-              value={reserved ?? 0}
-              display={reserved === null ? '—' : `${round2(reserved)} cr`}
-              tone={reserved !== null && reserved > 0 ? 'warn' : 'default'}
-              sub="released as each batch finishes"
-            />
-
-            <MeterFigure
-              label="Balance"
-              value={balance ?? 0}
-              display={balance === null ? '—' : `${Math.round(balance)} cr`}
-              of={run?.max_credits ?? null}
-              tone={
-                balance !== null && run?.max_credits && balance < run.max_credits
-                  ? 'warn'
-                  : 'default'
-              }
-              sub={
-                balance === null
-                  ? 'not loaded'
-                  : run?.max_credits
-                    ? balance < run.max_credits
-                      ? 'less than this run may still need'
-                      : 'covers the worst case'
-                    : undefined
-              }
-            />
-          </div>
-
-          {/* The sentence.
-              We have reserved the worst case and settled down since the first
-              migration and this screen has never said so. A user who watches
-              credits leave their balance and is never told what happens next has
-              every reason to think the worst, and this is the line that prevents
-              it. It is the cheapest and most load-bearing sentence in the app. */}
-          <p className="text-[10px] font-mono text-muted leading-relaxed mt-5 pt-3 border-t border-line-soft">
-            {run?.max_credits
-              ? `This run can cost at most ${round2(run.max_credits)} credits, and that figure is what was checked against your balance before it started. ` +
-                `Each batch holds only what it might spend and returns the rest as it finishes, so the balance moves in steps rather than dropping all at once.`
-              : 'Each batch holds only what it might spend and returns the rest as it finishes.'}
-          </p>
-        </div>
-      </div>
-
       {notice && (
         <div className="flex items-start gap-2 px-4 py-2.5 bg-surface border border-line">
           <span className="text-xs font-mono text-ink-2 leading-relaxed">{notice}</span>
@@ -1177,19 +1058,86 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
         </div>
       )}
 
-      {/* ---- Who actually did the work ----------------------------------- */}
-      {mix.length > 0 && (
-        <div className="border border-line bg-white p-5">
+      {/* ---- 4 Metric Cards (Photo 3) ----------------------------------- */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {/* 1. Found */}
+        <div className="border border-line bg-white p-4">
           <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-1">
-            Who found them
+            Found
           </span>
-          <p className="text-[11px] font-mono text-faint mb-4 leading-relaxed">
-            Of the rows on this page. A provider high on this bar is earning its place in the
-            waterfall; one at the end is costing money on every call it is asked about.
-          </p>
-          <ProviderMix mix={mix} />
+          <div className="text-xl font-mono font-semibold text-ink">
+            {stats.found} <span className="text-xs font-normal text-muted">of {run?.target || total}</span>
+          </div>
+          <span className="text-[10px] font-mono text-muted block mt-1">
+            {total > stats.found ? 'Resolving people' : 'people completed'}
+          </span>
         </div>
-      )}
+
+        {/* 2. Verified */}
+        <div className="border border-line bg-white p-4">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-1">
+            Verified
+          </span>
+          <div className="text-xl font-mono font-semibold text-ink">
+            {statusCounts.verified ?? 0}
+          </div>
+          <span className="text-[10px] font-mono text-ok block mt-1">
+            Valid deliverable
+          </span>
+        </div>
+
+        {/* 3. Catch-all */}
+        <div className="border border-line bg-white p-4">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-1">
+            Catch-all
+          </span>
+          <div className="text-xl font-mono font-semibold text-ink">
+            {statusCounts.catch_all ?? 0}
+          </div>
+          <span className="text-[10px] font-mono text-warn block mt-1">
+            Accept-all domain
+          </span>
+        </div>
+
+        {/* 4. Spent */}
+        <div className="border border-line bg-white p-4">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-1">
+            Spent
+          </span>
+          <div className="text-xl font-mono font-semibold text-ink">
+            {round2(stats.credits)} <span className="text-xs font-normal text-muted">credits</span>
+          </div>
+          <span className="text-[10px] font-mono text-faint block mt-1">
+            {providerUsd > 0 ? `$${formatUsd(providerUsd, { decimals: 4 })} Treg` : '0 Treg'}
+          </span>
+        </div>
+      </div>
+
+      {/* ---- Provider Waterfall Progress Bar (Photo 3) ------------------ */}
+      <div className="border border-line bg-white p-4">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted">
+            Provider Waterfall
+          </span>
+          {mix.length > 0 && (
+            <span className="text-[10px] font-mono text-faint">
+              {mix.reduce((n, p) => n + p.found, 0)} leads resolved
+            </span>
+          )}
+        </div>
+        {mix.length > 0 ? (
+          <ProviderMix mix={mix} />
+        ) : (
+          <div className="space-y-2">
+            <div className="w-full h-2.5 bg-surface-2 overflow-hidden relative">
+              <div className="h-full bg-line-strong w-1/4 animate-pulse" />
+            </div>
+            <span className="text-[10px] font-mono text-faint">
+              Waiting for providers to resolve contacts…
+            </span>
+          </div>
+        )}
+      </div>
 
       {/* ---- Where the money went --------------------------------------- */}
       {expensive.some((e) => e.attempts.length > 1) && (
@@ -1266,7 +1214,7 @@ const BackLink: React.FC<{ onBack: () => void }> = ({ onBack }) => (
     className="inline-flex items-center gap-1.5 text-xs font-mono text-muted hover:text-ink transition-colors cursor-pointer"
   >
     <ArrowLeft className="w-3 h-3" />
-    Runs
+    Lead list
   </button>
 );
 
