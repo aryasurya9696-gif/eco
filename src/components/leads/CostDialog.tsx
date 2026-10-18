@@ -89,28 +89,28 @@ export const CostDialog: React.FC<{
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4" role="dialog" aria-modal="true" aria-labelledby="cost-dialog-title">
-      <div className="w-full max-w-md bg-white border border-[#e3e3de] shadow-xl">
-        <div className="flex items-center justify-between px-5 py-3 border-b border-[#eeeeea]">
-          <h2 id="cost-dialog-title" className="text-sm font-medium text-[#141414]">{title}</h2>
-          <button onClick={onClose} disabled={busy} className="text-[#8a8a86] hover:text-[#141414] cursor-pointer" aria-label="Close">
+      <div className="w-full max-w-md bg-white border border-line shadow-xl">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-line-soft">
+          <h2 id="cost-dialog-title" className="text-sm font-medium text-ink">{title}</h2>
+          <button onClick={onClose} disabled={busy} className="text-muted hover:text-ink cursor-pointer" aria-label="Close">
             <X className="w-4 h-4" />
           </button>
         </div>
 
         <div className="p-5 space-y-4">
-          <p className="text-xs font-mono text-[#5a5a56] leading-relaxed">{description}</p>
+          <p className="text-xs font-mono text-ink-2 leading-relaxed">{description}</p>
 
           {loading ? (
-            <div className="flex items-center gap-2 text-xs font-mono text-[#8a8a86]">
+            <div className="flex items-center gap-2 text-xs font-mono text-muted">
               <Loader2 className="w-3.5 h-3.5 animate-spin" /> Pricing…
             </div>
           ) : est?.ok ? (
             <>
-              <div className="text-xs font-mono text-[#141414]">
+              <div className="text-xs font-mono text-ink">
                 <span className="tabular-nums font-medium">{est.eligible}</span> of{' '}
                 <span className="tabular-nums">{est.selected}</span> selected will be worked.
                 {skippedCopy(est.skipped).length > 0 && (
-                  <ul className="mt-1.5 space-y-0.5 text-[#8a8a86]">
+                  <ul className="mt-1.5 space-y-0.5 text-muted">
                     {skippedCopy(est.skipped).map((s) => (
                       <li key={s}>· {s}</li>
                     ))}
@@ -119,26 +119,26 @@ export const CostDialog: React.FC<{
               </div>
 
               {allowRefresh && (
-                <label className="flex items-center gap-2 text-xs font-mono text-[#5a5a56] cursor-pointer select-none">
+                <label className="flex items-center gap-2 text-xs font-mono text-ink-2 cursor-pointer select-none">
                   <input type="checkbox" checked={refresh} onChange={(e) => setRefresh(e.target.checked)} />
                   Refresh ones checked recently as well
                 </label>
               )}
 
               {est.estimate && est.estimate.ok !== false && (
-                <div className="border border-[#eeeeea]">
-                  <div className="grid grid-cols-3 divide-x divide-[#eeeeea]">
+                <div className="border border-line-soft">
+                  <div className="grid grid-cols-3 divide-x divide-line-soft">
                     <Cell label="Expected" value={est.estimate.expected_credits} />
                     <Cell label="At most" value={est.estimate.max_credits} />
                     <Cell label="Available" value={available} tone={short ? 'bad' : undefined} />
                   </div>
                   {est.estimate.breakdown && est.estimate.breakdown.length > 0 && (
-                    <ul className="border-t border-[#eeeeea] px-3 py-2 space-y-1">
+                    <ul className="border-t border-line-soft px-3 py-2 space-y-1">
                       {est.estimate.breakdown.map((b) => (
-                        <li key={b.label} className="flex justify-between gap-3 text-[11px] font-mono text-[#5a5a56]">
+                        <li key={b.label} className="flex justify-between gap-3 text-[11px] font-mono text-ink-2">
                           <span>
                             {b.label}
-                            {b.note && <span className="text-[#9b9b96]"> · {b.note}</span>}
+                            {b.note && <span className="text-muted"> · {b.note}</span>}
                           </span>
                           <span className="tabular-nums">{formatCredits(b.credits)}</span>
                         </li>
@@ -148,13 +148,13 @@ export const CostDialog: React.FC<{
                 </div>
               )}
 
-              <p className="text-[11px] font-mono text-[#8a8a86] leading-relaxed">
+              <p className="text-[11px] font-mono text-muted leading-relaxed">
                 Credits are held for the maximum while it runs and only what is found is charged; the rest is
                 released. A lookup that finds nothing costs nothing.
               </p>
 
               {short && (
-                <div className="flex items-start gap-2 text-xs font-mono text-[#b45309] bg-[#fdf6e9] border border-[#f3e2bf] px-3 py-2">
+                <div className="flex items-start gap-2 text-xs font-mono text-warn bg-warn-bg border border-warn-line px-3 py-2">
                   <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
                   <span>
                     The balance does not cover the maximum.{' '}
@@ -165,10 +165,10 @@ export const CostDialog: React.FC<{
             </>
           ) : null}
 
-          {error && <div className="text-xs font-mono text-[#c0462e]">{error}</div>}
+          {error && <div className="text-xs font-mono text-danger">{error}</div>}
         </div>
 
-        <div className="flex justify-end gap-2 px-5 py-3 border-t border-[#eeeeea]">
+        <div className="flex justify-end gap-2 px-5 py-3 border-t border-line-soft">
           <Button variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
           <Button onClick={() => void go()} disabled={loading || busy || !est?.ok || nothing || short}>
             {busy ? 'Starting…' : max !== null ? `Start · up to ${formatCredits(max)} credits` : 'Start'}
@@ -181,8 +181,8 @@ export const CostDialog: React.FC<{
 
 const Cell: React.FC<{ label: string; value: number | null; tone?: 'bad' }> = ({ label, value, tone }) => (
   <div className="px-3 py-2">
-    <div className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">{label}</div>
-    <div className={`text-sm font-mono tabular-nums ${tone === 'bad' ? 'text-[#c0462e]' : 'text-[#141414]'}`}>
+    <div className="text-[10px] font-mono uppercase tracking-wider text-muted">{label}</div>
+    <div className={`text-sm font-mono tabular-nums ${tone === 'bad' ? 'text-danger' : 'text-ink'}`}>
       {value === null ? '—' : formatCredits(value)}
     </div>
   </div>

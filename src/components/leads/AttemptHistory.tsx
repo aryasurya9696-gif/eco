@@ -50,7 +50,7 @@ export const AttemptHistory: React.FC<{
 
   if (attempts.length === 0) {
     return (
-      <p className="text-[10px] font-mono text-[#8a8a86] py-1">
+      <p className="text-[10px] font-mono text-muted py-1">
         No provider has been asked about this row yet.
       </p>
     );
@@ -66,13 +66,13 @@ export const AttemptHistory: React.FC<{
           comparable with another's, which is the question a user opens this to
           answer. */}
       <div className="flex items-center gap-3 mb-2.5">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">
+        <span className="text-[10px] font-mono uppercase tracking-wider text-muted">
           Every attempt for this row
         </span>
-        <span className="text-[11px] font-mono text-[#141414] tabular-nums">
+        <span className="text-[11px] font-mono text-ink tabular-nums">
           {formatUsd(total)}
         </span>
-        <span className="text-[10px] font-mono text-[#8a8a86]">
+        <span className="text-[10px] font-mono text-muted">
           {attempts.length} {attempts.length === 1 ? 'call' : 'calls'}
           {misses > 0 && `, ${misses} missed`}
         </span>
@@ -83,9 +83,9 @@ export const AttemptHistory: React.FC<{
           and the thing they need to know is "would this have worked if I had
           waited". */}
       {failures.length > 0 && (
-        <div className="flex items-start gap-2 mb-2.5 px-2.5 py-2 bg-[#fdf1ee] border border-[#f0cfc8]">
-          <AlertTriangle className="w-3 h-3 text-[#b03a20] mt-0.5 flex-shrink-0" />
-          <p className="text-[10px] font-mono text-[#b03a20] leading-relaxed">
+        <div className="flex items-start gap-2 mb-2.5 px-2.5 py-2 bg-danger-bg border border-danger-line">
+          <AlertTriangle className="w-3 h-3 text-danger-strong mt-0.5 flex-shrink-0" />
+          <p className="text-[10px] font-mono text-danger-strong leading-relaxed">
             {failures.length === 1 ? 'One call was refused' : `${failures.length} calls were refused`} by
             the provider. {describeFailures(failures)} Nothing was charged for those.
           </p>
@@ -101,7 +101,7 @@ export const AttemptHistory: React.FC<{
           and hiding it entirely is what makes a number unfalsifiable. */}
       <button
         onClick={() => setShowTable((v) => !v)}
-        className="mt-2.5 text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] hover:text-[#141414] transition-colors cursor-pointer"
+        className="mt-2.5 text-[10px] font-mono uppercase tracking-wider text-muted hover:text-ink transition-colors cursor-pointer"
       >
         {showTable ? 'Hide the detail' : 'Show every call'}
       </button>
@@ -109,21 +109,21 @@ export const AttemptHistory: React.FC<{
       {showTable && (
         <table className="mt-2 w-full text-[10px] font-mono">
           <thead>
-            <tr className="text-[#b5b5ad] text-left">
+            <tr className="text-faint text-left">
               <th className="font-normal pb-1 w-16">Step</th>
               <th className="font-normal pb-1">Provider</th>
               <th className="font-normal pb-1 w-40">Result</th>
               <th className="font-normal pb-1 text-right w-20">Cost</th>
             </tr>
           </thead>
-          <tbody className="border-t border-[#eeeeea]">
+          <tbody className="border-t border-line-soft">
             {attempts.map((a) => {
               const s = providerStyle(a.endpoint_id);
               const failed = Boolean(a.http_status && a.http_status >= 400);
 
               return (
-                <tr key={a.id} className="border-b border-[#eeeeea] last:border-b-0">
-                  <td className="py-1.5 text-[#8a8a86]">
+                <tr key={a.id} className="border-b border-line-soft last:border-b-0">
+                  <td className="py-1.5 text-muted">
                     {STEP_LABEL[a.step] ?? a.step}
                   </td>
                   <td className={`py-1.5 ${s.ink}`}>{s.label}</td>
@@ -131,12 +131,12 @@ export const AttemptHistory: React.FC<{
                     {failed ? (
                       <CallFailure status={a.http_status} code={a.error_code} />
                     ) : a.hit ? (
-                      <span className="text-[#1a7f4b]">found</span>
+                      <span className="text-ok">found</span>
                     ) : (
-                      <span className="text-[#b5b5ad]">nothing</span>
+                      <span className="text-faint">nothing</span>
                     )}
                   </td>
-                  <td className="py-1.5 text-right text-[#4a4a47] tabular-nums">
+                  <td className="py-1.5 text-right text-ink-2 tabular-nums">
                     {formatUsd(a.cost_usd ?? 0)}
                   </td>
                 </tr>
@@ -157,13 +157,13 @@ const AttemptChain: React.FC<{ attempts: AttemptWithFailure[] }> = ({ attempts }
       const failed = Boolean(a.http_status && a.http_status >= 400);
       return (
         <React.Fragment key={`${a.id}-${i}`}>
-          {i > 0 && <span className="w-3 h-px bg-[#e3e3de]" />}
+          {i > 0 && <span className="w-3 h-px bg-line" />}
           <span
             className={`w-2 h-2 rounded-full ${
               failed
-                ? 'bg-[#b03a20]'
+                ? 'bg-danger-strong'
                 : a.hit
-                  ? 'bg-[#141414]'
+                  ? 'bg-ink'
                   : `${s.chip} border border-current ${s.ink}`
             }`}
             title={`${s.label} — ${failed ? `HTTP ${a.http_status}` : a.hit ? 'found' : 'nothing'} · ${formatUsd(a.cost_usd ?? 0)}`}

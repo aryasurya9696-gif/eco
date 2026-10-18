@@ -246,13 +246,13 @@ export const PeopleView: React.FC<{
       {/* ---- Toolbar ---------------------------------------------------------- */}
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative flex-1 min-w-[220px] max-w-md">
-          <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-[#8a8a86]" />
+          <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted" />
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="Search name, title, company, domain or email"
             aria-label="Search leads"
-            className="w-full pl-8 pr-2 py-1.5 text-xs font-mono bg-white border border-[#e3e3de] focus:outline-none focus:ring-1 focus:ring-[#141414]"
+            className="w-full pl-8 pr-2 py-1.5 text-xs font-mono bg-white border border-line focus:outline-none focus:ring-1 focus:ring-ink"
           />
         </div>
         <Button variant="secondary" onClick={() => setShowFilters((v) => !v)}>
@@ -275,7 +275,7 @@ export const PeopleView: React.FC<{
         <div className="relative">
           <Button variant="quiet" onClick={() => setShowCols((v) => !v)}><Columns3 className="w-3 h-3" /> Columns</Button>
           {showCols && (
-            <div className="absolute right-0 top-full mt-1 z-20 w-44 bg-white border border-[#e3e3de] shadow-lg p-2 space-y-1">
+            <div className="absolute right-0 top-full mt-1 z-20 w-44 bg-white border border-line shadow-lg p-2 space-y-1">
               {COLUMNS.map((c) => (
                 <label key={c.key} className="flex items-center gap-2 text-xs font-mono cursor-pointer">
                   <input
@@ -303,20 +303,20 @@ export const PeopleView: React.FC<{
       {chips.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5">
           {chips.map((c) => <Chip key={c.key} label={c.label} onRemove={() => setFilters(c.clear)} />)}
-          <button onClick={() => { setFilters({}); setQ(''); }} className="text-[11px] font-mono text-[#8a8a86] hover:text-[#141414] cursor-pointer ml-1">
+          <button onClick={() => { setFilters({}); setQ(''); }} className="text-[11px] font-mono text-muted hover:text-ink cursor-pointer ml-1">
             Clear all
           </button>
         </div>
       )}
 
       {error && (
-        <div className="flex items-start justify-between gap-2 text-xs font-mono text-[#c0462e]" role="alert">
+        <div className="flex items-start justify-between gap-2 text-xs font-mono text-danger" role="alert">
           {error}
           <button onClick={() => setError(null)} aria-label="Dismiss"><X className="w-3 h-3" /></button>
         </div>
       )}
       {note && (
-        <div className="flex items-start justify-between gap-2 text-xs font-mono text-[#1a7f4b]" aria-live="polite">
+        <div className="flex items-start justify-between gap-2 text-xs font-mono text-ok" aria-live="polite">
           {note}
           <button onClick={() => setNote(null)} aria-label="Dismiss"><X className="w-3 h-3" /></button>
         </div>
@@ -324,7 +324,7 @@ export const PeopleView: React.FC<{
 
       {/* ---- Bulk bar ---------------------------------------------------------- */}
       {count > 0 && (
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 bg-[#141414] text-white px-3 py-2 text-xs font-mono">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 bg-ink text-white px-3 py-2 text-xs font-mono">
           <span className="tabular-nums">{count.toLocaleString()} {allMatching ? 'matching' : 'selected'}</span>
           {!allMatching && pageAll && total > rows.length && (
             <button className="underline cursor-pointer" onClick={() => setAllMatching(true)}>Select all {total.toLocaleString()} matching</button>
@@ -370,10 +370,10 @@ export const PeopleView: React.FC<{
           action={{ label: 'Search for people', onClick: onOpenSearch }}
         />
       ) : (
-        <div className="bg-white border border-[#e3e3de] overflow-x-auto">
+        <div className="bg-white border border-line overflow-x-auto">
           <table className="w-full text-xs font-mono">
             <thead>
-              <tr className="h-10 border-b border-[#e3e3de] text-left text-[10px] uppercase tracking-wider text-[#8a8a86]">
+              <tr className="h-10 border-b border-line text-left text-[10px] uppercase tracking-wider text-muted">
                 <th className="pl-4 w-8">
                   <input
                     type="checkbox"
@@ -400,14 +400,14 @@ export const PeopleView: React.FC<{
                 ? [0, 1, 2, 3, 4, 5].map((i) => <tr key={i}><td colSpan={12}><RowSkeleton /></td></tr>)
                 : rows.length === 0
                   ? (
-                    <tr><td colSpan={12} className="px-4 py-10 text-center text-[#8a8a86]">No leads match these filters.</td></tr>
+                    <tr><td colSpan={12} className="px-4 py-10 text-center text-muted">No leads match these filters.</td></tr>
                   )
                   : rows.map((c) => {
                     const on = allMatching || picked.has(c.id);
                     return (
                       <tr
                         key={c.id}
-                        className={`h-11 border-b border-[#eeeeea] hover:bg-[#fafaf8] cursor-pointer ${on ? 'bg-[#f6f6f4]' : ''} ${loading ? 'opacity-60' : ''}`}
+                        className={`h-11 border-b border-line-soft hover:bg-surface-2 cursor-pointer ${on ? 'bg-surface' : ''} ${loading ? 'opacity-60' : ''}`}
                         onClick={() => setOpenId(c.id)}
                       >
                         <td className="pl-4" onClick={(e) => e.stopPropagation()}>
@@ -427,13 +427,13 @@ export const PeopleView: React.FC<{
                           />
                         </td>
                         <td className="px-3 max-w-[220px]">
-                          <div className="text-[#141414] truncate">{c.person_name ?? '—'}</div>
-                          <div className="text-[10px] text-[#8a8a86] truncate">{c.title ?? '—'}</div>
+                          <div className="text-ink truncate">{c.person_name ?? '—'}</div>
+                          <div className="text-[10px] text-muted truncate">{c.title ?? '—'}</div>
                         </td>
                         {show('company') && (
                           <td className="px-3 max-w-[180px]">
-                            <div className="truncate text-[#141414]">{c.company_name ?? c.domain ?? '—'}</div>
-                            {c.company_name && <div className="text-[10px] text-[#8a8a86] truncate">{c.domain}</div>}
+                            <div className="truncate text-ink">{c.company_name ?? c.domain ?? '—'}</div>
+                            {c.company_name && <div className="text-[10px] text-muted truncate">{c.domain}</div>}
                           </td>
                         )}
                         {show('email') && (
@@ -444,31 +444,31 @@ export const PeopleView: React.FC<{
                                 <StatusBadge status={c.email_status} />
                               </div>
                             ) : (
-                              <span className="text-[#b5b5ad]">—</span>
+                              <span className="text-faint">—</span>
                             )}
                           </td>
                         )}
-                        {show('phone') && <td className="px-3 whitespace-nowrap">{c.phone ?? <span className="text-[#b5b5ad]">—</span>}</td>}
+                        {show('phone') && <td className="px-3 whitespace-nowrap">{c.phone ?? <span className="text-faint">—</span>}</td>}
                         {show('score') && <td className="px-3"><ScoreBadge score={c.score} label={c.score_label} /></td>}
-                        {show('status') && <td className="px-3 text-[#4a4a47]">{LEAD_STATUSES.find((s) => s.value === c.status)?.label ?? c.status}</td>}
+                        {show('status') && <td className="px-3 text-ink-2">{LEAD_STATUSES.find((s) => s.value === c.status)?.label ?? c.status}</td>}
                         {show('tags') && (
                           <td className="px-3 max-w-[160px]">
                             <div className="flex gap-1 overflow-hidden">
                               {(c.tags ?? []).slice(0, 3).map((t) => (
-                                <span key={t} className="px-1.5 py-0.5 text-[10px] bg-[#f0f0ec] whitespace-nowrap">{t}</span>
+                                <span key={t} className="px-1.5 py-0.5 text-[10px] bg-fill whitespace-nowrap">{t}</span>
                               ))}
                             </div>
                           </td>
                         )}
-                        {show('location') && <td className="px-3 truncate max-w-[160px] text-[#4a4a47]">{c.location ?? '—'}</td>}
-                        {show('source') && <td className="px-3 text-[#4a4a47]">{c.source}</td>}
-                        {show('updated') && <td className="px-3 text-[#8a8a86] whitespace-nowrap">{ago(c.updated_at)}</td>}
+                        {show('location') && <td className="px-3 truncate max-w-[160px] text-ink-2">{c.location ?? '—'}</td>}
+                        {show('source') && <td className="px-3 text-ink-2">{c.source}</td>}
+                        {show('updated') && <td className="px-3 text-muted whitespace-nowrap">{ago(c.updated_at)}</td>}
                       </tr>
                     );
                   })}
             </tbody>
           </table>
-          <div className="flex items-center justify-between px-4 py-2 text-[11px] font-mono text-[#8a8a86]">
+          <div className="flex items-center justify-between px-4 py-2 text-[11px] font-mono text-muted">
             <span className="tabular-nums">
               {total === 0 ? '0' : `${page * PAGE + 1}–${Math.min(total, page * PAGE + rows.length)}`} of {total.toLocaleString()}
             </span>
@@ -539,7 +539,7 @@ const BulkButton: React.FC<{ onClick: () => void; children: React.ReactNode }> =
 
 const SortTh: React.FC<{ label: string; field: string; sort: Sort; onSort: (f: string) => void }> = ({ label, field, sort, onSort }) => (
   <th className="px-3 font-normal" aria-sort={sort.field === field ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none'}>
-    <button onClick={() => onSort(field)} className={`inline-flex items-center gap-1 uppercase tracking-wider cursor-pointer ${sort.field === field ? 'text-[#141414]' : ''}`}>
+    <button onClick={() => onSort(field)} className={`inline-flex items-center gap-1 uppercase tracking-wider cursor-pointer ${sort.field === field ? 'text-ink' : ''}`}>
       {label}
       <ArrowUpDown className="w-3 h-3 opacity-50" />
     </button>
@@ -566,10 +566,10 @@ function filterChips(f: ContactFilters, lists: LeadList[]) {
 
 const Tri: React.FC<{ label: string; value: boolean | undefined; set: (v: boolean | undefined) => void }> = ({ label, value, set }) => (
   <div className="flex items-center gap-1 text-[11px] font-mono">
-    <span className="text-[#8a8a86] w-20">{label}</span>
+    <span className="text-muted w-20">{label}</span>
     {([['any', undefined], ['yes', true], ['no', false]] as const).map(([l, v]) => (
       <button key={l} onClick={() => set(v)} aria-pressed={value === v}
-        className={`px-2 py-0.5 border cursor-pointer ${value === v ? 'bg-[#141414] border-[#141414] text-white' : 'border-[#e3e3de]'}`}>{l}</button>
+        className={`px-2 py-0.5 border cursor-pointer ${value === v ? 'bg-ink border-ink text-white' : 'border-line'}`}>{l}</button>
     ))}
   </div>
 );
@@ -577,15 +577,15 @@ const Tri: React.FC<{ label: string; value: boolean | undefined; set: (v: boolea
 const FilterPanel: React.FC<{ filters: ContactFilters; lists: LeadList[]; onChange: (f: ContactFilters) => void }> = ({ filters, lists, onChange }) => {
   const toggle = <T extends string>(arr: T[] | undefined, v: T) => ((arr ?? []).includes(v) ? (arr ?? []).filter((x) => x !== v) : [...(arr ?? []), v]);
   return (
-    <div className="bg-white border border-[#e3e3de] p-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+    <div className="bg-white border border-line p-4 grid grid-cols-1 md:grid-cols-2 gap-4">
       <div>
-        <div className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] mb-1.5">Email status</div>
+        <div className="text-[10px] font-mono uppercase tracking-wider text-muted mb-1.5">Email status</div>
         <div className="flex flex-wrap gap-1">
           {EMAIL_FILTERS.map((s) => {
             const on = (filters.email_status ?? []).includes(s);
             return (
               <button key={s} aria-pressed={on} onClick={() => onChange({ ...filters, email_status: toggle(filters.email_status, s) })}
-                className={`px-2 py-0.5 text-[11px] font-mono border cursor-pointer ${on ? 'bg-[#141414] border-[#141414] text-white' : 'border-[#e3e3de]'}`}>
+                className={`px-2 py-0.5 text-[11px] font-mono border cursor-pointer ${on ? 'bg-ink border-ink text-white' : 'border-line'}`}>
                 {emailStatusLabel(s).label}
               </button>
             );
@@ -593,13 +593,13 @@ const FilterPanel: React.FC<{ filters: ContactFilters; lists: LeadList[]; onChan
         </div>
       </div>
       <div>
-        <div className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] mb-1.5">Lead status</div>
+        <div className="text-[10px] font-mono uppercase tracking-wider text-muted mb-1.5">Lead status</div>
         <div className="flex flex-wrap gap-1">
           {LEAD_STATUSES.map((s) => {
             const on = (filters.status ?? []).includes(s.value);
             return (
               <button key={s.value} aria-pressed={on} onClick={() => onChange({ ...filters, status: toggle(filters.status, s.value) })}
-                className={`px-2 py-0.5 text-[11px] font-mono border cursor-pointer ${on ? 'bg-[#141414] border-[#141414] text-white' : 'border-[#e3e3de]'}`}>
+                className={`px-2 py-0.5 text-[11px] font-mono border cursor-pointer ${on ? 'bg-ink border-ink text-white' : 'border-line'}`}>
                 {s.label}
               </button>
             );
@@ -612,20 +612,20 @@ const FilterPanel: React.FC<{ filters: ContactFilters; lists: LeadList[]; onChan
       </div>
       <div className="grid grid-cols-2 gap-3 text-[11px] font-mono">
         <label className="space-y-1">
-          <span className="text-[#8a8a86] block">List</span>
-          <select className="w-full border border-[#e3e3de] px-1 py-1" value={filters.list_id ?? ''} onChange={(e) => onChange({ ...filters, list_id: e.target.value || undefined })}>
+          <span className="text-muted block">List</span>
+          <select className="w-full border border-line px-1 py-1" value={filters.list_id ?? ''} onChange={(e) => onChange({ ...filters, list_id: e.target.value || undefined })}>
             <option value="">Any</option>
             {lists.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
           </select>
         </label>
         <label className="space-y-1">
-          <span className="text-[#8a8a86] block">Minimum fit</span>
-          <input type="number" min={0} max={100} className="w-full border border-[#e3e3de] px-1 py-1" value={filters.score_min ?? ''}
+          <span className="text-muted block">Minimum fit</span>
+          <input type="number" min={0} max={100} className="w-full border border-line px-1 py-1" value={filters.score_min ?? ''}
             onChange={(e) => onChange({ ...filters, score_min: e.target.value === '' ? null : Number(e.target.value) })} />
         </label>
         <label className="space-y-1">
-          <span className="text-[#8a8a86] block">Source</span>
-          <select className="w-full border border-[#e3e3de] px-1 py-1" value={filters.source ?? ''} onChange={(e) => onChange({ ...filters, source: (e.target.value || undefined) as ContactFilters['source'] })}>
+          <span className="text-muted block">Source</span>
+          <select className="w-full border border-line px-1 py-1" value={filters.source ?? ''} onChange={(e) => onChange({ ...filters, source: (e.target.value || undefined) as ContactFilters['source'] })}>
             <option value="">Any</option>
             <option value="search">People search</option>
             <option value="run">Lead run</option>
@@ -633,8 +633,8 @@ const FilterPanel: React.FC<{ filters: ContactFilters; lists: LeadList[]; onChan
           </select>
         </label>
         <label className="space-y-1">
-          <span className="text-[#8a8a86] block">Email not checked in</span>
-          <select className="w-full border border-[#e3e3de] px-1 py-1" value={filters.stale_days ?? ''} onChange={(e) => onChange({ ...filters, stale_days: e.target.value ? Number(e.target.value) : undefined })}>
+          <span className="text-muted block">Email not checked in</span>
+          <select className="w-full border border-line px-1 py-1" value={filters.stale_days ?? ''} onChange={(e) => onChange({ ...filters, stale_days: e.target.value ? Number(e.target.value) : undefined })}>
             <option value="">Any time</option>
             <option value="30">30 days</option>
             <option value="90">90 days</option>
@@ -643,9 +643,9 @@ const FilterPanel: React.FC<{ filters: ContactFilters; lists: LeadList[]; onChan
       </div>
       <div className="md:col-span-2">
         <label className="text-[11px] font-mono flex items-center gap-2">
-          <span className="text-[#8a8a86]">Tag</span>
+          <span className="text-muted">Tag</span>
           <input
-            className="border border-[#e3e3de] px-2 py-1"
+            className="border border-line px-2 py-1"
             placeholder="Type a tag and press Enter"
             onKeyDown={(e) => {
               const v = (e.target as HTMLInputElement).value.trim().toLowerCase();
@@ -667,14 +667,14 @@ const ViewsMenu: React.FC<{ views: SavedSearch[]; onApply: (v: SavedSearch) => v
     <div className="relative">
       <Button variant="quiet" onClick={() => setOpen((v) => !v)}>Views{views.length ? ` (${views.length})` : ''}</Button>
       {open && (
-        <div className="absolute left-0 top-full mt-1 z-20 w-60 bg-white border border-[#e3e3de] shadow-lg py-1">
+        <div className="absolute left-0 top-full mt-1 z-20 w-60 bg-white border border-line shadow-lg py-1">
           {views.map((v) => (
-            <div key={v.id} className="flex items-center justify-between px-3 py-1.5 hover:bg-[#f6f6f4]">
+            <div key={v.id} className="flex items-center justify-between px-3 py-1.5 hover:bg-surface">
               <button className="text-xs font-mono truncate cursor-pointer" onClick={() => { onApply(v); setOpen(false); }}>{v.name}</button>
-              <button className="text-[10px] font-mono text-[#8a8a86] hover:text-[#c0462e] cursor-pointer" onClick={() => onDelete(v.id)}>delete</button>
+              <button className="text-[10px] font-mono text-muted hover:text-danger cursor-pointer" onClick={() => onDelete(v.id)}>delete</button>
             </div>
           ))}
-          <button className="w-full text-left px-3 py-1.5 text-xs font-mono text-[#141414] hover:bg-[#f6f6f4] cursor-pointer border-t border-[#eeeeea]" onClick={() => { onSave(); setOpen(false); }}>
+          <button className="w-full text-left px-3 py-1.5 text-xs font-mono text-ink hover:bg-surface cursor-pointer border-t border-line-soft" onClick={() => { onSave(); setOpen(false); }}>
             Save current view…
           </button>
         </div>

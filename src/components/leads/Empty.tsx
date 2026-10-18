@@ -25,13 +25,13 @@ export const EmptyState: React.FC<{
   body: string;
   action?: { label: string; onClick: () => void };
 }> = ({ title, body, action }) => (
-  <div className="bg-white border border-[#e3e3de] px-8 py-16 flex flex-col items-center text-center">
-    <h3 className="text-sm font-bold tracking-tight text-[#141414]">{title}</h3>
-    <p className="text-xs font-mono text-[#8a8a86] mt-2 max-w-md leading-relaxed">{body}</p>
+  <div className="bg-white border border-line px-8 py-16 flex flex-col items-center text-center">
+    <h3 className="text-sm font-bold tracking-tight text-ink">{title}</h3>
+    <p className="text-xs font-mono text-muted mt-2 max-w-md leading-relaxed">{body}</p>
     {action && (
       <button
         onClick={action.onClick}
-        className="mt-6 inline-flex items-center gap-2 px-4 py-2 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer"
+        className="mt-6 inline-flex items-center gap-2 px-4 py-2 bg-ink hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer"
       >
         {action.label}
       </button>
@@ -47,12 +47,12 @@ export const EmptyState: React.FC<{
  * once the eye has seen the jump it keeps expecting it on every later load.
  */
 export const Skeleton: React.FC<{ className?: string }> = ({ className = '' }) => (
-  <div className={`bg-[#f0f0ec] animate-pulse ${className}`} aria-hidden="true" />
+  <div className={`bg-fill animate-pulse ${className}`} aria-hidden="true" />
 );
 
 /** A 44px row skeleton, matching the table's row height exactly. */
 export const RowSkeleton: React.FC = () => (
-  <div className="flex items-center gap-4 px-4 h-11 border-b border-[#eeeeea]">
+  <div className="flex items-center gap-4 px-4 h-11 border-b border-line-soft">
     <Skeleton className="w-4 h-4" />
     <Skeleton className="w-44 h-3" />
     <Skeleton className="w-32 h-3" />
@@ -71,5 +71,5 @@ export const RowSkeleton: React.FC = () => (
  * provider answers reads as a confident answer that nothing exists.
  */
 export const PendingCount: React.FC = () => (
-  <span className="text-[#b5b5ad] text-[10px] font-mono">—</span>
+  <span className="text-faint text-[10px] font-mono">—</span>
 );

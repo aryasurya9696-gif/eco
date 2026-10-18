@@ -200,11 +200,11 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[300px_1fr] gap-5">
       {/* ---- Filters --------------------------------------------------------- */}
-      <aside className="bg-white border border-[#e3e3de] p-4 space-y-5 lg:max-h-[calc(100vh-220px)] lg:overflow-y-auto" aria-label="Search filters">
+      <aside className="bg-white border border-line p-4 space-y-5 lg:max-h-[calc(100vh-220px)] lg:overflow-y-auto" aria-label="Search filters">
         <div className="flex items-center justify-between">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">Who</span>
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted">Who</span>
           {hasFilters(filters) && (
-            <button onClick={() => setFilters(EMPTY)} className="text-[10px] font-mono text-[#8a8a86] hover:text-[#141414] cursor-pointer">
+            <button onClick={() => setFilters(EMPTY)} className="text-[10px] font-mono text-muted hover:text-ink cursor-pointer">
               Reset all
             </button>
           )}
@@ -215,11 +215,11 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
         <OptionPick label="Department" options={vocab.departments ?? []} loading={vocabLoading} values={filters.departments ?? []} onChange={(v) => set('departments', v)} />
         <ChipRow boxed label="Person located in" values={filters.personLocations ?? []} onChange={(v) => set('personLocations', v)} placeholder="Country, state or city" />
 
-        <div className="pt-1 border-t border-[#eeeeea]" />
-        <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block">Where they work</span>
+        <div className="pt-1 border-t border-line-soft" />
+        <span className="text-[10px] font-mono uppercase tracking-wider text-muted block">Where they work</span>
         <OptionPick label="Industry" options={vocab.industries ?? []} loading={vocabLoading} values={filters.industries ?? []} onChange={(v) => set('industries', v)} />
         <div>
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-1.5">Employees</span>
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-1.5">Employees</span>
           <div className="flex flex-wrap gap-1 mb-1.5">
             {SIZE_PRESETS.map((p) => {
               const on = filters.employeesMin === p.min && filters.employeesMax === p.max;
@@ -228,7 +228,7 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
                   key={p.label}
                   onClick={() => setFilters((f) => (on ? { ...f, employeesMin: null, employeesMax: null } : { ...f, employeesMin: p.min, employeesMax: p.max }))}
                   aria-pressed={on}
-                  className={`px-2 py-0.5 text-[11px] font-mono border cursor-pointer ${on ? 'bg-[#141414] border-[#141414] text-white' : 'border-[#e3e3de] text-[#4a4a47] hover:border-[#141414]'}`}
+                  className={`px-2 py-0.5 text-[11px] font-mono border cursor-pointer ${on ? 'bg-ink border-ink text-white' : 'border-line text-ink-2 hover:border-ink'}`}
                 >
                   {p.label}
                 </button>
@@ -237,7 +237,7 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
           </div>
           <div className="flex items-center gap-2">
             <NumberBox label="Min employees" value={filters.employeesMin ?? null} onChange={(v) => set('employeesMin', v)} />
-            <span className="text-[#8a8a86] text-xs">–</span>
+            <span className="text-muted text-xs">–</span>
             <NumberBox label="Max employees" value={filters.employeesMax ?? null} onChange={(v) => set('employeesMax', v)} />
           </div>
         </div>
@@ -249,22 +249,22 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
         <OptionPick label="Revenue" options={vocab.revenue ?? []} loading={vocabLoading} values={filters.revenueRanges ?? []} onChange={(v) => set('revenueRanges', v)} />
         <ChipRow boxed label="Company keywords" values={filters.companyKeywords ?? []} onChange={(v) => set('companyKeywords', v)} placeholder="e.g. saas" />
         <div>
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-1.5">At most per company</span>
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-1.5">At most per company</span>
           <NumberBox label="At most per company" value={filters.maxPerCompany ?? null} onChange={(v) => set('maxPerCompany', v)} />
         </div>
       </aside>
 
       {/* ---- Results --------------------------------------------------------- */}
       <section className="min-w-0 space-y-3">
-        <div className="bg-white border border-[#e3e3de] p-4 space-y-3">
+        <div className="bg-white border border-line p-4 space-y-3">
           <div className="flex flex-wrap items-center gap-2 justify-between">
-            <div className="text-xs font-mono text-[#141414]" aria-live="polite">
+            <div className="text-xs font-mono text-ink" aria-live="polite">
               {!hasFilters(filters) ? (
-                <span className="text-[#8a8a86]">Add filters to see how many people match. Searching is free.</span>
+                <span className="text-muted">Add filters to see how many people match. Searching is free.</span>
               ) : counting ? (
-                <span className="text-[#8a8a86] inline-flex items-center gap-1.5"><Loader2 className="w-3 h-3 animate-spin" /> Counting…</span>
+                <span className="text-muted inline-flex items-center gap-1.5"><Loader2 className="w-3 h-3 animate-spin" /> Counting…</span>
               ) : count === null ? (
-                <span className="text-[#8a8a86]">Count unavailable.</span>
+                <span className="text-muted">Count unavailable.</span>
               ) : (
                 <>
                   About <span className="tabular-nums font-medium">{count.toLocaleString()}</span> people match · free to search
@@ -305,10 +305,10 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
           )}
 
           {showHistory && (
-            <div className="border-t border-[#eeeeea] pt-3">
-              <div className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] mb-1.5">Recent searches</div>
+            <div className="border-t border-line-soft pt-3">
+              <div className="text-[10px] font-mono uppercase tracking-wider text-muted mb-1.5">Recent searches</div>
               {history.length === 0 ? (
-                <p className="text-[11px] font-mono text-[#9b9b96]">No searches yet.</p>
+                <p className="text-[11px] font-mono text-muted">No searches yet.</p>
               ) : (
                 <ul className="space-y-1">
                   {history.map((h) => (
@@ -318,7 +318,7 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
                           setFilters(h.filters);
                           setShowHistory(false);
                         }}
-                        className="text-left text-[11px] font-mono text-[#4a4a47] hover:text-[#141414] cursor-pointer"
+                        className="text-left text-[11px] font-mono text-ink-2 hover:text-ink cursor-pointer"
                       >
                         {new Date(h.created_at).toLocaleString()} · {activeChips(h.filters, vocabMaps).map((c) => c.label).join(', ') || 'no filters'}
                       </button>
@@ -330,9 +330,9 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
           )}
         </div>
 
-        {error && <div className="text-xs font-mono text-[#c0462e] px-1" role="alert">{error}</div>}
+        {error && <div className="text-xs font-mono text-danger px-1" role="alert">{error}</div>}
         {note && (
-          <div className="flex flex-wrap items-center gap-3 text-xs font-mono text-[#1a7f4b] bg-[#eef7f1] border border-[#cfe7d8] px-3 py-2">
+          <div className="flex flex-wrap items-center gap-3 text-xs font-mono text-ok bg-ok-bg border border-ok-line px-3 py-2">
             <Check className="w-3.5 h-3.5" /> {note}
             {savedIds && savedIds.length > 0 && (
               <>
@@ -344,7 +344,7 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
         )}
 
         {selected.length > 0 && (
-          <div className="flex flex-wrap items-center gap-2 bg-[#141414] text-white px-3 py-2 text-xs font-mono">
+          <div className="flex flex-wrap items-center gap-2 bg-ink text-white px-3 py-2 text-xs font-mono">
             <span className="tabular-nums">{selected.length} selected</span>
             <span className="text-white/40">·</span>
             <button onClick={() => void save(null)} disabled={saving} className="inline-flex items-center gap-1 hover:underline cursor-pointer disabled:opacity-50">
@@ -372,7 +372,7 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
         )}
 
         {searching && !people ? (
-          <div className="bg-white border border-[#e3e3de]">{[0, 1, 2, 3, 4, 5].map((i) => <RowSkeleton key={i} />)}</div>
+          <div className="bg-white border border-line">{[0, 1, 2, 3, 4, 5].map((i) => <RowSkeleton key={i} />)}</div>
         ) : !people ? (
           <EmptyState
             title="Find people by role and company"
@@ -381,10 +381,10 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
         ) : people.length === 0 ? (
           <EmptyState title="Nobody matches these filters" body="Remove a filter or widen a range. The count above updates as you change them." />
         ) : (
-          <div className="bg-white border border-[#e3e3de] overflow-x-auto">
+          <div className="bg-white border border-line overflow-x-auto">
             <table className="w-full text-xs font-mono">
               <thead>
-                <tr className="h-10 border-b border-[#e3e3de] text-left text-[10px] uppercase tracking-wider text-[#8a8a86]">
+                <tr className="h-10 border-b border-line text-left text-[10px] uppercase tracking-wider text-muted">
                   <th className="pl-4 w-8">
                     <input
                       type="checkbox"
@@ -405,7 +405,7 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
                 {people.map((p) => {
                   const on = picked.has(p.leadsforge_id);
                   return (
-                    <tr key={p.leadsforge_id} className={`h-11 border-b border-[#eeeeea] ${on ? 'bg-[#f6f6f4]' : ''}`}>
+                    <tr key={p.leadsforge_id} className={`h-11 border-b border-line-soft ${on ? 'bg-surface' : ''}`}>
                       <td className="pl-4">
                         <input
                           type="checkbox"
@@ -422,25 +422,25 @@ export const SearchView: React.FC<{ onOpenRun: (id: string) => void; onOpenPeopl
                         />
                       </td>
                       <td className="px-3 max-w-[220px]">
-                        <div className="text-[#141414] truncate">{p.person_name}</div>
-                        <div className="text-[10px] text-[#8a8a86] truncate">{p.title ?? '—'}</div>
+                        <div className="text-ink truncate">{p.person_name}</div>
+                        <div className="text-[10px] text-muted truncate">{p.title ?? '—'}</div>
                       </td>
                       <td className="px-3 max-w-[180px]">
-                        <div className="text-[#141414] truncate">{p.company_name ?? p.domain ?? '—'}</div>
-                        {p.company_name && <div className="text-[10px] text-[#8a8a86] truncate">{p.domain}</div>}
+                        <div className="text-ink truncate">{p.company_name ?? p.domain ?? '—'}</div>
+                        {p.company_name && <div className="text-[10px] text-muted truncate">{p.domain}</div>}
                       </td>
-                      <td className="px-3 text-[#4a4a47] truncate max-w-[140px]">{p.company.industry ?? '—'}</td>
-                      <td className="px-3 text-right tabular-nums text-[#4a4a47]">{p.company.employee_count?.toLocaleString() ?? '—'}</td>
-                      <td className="px-3 text-[#4a4a47] truncate max-w-[160px]">{p.person_location ?? '—'}</td>
+                      <td className="px-3 text-ink-2 truncate max-w-[140px]">{p.company.industry ?? '—'}</td>
+                      <td className="px-3 text-right tabular-nums text-ink-2">{p.company.employee_count?.toLocaleString() ?? '—'}</td>
+                      <td className="px-3 text-ink-2 truncate max-w-[160px]">{p.person_location ?? '—'}</td>
                       <td className="px-3 text-right">
-                        {p.contact_id && <span className="text-[10px] text-[#1a7f4b]">In your leads</span>}
+                        {p.contact_id && <span className="text-[10px] text-ok">In your leads</span>}
                       </td>
                     </tr>
                   );
                 })}
               </tbody>
             </table>
-            <div className="flex items-center justify-between px-4 py-2 text-[11px] font-mono text-[#8a8a86]">
+            <div className="flex items-center justify-between px-4 py-2 text-[11px] font-mono text-muted">
               <span>
                 Showing {people.length}
                 {count !== null ? ` of about ${count.toLocaleString()}` : ''} · source: LeadsForge via Treg
@@ -484,7 +484,7 @@ const NumberBox: React.FC<{ label: string; value: number | null; onChange: (v: n
       const n = e.target.value === '' ? null : Math.max(0, Math.floor(Number(e.target.value)));
       onChange(Number.isFinite(n as number) || n === null ? n : null);
     }}
-    className="w-24 bg-transparent text-xs font-mono px-2 py-1 border border-[#e3e3de] focus:outline-none focus:ring-1 focus:ring-[#141414] tabular-nums"
+    className="w-24 bg-transparent text-xs font-mono px-2 py-1 border border-line focus:outline-none focus:ring-1 focus:ring-ink tabular-nums"
   />
 );
 
@@ -497,14 +497,14 @@ const SavedMenu: React.FC<{ saved: SavedSearch[]; onApply: (s: SavedSearch) => v
         <Bookmark className="w-3 h-3" /> Saved ({saved.length})
       </Button>
       {open && (
-        <div className="absolute right-0 top-full mt-1 z-20 w-64 bg-white border border-[#e3e3de] shadow-lg py-1">
+        <div className="absolute right-0 top-full mt-1 z-20 w-64 bg-white border border-line shadow-lg py-1">
           {saved.map((s) => (
-            <div key={s.id} className="flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-[#f6f6f4]">
-              <button className="text-left text-xs font-mono text-[#141414] truncate cursor-pointer" onClick={() => { onApply(s); setOpen(false); }}>
+            <div key={s.id} className="flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-surface">
+              <button className="text-left text-xs font-mono text-ink truncate cursor-pointer" onClick={() => { onApply(s); setOpen(false); }}>
                 {s.name}
-                {s.last_total != null && <span className="text-[10px] text-[#8a8a86]"> · ~{s.last_total.toLocaleString()}</span>}
+                {s.last_total != null && <span className="text-[10px] text-muted"> · ~{s.last_total.toLocaleString()}</span>}
               </button>
-              <button className="text-[10px] font-mono text-[#8a8a86] hover:text-[#c0462e] cursor-pointer" onClick={() => onDelete(s.id)} aria-label={`Delete saved search ${s.name}`}>
+              <button className="text-[10px] font-mono text-muted hover:text-danger cursor-pointer" onClick={() => onDelete(s.id)} aria-label={`Delete saved search ${s.name}`}>
                 delete
               </button>
             </div>

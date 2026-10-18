@@ -236,8 +236,8 @@ export const ProviderLab: React.FC = () => {
               title={s.blurb}
               className={`px-2.5 py-1 text-[10px] font-mono rounded-none transition-colors cursor-pointer ${
                 step === s.value
-                  ? 'bg-[#141414] text-white'
-                  : 'border border-[#e3e3de] text-[#8a8a86] hover:border-[#141414] hover:text-[#141414]'
+                  ? 'bg-ink text-white'
+                  : 'border border-line text-muted hover:border-ink hover:text-ink'
               }`}
             >
               {s.label}
@@ -245,13 +245,13 @@ export const ProviderLab: React.FC = () => {
           ))}
         </div>
         {stepInfo && (
-          <p className="text-[10px] font-mono text-[#8a8a86] leading-relaxed mt-2.5">{stepInfo.blurb}</p>
+          <p className="text-[10px] font-mono text-muted leading-relaxed mt-2.5">{stepInfo.blurb}</p>
         )}
       </Panel>
 
       {stats === null ? (
         <div className="py-20 flex justify-center">
-          <Loader2 className="w-4 h-4 animate-spin text-[#b5b5ad]" />
+          <Loader2 className="w-4 h-4 animate-spin text-faint" />
         </div>
       ) : (
         <>
@@ -276,9 +276,9 @@ export const ProviderLab: React.FC = () => {
           </Panel>
 
           {totalAttempts === 0 && (
-            <div className="flex items-start gap-2 px-4 py-3 bg-[#fdf6ec] border border-[#e8d9bd]">
-              <AlertTriangle className="w-3.5 h-3.5 text-[#b45309] mt-0.5 flex-shrink-0" />
-              <p className="text-xs font-mono text-[#b45309] leading-relaxed">
+            <div className="flex items-start gap-2 px-4 py-3 bg-warn-bg border border-warn-line">
+              <AlertTriangle className="w-3.5 h-3.5 text-warn mt-0.5 flex-shrink-0" />
+              <p className="text-xs font-mono text-warn leading-relaxed">
                 Nothing has been tried yet, so there is nothing to compare. These are the shipped
                 prices; the rates fill in after your first run.
               </p>
@@ -290,7 +290,7 @@ export const ProviderLab: React.FC = () => {
             aside={
               <div className="flex items-center gap-3">
                 {worth && (
-                  <span className="text-[10px] font-mono text-[#1a7f4b]">
+                  <span className="text-[10px] font-mono text-ok">
                     {worth.better} moved up
                     {worth.saving !== null && ` · ${formatUsd(worth.saving)} apart at the extremes`}
                   </span>
@@ -299,7 +299,7 @@ export const ProviderLab: React.FC = () => {
                   <>
                     <button
                       onClick={reset}
-                      className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] hover:text-[#141414] transition-colors cursor-pointer flex items-center gap-1.5"
+                      className="text-[10px] font-mono uppercase tracking-wider text-muted hover:text-ink transition-colors cursor-pointer flex items-center gap-1.5"
                     >
                       <RotateCcw className="w-3 h-3" />
                       Reset
@@ -316,7 +316,7 @@ export const ProviderLab: React.FC = () => {
             {/* Nothing to drag. Say so rather than drawing an empty panel, which
                 reads as a broken screen rather than a step with no providers. */}
             {order.length === 0 ? (
-              <p className="text-xs font-mono text-[#8a8a86] leading-relaxed py-4">
+              <p className="text-xs font-mono text-muted leading-relaxed py-4">
                 No providers are registered for this step.
               </p>
             ) : (
@@ -337,7 +337,7 @@ export const ProviderLab: React.FC = () => {
               </DndContext>
             )}
 
-            <p className="text-[10px] font-mono text-[#8a8a86] leading-relaxed mt-4 pt-4 border-t border-[#eeeeea]">
+            <p className="text-[10px] font-mono text-muted leading-relaxed mt-4 pt-4 border-t border-line-soft">
               The waterfall stops at each provider&apos;s own success price, so a miss costs
               whatever the provider charges for a miss. Prices are what was last set in the
               catalogue and have not been confirmed against a live response yet.
@@ -345,12 +345,12 @@ export const ProviderLab: React.FC = () => {
           </Panel>
 
           {error && (
-            <div className="px-4 py-3 bg-[#fdf2f2] border border-[#f0c4c4] text-xs font-mono text-[#8a2a2a]">
+            <div className="px-4 py-3 bg-danger-bg border border-danger-line text-xs font-mono text-danger-ink">
               {error}
             </div>
           )}
           {notice && (
-            <div className="px-4 py-3 bg-[#f6f6f4] border border-[#e3e3de] text-xs font-mono text-[#4a4a47]">
+            <div className="px-4 py-3 bg-surface border border-line text-xs font-mono text-ink-2">
               {notice}
             </div>
           )}
@@ -380,20 +380,20 @@ const Row: React.FC<{
     <li
       ref={setNodeRef}
       style={{ transform: CSS.Transform.toString(transform), transition }}
-      className={`flex items-center gap-3 px-2 h-14 border-b border-[#eeeeea] last:border-b-0 ${
-        isDragging ? 'bg-[#f6f6f4] relative z-10' : ''
+      className={`flex items-center gap-3 px-2 h-14 border-b border-line-soft last:border-b-0 ${
+        isDragging ? 'bg-surface relative z-10' : ''
       }`}
     >
       <div
         {...attributes}
         {...listeners}
-        className={draggable ? 'cursor-grab active:cursor-grabbing text-[#b5b5ad] hover:text-[#8a8a86] touch-none p-1 -m-1' : 'p-1 -m-1 text-transparent'}
+        className={draggable ? 'cursor-grab active:cursor-grabbing text-faint hover:text-muted touch-none p-1 -m-1' : 'p-1 -m-1 text-transparent'}
         aria-label={draggable ? `Reorder ${providerStyle(id).label}` : undefined}
       >
         <GripVertical className="w-3.5 h-3.5" />
       </div>
 
-      <span className="text-[10px] font-mono text-[#b5b5ad] w-4 tabular-nums text-right flex-shrink-0">
+      <span className="text-[10px] font-mono text-faint w-4 tabular-nums text-right flex-shrink-0">
         {position}
       </span>
 
@@ -403,29 +403,29 @@ const Row: React.FC<{
         {providerStyle(id).label}
       </span>
 
-      <span className="text-[10px] font-mono text-[#8a8a86] tabular-nums w-16 flex-shrink-0">
+      <span className="text-[10px] font-mono text-muted tabular-nums w-16 flex-shrink-0">
         {formatUsd(stat?.price_usd ?? 0)}
       </span>
 
       <div className="flex-1 min-w-0 flex items-center gap-3">
         {noHistory ? (
-          <span className="text-[10px] font-mono text-[#d5d5cf]">never tried</span>
+          <span className="text-[10px] font-mono text-line-strong">never tried</span>
         ) : (
           <>
             {/* The rate as a bar rather than a percentage alone. Two providers at
                 20% and 80% are far less distinguishable as digits at a glance
                 than as two lengths, and the comparison is the reason to open
                 this screen. */}
-            <div className="flex-1 max-w-[140px] h-1 bg-[#eeeeea]">
+            <div className="flex-1 max-w-[140px] h-1 bg-line-soft">
               <div
                 className="h-full transition-[width] duration-500"
                 style={{
                   width: `${(rate ?? 0) * 100}%`,
-                  backgroundColor: rate !== null && rate >= 0.6 ? '#1a7f4b' : rate !== null && rate >= 0.3 ? '#b45309' : '#b03a20',
+                  backgroundColor: rate !== null && rate >= 0.6 ? 'var(--color-ok)' : rate !== null && rate >= 0.3 ? 'var(--color-warn)' : 'var(--color-danger-strong)',
                 }}
               />
             </div>
-            <span className="text-[10px] font-mono text-[#4a4a47] tabular-nums w-9 flex-shrink-0">
+            <span className="text-[10px] font-mono text-ink-2 tabular-nums w-9 flex-shrink-0">
               {Math.round((rate ?? 0) * 100)}%
             </span>
           </>
@@ -435,13 +435,13 @@ const Row: React.FC<{
       <div className="w-40 text-right flex-shrink-0">
         {stat && stat.cost_per_find !== null ? (
           <>
-            <span className="block text-[11px] font-mono text-[#141414] tabular-nums">
+            <span className="block text-[11px] font-mono text-ink tabular-nums">
               {formatUsd(stat.cost_per_find)}
             </span>
-            <span className="block text-[9px] font-mono text-[#b5b5ad]">per find</span>
+            <span className="block text-[9px] font-mono text-faint">per find</span>
           </>
         ) : (
-          <span className="text-[10px] font-mono text-[#d5d5cf]">
+          <span className="text-[10px] font-mono text-line-strong">
             {noHistory ? '—' : `${formatUsd(stat.cost_usd)} spent`}
           </span>
         )}

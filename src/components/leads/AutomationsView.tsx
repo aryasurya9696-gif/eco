@@ -63,11 +63,11 @@ const PAUSE_COPY: Record<string, string> = {
 };
 
 const RUN_STATUS: Record<string, { label: string; tone: string }> = {
-  running: { label: 'Running', tone: 'text-[#4a4a47]' },
-  succeeded: { label: 'Done', tone: 'text-[#2f7d4f]' },
-  skipped: { label: 'Nothing to do', tone: 'text-[#8a8a86]' },
-  refused: { label: 'Refused', tone: 'text-[#b5781f]' },
-  failed: { label: 'Failed', tone: 'text-[#c0462e]' },
+  running: { label: 'Running', tone: 'text-ink-2' },
+  succeeded: { label: 'Done', tone: 'text-ok' },
+  skipped: { label: 'Nothing to do', tone: 'text-muted' },
+  refused: { label: 'Refused', tone: 'text-warn' },
+  failed: { label: 'Failed', tone: 'text-danger' },
 };
 
 const hh = (h: number) => `${String(h).padStart(2, '0')}:00 UTC`;
@@ -121,14 +121,14 @@ export const AutomationsView: React.FC<{ onOpenRun: (id: string) => void }> = ({
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <p className="text-[11px] font-mono text-[#8a8a86] max-w-xl leading-relaxed">
+        <p className="text-[11px] font-mono text-muted max-w-xl leading-relaxed">
           Automations run on a schedule, in UTC. Searching, saving and tagging are free. Anything that finds or verifies
           is priced like any other run, and only starts if the most it could cost fits both of the automation's caps.
         </p>
         <Button onClick={() => setEditing('new')}><Plus className="w-3 h-3" /> New automation</Button>
       </div>
 
-      {error && <div className="text-xs font-mono text-[#c0462e]" role="alert">{error}</div>}
+      {error && <div className="text-xs font-mono text-danger" role="alert">{error}</div>}
 
       {items === null ? (
         <RowSkeleton />
@@ -213,21 +213,21 @@ const AutomationCard: React.FC<{
   const used = paid && a.max_credits_per_month > 0 ? Math.min(1, a.month_committed / a.max_credits_per_month) : 0;
 
   return (
-    <li className="bg-white border border-[#e3e3de] px-5 py-4">
+    <li className="bg-white border border-line px-5 py-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-mono text-[#141414] truncate">{a.name}</span>
-            <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] border border-[#e3e3de] px-1.5 py-0.5">
+            <span className="text-sm font-mono text-ink truncate">{a.name}</span>
+            <span className="text-[10px] font-mono uppercase tracking-wider text-muted border border-line px-1.5 py-0.5">
               {KIND_LABEL[a.kind]}
             </span>
-            <span className={`text-[10px] font-mono uppercase tracking-wider ${active ? 'text-[#2f7d4f]' : 'text-[#b5781f]'}`}>
+            <span className={`text-[10px] font-mono uppercase tracking-wider ${active ? 'text-ok' : 'text-warn'}`}>
               {active ? 'Active' : PAUSE_COPY[a.pause_reason ?? 'user_paused'] ?? 'Paused'}
             </span>
           </div>
-          <p className="text-[11px] font-mono text-[#4a4a47] mt-1">
-            {a.saved_search ? `“${a.saved_search.name}”` : <span className="text-[#c0462e]">Saved search deleted</span>}
-            <span className="text-[#8a8a86]"> · {what} · {scheduleCopy(a)}</span>
+          <p className="text-[11px] font-mono text-ink-2 mt-1">
+            {a.saved_search ? `“${a.saved_search.name}”` : <span className="text-danger">Saved search deleted</span>}
+            <span className="text-muted"> · {what} · {scheduleCopy(a)}</span>
           </p>
         </div>
         <div className="flex items-center gap-1 flex-wrap">
@@ -243,40 +243,40 @@ const AutomationCard: React.FC<{
           <Button variant="quiet" className="px-2" onClick={onHistory} title="Show this automation's runs below">
             <History className="w-3 h-3" /> {historyOpen ? 'All history' : 'History'}
           </Button>
-          <Button variant="quiet" className="px-2 hover:text-[#c0462e]" onClick={onDelete}><Trash2 className="w-3 h-3" /> Delete</Button>
+          <Button variant="quiet" className="px-2 hover:text-danger" onClick={onDelete}><Trash2 className="w-3 h-3" /> Delete</Button>
         </div>
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-3 text-[11px] font-mono">
         <div>
-          <div className="text-[10px] uppercase tracking-wider text-[#8a8a86]">Next run</div>
-          <div className="text-[#141414]">{active ? whenCopy(a.next_run_at) : '—'}</div>
+          <div className="text-[10px] uppercase tracking-wider text-muted">Next run</div>
+          <div className="text-ink">{active ? whenCopy(a.next_run_at) : '—'}</div>
         </div>
         <div>
-          <div className="text-[10px] uppercase tracking-wider text-[#8a8a86]">Last run</div>
-          <div className={RUN_STATUS[a.last_status ?? '']?.tone ?? 'text-[#141414]'}>
+          <div className="text-[10px] uppercase tracking-wider text-muted">Last run</div>
+          <div className={RUN_STATUS[a.last_status ?? '']?.tone ?? 'text-ink'}>
             {a.last_run_at ? `${RUN_STATUS[a.last_status ?? '']?.label ?? a.last_status} · ${whenCopy(a.last_run_at)}` : 'Not yet'}
           </div>
         </div>
         {paid ? (
           <>
             <div>
-              <div className="text-[10px] uppercase tracking-wider text-[#8a8a86]">Cap per run</div>
+              <div className="text-[10px] uppercase tracking-wider text-muted">Cap per run</div>
               <div className="tabular-nums">{formatCredits(a.max_credits_per_run)} credits</div>
             </div>
             <div>
-              <div className="text-[10px] uppercase tracking-wider text-[#8a8a86]">This month</div>
+              <div className="text-[10px] uppercase tracking-wider text-muted">This month</div>
               <div className="tabular-nums">
                 {formatCredits(a.month_committed)} of {formatCredits(a.max_credits_per_month)}
               </div>
-              <div className="h-1 bg-[#eeeeea] mt-1" aria-hidden="true">
-                <div className={`h-1 ${used >= 1 ? 'bg-[#c0462e]' : 'bg-[#141414]'}`} style={{ width: `${Math.round(used * 100)}%` }} />
+              <div className="h-1 bg-line-soft mt-1" aria-hidden="true">
+                <div className={`h-1 ${used >= 1 ? 'bg-danger' : 'bg-ink'}`} style={{ width: `${Math.round(used * 100)}%` }} />
               </div>
             </div>
           </>
         ) : (
           <div className="col-span-2">
-            <div className="text-[10px] uppercase tracking-wider text-[#8a8a86]">Cost</div>
+            <div className="text-[10px] uppercase tracking-wider text-muted">Cost</div>
             <div>Free</div>
           </div>
         )}
@@ -307,21 +307,21 @@ const HistoryTable: React.FC<{
   const title = automationId ? `History · ${byId.get(automationId)?.name ?? ''}` : 'History · all automations';
 
   return (
-    <section className="bg-white border border-[#e3e3de]">
-      <div className="flex items-center justify-between px-5 py-3 border-b border-[#eeeeea]">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">{title}</span>
+    <section className="bg-white border border-line">
+      <div className="flex items-center justify-between px-5 py-3 border-b border-line-soft">
+        <span className="text-[10px] font-mono uppercase tracking-wider text-muted">{title}</span>
         {automationId && <Button variant="quiet" className="px-2" onClick={onShowAll}>Show all</Button>}
       </div>
-      {error && <div className="px-5 py-3 text-xs font-mono text-[#c0462e]">{error}</div>}
+      {error && <div className="px-5 py-3 text-xs font-mono text-danger">{error}</div>}
       {runs === null ? (
         <RowSkeleton />
       ) : runs.length === 0 ? (
-        <p className="px-5 py-6 text-xs font-mono text-[#8a8a86]">No runs yet. The first runs at its next scheduled time.</p>
+        <p className="px-5 py-6 text-xs font-mono text-muted">No runs yet. The first runs at its next scheduled time.</p>
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full text-xs font-mono">
             <thead>
-              <tr className="h-10 border-b border-[#e3e3de] text-left text-[10px] uppercase tracking-wider text-[#8a8a86]">
+              <tr className="h-10 border-b border-line text-left text-[10px] uppercase tracking-wider text-muted">
                 <th className="px-4 font-normal">Started</th>
                 {!automationId && <th className="px-3 font-normal">Automation</th>}
                 <th className="px-3 font-normal">Status</th>
@@ -338,29 +338,29 @@ const HistoryTable: React.FC<{
                 const s = RUN_STATUS[r.status] ?? { label: r.status, tone: '' };
                 return (
                   <React.Fragment key={r.id}>
-                    <tr className={`h-10 ${note ? '' : 'border-b border-[#eeeeea]'}`}>
-                      <td className="px-4 text-[#8a8a86] whitespace-nowrap">{whenCopy(r.started_at)}</td>
+                    <tr className={`h-10 ${note ? '' : 'border-b border-line-soft'}`}>
+                      <td className="px-4 text-muted whitespace-nowrap">{whenCopy(r.started_at)}</td>
                       {!automationId && <td className="px-3 truncate max-w-[180px]">{a?.name ?? 'Deleted'}</td>}
                       <td className={`px-3 ${s.tone}`}>{s.label}</td>
-                      <td className="px-3 text-[#4a4a47]">{outcomeCopy(r, a?.kind)}</td>
-                      <td className="px-3 text-right tabular-nums text-[#8a8a86]">
+                      <td className="px-3 text-ink-2">{outcomeCopy(r, a?.kind)}</td>
+                      <td className="px-3 text-right tabular-nums text-muted">
                         {r.credits_estimated_max == null ? '—' : formatCredits(r.credits_estimated_max)}
                       </td>
                       <td className="px-3 text-right tabular-nums">{r.run_id ? formatCredits(r.credits_charged) : '—'}</td>
                       <td className="px-3">
                         {r.run_id ? (
-                          <button className="underline cursor-pointer text-[#141414]" onClick={() => onOpenRun(r.run_id!)}>
+                          <button className="underline cursor-pointer text-ink" onClick={() => onOpenRun(r.run_id!)}>
                             Open{r.run_status ? ` · ${r.run_status}` : ''}
                           </button>
                         ) : (
-                          <span className="text-[#b5b5ad]">—</span>
+                          <span className="text-faint">—</span>
                         )}
                       </td>
                     </tr>
                     {note && (
-                      <tr className="border-b border-[#eeeeea]">
-                        <td colSpan={automationId ? 6 : 7} className="px-4 pb-2 text-[11px] text-[#8a8a86]">
-                          <AlertTriangle className="w-3 h-3 inline mr-1 -mt-0.5 text-[#b5781f]" />
+                      <tr className="border-b border-line-soft">
+                        <td colSpan={automationId ? 6 : 7} className="px-4 pb-2 text-[11px] text-muted">
+                          <AlertTriangle className="w-3 h-3 inline mr-1 -mt-0.5 text-warn" />
                           {note}
                         </td>
                       </tr>
@@ -484,7 +484,7 @@ const AutomationEditor: React.FC<{ initial: Automation | null; onClose: () => vo
       onClose={onClose}
       footer={
         <div className="flex items-center justify-between gap-3">
-          <span className="text-[11px] font-mono text-[#c0462e]">{error}</span>
+          <span className="text-[11px] font-mono text-danger">{error}</span>
           <div className="flex gap-2">
             <Button variant="secondary" onClick={onClose}>Cancel</Button>
             <Button onClick={() => void save()} disabled={busy || !d.name.trim() || !d.config.saved_search_id || capsMissing || capsInverted}>
@@ -503,7 +503,7 @@ const AutomationEditor: React.FC<{ initial: Automation | null; onClose: () => vo
         <SectionLabel>What it does</SectionLabel>
         <div className="space-y-1.5">
           {KINDS.map((k) => (
-            <label key={k.value} className={`flex gap-2 items-start border px-3 py-2 cursor-pointer ${d.kind === k.value ? 'border-[#141414]' : 'border-[#e3e3de]'} ${initial ? 'opacity-60 cursor-not-allowed' : ''}`}>
+            <label key={k.value} className={`flex gap-2 items-start border px-3 py-2 cursor-pointer ${d.kind === k.value ? 'border-ink' : 'border-line'} ${initial ? 'opacity-60 cursor-not-allowed' : ''}`}>
               <input
                 type="radio"
                 name="kind"
@@ -513,8 +513,8 @@ const AutomationEditor: React.FC<{ initial: Automation | null; onClose: () => vo
                 onChange={() => setD({ ...d, kind: k.value, config: { ...DEFAULT_CONFIG[k.value] } })}
               />
               <span>
-                <span className="block text-xs font-mono text-[#141414]">{k.label}</span>
-                <span className="block text-[11px] font-mono text-[#8a8a86] leading-relaxed">{k.hint}</span>
+                <span className="block text-xs font-mono text-ink">{k.label}</span>
+                <span className="block text-[11px] font-mono text-muted leading-relaxed">{k.hint}</span>
               </span>
             </label>
           ))}
@@ -526,14 +526,14 @@ const AutomationEditor: React.FC<{ initial: Automation | null; onClose: () => vo
         <select
           value={d.config.saved_search_id ?? ''}
           onChange={(e) => setConfig({ saved_search_id: e.target.value || undefined })}
-          className="w-full text-xs font-mono border border-[#e3e3de] px-2 py-1.5 bg-white"
+          className="w-full text-xs font-mono border border-line px-2 py-1.5 bg-white"
           aria-label="Saved search"
         >
           <option value="">Choose…</option>
           {searches.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
         </select>
         {searches.length === 0 && (
-          <p className="text-[11px] font-mono text-[#8a8a86] mt-1">
+          <p className="text-[11px] font-mono text-muted mt-1">
             {d.kind === 'saved_search_refresh' ? 'Save a search from Search first.' : 'Save a view from People first.'}
           </p>
         )}
@@ -546,7 +546,7 @@ const AutomationEditor: React.FC<{ initial: Automation | null; onClose: () => vo
           <div>
             <SectionLabel>Save them to a list (optional)</SectionLabel>
             <select value={d.config.list_id ?? ''} onChange={(e) => setConfig({ list_id: e.target.value || null })}
-              className="w-full text-xs font-mono border border-[#e3e3de] px-2 py-1.5 bg-white" aria-label="List">
+              className="w-full text-xs font-mono border border-line px-2 py-1.5 bg-white" aria-label="List">
               <option value="">No list</option>
               {lists.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
             </select>
@@ -563,7 +563,7 @@ const AutomationEditor: React.FC<{ initial: Automation | null; onClose: () => vo
           <div>
             <SectionLabel>Enrichment</SectionLabel>
             <select value={d.config.enrich ?? 'find_email'} onChange={(e) => setConfig({ enrich: e.target.value as 'find_email' | 'verify' | 'phone' })}
-              className="w-full text-xs font-mono border border-[#e3e3de] px-2 py-1.5 bg-white" aria-label="Enrichment">
+              className="w-full text-xs font-mono border border-line px-2 py-1.5 bg-white" aria-label="Enrichment">
               <option value="find_email">Find emails</option>
               <option value="verify">Verify emails</option>
               <option value="phone">Find phones</option>
@@ -593,18 +593,18 @@ const AutomationEditor: React.FC<{ initial: Automation | null; onClose: () => vo
         <div className="flex flex-wrap gap-2">
           <select value={d.schedule.frequency}
             onChange={(e) => setD({ ...d, schedule: { ...d.schedule, frequency: e.target.value as 'daily' | 'weekly', weekday: e.target.value === 'weekly' ? (d.schedule.weekday ?? 1) : null } })}
-            className="text-xs font-mono border border-[#e3e3de] px-2 py-1.5 bg-white" aria-label="Frequency">
+            className="text-xs font-mono border border-line px-2 py-1.5 bg-white" aria-label="Frequency">
             <option value="daily">Daily</option>
             <option value="weekly">Weekly</option>
           </select>
           {d.schedule.frequency === 'weekly' && (
             <select value={d.schedule.weekday ?? 1} onChange={(e) => setD({ ...d, schedule: { ...d.schedule, weekday: Number(e.target.value) } })}
-              className="text-xs font-mono border border-[#e3e3de] px-2 py-1.5 bg-white" aria-label="Day">
+              className="text-xs font-mono border border-line px-2 py-1.5 bg-white" aria-label="Day">
               {WEEKDAYS.map((w, i) => <option key={w} value={i}>{w}</option>)}
             </select>
           )}
           <select value={d.schedule.hour} onChange={(e) => setD({ ...d, schedule: { ...d.schedule, hour: Number(e.target.value) } })}
-            className="text-xs font-mono border border-[#e3e3de] px-2 py-1.5 bg-white" aria-label="Hour">
+            className="text-xs font-mono border border-line px-2 py-1.5 bg-white" aria-label="Hour">
             {Array.from({ length: 24 }, (_, h) => <option key={h} value={h}>{hh(h)}</option>)}
           </select>
         </div>
@@ -619,16 +619,16 @@ const AutomationEditor: React.FC<{ initial: Automation | null; onClose: () => vo
             <NumberField label="Per month" value={d.max_credits_per_month} min={0} step="any"
               onChange={(n) => setD({ ...d, max_credits_per_month: n })} />
           </div>
-          {capsMissing && <p className="text-[11px] font-mono text-[#b5781f]">Both caps are required: this automation spends credits.</p>}
-          {capsInverted && <p className="text-[11px] font-mono text-[#c0462e]">{errorCopy('run_cap_over_month_cap')}</p>}
+          {capsMissing && <p className="text-[11px] font-mono text-warn">Both caps are required: this automation spends credits.</p>}
+          {capsInverted && <p className="text-[11px] font-mono text-danger">{errorCopy('run_cap_over_month_cap')}</p>}
 
-          <div className="border border-[#e3e3de] bg-[#fafaf8] px-3 py-2.5 text-[11px] font-mono leading-relaxed">
+          <div className="border border-line bg-surface-2 px-3 py-2.5 text-[11px] font-mono leading-relaxed">
             {!d.config.saved_search_id ? (
-              <span className="text-[#8a8a86]">Choose a saved search to see what one run can cost.</span>
+              <span className="text-muted">Choose a saved search to see what one run can cost.</span>
             ) : estLoading && !est ? (
-              <span className="text-[#8a8a86]"><Loader2 className="w-3 h-3 inline animate-spin mr-1" />Pricing one run…</span>
+              <span className="text-muted"><Loader2 className="w-3 h-3 inline animate-spin mr-1" />Pricing one run…</span>
             ) : est && !est.ok ? (
-              <span className="text-[#c0462e]">{errorCopy(est.error)}</span>
+              <span className="text-danger">{errorCopy(est.error)}</span>
             ) : est?.estimate ? (
               <>
                 <div>
@@ -636,20 +636,20 @@ const AutomationEditor: React.FC<{ initial: Automation | null; onClose: () => vo
                   {' '}(about {formatCredits(est.estimate.expected_credits)} expected). A miss is never charged.
                 </div>
                 {max !== null && d.max_credits_per_run > 0 && !est.fits_run_cap && (
-                  <div className="text-[#b5781f] mt-1">
+                  <div className="text-warn mt-1">
                     <AlertTriangle className="w-3 h-3 inline mr-1 -mt-0.5" />
                     That is over the cap per run, so a run this size will be refused. Raise the cap or lower the number of people.
                   </div>
                 )}
                 {est.runs_per_month_cap != null && est.fits_run_cap && (
-                  <div className="text-[#8a8a86] mt-1">The monthly cap covers at least {est.runs_per_month_cap} full-size runs.</div>
+                  <div className="text-muted mt-1">The monthly cap covers at least {est.runs_per_month_cap} full-size runs.</div>
                 )}
               </>
             ) : null}
           </div>
         </div>
       ) : (
-        <p className="text-[11px] font-mono text-[#8a8a86]">This automation is free: it never starts a priced run.</p>
+        <p className="text-[11px] font-mono text-muted">This automation is free: it never starts a priced run.</p>
       )}
     </Drawer>
   );
@@ -664,7 +664,7 @@ const NumberField: React.FC<{
   onChange: (n: number) => void;
 }> = ({ label, value, min, max, step, onChange }) => (
   <label className="block">
-    <span className="block text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] mb-1">{label}</span>
+    <span className="block text-[10px] font-mono uppercase tracking-wider text-muted mb-1">{label}</span>
     <Input
       type="number"
       value={Number.isFinite(value) ? value : ''}

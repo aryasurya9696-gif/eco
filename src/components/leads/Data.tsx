@@ -30,10 +30,10 @@ const SEGMENTS: Array<{
   /** The outline used in the legend, so a colour is never the only signal. */
   edge: string;
 }> = [
-  { key: 'verified', label: 'Verified', fill: '#1a7f4b', edge: '#1a7f4b' },
-  { key: 'catch_all', label: 'Catch-all', fill: '#b45309', edge: '#b45309' },
-  { key: 'unknown', label: 'Unchecked', fill: '#8a8a86', edge: '#8a8a86' },
-  { key: 'invalid', label: 'No mailbox', fill: '#b03a20', edge: '#b03a20' },
+  { key: 'verified', label: 'Verified', fill: 'var(--color-ok)', edge: 'var(--color-ok)' },
+  { key: 'catch_all', label: 'Catch-all', fill: 'var(--color-warn)', edge: 'var(--color-warn)' },
+  { key: 'unknown', label: 'Unchecked', fill: 'var(--color-muted)', edge: 'var(--color-muted)' },
+  { key: 'invalid', label: 'No mailbox', fill: 'var(--color-danger-strong)', edge: 'var(--color-danger-strong)' },
 ];
 
 export const CompositionBar: React.FC<{
@@ -51,8 +51,8 @@ export const CompositionBar: React.FC<{
   if (total === 0) {
     return (
       <div>
-        <div className="w-full bg-[#eeeeea]" style={{ height }} />
-        <p className="text-[10px] font-mono text-[#b5b5ad] mt-1.5">
+        <div className="w-full bg-line-soft" style={{ height }} />
+        <p className="text-[10px] font-mono text-faint mt-1.5">
           {notFound > 0 ? `${notFound.toLocaleString()} rows, none with an address` : 'nothing worked yet'}
         </p>
       </div>
@@ -90,15 +90,15 @@ export const CompositionBar: React.FC<{
           {present.map((s) => (
             <span key={s.key} className="inline-flex items-center gap-1.5">
               <span className="w-2 h-2 rounded-sm flex-shrink-0" style={{ backgroundColor: s.fill }} />
-              <span className="text-[10px] font-mono text-[#8a8a86]">{s.label}</span>
-              <span className="text-[10px] font-mono text-[#141414] tabular-nums">{counts[s.key]}</span>
+              <span className="text-[10px] font-mono text-muted">{s.label}</span>
+              <span className="text-[10px] font-mono text-ink tabular-nums">{counts[s.key]}</span>
             </span>
           ))}
           {notFound > 0 && (
             <span className="inline-flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-sm border border-[#e3e3de] flex-shrink-0" />
-              <span className="text-[10px] font-mono text-[#8a8a86]">No address</span>
-              <span className="text-[10px] font-mono text-[#141414] tabular-nums">{notFound}</span>
+              <span className="w-2 h-2 rounded-sm border border-line flex-shrink-0" />
+              <span className="text-[10px] font-mono text-muted">No address</span>
+              <span className="text-[10px] font-mono text-ink tabular-nums">{notFound}</span>
             </span>
           )}
         </div>
@@ -124,16 +124,16 @@ export const RunStrip: React.FC<{ status: LeadRunStatus; pauseReason?: string | 
 
   const tone =
     status === 'done'
-      ? { bar: 'bg-[#1a7f4b]', text: 'text-[#1a7f4b]', label: 'Done' }
+      ? { bar: 'bg-ok', text: 'text-ok', label: 'Done' }
       : status === 'running'
-        ? { bar: 'bg-[#141414]', text: 'text-[#141414]', label: 'Running' }
+        ? { bar: 'bg-ink', text: 'text-ink', label: 'Running' }
         : status === 'paused'
-          ? { bar: 'bg-[#b45309]', text: 'text-[#b45309]', label: 'Paused' }
+          ? { bar: 'bg-warn', text: 'text-warn', label: 'Paused' }
           : status === 'failed'
-            ? { bar: 'bg-[#b03a20]', text: 'text-[#b03a20]', label: 'Failed' }
+            ? { bar: 'bg-danger-strong', text: 'text-danger-strong', label: 'Failed' }
             : status === 'cancelled'
-              ? { bar: 'bg-[#c9c9c2]', text: 'text-[#8a8a86]', label: 'Cancelled' }
-              : { bar: 'bg-[#d5d5cf]', text: 'text-[#8a8a86]', label: 'Queued' };
+              ? { bar: 'bg-line-strong', text: 'text-muted', label: 'Cancelled' }
+              : { bar: 'bg-line-strong', text: 'text-muted', label: 'Queued' };
 
   return (
     <span
@@ -211,7 +211,7 @@ export const ProviderMix: React.FC<{
               <span className="text-[10px] font-mono uppercase tracking-wider" style={{ color: style.ink }}>
                 {p.label}
               </span>
-              <span className="text-[10px] font-mono text-[#141414] tabular-nums">{p.found}</span>
+              <span className="text-[10px] font-mono text-ink tabular-nums">{p.found}</span>
             </span>
           );
         })}
@@ -232,7 +232,7 @@ function colourFor(endpointId: string): string {
   // The chip classes carry the hue; take it rather than restating the palette
   // here, which is how a second list of provider colours comes to exist.
   const m = s.chip.match(/bg-\[#([0-9a-f]{6})\]/i);
-  return m ? `#${m[1]}` : '#8a8a86';
+  return m ? `#${m[1]}` : 'var(--color-muted)';
 }
 
 /**
@@ -263,16 +263,16 @@ export const MeterFigure: React.FC<{
 
   const toneClass =
     tone === 'good'
-      ? 'text-[#1a7f4b]'
+      ? 'text-ok'
       : tone === 'warn'
-        ? 'text-[#b45309]'
+        ? 'text-warn'
         : tone === 'bad'
-          ? 'text-[#b03a20]'
-          : 'text-[#141414]';
+          ? 'text-danger-strong'
+          : 'text-ink';
 
   return (
     <div className="min-w-0">
-      <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block leading-none">
+      <span className="text-[10px] font-mono uppercase tracking-wider text-muted block leading-none">
         {label}
       </span>
       <span className={`text-xl font-mono font-medium tabular-nums leading-tight ${toneClass} block`}>
@@ -281,11 +281,11 @@ export const MeterFigure: React.FC<{
 
       {pct !== null && (
         <div
-          className="h-0.5 w-full bg-[#eeeeea] mt-2"
+          className="h-0.5 w-full bg-line-soft mt-2"
           title={`${Math.round(pct)}% of ${of}`}
         >
           <motion.div
-            className={`h-full ${tone === 'default' ? 'bg-[#8a8a86]' : toneClass}`}
+            className={`h-full ${tone === 'default' ? 'bg-muted' : toneClass}`}
             initial={{ width: 0 }}
             animate={{ width: `${pct}%` }}
             transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
@@ -293,7 +293,7 @@ export const MeterFigure: React.FC<{
         </div>
       )}
 
-      {sub && <span className="block text-[10px] font-mono text-[#8a8a86] mt-1.5">{sub}</span>}
+      {sub && <span className="block text-[10px] font-mono text-muted mt-1.5">{sub}</span>}
     </div>
   );
 };

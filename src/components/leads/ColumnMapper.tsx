@@ -144,38 +144,38 @@ export const ColumnMapper: React.FC<ColumnMapperProps> = ({
   };
 
   return (
-    <div className="bg-white border border-[#e3e3de]">
-      <div className="px-4 py-3 border-b border-[#e3e3de] flex items-center gap-3">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">
+    <div className="bg-white border border-line">
+      <div className="px-4 py-3 border-b border-line flex items-center gap-3">
+        <span className="text-[10px] font-mono uppercase tracking-wider text-muted">
           Match your columns
         </span>
-        <span className="text-[10px] font-mono text-[#b5b5ad]">
+        <span className="text-[10px] font-mono text-faint">
           {mapped.size} of {headers.length} mapped
         </span>
         {!ok && (
-          <span className="ml-auto inline-flex items-center gap-1 text-[10px] font-mono text-[#b5801f]">
+          <span className="ml-auto inline-flex items-center gap-1 text-[10px] font-mono text-warn">
             <AlertTriangle className="w-3 h-3" />
             needs {missing[0]}
           </span>
         )}
       </div>
 
-      <div className="divide-y divide-[#eeeeea]">
+      <div className="divide-y divide-line-soft">
         {ORDER.map((field) => {
           const current = mapping[field];
 
           return (
             <div key={field} className="flex items-center gap-3 px-4 h-11">
-              <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] w-32 shrink-0">
+              <span className="text-[10px] font-mono uppercase tracking-wider text-muted w-32 shrink-0">
                 {FIELD_LABEL[field]}
               </span>
 
-              <ArrowRight className="w-3 h-3 text-[#e3e3de] shrink-0" />
+              <ArrowRight className="w-3 h-3 text-line shrink-0" />
 
               <select
                 value={current ?? ''}
                 onChange={(e) => set(field, e.target.value)}
-                className="bg-transparent text-[11px] font-mono text-[#141414] focus:outline-none focus:ring-0 cursor-pointer w-40 shrink-0"
+                className="bg-transparent text-[11px] font-mono text-ink focus:outline-none focus:ring-0 cursor-pointer w-40 shrink-0"
               >
                 <option value="">— not mapped —</option>
                 {headers.map((h) => (
@@ -192,12 +192,12 @@ export const ColumnMapper: React.FC<ColumnMapperProps> = ({
 
               {/* A live value from the file, so a wrong mapping is visible before
                   the run rather than after it. */}
-              <span className="text-[10px] font-mono text-[#8a8a86] truncate flex-1 min-w-0">
-                {current ? sampleValue(sample, current) : <span className="text-[#d5d5cf]">no column chosen</span>}
+              <span className="text-[10px] font-mono text-muted truncate flex-1 min-w-0">
+                {current ? sampleValue(sample, current) : <span className="text-line-strong">no column chosen</span>}
               </span>
 
               {current && (
-                <Check className="w-3 h-3 text-[#1a7f4b] shrink-0" aria-hidden="true" />
+                <Check className="w-3 h-3 text-ok shrink-0" aria-hidden="true" />
               )}
             </div>
           );
@@ -205,10 +205,10 @@ export const ColumnMapper: React.FC<ColumnMapperProps> = ({
       </div>
 
       {passthrough.length > 0 && (
-        <div className="px-4 py-3 border-t border-[#e3e3de] bg-[#fbfbfa]">
-          <p className="text-[10px] font-mono text-[#8a8a86] leading-relaxed">
+        <div className="px-4 py-3 border-t border-line bg-surface-2">
+          <p className="text-[10px] font-mono text-muted leading-relaxed">
             Kept as-is in the export:{' '}
-            <span className="text-[#4a4a47]">{passthrough.join(', ')}</span>
+            <span className="text-ink-2">{passthrough.join(', ')}</span>
           </p>
         </div>
       )}

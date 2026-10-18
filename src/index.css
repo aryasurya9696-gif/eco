@@ -1,5 +1,36 @@
 @import "tailwindcss";
 
+/*
+ * Colour tokens. Each becomes a utility (text-ink, bg-surface-2, border-line,
+ * bg-danger-bg, ...) and a CSS variable (var(--color-ok)) for inline styles.
+ * One value per meaning: use these rather than a hex code in a class.
+ */
+@theme {
+  --color-ink: #141414;
+  --color-ink-2: #4a4a47;
+  --color-muted: #8a8a86;
+  --color-faint: #b5b5ad;
+  --color-line: #e3e3de;
+  --color-line-soft: #eeeeea;
+  --color-line-strong: #d5d5cf;
+  --color-surface: #f6f6f4;
+  --color-surface-2: #fafaf8;
+  --color-fill: #f0f0ec;
+  --color-ok: #1a7f4b;
+  --color-ok-bg: #eef7f1;
+  --color-ok-line: #cfe7d8;
+  --color-warn: #b45309;
+  --color-warn-bg: #fdf6ec;
+  --color-warn-line: #f0e0bd;
+  --color-danger: #c0462e;
+  --color-danger-strong: #b03a20;
+  --color-danger-ink: #8a2a2a;
+  --color-danger-bg: #fdf1ee;
+  --color-danger-line: #f0cfc8;
+  --color-info: #2f6aa8;
+  --color-info-bg: #eef3f8;
+}
+
 @layer base {
   :root {
     --bg-main: #f6f6f4;

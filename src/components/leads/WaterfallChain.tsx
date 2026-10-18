@@ -106,7 +106,7 @@ export const WaterfallChain: React.FC<{
               {i > 0 && (
                 <div
                   className={`${line} flex-1 min-w-[14px] mx-1.5 ${
-                    afterHit ? 'bg-[#eeeeea]' : reached ? 'bg-[#c9c9c2]' : 'bg-[#f0f0ec]'
+                    afterHit ? 'bg-line-soft' : reached ? 'bg-line-strong' : 'bg-fill'
                   }`}
                 >
                   {/* The line only grows once something has actually happened on
@@ -115,7 +115,7 @@ export const WaterfallChain: React.FC<{
                       say. */}
                   {reached && !reduce && (
                     <motion.div
-                      className={`h-full ${afterHit ? 'bg-[#eeeeea]' : 'bg-[#c9c9c2]'}`}
+                      className={`h-full ${afterHit ? 'bg-line-soft' : 'bg-line-strong'}`}
                       initial={{ scaleX: 0 }}
                       animate={{ scaleX: 1 }}
                       transition={{ duration: 0.25, delay: i * 0.04 }}
@@ -132,10 +132,10 @@ export const WaterfallChain: React.FC<{
                   transition={{ duration: reduce ? 0 : 0.2, delay: 0.05 + i * 0.04 }}
                   className={`${dot} rounded-full flex-shrink-0 ${
                     node.state === 'hit'
-                      ? 'bg-[#141414] ring-2 ring-[#141414] ring-offset-2 ring-offset-white'
+                      ? 'bg-ink ring-2 ring-ink ring-offset-2 ring-offset-white'
                       : node.state === 'miss'
                         ? `${s.chip} border border-current ${s.ink}`
-                        : 'border border-dashed border-[#d5d5cf]'
+                        : 'border border-dashed border-line-strong'
                   }`}
                   title={`${s.label} — ${
                     node.state === 'hit' ? 'found the address' : node.state === 'miss' ? 'no address' : 'never reached'
@@ -146,12 +146,12 @@ export const WaterfallChain: React.FC<{
                   <>
                     <span
                       className={`text-[9px] font-mono uppercase tracking-wider whitespace-nowrap ${
-                        node.state === 'skipped' ? 'text-[#d5d5cf]' : s.ink
+                        node.state === 'skipped' ? 'text-line-strong' : s.ink
                       }`}
                     >
                       {s.label}
                     </span>
-                    <span className="text-[9px] font-mono text-[#b5b5ad] tabular-nums whitespace-nowrap">
+                    <span className="text-[9px] font-mono text-faint tabular-nums whitespace-nowrap">
                       {node.state === 'skipped' ? '—' : formatUsd(node.costUsd)}
                     </span>
                   </>
@@ -164,11 +164,11 @@ export const WaterfallChain: React.FC<{
         {/* The arrow past the end, so the chain reads as continuing rather than
             stopping. Without it a five-node diagram with three misses looks like
             a list that ran out. */}
-        <ArrowRight className={`${size === 'sm' ? 'w-3 h-3' : 'w-3.5 h-3.5'} text-[#d5d5cf] ml-2 flex-shrink-0`} />
+        <ArrowRight className={`${size === 'sm' ? 'w-3 h-3' : 'w-3.5 h-3.5'} text-line-strong ml-2 flex-shrink-0`} />
       </div>
 
       {size === 'md' && (
-        <p className="text-[10px] font-mono text-[#8a8a86]">
+        <p className="text-[10px] font-mono text-muted">
           {hitIndex === -1 ? (
             <>tried {nodes.filter((n) => n.state === 'miss').length} providers, none had it</>
           ) : (
@@ -176,7 +176,7 @@ export const WaterfallChain: React.FC<{
               found on the {hitIndex === 0 ? 'first' : `${ordinal(hitIndex + 1)}`} try
               {missed > 0 && `, after ${missed} miss${missed === 1 ? '' : 'es'}`}
               {' · '}
-              <span className="text-[#4a4a47]">{formatUsd(spent)}</span> at providers
+              <span className="text-ink-2">{formatUsd(spent)}</span> at providers
             </>
           )}
         </p>
@@ -255,7 +255,7 @@ export const WaterfallColumn: React.FC<{
               // Only when there is more than one. A single chain says what it is
               // from the providers in it; a caption on every row would be a line
               // of text repeating itself down the panel.
-              <p className="text-[9px] font-mono text-[#b5b5ad] uppercase tracking-wider">
+              <p className="text-[9px] font-mono text-faint uppercase tracking-wider">
                 {used.map((s) => STEP_HEADING[s]).join(' · then ')}
               </p>
             )}
@@ -272,7 +272,7 @@ export const WaterfallColumn: React.FC<{
         );
       })}
 
-      <p className="text-[10px] font-mono text-[#8a8a86] pt-2 border-t border-[#eeeeea]">
+      <p className="text-[10px] font-mono text-muted pt-2 border-t border-line-soft">
         {rows.length} row{rows.length === 1 ? '' : 's'} · {foundOn} with any history ·{' '}
         {totalMisses} miss{totalMisses === 1 ? '' : 'es'} · {formatUsd(totalSpent)} at providers
       </p>

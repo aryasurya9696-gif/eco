@@ -165,9 +165,9 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
                   }}
                 />
               ) : (
-                <div className="w-4 h-4 bg-[#f0f0ec] flex-shrink-0" aria-hidden="true" />
+                <div className="w-4 h-4 bg-fill flex-shrink-0" aria-hidden="true" />
               )}
-              <span className="text-[11px] text-[#141414] truncate">
+              <span className="text-[11px] text-ink truncate">
                 {r.company_name || r.domain || '—'}
               </span>
             </div>
@@ -181,7 +181,7 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
         cell: (info) => {
           const r = info.row.original;
           if (!r.person_name) return <Dash />;
-          return <span className="text-[11px] text-[#141414] truncate">{r.person_name}</span>;
+          return <span className="text-[11px] text-ink truncate">{r.person_name}</span>;
         },
       }),
 
@@ -191,7 +191,7 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
         cell: (info) => {
           const v = info.getValue();
           return v ? (
-            <span className="text-[10px] font-mono text-[#8a8a86] truncate">{v}</span>
+            <span className="text-[10px] font-mono text-muted truncate">{v}</span>
           ) : (
             <Dash />
           );
@@ -207,7 +207,7 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
           // checked for whether it reaches anyone, and a dialable link on an
           // unchecked number is a claim the product cannot make.
           return v ? (
-            <span className="text-[10px] font-mono text-[#8a8a86] truncate">{v}</span>
+            <span className="text-[10px] font-mono text-muted truncate">{v}</span>
           ) : (
             <Dash />
           );
@@ -220,7 +220,7 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
         cell: (info) => {
           const v = info.getValue();
           return v ? (
-            <span className="text-[10px] font-mono text-[#8a8a86] truncate">{v}</span>
+            <span className="text-[10px] font-mono text-muted truncate">{v}</span>
           ) : (
             <Dash />
           );
@@ -240,7 +240,7 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
             <a
               href={`mailto:${r.email}`}
               onClick={(e) => e.stopPropagation()}
-              className="text-[11px] text-[#2f6aa8] hover:underline truncate block"
+              className="text-[11px] text-info hover:underline truncate block"
             >
               {r.email}
             </a>
@@ -293,12 +293,12 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
 
           return (
             <div className="leading-tight">
-              <span className="block text-[11px] font-mono text-[#141414] tabular-nums">
+              <span className="block text-[11px] font-mono text-ink tabular-nums">
                 {formatCredits(r.credits)}
               </span>
               {r.treg_cost_usd !== null && r.treg_cost_usd !== undefined ? (
                 <span
-                  className="block text-[9px] font-mono text-[#b5b5ad] tabular-nums"
+                  className="block text-[9px] font-mono text-faint tabular-nums"
                   title="What the provider charged for this row. The difference between that and the credits above is Echo's margin."
                 >
                   {formatUsd(r.treg_cost_usd, { decimals: 4 })}
@@ -315,13 +315,13 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
                 // earned credits and nothing was recorded against the provider
                 // who earned them - so it is called out rather than left blank.
                 <span
-                  className="block text-[9px] font-mono text-[#b5801f] tabular-nums"
+                  className="block text-[9px] font-mono text-warn tabular-nums"
                   title="This row was charged for, but no provider cost was recorded against it. The credits above were charged without a matching cost."
                 >
                   no cost recorded
                 </span>
               ) : (
-                <span className="block text-[9px] font-mono text-[#d5d5cf]">not worked</span>
+                <span className="block text-[9px] font-mono text-line-strong">not worked</span>
               )}
             </div>
           );
@@ -448,7 +448,7 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
 
   if (loading) {
     return (
-      <div className="bg-white border border-[#e3e3de]">
+      <div className="bg-white border border-line">
         {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
           <RowSkeleton key={i} />
         ))}
@@ -468,18 +468,18 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
   const gridTemplate = visible.map((c) => GRID[String(c.id)] ?? '1fr').join(' ');
 
   return (
-    <div className="bg-white border border-[#e3e3de]">
+    <div className="bg-white border border-line">
       {/* ---- Toolbar ------------------------------------------------------ */}
-      <div className="flex items-center gap-2 px-4 h-11 border-b border-[#e3e3de]">
-        <Search className="w-3 h-3 text-[#b5b5ad] flex-shrink-0" />
+      <div className="flex items-center gap-2 px-4 h-11 border-b border-line">
+        <Search className="w-3 h-3 text-faint flex-shrink-0" />
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search company, person or email"
-          className="flex-1 min-w-0 bg-transparent text-[11px] font-mono text-[#141414] placeholder:text-[#b5b5ad] focus:outline-none"
+          className="flex-1 min-w-0 bg-transparent text-[11px] font-mono text-ink placeholder:text-faint focus:outline-none"
         />
 
-        <span className="text-[10px] font-mono text-[#8a8a86] tabular-nums flex-shrink-0">
+        <span className="text-[10px] font-mono text-muted tabular-nums flex-shrink-0">
           {model.length === rows.length ? `${rows.length}` : `${model.length} of ${rows.length}`}
           {total > rows.length && rows.length < total && ` of ${total}`}
         </span>
@@ -487,19 +487,19 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
         {query && (
           <button
             onClick={() => setQuery('')}
-            className="text-[#b5b5ad] hover:text-[#141414] cursor-pointer flex-shrink-0"
+            className="text-faint hover:text-ink cursor-pointer flex-shrink-0"
             aria-label="Clear search"
           >
             <X className="w-3 h-3" />
           </button>
         )}
 
-        <div className="w-px h-4 bg-[#e3e3de] flex-shrink-0" />
+        <div className="w-px h-4 bg-line flex-shrink-0" />
 
         <button
           onClick={() => setDense((d) => !d)}
           className={`text-[10px] font-mono uppercase tracking-wider transition-colors cursor-pointer flex-shrink-0 px-1.5 py-1 ${
-            dense ? 'text-[#141414] bg-[#f0f0ec]' : 'text-[#8a8a86] hover:text-[#141414]'
+            dense ? 'text-ink bg-fill' : 'text-muted hover:text-ink'
           }`}
           title={dense ? 'Comfortable rows' : 'Compact rows'}
         >
@@ -509,7 +509,7 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
         <div className="relative flex-shrink-0">
           <button
             onClick={() => setShowCols((v) => !v)}
-            className="flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] hover:text-[#141414] transition-colors cursor-pointer px-1.5 py-1"
+            className="flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider text-muted hover:text-ink transition-colors cursor-pointer px-1.5 py-1"
           >
             <Columns3 className="w-3 h-3" />
             Columns
@@ -517,11 +517,11 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
           {showCols && (
             <>
               <div className="fixed inset-0 z-10" onClick={() => setShowCols(false)} />
-              <div className="absolute right-0 top-full mt-1 z-20 w-48 bg-white border border-[#e3e3de] shadow-lg py-1">
+              <div className="absolute right-0 top-full mt-1 z-20 w-48 bg-white border border-line shadow-lg py-1">
                 {ALL_COLUMNS.filter((c) => !c.always).map((c) => (
                   <label
                     key={c.id}
-                    className="flex items-center gap-2 px-3 py-1.5 hover:bg-[#f6f6f4] cursor-pointer"
+                    className="flex items-center gap-2 px-3 py-1.5 hover:bg-surface cursor-pointer"
                   >
                     <input
                       type="checkbox"
@@ -534,9 +534,9 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
                           return next;
                         })
                       }
-                      className="accent-[#141414]"
+                      className="accent-ink"
                     />
-                    <span className="text-[10px] font-mono text-[#4a4a47]">{c.label}</span>
+                    <span className="text-[10px] font-mono text-ink-2">{c.label}</span>
                   </label>
                 ))}
               </div>
@@ -561,14 +561,14 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
         />
       )}
       {!selectedIds.length && note && (
-        <div className="px-4 py-2 border-b border-[#eeeeea] bg-[#f6f6f4] text-[10px] font-mono text-[#4a4a47]">
+        <div className="px-4 py-2 border-b border-line-soft bg-surface text-[10px] font-mono text-ink-2">
           {note}
         </div>
       )}
 
       {/* ---- Header --------------------------------------------------------- */}
       <div
-        className="grid items-center gap-3 px-4 h-9 border-b border-[#e3e3de] bg-[#fbfbfa] sticky top-0 z-[5]"
+        className="grid items-center gap-3 px-4 h-9 border-b border-line bg-surface-2 sticky top-0 z-[5]"
         style={{ gridTemplateColumns: `28px ${gridTemplate}` }}
       >
         <SelectAll
@@ -602,8 +602,8 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
             return (
               <React.Fragment key={row.id}>
                 <div
-                  className={`absolute left-0 right-0 grid items-center gap-3 px-4 border-b border-[#eeeeea] cursor-pointer ${
-                    open ? 'bg-[#f6f6f4]' : isPicked ? 'bg-[#f0f4f8]' : 'hover:bg-[#fbfbfa]'
+                  className={`absolute left-0 right-0 grid items-center gap-3 px-4 border-b border-line-soft cursor-pointer ${
+                    open ? 'bg-surface' : isPicked ? 'bg-info-bg' : 'hover:bg-surface-2'
                   }`}
                   style={{ height: rowH, gridTemplateColumns: `28px ${gridTemplate}`, transform: `translateY(${vi.start + shift}px)` }}
                   onClick={() => void toggleExpand(r.id)}
@@ -706,7 +706,7 @@ const STATUS_RANK: Record<string, number> = {
   verified: 4,
 };
 
-const Dash = () => <span className="text-[#d5d5cf] text-[10px] font-mono">—</span>;
+const Dash = () => <span className="text-line-strong text-[10px] font-mono">—</span>;
 
 /**
  * What a row being worked on shows in the address column.
@@ -718,8 +718,8 @@ const Dash = () => <span className="text-[#d5d5cf] text-[10px] font-mono">—</s
  */
 const Working: React.FC<{ provider: string | null }> = ({ provider }) => (
   <span className="inline-flex items-center gap-1.5">
-    <span className="w-1.5 h-1.5 rounded-full bg-[#141414] animate-pulse" />
-    <span className="text-[10px] font-mono text-[#8a8a86]">
+    <span className="w-1.5 h-1.5 rounded-full bg-ink animate-pulse" />
+    <span className="text-[10px] font-mono text-muted">
       {provider ? providerStyle(provider).label : 'starting'}
     </span>
   </span>
@@ -740,7 +740,7 @@ const Checkbox: React.FC<{ checked: boolean; some?: boolean; onChange: () => voi
       }}
       onChange={onChange}
       onClick={(e) => e.stopPropagation()}
-      className="w-3 h-3 accent-[#141414] cursor-pointer"
+      className="w-3 h-3 accent-ink cursor-pointer"
       aria-label="Select row"
     />
   </span>
@@ -763,7 +763,7 @@ const HeaderCell: React.FC<{ header: ReturnType<ReturnType<typeof useReactTable<
 
   if (!canSort) {
     return (
-      <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] truncate">
+      <span className="text-[10px] font-mono uppercase tracking-wider text-muted truncate">
         {label}
       </span>
     );
@@ -772,13 +772,13 @@ const HeaderCell: React.FC<{ header: ReturnType<ReturnType<typeof useReactTable<
   return (
     <button
       onClick={header.column.getToggleSortingHandler()}
-      className="group flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] hover:text-[#141414] transition-colors cursor-pointer min-w-0"
+      className="group flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider text-muted hover:text-ink transition-colors cursor-pointer min-w-0"
     >
       <span className="truncate">{label}</span>
       {sorted === 'asc' ? (
-        <ArrowUp className="w-2.5 h-2.5 text-[#141414] flex-shrink-0" />
+        <ArrowUp className="w-2.5 h-2.5 text-ink flex-shrink-0" />
       ) : sorted === 'desc' ? (
-        <ArrowDown className="w-2.5 h-2.5 text-[#141414] flex-shrink-0" />
+        <ArrowDown className="w-2.5 h-2.5 text-ink flex-shrink-0" />
       ) : (
         <span className="w-2.5 h-2.5 flex-shrink-0 opacity-0 group-hover:opacity-40 transition-opacity">
           <ArrowUp className="w-2.5 h-2.5" />
@@ -809,7 +809,7 @@ const Expanded: React.FC<{
   // absolutely-positioned slot the table gives it, so its own height is
   // measurable and the rows below can be moved by exactly that much.
   return (
-    <div className="bg-[#fbfbfa] border-b border-[#e3e3de] px-4 py-4">
+    <div className="bg-surface-2 border-b border-line px-4 py-4">
       <div className="flex items-start justify-between gap-6">
         <div className="min-w-0 flex-1">
           <AttemptHistory attempts={attempts} loading={loading} />
@@ -817,7 +817,7 @@ const Expanded: React.FC<{
 
         <button
           onClick={onClose}
-          className="text-[#b5b5ad] hover:text-[#141414] transition-colors cursor-pointer flex-shrink-0"
+          className="text-faint hover:text-ink transition-colors cursor-pointer flex-shrink-0"
           aria-label="Close"
         >
           <X className="w-3.5 h-3.5" />
@@ -825,11 +825,11 @@ const Expanded: React.FC<{
       </div>
 
       {facts.length > 0 && (
-        <dl className="flex flex-wrap gap-x-8 gap-y-1.5 mt-4 pt-3 border-t border-[#eeeeea]">
+        <dl className="flex flex-wrap gap-x-8 gap-y-1.5 mt-4 pt-3 border-t border-line-soft">
           {facts.map(([k, v]) => (
             <div key={k} className="min-w-0">
-              <dt className="text-[9px] font-mono uppercase tracking-wider text-[#b5b5ad]">{k.replace(/_/g, ' ')}</dt>
-              <dd className="text-[10px] font-mono text-[#4a4a47] truncate">{String(v)}</dd>
+              <dt className="text-[9px] font-mono uppercase tracking-wider text-faint">{k.replace(/_/g, ' ')}</dt>
+              <dd className="text-[10px] font-mono text-ink-2 truncate">{String(v)}</dd>
             </div>
           ))}
         </dl>
@@ -854,7 +854,7 @@ const BulkBar: React.FC<{
   onDelete: () => void;
   onClear: () => void;
 }> = ({ count, busy, note, onReverify, onSuppress, onDelete, onClear }) => (
-  <div className="flex items-center gap-2 px-4 h-11 border-b border-[#e3e3de] bg-[#141414] text-white">
+  <div className="flex items-center gap-2 px-4 h-11 border-b border-line bg-ink text-white">
     <span className="text-[10px] font-mono tabular-nums flex-shrink-0">
       {count} selected
     </span>

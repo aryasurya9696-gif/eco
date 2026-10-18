@@ -245,87 +245,87 @@ export const ExportMenu: React.FC<ExportMenuProps> = ({ runId, rowCount }) => {
       <button
         onClick={() => setOpen((v) => !v)}
         disabled={busy !== null}
-        className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-[#e3e3de] text-[10px] font-mono uppercase tracking-wider text-[#4a4a47] hover:border-[#141414] hover:text-[#141414] transition-colors cursor-pointer disabled:opacity-40 rounded-none"
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-line text-[10px] font-mono uppercase tracking-wider text-ink-2 hover:border-ink hover:text-ink transition-colors cursor-pointer disabled:opacity-40 rounded-none"
       >
         {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
         {busy ? (busy === 'csv' ? 'csv' : 'xlsx') : 'Export'}
-        {!busy && <ChevronDown className="w-3 h-3 text-[#8a8a86]" />}
+        {!busy && <ChevronDown className="w-3 h-3 text-muted" />}
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full mt-1 z-20 w-72 bg-white border border-[#e3e3de] shadow-lg">
-          <div className="px-3 py-2 border-b border-[#e3e3de]">
-            <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">
+        <div className="absolute right-0 top-full mt-1 z-20 w-72 bg-white border border-line shadow-lg">
+          <div className="px-3 py-2 border-b border-line">
+            <span className="text-[10px] font-mono uppercase tracking-wider text-muted">
               What goes in the file
             </span>
           </div>
 
-          <div className="divide-y divide-[#eeeeea]">
-            <label className="flex items-start gap-2.5 px-3 py-2.5 cursor-pointer hover:bg-[#fbfbfa]">
+          <div className="divide-y divide-line-soft">
+            <label className="flex items-start gap-2.5 px-3 py-2.5 cursor-pointer hover:bg-surface-2">
               <input
                 type="checkbox"
                 checked={opts.verifiedOnly}
                 onChange={(e) => setOpts({ ...opts, verifiedOnly: e.target.checked })}
-                className="mt-0.5 accent-[#141414]"
+                className="mt-0.5 accent-ink"
               />
               <span>
-                <span className="block text-[10px] font-mono text-[#141414]">Verified addresses only</span>
-                <span className="block text-[9px] font-mono text-[#8a8a86] mt-0.5 leading-relaxed">
+                <span className="block text-[10px] font-mono text-ink">Verified addresses only</span>
+                <span className="block text-[9px] font-mono text-muted mt-0.5 leading-relaxed">
                   Catch-all and unknown addresses go in at a guessed mailbox. Sending to them is what
                   gets a domain flagged.
                 </span>
               </span>
             </label>
 
-            <label className="flex items-start gap-2.5 px-3 py-2.5 cursor-pointer hover:bg-[#fbfbfa]">
+            <label className="flex items-start gap-2.5 px-3 py-2.5 cursor-pointer hover:bg-surface-2">
               <input
                 type="checkbox"
                 checked={opts.includeCatchAll}
                 disabled={opts.verifiedOnly}
                 onChange={(e) => setOpts({ ...opts, includeCatchAll: e.target.checked })}
-                className="mt-0.5 accent-[#141414] disabled:opacity-40"
+                className="mt-0.5 accent-ink disabled:opacity-40"
               />
               <span className={opts.verifiedOnly ? 'opacity-40' : ''}>
-                <span className="block text-[10px] font-mono text-[#141414]">Include catch-all</span>
-                <span className="block text-[9px] font-mono text-[#8a8a86] mt-0.5 leading-relaxed">
+                <span className="block text-[10px] font-mono text-ink">Include catch-all</span>
+                <span className="block text-[9px] font-mono text-muted mt-0.5 leading-relaxed">
                   Looked up and confirmed as a pattern, not as a person&rsquo;s mailbox.
                 </span>
               </span>
             </label>
 
-            <label className="flex items-start gap-2.5 px-3 py-2.5 cursor-pointer hover:bg-[#fbfbfa]">
+            <label className="flex items-start gap-2.5 px-3 py-2.5 cursor-pointer hover:bg-surface-2">
               <input
                 type="checkbox"
                 checked={opts.includeAttempts}
                 onChange={(e) => setOpts({ ...opts, includeAttempts: e.target.checked })}
-                className="mt-0.5 accent-[#141414]"
+                className="mt-0.5 accent-ink"
               />
               <span>
-                <span className="block text-[10px] font-mono text-[#141414]">Found by, and cost</span>
-                <span className="block text-[9px] font-mono text-[#8a8a86] mt-0.5 leading-relaxed">
+                <span className="block text-[10px] font-mono text-ink">Found by, and cost</span>
+                <span className="block text-[9px] font-mono text-muted mt-0.5 leading-relaxed">
                   Which provider found each address and what it charged, so the waterfall is auditable.
                 </span>
               </span>
             </label>
           </div>
 
-          <div className="border-t border-[#e3e3de] p-2 flex gap-2">
+          <div className="border-t border-line p-2 flex gap-2">
             <button
               onClick={() => void doExport('csv')}
-              className="flex-1 px-3 py-1.5 bg-[#141414] hover:bg-black text-white text-[10px] font-mono uppercase tracking-wider transition-colors cursor-pointer"
+              className="flex-1 px-3 py-1.5 bg-ink hover:bg-black text-white text-[10px] font-mono uppercase tracking-wider transition-colors cursor-pointer"
             >
               CSV
             </button>
             <button
               onClick={() => void doExport('xlsx')}
-              className="flex-1 px-3 py-1.5 border border-[#e3e3de] text-[#4a4a47] hover:border-[#141414] hover:text-[#141414] text-[10px] font-mono uppercase tracking-wider transition-colors cursor-pointer"
+              className="flex-1 px-3 py-1.5 border border-line text-ink-2 hover:border-ink hover:text-ink text-[10px] font-mono uppercase tracking-wider transition-colors cursor-pointer"
             >
               Excel
             </button>
           </div>
 
           {rowCount !== undefined && (
-            <p className="px-3 py-2 border-t border-[#eeeeea] text-[9px] font-mono text-[#b5b5ad]">
+            <p className="px-3 py-2 border-t border-line-soft text-[9px] font-mono text-faint">
               {rowCount.toLocaleString()} rows in this run
             </p>
           )}
@@ -333,11 +333,11 @@ export const ExportMenu: React.FC<ExportMenuProps> = ({ runId, rowCount }) => {
       )}
 
       {note && (
-        <div className="absolute right-0 top-full mt-1 z-20 w-72 bg-white border border-[#e3e3de] px-3 py-2 shadow-lg">
-          <p className="text-[10px] font-mono text-[#4a4a47] leading-relaxed">{note}</p>
+        <div className="absolute right-0 top-full mt-1 z-20 w-72 bg-white border border-line px-3 py-2 shadow-lg">
+          <p className="text-[10px] font-mono text-ink-2 leading-relaxed">{note}</p>
           <button
             onClick={() => setNote(null)}
-            className="mt-1 text-[10px] font-mono text-[#8a8a86] hover:text-[#141414] underline cursor-pointer"
+            className="mt-1 text-[10px] font-mono text-muted hover:text-ink underline cursor-pointer"
           >
             Dismiss
           </button>

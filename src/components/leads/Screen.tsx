@@ -25,12 +25,12 @@ export const Screen: React.FC<{
   <div className="max-w-5xl mx-auto px-6 py-8 space-y-6">
     <header className="flex items-start justify-between gap-6">
       <div className="min-w-0">
-        <h1 className="text-lg font-medium text-[#141414] flex items-center gap-2">
-          {icon && <span className="text-[#8a8a86]">{icon}</span>}
+        <h1 className="text-lg font-medium text-ink flex items-center gap-2">
+          {icon && <span className="text-muted">{icon}</span>}
           {title}
         </h1>
         {subtitle && (
-          <p className="text-xs text-[#8a8a86] font-mono mt-1 leading-relaxed">{subtitle}</p>
+          <p className="text-xs text-muted font-mono mt-1 leading-relaxed">{subtitle}</p>
         )}
       </div>
       {action && <div className="flex-shrink-0 pt-0.5">{action}</div>}
@@ -52,13 +52,13 @@ export const Panel: React.FC<{
   /** Removes the body padding, for a table that wants to reach the edges. */
   flush?: boolean;
 }> = ({ label, hint, aside, children, flush = false }) => (
-  <section className="border border-[#e3e3de] bg-white">
-    <div className="px-5 py-3 border-b border-[#eeeeea] flex items-center justify-between gap-4">
+  <section className="border border-line bg-white">
+    <div className="px-5 py-3 border-b border-line-soft flex items-center justify-between gap-4">
       <div className="min-w-0">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">
+        <span className="text-[10px] font-mono uppercase tracking-wider text-muted">
           {label}
         </span>
-        {hint && <div className="text-[11px] text-[#8a8a86] font-mono mt-1">{hint}</div>}
+        {hint && <div className="text-[11px] text-muted font-mono mt-1">{hint}</div>}
       </div>
       {aside}
     </div>
@@ -91,10 +91,10 @@ export const Button: React.FC<{
     'inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-mono transition-colors cursor-pointer disabled:cursor-not-allowed';
   const tone =
     variant === 'primary'
-      ? 'bg-[#141414] text-white hover:bg-black disabled:bg-[#e3e3de] disabled:text-[#8a8a86]'
+      ? 'bg-ink text-white hover:bg-black disabled:bg-line disabled:text-muted'
       : variant === 'secondary'
-        ? 'border border-[#e3e3de] text-[#4a4a47] hover:border-[#141414] hover:text-[#141414] disabled:opacity-40'
-        : 'text-[#8a8a86] hover:text-[#141414] disabled:opacity-40';
+        ? 'border border-line text-ink-2 hover:border-ink hover:text-ink disabled:opacity-40'
+        : 'text-muted hover:text-ink disabled:opacity-40';
   return (
     <button
       type={type}
@@ -115,7 +115,7 @@ export const Input: React.FC<React.InputHTMLAttributes<HTMLInputElement>> = ({
 }) => (
   <input
     {...rest}
-    className={`w-full bg-transparent text-xs font-mono text-[#141414] placeholder:text-[#b5b5ad] focus:outline-none focus:ring-1 focus:ring-[#141414] px-2 py-1.5 border border-[#e3e3de] ${className}`}
+    className={`w-full bg-transparent text-xs font-mono text-ink placeholder:text-faint focus:outline-none focus:ring-1 focus:ring-ink px-2 py-1.5 border border-line ${className}`}
   />
 );
 
@@ -125,7 +125,7 @@ export const Textarea: React.FC<React.TextareaHTMLAttributes<HTMLTextAreaElement
 }) => (
   <textarea
     {...rest}
-    className={`w-full bg-transparent text-xs font-mono text-[#141414] placeholder:text-[#b5b5ad] focus:outline-none focus:ring-1 focus:ring-[#141414] px-3 py-2.5 border border-[#e3e3de] resize-y leading-relaxed ${className}`}
+    className={`w-full bg-transparent text-xs font-mono text-ink placeholder:text-faint focus:outline-none focus:ring-1 focus:ring-ink px-3 py-2.5 border border-line resize-y leading-relaxed ${className}`}
   />
 );
 
@@ -151,16 +151,16 @@ export const Figure: React.FC<{
   title?: string;
 }> = ({ label, value, sub, tone = 'default', size = 'lg', title }) => {
   const toneClass =
-    tone === 'good' ? 'text-[#1a7f4b]' : tone === 'warn' ? 'text-[#b45309]' : tone === 'bad' ? 'text-[#b03a20]' : 'text-[#141414]';
+    tone === 'good' ? 'text-ok' : tone === 'warn' ? 'text-warn' : tone === 'bad' ? 'text-danger-strong' : 'text-ink';
   return (
     <div className="min-w-0" title={title}>
-      <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block">{label}</span>
+      <span className="text-[10px] font-mono uppercase tracking-wider text-muted block">{label}</span>
       <span
         className={`${size === 'lg' ? 'text-2xl' : 'text-sm'} font-mono font-medium tabular-nums leading-tight ${toneClass}`}
       >
         {value}
       </span>
-      {sub && <span className="block text-[10px] font-mono text-[#8a8a86] mt-0.5">{sub}</span>}
+      {sub && <span className="block text-[10px] font-mono text-muted mt-0.5">{sub}</span>}
     </div>
   );
 };
@@ -175,18 +175,18 @@ export const Segmented: React.FC<{
   value: string;
   onChange: (v: string) => void;
 }> = ({ options, value, onChange }) => (
-  <div className="inline-flex border border-[#e3e3de]">
+  <div className="inline-flex border border-line">
     {options.map((o, i) => (
       <button
         key={o.value}
         onClick={() => onChange(o.value)}
         title={o.title}
         className={`px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider transition-colors cursor-pointer ${
-          i > 0 ? 'border-l border-[#e3e3de]' : ''
+          i > 0 ? 'border-l border-line' : ''
         } ${
           value === o.value
-            ? 'bg-[#141414] text-white'
-            : 'text-[#8a8a86] hover:text-[#141414] hover:bg-[#f6f6f4]'
+            ? 'bg-ink text-white'
+            : 'text-muted hover:text-ink hover:bg-surface'
         }`}
       >
         {o.label}
@@ -216,20 +216,20 @@ export const PriceBar: React.FC<{
 
   return (
     <div className="w-full">
-      <div className="relative h-1.5 w-full bg-[#eeeeea]">
-        <div className="absolute inset-y-0 left-0 bg-[#141414] transition-[width] duration-500" style={{ width: `${expectedPct}%` }} />
+      <div className="relative h-1.5 w-full bg-line-soft">
+        <div className="absolute inset-y-0 left-0 bg-ink transition-[width] duration-500" style={{ width: `${expectedPct}%` }} />
         {coveredPct !== null && coveredPct < 100 && (
           <div
-            className="absolute inset-y-0 border-r border-[#b45309]"
+            className="absolute inset-y-0 border-r border-warn"
             style={{ left: `${coveredPct}%` }}
             title={`Wallet covers ${Math.round(coveredPct)}% of the worst case`}
           />
         )}
       </div>
-      <div className="flex justify-between text-[10px] font-mono text-[#8a8a86] mt-1.5">
+      <div className="flex justify-between text-[10px] font-mono text-muted mt-1.5">
         <span>likely {Math.round(expectedPct)}% of the worst case</span>
         {coveredPct !== null && coveredPct < expectedPct && (
-          <span className="text-[#b45309]">balance covers {Math.round(coveredPct)}%</span>
+          <span className="text-warn">balance covers {Math.round(coveredPct)}%</span>
         )}
       </div>
     </div>
@@ -248,9 +248,9 @@ export const Blank: React.FC<{
   body: string;
   action?: React.ReactNode;
 }> = ({ title, body, action }) => (
-  <div className="border border-[#e3e3de] bg-white px-8 py-14 flex flex-col items-center text-center">
-    <h3 className="text-sm font-medium text-[#141414]">{title}</h3>
-    <p className="text-xs font-mono text-[#8a8a86] mt-2 max-w-md leading-relaxed">{body}</p>
+  <div className="border border-line bg-white px-8 py-14 flex flex-col items-center text-center">
+    <h3 className="text-sm font-medium text-ink">{title}</h3>
+    <p className="text-xs font-mono text-muted mt-2 max-w-md leading-relaxed">{body}</p>
     {action && <div className="mt-5">{action}</div>}
   </div>
 );

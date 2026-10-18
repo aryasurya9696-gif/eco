@@ -137,11 +137,11 @@ export const OptOuts: React.FC = () => {
                 user should never have to wonder what was stored on their
                 behalf. */}
             {normalised && (
-              <p className="text-[10px] font-mono text-[#8a8a86] mt-1.5">
+              <p className="text-[10px] font-mono text-muted mt-1.5">
                 will suppress{' '}
-                <span className="text-[#4a4a47]">{normalised}</span> as a{' '}
+                <span className="text-ink-2">{normalised}</span> as a{' '}
                 {preview === 'email' ? 'single address' : 'whole domain'}
-                {alreadyThere && <span className="text-[#b45309]"> · already on the list</span>}
+                {alreadyThere && <span className="text-warn"> · already on the list</span>}
               </p>
             )}
           </div>
@@ -153,15 +153,15 @@ export const OptOuts: React.FC = () => {
       </Panel>
 
       {error && (
-        <div className="flex items-start gap-2 px-4 py-3 bg-[#fdf2f2] border border-[#f0c4c4]">
-          <X className="w-3.5 h-3.5 text-[#8a2a2a] mt-0.5 flex-shrink-0" />
-          <span className="text-xs font-mono text-[#8a2a2a]">{error}</span>
+        <div className="flex items-start gap-2 px-4 py-3 bg-danger-bg border border-danger-line">
+          <X className="w-3.5 h-3.5 text-danger-ink mt-0.5 flex-shrink-0" />
+          <span className="text-xs font-mono text-danger-ink">{error}</span>
         </div>
       )}
 
       {notice && (
-        <div className="flex items-start gap-2 px-4 py-3 bg-[#f6f6f4] border border-[#e3e3de]">
-          <span className="text-xs font-mono text-[#4a4a47] leading-relaxed">{notice}</span>
+        <div className="flex items-start gap-2 px-4 py-3 bg-surface border border-line">
+          <span className="text-xs font-mono text-ink-2 leading-relaxed">{notice}</span>
         </div>
       )}
 
@@ -172,7 +172,7 @@ export const OptOuts: React.FC = () => {
             <button
               onClick={() => void bulkClear()}
               disabled={busy}
-              className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] hover:text-[#b03a20] transition-colors cursor-pointer disabled:opacity-40 flex items-center gap-1.5"
+              className="text-[10px] font-mono uppercase tracking-wider text-muted hover:text-danger-strong transition-colors cursor-pointer disabled:opacity-40 flex items-center gap-1.5"
             >
               <Trash2 className="w-3 h-3" />
               Clear all
@@ -182,11 +182,11 @@ export const OptOuts: React.FC = () => {
       >
         {items === null ? (
           <div className="py-6 flex justify-center">
-            <Loader2 className="w-4 h-4 animate-spin text-[#b5b5ad]" />
+            <Loader2 className="w-4 h-4 animate-spin text-faint" />
           </div>
         ) : items.length === 0 ? (
           <div className="py-4 text-center">
-            <p className="text-xs font-mono text-[#8a8a86] leading-relaxed max-w-sm mx-auto">
+            <p className="text-xs font-mono text-muted leading-relaxed max-w-sm mx-auto">
               Nothing suppressed. Add an address or a domain above and Echo will skip it before it
               spends anything looking.
             </p>
@@ -196,7 +196,7 @@ export const OptOuts: React.FC = () => {
             {/* Two counts rather than one list length, because suppressing one
                 company and suppressing six people at one company are different
                 amounts of protection and the number alone cannot say which. */}
-            <div className="flex gap-8 pb-4 mb-4 border-b border-[#eeeeea]">
+            <div className="flex gap-8 pb-4 mb-4 border-b border-line-soft">
               <Figure label="Addresses" value={emails} size="sm" />
               <Figure
                 label="Domains"
@@ -205,27 +205,27 @@ export const OptOuts: React.FC = () => {
               />
             </div>
 
-            <ul className="divide-y divide-[#eeeeea] -mx-5">
+            <ul className="divide-y divide-line-soft -mx-5">
               {items.map((item) => (
                 <li key={item.id ?? item.value} className="flex items-center gap-3 px-5 h-11 group">
                   <span
                     className={`inline-flex items-center px-1.5 py-0.5 text-[9px] font-mono uppercase tracking-wider flex-shrink-0 ${
                       item.kind === 'email'
-                        ? 'bg-[#eef3f8] text-[#2f6aa8]'
-                        : 'bg-[#f0f0ec] text-[#4a4a47]'
+                        ? 'bg-info-bg text-info'
+                        : 'bg-fill text-ink-2'
                     }`}
                   >
                     {item.kind}
                   </span>
-                  <span className="text-xs font-mono text-[#141414] truncate flex-1 min-w-0">
+                  <span className="text-xs font-mono text-ink truncate flex-1 min-w-0">
                     {item.value}
                   </span>
-                  <span className="text-[10px] font-mono text-[#b5b5ad] hidden sm:block flex-shrink-0">
+                  <span className="text-[10px] font-mono text-faint hidden sm:block flex-shrink-0">
                     {whenAdded(item.created_at)}
                   </span>
                   <button
                     onClick={() => void remove(item.value)}
-                    className="text-[#b5b5ad] hover:text-[#b03a20] transition-colors cursor-pointer flex-shrink-0 p-1"
+                    className="text-faint hover:text-danger-strong transition-colors cursor-pointer flex-shrink-0 p-1"
                     aria-label={`Stop suppressing ${item.value}`}
                     title="Stop suppressing"
                   >
@@ -239,7 +239,7 @@ export const OptOuts: React.FC = () => {
       </Panel>
 
       {items && items.length > 0 && (
-        <p className="text-[10px] font-mono text-[#8a8a86] leading-relaxed max-w-2xl">
+        <p className="text-[10px] font-mono text-muted leading-relaxed max-w-2xl">
           An address on this list is never sent to a provider, so it costs nothing to suppress and
           nothing about it is fetched. Removing it makes it eligible again for every run from then
           on — runs already finished are not revisited.

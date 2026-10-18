@@ -68,13 +68,13 @@ export const ContactPanel: React.FC<{
       title={
         c ? (
           <div>
-            <div className="text-sm font-medium text-[#141414]">{c.person_name ?? c.email ?? 'Unnamed lead'}</div>
-            <div className="text-[11px] font-mono text-[#8a8a86] mt-0.5">
+            <div className="text-sm font-medium text-ink">{c.person_name ?? c.email ?? 'Unnamed lead'}</div>
+            <div className="text-[11px] font-mono text-muted mt-0.5">
               {[c.title, c.company_name ?? c.domain].filter(Boolean).join(' · ') || '—'}
             </div>
           </div>
         ) : (
-          <div className="text-sm text-[#8a8a86]">Loading…</div>
+          <div className="text-sm text-muted">Loading…</div>
         )
       }
       footer={
@@ -86,7 +86,7 @@ export const ContactPanel: React.FC<{
             {!c.phone && <Button variant="secondary" onClick={() => onEnrich('phone', [c.id])}>Find phone</Button>}
             <Button
               variant="quiet"
-              className="ml-auto !text-[#c0462e]"
+              className="ml-auto !text-danger"
               onClick={async () => {
                 if (!window.confirm('Delete this lead from your database? Runs that found it keep their own rows.')) return;
                 const r = await deleteContacts([c.id]);
@@ -102,7 +102,7 @@ export const ContactPanel: React.FC<{
         )
       }
     >
-      {error && <div className="text-xs font-mono text-[#c0462e]" role="alert">{error}</div>}
+      {error && <div className="text-xs font-mono text-danger" role="alert">{error}</div>}
       {c && (
         <>
           <section className="space-y-2">
@@ -157,15 +157,15 @@ export const ContactPanel: React.FC<{
               <SectionLabel>Fit score</SectionLabel>
               <ScoreBadge score={c.score} label={c.score_label} />
             </div>
-            <p className="text-[11px] font-mono text-[#8a8a86]">
+            <p className="text-[11px] font-mono text-muted">
               {c.score_label ?? 'Not scored'} · how well this lead matches your scoring rules. Not a likelihood of anything.
             </p>
             {(c.score_reasons ?? []).length > 0 && (
               <ul className="space-y-1">
                 {(c.score_reasons ?? []).map((r) => (
                   <li key={r.factor} className="flex justify-between gap-3 text-[11px] font-mono">
-                    <span className="text-[#4a4a47]">{r.note}</span>
-                    <span className="tabular-nums text-[#8a8a86] whitespace-nowrap">{r.points}/{r.max}</span>
+                    <span className="text-ink-2">{r.note}</span>
+                    <span className="tabular-nums text-muted whitespace-nowrap">{r.points}/{r.max}</span>
                   </li>
                 ))}
               </ul>
@@ -182,7 +182,7 @@ export const ContactPanel: React.FC<{
                   aria-pressed={c.status === s.value}
                   onClick={() => void patch({ status: s.value as LeadStatus })}
                   className={`px-2 py-0.5 text-[11px] font-mono border cursor-pointer ${
-                    c.status === s.value ? 'bg-[#141414] border-[#141414] text-white' : 'border-[#e3e3de] text-[#4a4a47] hover:border-[#141414]'
+                    c.status === s.value ? 'bg-ink border-ink text-white' : 'border-line text-ink-2 hover:border-ink'
                   }`}
                 >
                   {s.label}
@@ -213,11 +213,11 @@ export const ContactPanel: React.FC<{
           <section className="space-y-2">
             <SectionLabel>Lists</SectionLabel>
             {data!.lists.length === 0 ? (
-              <p className="text-[11px] font-mono text-[#9b9b96]">Not in any list.</p>
+              <p className="text-[11px] font-mono text-muted">Not in any list.</p>
             ) : (
               <div className="flex flex-wrap gap-1">
                 {data!.lists.map((l) => (
-                  <span key={l.id} className="px-2 py-0.5 text-[11px] font-mono bg-[#f0f0ec] border border-[#e3e3de]">{l.name}</span>
+                  <span key={l.id} className="px-2 py-0.5 text-[11px] font-mono bg-fill border border-line">{l.name}</span>
                 ))}
               </div>
             )}

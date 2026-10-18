@@ -249,19 +249,19 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
           onDragLeave={() => setDragging(false)}
           onDrop={onDrop}
           className={`bg-white border px-8 py-16 flex flex-col items-center text-center cursor-pointer transition-colors ${
-            dragging ? 'border-[#141414]' : 'border-[#e3e3de] hover:border-[#b5b5ad]'
+            dragging ? 'border-ink' : 'border-line hover:border-faint'
           }`}
         >
-          <Upload className={`w-5 h-5 ${dragging ? 'text-[#141414]' : 'text-[#b5b5ad]'}`} />
-          <h3 className="text-sm font-bold tracking-tight text-[#141414] mt-3">
+          <Upload className={`w-5 h-5 ${dragging ? 'text-ink' : 'text-faint'}`} />
+          <h3 className="text-sm font-bold tracking-tight text-ink mt-3">
             Drop a CSV here
           </h3>
-          <p className="text-xs font-mono text-[#8a8a86] mt-2 max-w-sm leading-relaxed">
+          <p className="text-xs font-mono text-muted mt-2 max-w-sm leading-relaxed">
             People, companies, or both. Columns are matched automatically and you can correct them
             before anything runs.
           </p>
           <button
-            className="mt-5 px-4 py-2 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer"
+            className="mt-5 px-4 py-2 bg-ink hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer"
             onClick={(e) => {
               e.stopPropagation();
               inputRef.current?.click();
@@ -281,17 +281,17 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
           />
         </div>
 
-        {error && <p className="text-xs font-mono text-[#c0462e]">{error}</p>}
+        {error && <p className="text-xs font-mono text-danger">{error}</p>}
 
-        <div className="bg-white border border-[#e3e3de] px-6 py-5">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">
+        <div className="bg-white border border-line px-6 py-5">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted">
             What each mode does
           </span>
           <div className="grid grid-cols-3 gap-4 mt-3">
             {MODES.map((m) => (
               <div key={m.id}>
-                <p className="text-[11px] font-mono text-[#141414]">{m.label}</p>
-                <p className="text-[10px] font-mono text-[#8a8a86] mt-1 leading-relaxed">{m.body}</p>
+                <p className="text-[11px] font-mono text-ink">{m.label}</p>
+                <p className="text-[10px] font-mono text-muted mt-1 leading-relaxed">{m.body}</p>
               </div>
             ))}
           </div>
@@ -307,15 +307,15 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
   return (
     <div className="space-y-4">
       {/* What was loaded */}
-      <div className="bg-white border border-[#e3e3de] px-4 py-3 flex items-center gap-3">
-        <FileText className="w-3.5 h-3.5 text-[#8a8a86] shrink-0" />
-        <span className="text-xs font-mono text-[#141414] truncate">{file?.name}</span>
-        <span className="text-[10px] font-mono text-[#8a8a86]">
+      <div className="bg-white border border-line px-4 py-3 flex items-center gap-3">
+        <FileText className="w-3.5 h-3.5 text-muted shrink-0" />
+        <span className="text-xs font-mono text-ink truncate">{file?.name}</span>
+        <span className="text-[10px] font-mono text-muted">
           {parsed?.rows.length ?? 0} rows · {parsed?.headers.length ?? 0} columns
         </span>
         {parsed && parsed.malformed > 0 && (
           <span
-            className="text-[10px] font-mono text-[#b5801f]"
+            className="text-[10px] font-mono text-warn"
             title="Some lines did not split into the same number of fields. They were read as far as they went."
           >
             {parsed.malformed} unreadable lines
@@ -324,15 +324,15 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
         <button
           onClick={reset}
           disabled={busy}
-          className="ml-auto text-[10px] font-mono text-[#8a8a86] hover:text-[#141414] underline cursor-pointer disabled:opacity-40"
+          className="ml-auto text-[10px] font-mono text-muted hover:text-ink underline cursor-pointer disabled:opacity-40"
         >
           Choose another
         </button>
       </div>
 
       {/* Worth knowing before choosing, because it decides the bill. */}
-      <div className="bg-white border border-[#e3e3de] px-4 py-2.5">
-        <p className="text-[10px] font-mono text-[#8a8a86] leading-relaxed">
+      <div className="bg-white border border-line px-4 py-2.5">
+        <p className="text-[10px] font-mono text-muted leading-relaxed">
           Verification is charged per row whatever the answer turns out to be — you are buying the
           check, not the result. A replacement is charged on top, and only for the rows whose address
           did not survive.
@@ -340,8 +340,8 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
       </div>
 
       {/* Mode */}
-      <div className="bg-white border border-[#e3e3de] px-4 py-3">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-2">
+      <div className="bg-white border border-line px-4 py-3">
+        <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-2">
           What to do
         </span>
         <div className="flex flex-col gap-1.5">
@@ -350,8 +350,8 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
               key={m.id}
               className={`flex items-start gap-2.5 px-3 py-2 border cursor-pointer transition-colors ${
                 mode === m.id
-                  ? 'border-[#141414] bg-[#f6f6f4]'
-                  : 'border-[#e3e3de] hover:border-[#b5b5ad]'
+                  ? 'border-ink bg-surface'
+                  : 'border-line hover:border-faint'
               }`}
             >
               <input
@@ -359,14 +359,14 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
                 name="clean-mode"
                 checked={mode === m.id}
                 onChange={() => setMode(m.id)}
-                className="mt-0.5 accent-[#141414]"
+                className="mt-0.5 accent-ink"
               />
               <span>
-                <span className="block text-[11px] font-mono text-[#141414]">{m.label}</span>
-                <span className="block text-[10px] font-mono text-[#8a8a86] mt-0.5 leading-relaxed">
+                <span className="block text-[11px] font-mono text-ink">{m.label}</span>
+                <span className="block text-[10px] font-mono text-muted mt-0.5 leading-relaxed">
                   {m.body}
                 </span>
-                <span className="block text-[9px] font-mono text-[#b5b5ad] mt-0.5">{m.credits}</span>
+                <span className="block text-[9px] font-mono text-faint mt-0.5">{m.credits}</span>
               </span>
             </label>
           ))}
@@ -382,7 +382,7 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
       />
 
       {/* What survived */}
-      <div className="bg-white border border-[#e3e3de] px-4 py-3 flex items-center gap-6 flex-wrap">
+      <div className="bg-white border border-line px-4 py-3 flex items-center gap-6 flex-wrap">
         <Figure size="sm" label="In file" value={parsed?.rows.length ?? 0} />
         <Figure
           size="sm"
@@ -402,8 +402,8 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
       </div>
 
       {overCap && (
-        <div className="bg-[#f8eedb] border border-[#f0e0bd] px-4 py-3">
-          <p className="text-[10px] font-mono text-[#b5801f] leading-relaxed">
+        <div className="bg-warn-bg border border-warn-line px-4 py-3">
+          <p className="text-[10px] font-mono text-warn leading-relaxed">
             This file has <span className="font-semibold">{usable.toLocaleString()}</span> workable
             rows. A run can be priced for at most {MAX_RUN_ROWS.toLocaleString()}, which is also the
             worst case the wallet is checked against, so the first{' '}
@@ -414,36 +414,36 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
       )}
 
       {/* Price */}
-      <div className="bg-white border border-[#e3e3de] px-4 py-3 flex items-center gap-6 flex-wrap">
+      <div className="bg-white border border-line px-4 py-3 flex items-center gap-6 flex-wrap">
         <div>
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block leading-none">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block leading-none">
             Likely
           </span>
-          <span className="text-base font-bold tabular-nums text-[#141414]">
+          <span className="text-base font-bold tabular-nums text-ink">
             {pricing || !estimate ? (
-              <Loader2 className="w-4 h-4 animate-spin text-[#b5b5ad]" />
+              <Loader2 className="w-4 h-4 animate-spin text-faint" />
             ) : (
               `${estimate.expected_credits} cr`
             )}
           </span>
         </div>
         <div>
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block leading-none">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block leading-none">
             Most it can cost
           </span>
-          <span className="text-base font-bold tabular-nums text-[#141414]">
+          <span className="text-base font-bold tabular-nums text-ink">
             {estimate ? `${estimate.max_credits} cr` : '—'}
           </span>
         </div>
         {estimate && (
-          <span className="text-[10px] font-mono text-[#8a8a86]">
+          <span className="text-[10px] font-mono text-muted">
             {formatUsd(estimate.min_credits)} – {formatUsd(estimate.max_credits)}
           </span>
         )}
         <button
           onClick={() => void run()}
           disabled={busy || usable === 0 || !mappingCheck.ok || pricing || !estimate}
-          className="ml-auto inline-flex items-center gap-2 px-4 py-2 bg-[#141414] hover:bg-black disabled:bg-[#e3e3de] disabled:text-[#8a8a86] disabled:cursor-not-allowed text-white text-xs font-mono transition-colors cursor-pointer"
+          className="ml-auto inline-flex items-center gap-2 px-4 py-2 bg-ink hover:bg-black disabled:bg-line disabled:text-muted disabled:cursor-not-allowed text-white text-xs font-mono transition-colors cursor-pointer"
         >
           {busy ? (
             <>
@@ -460,30 +460,30 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
       </div>
 
       {!mappingCheck.ok && usable > 0 && (
-        <p className="text-[10px] font-mono text-[#b5801f]">
+        <p className="text-[10px] font-mono text-warn">
           This mode still needs {mappingCheck.missing.join(' or ')} mapped before it can run.
         </p>
       )}
 
       {progress && (
-        <div className="bg-white border border-[#e3e3de] px-4 py-3">
+        <div className="bg-white border border-line px-4 py-3">
           <div className="flex items-center gap-3">
-            <Loader2 className="w-3 h-3 animate-spin text-[#8a8a86]" />
-            <span className="text-[10px] font-mono text-[#4a4a47] tabular-nums">
+            <Loader2 className="w-3 h-3 animate-spin text-muted" />
+            <span className="text-[10px] font-mono text-ink-2 tabular-nums">
               {progress.done.toLocaleString()} of {progress.total.toLocaleString()} imported
             </span>
             {progress.skipped > 0 && (
               <span
-                className="text-[10px] font-mono text-[#8a8a86]"
+                className="text-[10px] font-mono text-muted"
                 title="Matched something on your opt-outs list. Never written, never billed."
               >
                 {progress.skipped.toLocaleString()} on your opt-outs
               </span>
             )}
           </div>
-          <div className="h-1 w-full bg-[#eeeeea] mt-2">
+          <div className="h-1 w-full bg-line-soft mt-2">
             <div
-              className="h-full bg-[#141414] transition-[width] duration-300"
+              className="h-full bg-ink transition-[width] duration-300"
               style={{ width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%` }}
             />
           </div>
@@ -491,9 +491,9 @@ export const CleanList: React.FC<CleanListProps> = ({ onOpenRun }) => {
       )}
 
       {error && (
-        <div className="bg-[#f8e4df] border border-[#f2d6cf] px-4 py-3 flex items-start gap-2">
-          <X className="w-3.5 h-3.5 text-[#c0462e] shrink-0 mt-0.5" />
-          <p className="text-xs font-mono text-[#c0462e]">{error}</p>
+        <div className="bg-danger-bg border border-danger-line px-4 py-3 flex items-start gap-2">
+          <X className="w-3.5 h-3.5 text-danger shrink-0 mt-0.5" />
+          <p className="text-xs font-mono text-danger">{error}</p>
         </div>
       )}
     </div>

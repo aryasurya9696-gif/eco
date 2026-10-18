@@ -47,7 +47,7 @@ export const ProviderDot: React.FC<{
   endpointId: string | null | undefined;
   title?: string;
 }> = ({ endpointId, title }) => {
-  if (!endpointId) return <span className="text-[#b5b5ad] text-[10px] font-mono">—</span>;
+  if (!endpointId) return <span className="text-faint text-[10px] font-mono">—</span>;
   const s = providerStyle(endpointId);
   return (
     <span

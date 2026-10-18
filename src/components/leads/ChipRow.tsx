@@ -49,12 +49,12 @@ export const ChipRow: React.FC<{
   return (
     <div className="group/row">
       <div className="flex items-baseline justify-between mb-1.5">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">
+        <span className="text-[10px] font-mono uppercase tracking-wider text-muted">
           {label}
         </span>
         {!mapped && (
           <span
-            className="text-[9px] font-mono text-[#b5801f]"
+            className="text-[9px] font-mono text-warn"
             title="This provider has no value for one of these, so it is being matched by keyword instead. The search will be a little broader."
           >
             matched by keyword
@@ -62,17 +62,17 @@ export const ChipRow: React.FC<{
         )}
       </div>
 
-      <div className={`flex flex-wrap items-center gap-1.5 ${boxed ? 'border border-[#e3e3de] px-1.5 py-1 focus-within:ring-1 focus-within:ring-[#141414]' : ''}`}>
+      <div className={`flex flex-wrap items-center gap-1.5 ${boxed ? 'border border-line px-1.5 py-1 focus-within:ring-1 focus-within:ring-ink' : ''}`}>
         {values.map((v) => (
           <span
             key={v}
-            className="inline-flex items-center gap-1 px-2 py-0.5 bg-[#f0f0ec] text-[10px] font-mono text-[#4a4a47] rounded-none"
+            className="inline-flex items-center gap-1 px-2 py-0.5 bg-fill text-[10px] font-mono text-ink-2 rounded-none"
           >
             {v}
             {!disabled && (
               <button
                 onClick={() => remove(v)}
-                className="text-[#b5b5ad] hover:text-[#c0462e] transition-colors cursor-pointer"
+                className="text-faint hover:text-danger transition-colors cursor-pointer"
                 aria-label={`Remove ${v}`}
               >
                 <X className="w-2.5 h-2.5" />
@@ -97,7 +97,7 @@ export const ChipRow: React.FC<{
             onBlur={() => commit(draft)}
             placeholder={values.length === 0 && (suggestions.length || boxed) ? placeholder : ''}
             aria-label={label}
-            className="min-w-[6rem] flex-1 bg-transparent text-[10px] font-mono text-[#141414] placeholder:text-[#b5b5ad] focus:outline-none py-0.5"
+            className="min-w-[6rem] flex-1 bg-transparent text-[10px] font-mono text-ink placeholder:text-faint focus:outline-none py-0.5"
           />
         )}
 
@@ -107,7 +107,7 @@ export const ChipRow: React.FC<{
               <button
                 key={s}
                 onClick={() => commit(s)}
-                className="inline-flex items-center gap-1 px-2 py-0.5 border border-[#e3e3de] text-[10px] font-mono text-[#8a8a86] hover:border-[#141414] hover:text-[#141414] transition-colors cursor-pointer rounded-none"
+                className="inline-flex items-center gap-1 px-2 py-0.5 border border-line text-[10px] font-mono text-muted hover:border-ink hover:text-ink transition-colors cursor-pointer rounded-none"
               >
                 <Plus className="w-2.5 h-2.5" />
                 {s}
@@ -134,7 +134,7 @@ export const ChipChoice: React.FC<{
   onChange: (v: string) => void;
 }> = ({ label, options, value, onChange }) => (
   <div>
-    <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-1.5">
+    <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-1.5">
       {label}
     </span>
     <div className="flex flex-wrap gap-1.5">
@@ -144,8 +144,8 @@ export const ChipChoice: React.FC<{
           onClick={() => onChange(o)}
           className={`px-2 py-0.5 text-[10px] font-mono rounded-none transition-colors cursor-pointer ${
             value === o
-              ? 'bg-[#141414] text-white'
-              : 'border border-[#e3e3de] text-[#8a8a86] hover:border-[#141414] hover:text-[#141414]'
+              ? 'bg-ink text-white'
+              : 'border border-line text-muted hover:border-ink hover:text-ink'
           }`}
         >
           {o}

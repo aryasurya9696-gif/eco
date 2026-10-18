@@ -101,11 +101,11 @@ export const RunsList: React.FC<RunsListProps> = ({ onOpenRun, onNewSearch, init
   if (error) {
     return (
       <Screen title="Runs" icon={<ListChecks className="w-4 h-4" />}>
-        <div className="bg-white border border-[#e3e3de] px-8 py-10">
-          <p className="text-xs font-mono text-[#b03a20]">{error}</p>
+        <div className="bg-white border border-line px-8 py-10">
+          <p className="text-xs font-mono text-danger-strong">{error}</p>
           <button
             onClick={() => window.location.reload()}
-            className="mt-3 text-[10px] font-mono text-[#8a8a86] hover:text-[#141414] underline cursor-pointer"
+            className="mt-3 text-[10px] font-mono text-muted hover:text-ink underline cursor-pointer"
           >
             Try again
           </button>
@@ -128,7 +128,7 @@ export const RunsList: React.FC<RunsListProps> = ({ onOpenRun, onNewSearch, init
       action={<Button onClick={onNewSearch}><Plus className="w-3.5 h-3.5" />New search</Button>}
     >
       {loading ? (
-        <div className="border border-[#e3e3de] bg-white">
+        <div className="border border-line bg-white">
           {[0, 1, 2].map((i) => (
             <RowSkeleton key={i} />
           ))}
@@ -206,28 +206,28 @@ const RunCard: React.FC<{ run: LeadRun; onOpen: () => void }> = ({ run, onOpen }
   return (
     <button
       onClick={onOpen}
-      className="w-full text-left bg-white border border-[#e3e3de] hover:border-[#b5b5ad] transition-colors cursor-pointer group"
+      className="w-full text-left bg-white border border-line hover:border-faint transition-colors cursor-pointer group"
     >
       <div className="px-5 pt-4 pb-3">
         {/* Title line */}
         <div className="flex items-center gap-3">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] flex-shrink-0">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted flex-shrink-0">
             {KIND_LABEL[run.kind]}
           </span>
-          <span className="text-sm font-medium text-[#141414] truncate min-w-0">{run.name || 'Run'}</span>
+          <span className="text-sm font-medium text-ink truncate min-w-0">{run.name || 'Run'}</span>
 
           {run.mode && (
-            <span className="text-[10px] font-mono text-[#b5b5ad] hidden sm:inline flex-shrink-0">
+            <span className="text-[10px] font-mono text-faint hidden sm:inline flex-shrink-0">
               {run.mode.replace(/_/g, ' ')}
             </span>
           )}
 
           <div className="ml-auto flex items-center gap-3 flex-shrink-0">
             <RunStatusPill status={run.status} pauseReason={run.pause_reason} />
-            <span className="text-[10px] font-mono text-[#8a8a86] tabular-nums w-16 text-right">
+            <span className="text-[10px] font-mono text-muted tabular-nums w-16 text-right">
               {when(run)}
             </span>
-            <ChevronRight className="w-3.5 h-3.5 text-[#d5d5cf] group-hover:text-[#8a8a86] transition-colors" />
+            <ChevronRight className="w-3.5 h-3.5 text-line-strong group-hover:text-muted transition-colors" />
           </div>
         </div>
 
@@ -236,9 +236,9 @@ const RunCard: React.FC<{ run: LeadRun; onOpen: () => void }> = ({ run, onOpen }
             nothing, so it is not drawn. */}
         {target > 0 && (running || pct < 100) && (
           <div className="mt-3">
-            <div className="h-1 w-full bg-[#eeeeea]">
+            <div className="h-1 w-full bg-line-soft">
               <div
-                className={`h-full transition-[width] duration-700 ${running ? 'bg-[#1a7f4b]' : 'bg-[#8a8a86]'}`}
+                className={`h-full transition-[width] duration-700 ${running ? 'bg-ok' : 'bg-muted'}`}
                 style={{ width: `${pct}%` }}
               />
             </div>
@@ -248,7 +248,7 @@ const RunCard: React.FC<{ run: LeadRun; onOpen: () => void }> = ({ run, onOpen }
         {/* Pause reason, where there is one. "top up to continue" is the single
             most useful thing on this card and it used to need a click. */}
         {run.status === 'paused' && run.pause_reason && (
-          <p className="text-[10px] font-mono text-[#b45309] mt-2.5">
+          <p className="text-[10px] font-mono text-warn mt-2.5">
             {run.pause_reason === 'credits'
               ? 'Out of credits — top up to continue.'
               : run.pause_reason === 'provider_balance'
@@ -260,7 +260,7 @@ const RunCard: React.FC<{ run: LeadRun; onOpen: () => void }> = ({ run, onOpen }
 
       {/* Counters. Below a hairline so the numbers are a separate thing from the
           title rather than floating in the middle of the card. */}
-      <div className="px-5 py-3 border-t border-[#eeeeea] flex items-baseline gap-8 flex-wrap">
+      <div className="px-5 py-3 border-t border-line-soft flex items-baseline gap-8 flex-wrap">
         <Stat label="Rows" value={found} />
         <Stat label="Verified" value={verified} tone={verified > 0 ? 'good' : undefined} />
         <Stat label="Catch-all" value={catchAll} tone={catchAll > 0 ? 'warn' : undefined} />
@@ -283,10 +283,10 @@ const Stat: React.FC<{ label: string; value: React.ReactNode; tone?: 'good' | 'w
   muted,
 }) => (
   <div className="flex items-baseline gap-1.5">
-    <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">{label}</span>
+    <span className="text-[10px] font-mono uppercase tracking-wider text-muted">{label}</span>
     <span
       className={`text-xs font-mono tabular-nums ${
-        tone === 'good' ? 'text-[#1a7f4b]' : tone === 'warn' ? 'text-[#b45309]' : muted ? 'text-[#b5b5ad]' : 'text-[#141414]'
+        tone === 'good' ? 'text-ok' : tone === 'warn' ? 'text-warn' : muted ? 'text-faint' : 'text-ink'
       }`}
     >
       {value}

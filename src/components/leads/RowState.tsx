@@ -93,11 +93,11 @@ export function rowStateLabel(row: {
 }
 
 const TONE_CLASS: Record<RowStateLabel['tone'], string> = {
-  good: 'bg-[#eef7f1] text-[#1a7f4b] border-[#cfe6da]',
-  warn: 'bg-[#fdf6ec] text-[#b45309] border-[#e8d9bd]',
-  bad: 'bg-[#fdf1ee] text-[#b03a20] border-[#f0cfc8]',
-  busy: 'bg-white text-[#141414] border-[#e3e3de]',
-  default: 'bg-[#f6f6f4] text-[#8a8a86] border-[#eeeeea]',
+  good: 'bg-ok-bg text-ok border-ok-line',
+  warn: 'bg-warn-bg text-warn border-warn-line',
+  bad: 'bg-danger-bg text-danger-strong border-danger-line',
+  busy: 'bg-white text-ink border-line',
+  default: 'bg-surface text-muted border-line-soft',
 };
 
 /**
@@ -115,7 +115,7 @@ export const RowStateBadge: React.FC<{ row: LeadRow }> = ({ row }) => {
     <span
       className={`inline-flex items-center gap-1.5 px-1.5 py-0.5 border text-[9px] font-mono uppercase tracking-wider whitespace-nowrap ${TONE_CLASS[tone]}`}
     >
-      {busy && <span className="w-1.5 h-1.5 rounded-full bg-[#141414] animate-pulse flex-shrink-0" />}
+      {busy && <span className="w-1.5 h-1.5 rounded-full bg-ink animate-pulse flex-shrink-0" />}
       {text}
     </span>
   );
@@ -158,7 +158,7 @@ export const CallFailure: React.FC<{ status?: number | null; code?: string | nul
 
   return (
     <span
-      className="inline-flex items-center gap-1.5 px-1.5 py-0.5 border border-[#f0cfc8] bg-[#fdf1ee] text-[#b03a20] text-[9px] font-mono whitespace-nowrap"
+      className="inline-flex items-center gap-1.5 px-1.5 py-0.5 border border-danger-line bg-danger-bg text-danger-strong text-[9px] font-mono whitespace-nowrap"
       title={explain(status, code)}
     >
       {status ? `HTTP ${status}` : code}

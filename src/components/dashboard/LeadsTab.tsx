@@ -171,19 +171,19 @@ const SubNav: React.FC<{ view: LeadsView; onViewChange: (v: LeadsView) => void }
   view,
   onViewChange,
 }) => (
-  <nav className="flex items-center gap-1 border-b border-[#e3e3de] -mt-2 overflow-x-auto" aria-label="Leads sections">
+  <nav className="flex items-center gap-1 border-b border-line -mt-2 overflow-x-auto" aria-label="Leads sections">
     {SUB_NAV.map((item) => {
       const active = view === item.view;
       return (
         <React.Fragment key={item.view}>
-        {item.divider && <span className="w-px h-4 bg-[#e3e3de] mx-1.5 flex-shrink-0" aria-hidden="true" />}
+        {item.divider && <span className="w-px h-4 bg-line mx-1.5 flex-shrink-0" aria-hidden="true" />}
         <button
           aria-current={active ? 'page' : undefined}
           onClick={() => onViewChange(item.view)}
           className={`flex items-center gap-1.5 px-3 py-2 text-xs font-mono transition-colors cursor-pointer border-b-2 -mb-px ${
             active
-              ? 'border-[#141414] text-[#141414] font-medium'
-              : 'border-transparent text-[#8a8a86] hover:text-[#141414]'
+              ? 'border-ink text-ink font-medium'
+              : 'border-transparent text-muted hover:text-ink'
           }`}
         >
           {item.icon}
@@ -567,8 +567,8 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
     return (
       <div className="space-y-4">
         <BackLink onBack={onBack} />
-        <div className="bg-white border border-[#e3e3de] px-8 py-10">
-          <p className="text-xs font-mono text-[#c0462e]">{error}</p>
+        <div className="bg-white border border-line px-8 py-10">
+          <p className="text-xs font-mono text-danger">{error}</p>
         </div>
       </div>
     );
@@ -581,10 +581,10 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
       {/* ---- Title ------------------------------------------------------- */}
       <div className="flex items-start justify-between gap-6">
         <div className="min-w-0">
-          <h1 className="text-lg font-medium text-[#141414] truncate">
+          <h1 className="text-lg font-medium text-ink truncate">
             {run?.name || (run?.target ? `${run.target} leads` : 'Run')}
           </h1>
-          <p className="text-xs text-[#8a8a86] font-mono mt-1">
+          <p className="text-xs text-muted font-mono mt-1">
             {total.toLocaleString()} {total === 1 ? 'row' : 'rows'}
             {run?.target ? ` of ${run.target.toLocaleString()}` : ''}
             {run?.started_at ? ` · started ${ago(run.started_at)}` : ''}
@@ -598,7 +598,7 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
             className={`text-[10px] font-mono px-1.5 py-0.5 border ${
               live
                 ? 'text-emerald-700 border-emerald-200 bg-emerald-50'
-                : 'text-[#8a8a86] border-[#e3e3de]'
+                : 'text-muted border-line'
             }`}
             title={live ? 'Updating over a live connection' : 'Updating every few seconds'}
           >
@@ -613,9 +613,9 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
 
       {/* ---- Pause ------------------------------------------------------- */}
       {run?.status === 'paused' && run.pause_reason && (
-        <div className="flex items-start gap-2 px-4 py-3 bg-[#fdf6ec] border border-[#e8d9bd]">
-          <AlertTriangle className="w-3.5 h-3.5 text-[#b45309] mt-0.5 flex-shrink-0" />
-          <p className="text-xs font-mono text-[#b45309] leading-relaxed">
+        <div className="flex items-start gap-2 px-4 py-3 bg-warn-bg border border-warn-line">
+          <AlertTriangle className="w-3.5 h-3.5 text-warn mt-0.5 flex-shrink-0" />
+          <p className="text-xs font-mono text-warn leading-relaxed">
             {run.pause_reason === 'credits'
               ? 'Out of credits for the worst case of this run. Top up and it will pick up where it stopped.'
               : run.pause_reason === 'provider_balance'
@@ -629,8 +629,8 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
 
       {/* ---- What it produced, and what it cost -------------------------- */}
       <div className="grid grid-cols-1 lg:grid-cols-[1.4fr_1fr] gap-5">
-        <div className="border border-[#e3e3de] bg-white p-5">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-3">
+        <div className="border border-line bg-white p-5">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-3">
             What it produced
           </span>
           <CompositionBar
@@ -640,8 +640,8 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
           />
         </div>
 
-        <div className="border border-[#e3e3de] bg-white p-5 flex flex-col">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-3">
+        <div className="border border-line bg-white p-5 flex flex-col">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-3">
             What it cost
           </span>
 
@@ -691,7 +691,7 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
               credits leave their balance and is never told what happens next has
               every reason to think the worst, and this is the line that prevents
               it. It is the cheapest and most load-bearing sentence in the app. */}
-          <p className="text-[10px] font-mono text-[#8a8a86] leading-relaxed mt-5 pt-3 border-t border-[#eeeeea]">
+          <p className="text-[10px] font-mono text-muted leading-relaxed mt-5 pt-3 border-t border-line-soft">
             {run?.max_credits
               ? `This run can cost at most ${round2(run.max_credits)} credits, and that figure is what was checked against your balance before it started. ` +
                 `Each batch holds only what it might spend and returns the rest as it finishes, so the balance moves in steps rather than dropping all at once.`
@@ -701,11 +701,11 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
       </div>
 
       {notice && (
-        <div className="flex items-start gap-2 px-4 py-2.5 bg-[#f6f6f4] border border-[#e3e3de]">
-          <span className="text-xs font-mono text-[#4a4a47] leading-relaxed">{notice}</span>
+        <div className="flex items-start gap-2 px-4 py-2.5 bg-surface border border-line">
+          <span className="text-xs font-mono text-ink-2 leading-relaxed">{notice}</span>
           <button
             onClick={() => setNotice(null)}
-            className="ml-auto text-[#8a8a86] hover:text-[#141414] cursor-pointer flex-shrink-0"
+            className="ml-auto text-muted hover:text-ink cursor-pointer flex-shrink-0"
             aria-label="Dismiss"
           >
             <X className="w-3 h-3" />
@@ -715,11 +715,11 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
 
       {/* ---- Who actually did the work ----------------------------------- */}
       {mix.length > 0 && (
-        <div className="border border-[#e3e3de] bg-white p-5">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-1">
+        <div className="border border-line bg-white p-5">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-1">
             Who found them
           </span>
-          <p className="text-[11px] font-mono text-[#b5b5ad] mb-4 leading-relaxed">
+          <p className="text-[11px] font-mono text-faint mb-4 leading-relaxed">
             Of the rows on this page. A provider high on this bar is earning its place in the
             waterfall; one at the end is costing money on every call it is asked about.
           </p>
@@ -729,11 +729,11 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
 
       {/* ---- Where the money went --------------------------------------- */}
       {expensive.some((e) => e.attempts.length > 1) && (
-        <div className="border border-[#e3e3de] bg-white p-5">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-1">
+        <div className="border border-line bg-white p-5">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted block mb-1">
             Where the money went
           </span>
-          <p className="text-[11px] font-mono text-[#b5b5ad] mb-4 leading-relaxed">
+          <p className="text-[11px] font-mono text-faint mb-4 leading-relaxed">
             The rows that took the most providers to resolve. One dot lit cost the price of one
             lookup; four dots with the last one filled cost four.
           </p>
@@ -759,7 +759,7 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
             <Square className="w-3 h-3" />
             Cancel run
           </Button>
-          <span className="text-[10px] font-mono text-[#8a8a86] ml-1">
+          <span className="text-[10px] font-mono text-muted ml-1">
             Cancelling keeps every row it already found.
           </span>
         </div>
@@ -811,7 +811,7 @@ function ago(iso: string): string {
 const BackLink: React.FC<{ onBack: () => void }> = ({ onBack }) => (
   <button
     onClick={onBack}
-    className="inline-flex items-center gap-1.5 text-xs font-mono text-[#8a8a86] hover:text-[#141414] transition-colors cursor-pointer"
+    className="inline-flex items-center gap-1.5 text-xs font-mono text-muted hover:text-ink transition-colors cursor-pointer"
   >
     <ArrowLeft className="w-3 h-3" />
     Runs

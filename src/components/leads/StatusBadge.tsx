@@ -54,12 +54,12 @@ export const RunStatusPill: React.FC<{
     status === 'done'
       ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
       : status === 'paused'
-        ? 'bg-[#f8eedb] text-[#b5801f] border-[#f0e0bd]'
+        ? 'bg-warn-bg text-warn border-warn-line'
         : status === 'failed'
-          ? 'bg-[#f8e4df] text-[#c0462e] border-[#f2d6cf]'
+          ? 'bg-danger-bg text-danger border-danger-line'
           : status === 'cancelled'
-            ? 'bg-[#eeeeea] text-[#8a8a86] border-[#e3e3de]'
-            : 'bg-white text-[#4a4a47] border-[#e3e3de]';
+            ? 'bg-line-soft text-muted border-line'
+            : 'bg-white text-ink-2 border-line';
 
   return (
     <span
@@ -68,7 +68,7 @@ export const RunStatusPill: React.FC<{
     >
       {active && (
         <span
-          className={`w-1.5 h-1.5 rounded-full ${status === 'paused' ? 'bg-[#b5801f]' : 'bg-emerald-500 animate-pulse'}`}
+          className={`w-1.5 h-1.5 rounded-full ${status === 'paused' ? 'bg-warn' : 'bg-emerald-500 animate-pulse'}`}
           aria-hidden="true"
         />
       )}
