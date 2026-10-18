@@ -17,6 +17,7 @@ import type { LeadRow } from '../../types';
 import { providerStyle } from '../../lib/leads';
 import { RowStateBadge, AddressBadge } from './RowState';
 import { AttemptHistory, type AttemptWithFailure } from './AttemptHistory';
+import { rowShift, extraScrollHeight } from '../../lib/leads-table';
 import { formatCredits, formatUsd } from '../../lib/billing';
 import { ProviderChip } from './ProviderChip';
 import { EmptyState, RowSkeleton } from './Empty';
@@ -81,6 +82,46 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
   const [sorting, setSorting] = React.useState<SortingState>([]);
   const [query, setQuery] = React.useState('');
   const [expanded, setExpanded] = React.useState<string | null>(null);
+  // How tall the expanded panel actually is.
+  //
+  // The table is virtualised with every row the same fixed height, so the
+  // virtualizer has no idea an expansion exists. The panel was positioned
+  // absolutely below its row and the rows after it stayed exactly where they
+  // were - which meant it was drawn on top of them, and because those rows come
+  // later in the document they painted on top of the panel. A row's whole
+  // attempt history ended up interleaved with three unrelated companies.
+  //
+  // Measured rather than estimated, because the content is not known in advance:
+  // the history arrives after a fetch, and a row with firmographics is taller
+  // than one without.
+  const [expandedH, setExpandedH] = React.useState(0);
+  const panelRef = React.useRef<HTMLDivElement | null>(null);
+
+  // Collapsing must not leave the rows below offset by a panel that is gone.
+  React.useEffect(() => {
+    setExpandedH(0);
+  }, [expanded]);
+
+  // Measured after every render rather than once on mount, because the panel's
+  // height changes when its attempts arrive and again if the row's company data
+  // does. A ResizeObserver catches both without this component having to know
+  // when either happens.
+  React.useEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+
+    const measure = () => {
+      const h = el.getBoundingClientRect().height;
+      // Rounded, so a fractional height does not put every row on a
+      // half-pixel and accumulate into visible drift down the page.
+      setExpandedH((prev) => (Math.abs(prev - h) < 1 ? prev : Math.round(h)));
+    };
+
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
   const [attempts, setAttempts] = React.useState<Record<string, AttemptWithFailure[]>>({});
   const [fetching, setFetching] = React.useState<string | null>(null);
   const [picked, setPicked] = React.useState<Set<string>>(new Set());
@@ -258,6 +299,23 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
                 >
                   {formatUsd(r.treg_cost_usd, { decimals: 4 })}
                 </span>
+              ) : Number(r.credits ?? 0) > 0 ? (
+                // Charged, with no provider cost against it. Not the same thing
+                // as "not worked" and it was saying so: a row that has been
+                // worked and paid for was labelled as a row that has not been
+                // started, which reads as a lie about the one number on the
+                // screen a user would use to judge whether the run was worth
+                // running.
+                //
+                // It is also a real gap rather than a display quirk - the row
+                // earned credits and nothing was recorded against the provider
+                // who earned them - so it is called out rather than left blank.
+                <span
+                  className="block text-[9px] font-mono text-[#b5801f] tabular-nums"
+                  title="This row was charged for, but no provider cost was recorded against it. The credits above were charged without a matching cost."
+                >
+                  no cost recorded
+                </span>
               ) : (
                 <span className="block text-[9px] font-mono text-[#d5d5cf]">not worked</span>
               )}
@@ -294,6 +352,25 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
   });
 
   const model = table.getRowModel().rows;
+
+  // Which row in the current order is the open one. Recomputed against `model`
+  // rather than cached, because the open row's index moves whenever the sort or
+  // the search changes underneath it - and an index from before the re-sort is
+  // what makes the rows below jump to the wrong place.
+  const expandedIndex = React.useMemo(
+    () => (expanded ? model.findIndex((r) => r.original.id === expanded) : -1),
+    [expanded, model],
+  );
+
+  // The open row can leave the list - typed into the search box, or moved by a
+  // re-sort. Nothing renders for it any more, so the offset it was pushing the
+  // rows down by has to go with it. Left in place, the whole list sits one panel
+  // too low with no panel above it, which looks like the table has gained a blank
+  // band nobody can account for.
+  React.useEffect(() => {
+    if (expanded && expandedIndex === -1) setExpanded(null);
+  }, [expanded, expandedIndex]);
+
   const virtualizer = useVirtualizer({
     count: model.length,
     getScrollElement: () => scrollRef.current,
@@ -502,12 +579,21 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
 
       {/* ---- Body ----------------------------------------------------------- */}
       <div ref={scrollRef} className="overflow-auto" style={{ height: 'min(66vh, 760px)' }}>
-        <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+        {/* The expansion is added to the scrollable height, or the last row of
+            the list cannot be scrolled far enough to read its own panel. */}
+        <div style={{ height: virtualizer.getTotalSize() + extraScrollHeight(expandedIndex, expandedH), position: 'relative' }}>
           {virtualizer.getVirtualItems().map((vi) => {
             const row = model[vi.index];
             const r = row.original;
             const open = expanded === r.id;
             const isPicked = picked.has(r.id);
+
+            // Everything below an open row moves down by however tall the panel
+            // turned out to be. Per row rather than once, because the rows in
+            // view are not the rows after the expanded one - and because a stale
+            // index would otherwise offset the whole table by a panel that is
+            // not being rendered. See leads-table.ts.
+            const shift = rowShift(vi.index, expandedIndex, expandedH);
 
             return (
               <React.Fragment key={row.id}>
@@ -515,7 +601,7 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
                   className={`absolute left-0 right-0 grid items-center gap-3 px-4 border-b border-[#eeeeea] cursor-pointer ${
                     open ? 'bg-[#f6f6f4]' : isPicked ? 'bg-[#f0f4f8]' : 'hover:bg-[#fbfbfa]'
                   }`}
-                  style={{ height: rowH, gridTemplateColumns: `28px ${gridTemplate}`, transform: `translateY(${vi.start}px)` }}
+                  style={{ height: rowH, gridTemplateColumns: `28px ${gridTemplate}`, transform: `translateY(${vi.start + shift}px)` }}
                   onClick={() => void toggleExpand(r.id)}
                   role="button"
                   tabIndex={0}
@@ -547,13 +633,23 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
                 </div>
 
                 {open && (
-                  <Expanded
-                    row={r}
-                    attempts={attempts[r.id] ?? []}
-                    loading={fetching === r.id}
-                    onClose={() => setExpanded(null)}
-                    top={vi.start + rowH}
-                  />
+                  <div
+                    ref={panelRef}
+                    // z-[4] rather than nothing: on the one frame between the
+                    // panel mounting at height zero and the measurement landing,
+                    // the row below would otherwise paint over it. Below the
+                    // sticky header's z-[5].
+                    className="absolute left-0 right-0 z-[4]"
+                    style={{ top: vi.start + rowH }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <Expanded
+                      row={r}
+                      attempts={attempts[r.id] ?? []}
+                      loading={fetching === r.id}
+                      onClose={() => setExpanded(null)}
+                    />
+                  </div>
                 )}
               </React.Fragment>
             );
@@ -701,16 +797,15 @@ const Expanded: React.FC<{
   attempts: AttemptWithFailure[];
   loading: boolean;
   onClose: () => void;
-  top: number;
-}> = ({ row, attempts, loading, onClose, top }) => {
+}> = ({ row, attempts, loading, onClose }) => {
   const facts = Object.entries(row.company_data ?? {}).slice(0, 8);
 
+  // Positioned by the caller now, which is the only thing that can be correct
+  // inside a virtualiser: this component sits in normal flow inside the
+  // absolutely-positioned slot the table gives it, so its own height is
+  // measurable and the rows below can be moved by exactly that much.
   return (
-    <div
-      className="absolute left-0 right-0 bg-[#fbfbfa] border-b border-[#e3e3de] px-4 py-4"
-      style={{ top }}
-      onClick={(e) => e.stopPropagation()}
-    >
+    <div className="bg-[#fbfbfa] border-b border-[#e3e3de] px-4 py-4">
       <div className="flex items-start justify-between gap-6">
         <div className="min-w-0 flex-1">
           <AttemptHistory attempts={attempts} loading={loading} />
