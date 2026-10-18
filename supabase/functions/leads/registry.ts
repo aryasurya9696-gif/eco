@@ -362,7 +362,7 @@ export const REGISTRY: Record<string, EndpointEntry> = {
 // until something is found, and a miss is free on all five, so the only cost of
 // running it this way is time.
 
-const DEFAULT_ORDER: Record<LeadStep, string[]> = {
+export const DEFAULT_ORDER: Record<LeadStep, string[]> = {
   company: ['tomba.companies.search.reveal', 'icypeas.companies.search'],
   person: ['icypeas.people.search', 'findymail.search.employees', 'leadmagic.people.search'],
   email: [

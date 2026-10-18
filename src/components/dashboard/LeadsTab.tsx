@@ -6,10 +6,13 @@ import { supabase } from '../../lib/supabase';
 import { subscribeToRun, mergeRow, summarise } from '../../lib/leads-live';
 import { RunsList } from '../leads/RunsList';
 import { CleanList } from '../leads/CleanList';
+import { NewSearch } from '../leads/NewSearch';
+import { ProviderLab } from '../leads/ProviderLab';
+import { OptOuts } from '../leads/OptOuts';
 import { LeadsTable } from '../leads/LeadsTable';
 import { RunStatusPill } from '../leads/StatusBadge';
 import { CreditsMeter, Counter } from '../leads/CreditsMeter';
-import { EmptyPanel, EmptyState } from '../leads/EmptyPanel';
+import { EmptyState } from '../leads/Empty';
 import { ExportMenu } from '../leads/ExportMenu';
 
 /**
@@ -52,25 +55,13 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ view, runId, onViewChange, o
         />
       )}
 
-      {view === 'new' && (
-        <NewSearchPlaceholder onBack={() => onViewChange('runs')} />
-      )}
+      {view === 'new' && <NewSearch onStarted={onOpenRun} />}
 
       {view === 'clean' && <CleanList onOpenRun={onOpenRun} />}
 
-      {view === 'lab' && (
-        <EmptyPanel
-          title="Provider lab"
-          body="Run the same leads through each email provider alone, and through the waterfall, and see which actually finds the most for what it costs. Uses your own rows, so the numbers are yours."
-        />
-      )}
+      {view === 'lab' && <ProviderLab />}
 
-      {view === 'optouts' && (
-        <EmptyPanel
-          title="Opt-outs"
-          body="People and domains you never want contacted. Echo checks this list before every paid call, so a suppressed address is never even looked up."
-        />
-      )}
+      {view === 'optouts' && <OptOuts />}
     </div>
   );
 };
@@ -278,16 +269,3 @@ const BackLink: React.FC<{ onBack: () => void }> = ({ onBack }) => (
   </button>
 );
 
-// ---------------------------------------------------------------------------
-// New search — Wave C
-// ---------------------------------------------------------------------------
-
-const NewSearchPlaceholder: React.FC<{ onBack: () => void }> = ({ onBack }) => (
-  <div className="space-y-4">
-    <BackLink onBack={onBack} />
-    <EmptyPanel
-      title="New search"
-      body="Your website and what you sell are already on file, so this starts from your profile: Echo reads the site, writes an ideal customer profile from it, and shows you a free count of the companies that match before you spend anything."
-    />
-  </div>
-);

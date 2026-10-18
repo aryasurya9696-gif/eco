@@ -23,7 +23,7 @@
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { tregCallWithRetry, tregConfig, resolveToken, type TregConfig } from './treg.ts';
-import { orderFor, canRunWith, REGISTRY, type LeadStep } from './registry.ts';
+import { orderFor, canRunWith, REGISTRY, DEFAULT_ORDER, type LeadStep } from './registry.ts';
 import {
   reserveChunk,
   settleChunk,
@@ -220,6 +220,22 @@ Deno.serve(async (req) => {
         return json({ ok: true, estimate: data });
       }
 
+      case 'icp_get': {
+        // The approved one, falling back to the most recent draft. Returning to
+        // the screen and being shown a blank form for an ICP that already exists
+        // reads as losing work.
+        const { data, error } = await db
+          .from('lead_icps')
+          .select('*')
+          .eq('user_id', userId)
+          .order('approved_at', { ascending: false, nullsFirst: false })
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (error) throw error;
+        return json({ ok: true, icp: data ?? null });
+      }
+
       case 'save_icp':
         return json(await saveIcp(db, userId, body));
 
@@ -304,6 +320,9 @@ Deno.serve(async (req) => {
         return json({ ok: true, order: known });
       }
 
+      case 'provider_stats':
+        return json(await providerStats(db, userId, body));
+
       case 'lab_results':
         return json(await labResults(db, userId, body));
 
@@ -386,6 +405,137 @@ async function getRun(db: any, userId: string, body: any) {
  * waterfall, so the comparison the lab exists to make is reconstructed from the
  * attempts a waterfall run already logged rather than bought twice.
  */
+/**
+ * Every provider this workspace has ever used, with what it actually did.
+ *
+ * Across all runs, not one. The per-run numbers in lab_results answer "how did
+ * this run go"; this answers "which of the five is worth keeping in the
+ * waterfall", which can only be answered on the whole history — a provider that
+ * was fourth in one run and never reached in another still has something to say
+ * about its hit rate.
+ *
+ * Two numbers per provider that are easy to confuse and must not be.
+ *
+ *   found          attempts that returned an address. Includes addresses a
+ *                  provider repeated after another one already had it.
+ *   first_to_find  attempts that were the one to supply an address nothing else
+ *                  had. This is the number worth ranking on: a provider that
+ *                  re-finds what Kitt already found is not earning its place in
+ *                  the chain, and a lab that cannot see that will recommend it.
+ *
+ * Cost per first find is the ranking key. Price on its own is misleading — a
+ * cheap provider that misses most of the time costs more per successful address
+ * than a dearer one that does not — and the user already pays that lesson in the
+ * waterfall without ever seeing it written down.
+ */
+async function providerStats(db: any, userId: string, body: any) {
+  const step = (asString(body?.step, 20) || 'email') as LeadStep;
+
+  const { data: attempts, error } = await db
+    .from('lead_attempts')
+    .select('endpoint_id, hit, cost_usd, row_id, run_id')
+    .eq('user_id', userId)
+    .eq('step', step);
+
+  if (error) throw error;
+
+  const { data: rows } = await db
+    .from('lead_rows')
+    .select('id, email, email_provider')
+    .eq('user_id', userId);
+
+  // Who actually supplied each address across the whole workspace.
+  const suppliedBy = new Map<string, string>();
+  for (const r of rows ?? []) {
+    if (r.email && r.email_provider) suppliedBy.set(r.email, r.email_provider);
+  }
+
+  // Row id to the address that row ended up with, built once. The alternative
+  // was a linear scan per attempt, which on a workspace with a few thousand rows
+  // and a few thousand attempts is millions of comparisons for a screen whose
+  // whole job is to answer a question quickly.
+  const emailByRow = new Map<string, string>();
+  for (const r of (rows ?? []) as Array<{ id: string; email: string | null }>) {
+    if (r.email) emailByRow.set(String(r.id), r.email);
+  }
+
+  const acc = new Map<string, {
+    attempts: number;
+    hits: number;
+    costUsd: number;
+    firstToFind: number;
+    runs: Set<string>;
+    rows: Set<string>;
+  }>();
+
+  for (const a of (attempts ?? []) as Array<{
+    endpoint_id: string; hit: boolean | null; cost_usd: number | null;
+    row_id: string | null; run_id: string | null;
+  }>) {
+    const cur = acc.get(a.endpoint_id) ?? {
+      attempts: 0, hits: 0, costUsd: 0, firstToFind: 0, runs: new Set<string>(), rows: new Set<string>(),
+    };
+    cur.attempts++;
+    cur.hits += a.hit ? 1 : 0;
+    cur.costUsd += num(a.cost_usd);
+    cur.runs.add(String(a.run_id));
+    if (a.row_id) cur.rows.add(String(a.row_id));
+
+    // An attempt only counts as the provider's own find if the address the row
+    // ended up with is one nobody else had already supplied.
+    const address = a.row_id ? emailByRow.get(String(a.row_id)) : undefined;
+    if (a.hit && address && suppliedBy.get(address) === a.endpoint_id) cur.firstToFind++;
+
+    acc.set(a.endpoint_id, cur);
+  }
+
+  // Every endpoint in the registry, whether or not it has ever been called.
+  // A provider that has never run is information: it is in the waterfall and
+  // costing nothing, and hiding it makes the list look shorter than the chain
+  // that actually executes.
+  const ids = new Set<string>([...Object.keys(REGISTRY), ...acc.keys()]);
+
+  const providers = [...ids].map((id) => {
+    const s = acc.get(id);
+    const entry = REGISTRY[id];
+    const attempts_ = s?.attempts ?? 0;
+    const finds = s?.firstToFind ?? 0;
+    const cost = s?.costUsd ?? 0;
+
+    return {
+      endpoint_id: id,
+      label: entry?.label ?? id,
+      step: entry?.step ?? step,
+      price_usd: num(entry?.priceUsd),
+      verified: entry?.verified ?? false,
+      in_order: (DEFAULT_ORDER[step] ?? []).includes(id),
+      attempts: attempts_,
+      hits: s?.hits ?? 0,
+      first_to_find: finds,
+      cost_usd: Math.round(cost * 1e6) / 1e6,
+      runs: s?.runs.size ?? 0,
+      rows: s?.rows.size ?? 0,
+      // Null rather than 0 for a provider with no history. A zero hit rate for a
+      // provider that has never been asked is a claim, and the lab would rank on
+      // it.
+      hit_rate: attempts_ > 0 ? Math.round(((s?.hits ?? 0) / attempts_) * 1000) / 1000 : null,
+      // What one successful independent find actually cost. Null until there has
+      // been at least one, because dividing by zero is infinity and rendering
+      // "infinite" next to a price is worse than rendering nothing.
+      cost_per_find: finds > 0 ? Math.round((cost / finds) * 1e6) / 1e6 : null,
+      cost_per_attempt: attempts_ > 0 ? Math.round((cost / attempts_) * 1e6) / 1e6 : null,
+    };
+  });
+
+  return {
+    ok: true,
+    step,
+    providers,
+    total_attempts: providers.reduce((n, p) => n + p.attempts, 0),
+    total_cost_usd: Math.round(providers.reduce((n, p) => n + p.cost_usd, 0) * 1e6) / 1e6,
+  };
+}
+
 async function labResults(db: any, userId: string, body: any) {
   if (!isUuid(body?.run_id)) return { ok: false, error: 'bad_run_id' };
 

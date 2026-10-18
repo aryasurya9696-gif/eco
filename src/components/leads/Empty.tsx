@@ -1,21 +1,17 @@
-import React from 'react';
-
 /**
- * A titled panel for a sub-view that is routed but not built yet, and the shared
- * shell the real ones sit in.
+ * Echo Leads — the shapes a screen has not got data for yet
+ * ---------------------------------------------------------------------------
+ * Deliberately small. A skeleton at the finished size, an empty state that
+ * offers the action rather than describing the absence, and a dash for a count
+ * that has not arrived.
  *
- * Kept deliberately plain. The panels behind this say what the feature will do
- * in one sentence, because a screen that says nothing is more annoying than one
- * that says what is coming.
+ * The dash is the one worth arguing for. Rendering zero while a free count is in
+ * flight produces a confident "0 companies match" for as long as the provider
+ * takes to answer, and a user who reads that and closes the tab has been told
+ * something false. "Not asked yet" and "nothing found" are different facts and
+ * they look different here.
  */
-export const EmptyPanel: React.FC<{ title: string; body: string }> = ({ title, body }) => (
-  <div className="bg-white border border-[#e3e3de] px-8 py-12">
-    <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-3">
-      {title}
-    </span>
-    <p className="text-xs font-mono text-[#4a4a47] leading-relaxed max-w-2xl">{body}</p>
-  </div>
-);
+import React from 'react';
 
 /**
  * The first-run empty state: one line and one button.

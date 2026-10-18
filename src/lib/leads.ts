@@ -31,6 +31,8 @@ import type {
   LeadRow,
   LeadSuppression,
   LeadRunStatus,
+  LeadIcp,
+  LeadIcpDocument,
   LeadsView,
 } from '../types';
 
@@ -203,6 +205,186 @@ export async function estimateRun(input: {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The ideal customer profile
+// ---------------------------------------------------------------------------
+
+/**
+ * The user's saved ICP, or null.
+ *
+ * Ordered by approval rather than creation, so returning to the New search
+ * screen shows the profile they last approved rather than the newest draft
+ * somebody half-filled and abandoned. A screen that greets a returning user with
+ * a blank form for an ICP that already exists reads as losing their work.
+ */
+export async function getIcp(): Promise<LeadIcp | null> {
+  const res = await invokeFunction<{ icp: LeadIcp | null }>('leads', { action: 'icp_get' });
+  return res.icp ?? null;
+}
+
+/**
+ * Writes the ICP.
+ *
+ * "approved" is a separate argument rather than a field inside the document
+ * because approval is a fact about the row, not about what the user wrote. The
+ * search screen marks the profile it is about to run as approved so it is the
+ * one that comes back next time.
+ */
+export async function saveIcp(input: {
+  id?: string | null;
+  website?: string | null;
+  offer?: string | null;
+  icp: LeadIcpDocument;
+  approved?: boolean;
+  note?: string | null;
+}): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  return invokeFunction<{ ok: true; id: string } | { ok: false; error: string }>('leads', {
+    action: 'save_icp',
+    ...input,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The waterfall order
+// ---------------------------------------------------------------------------
+
+export interface WaterfallOrder {
+  /** Null means "no custom order", which is what the shipped default means. */
+  order: string[] | null;
+  mode: 'default' | 'smart' | 'custom';
+}
+
+export async function getWaterfall(step: 'email' | 'verify'): Promise<WaterfallOrder> {
+  try {
+    const res = await invokeFunction<{ order: string[] | null; mode: string }>('leads', {
+      action: 'waterfall_get',
+      step,
+    });
+    return {
+      order: res.order ?? null,
+      mode: (res.mode as WaterfallOrder['mode']) ?? 'default',
+    };
+  } catch {
+    // A screen that cannot read the order shows the shipped default rather than
+    // an error, because the default is genuinely what will run. Failing to read
+    // is not a reason to tell the user their waterfall is broken when it is
+    // working exactly as it did before they opened this page.
+    return { order: null, mode: 'default' };
+  }
+}
+
+export async function setWaterfall(
+  step: 'email' | 'verify',
+  endpointIds: string[],
+): Promise<{ ok: boolean; error?: string }> {
+  return invokeFunction<{ ok: boolean; error?: string }>('leads', {
+    action: 'waterfall_put',
+    step,
+    endpoint_ids: endpointIds,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// What the providers actually did
+// ---------------------------------------------------------------------------
+
+export interface ProviderStat {
+  endpoint_id: string;
+  label: string;
+  step: string;
+  price_usd: number;
+  verified: boolean;
+  in_order: boolean;
+  attempts: number;
+  hits: number;
+  /** Attempts that supplied an address no other provider had already. */
+  first_to_find: number;
+  cost_usd: number;
+  runs: number;
+  rows: number;
+  /** Null rather than 0 for a provider nobody has asked yet. */
+  hit_rate: number | null;
+  /** Null until there has been at least one independent find. */
+  cost_per_find: number | null;
+  cost_per_attempt: number | null;
+}
+
+export interface ProviderStatsResult {
+  step: string;
+  providers: ProviderStat[];
+  total_attempts: number;
+  total_cost_usd: number;
+}
+
+/**
+ * The lab's numbers, across every run rather than one.
+ *
+ * Returns every endpoint in the registry, not only the ones with history,
+ * because "in the chain and never called" is itself an answer to a question
+ * somebody is on this screen to ask.
+ */
+export async function getProviderStats(
+  step: 'email' | 'verify' = 'email',
+): Promise<ProviderStatsResult | null> {
+  try {
+    return await invokeFunction<ProviderStatsResult>('leads', { action: 'provider_stats', step });
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Opt-outs
+// ---------------------------------------------------------------------------
+
+export async function addSuppression(
+  value: string,
+  reason?: string,
+): Promise<{ ok: boolean; kind?: 'email' | 'domain'; error?: string }> {
+  return invokeFunction<{ ok: boolean; kind?: 'email' | 'domain'; error?: string }>('leads', {
+    action: 'suppressions_add',
+    value,
+    reason,
+  });
+}
+
+export async function removeSuppression(
+  value: string,
+): Promise<{ ok: boolean; error?: string }> {
+  return invokeFunction<{ ok: boolean; error?: string }>('leads', {
+    action: 'suppressions_remove',
+    value,
+  });
+}
+
+/**
+ * Whether a value will be filed as an address or as a domain.
+ *
+ * The server derives the same thing and is what actually decides, so this only
+ * exists to show the user what they are about to add. Deliberately the identical
+ * test: a UI that labelled it one way and the server filed it another would be
+ * worse than not labelling it at all.
+ */
+export function suppressionKind(value: string): 'email' | 'domain' {
+  return value.includes('@') ? 'email' : 'domain';
+}
+
+/**
+ * What to send, so what is typed is what is stored.
+ *
+ * Mirrors the server's normalisation rather than inventing a tidier one: an
+ * opt-out for "HTTPS://Pemberton.example/pricing" has to become the same row as
+ * one for "pemberton.example", or the list silently fails to suppress anything
+ * and the user believes it is working.
+ */
+export function normaliseSuppression(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/\/.*$/, '')
+    .trim();
+}
 // ---------------------------------------------------------------------------
 // Starting and feeding a run
 // ---------------------------------------------------------------------------

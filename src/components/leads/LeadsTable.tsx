@@ -17,7 +17,7 @@ import { StatusBadge, CreditsCell } from './StatusBadge';
 import { CellLadder } from './CellLadder';
 import { ProviderChip } from './ProviderChip';
 import { RowReceipt } from './CountLine';
-import { EmptyState, RowSkeleton } from './EmptyPanel';
+import { EmptyState, RowSkeleton } from './Empty';
 
 /**
  * The run table — the screen people screenshot.
