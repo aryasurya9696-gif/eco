@@ -34,6 +34,7 @@ import {
 import { planSteps, shouldFindEmail, worstCasePerRow, shouldDiscover } from './steps.ts';
 import { creditsForRow, round6 } from './pricing-row.ts';
 import { readEmail, readVerdict, type Verdict } from './read-response.ts';
+import { foldAttempts } from './attribution.ts';
 import { readPeople, readPhone, readCompanyRecord, type PersonHit } from './read-lists.ts';
 import { scoreTitle, describeChoice } from './choose-person.ts';
 import {
@@ -305,10 +306,24 @@ Deno.serve(async (req) => {
           .eq('step', step)
           .maybeSingle();
         if (error) throw error;
+
+        // The shipped order comes from here rather than from a copy in the client.
+        // The lab needs it to show a user what "reset to default" actually resets
+        // to, and a client-side copy of a table with six steps and twenty-five
+        // entries is a table that goes stale silently - the same reason the
+        // endpoint ids themselves are not held by the browser.
         return json({
           ok: true,
           order: data?.endpoint_ids ?? null,
           mode: data?.mode ?? 'default',
+          default_order: DEFAULT_ORDER[step] ?? [],
+          // With a saved order, the effective chain is that order plus anything
+          // in the shipped one the user has not seen. Sent whole, so the list a
+          // user drags is the list that will actually run rather than their
+          // saved prefix with new providers invisible below it.
+          effective_order: orderFor(step, {}, (data?.endpoint_ids as string[]) ?? null).map(
+            (e) => e.id,
+          ),
         });
       }
 
@@ -427,12 +442,16 @@ async function getRun(db: any, userId: string, body: any) {
  *
  * Two numbers per provider that are easy to confuse and must not be.
  *
- *   found          attempts that returned an address. Includes addresses a
- *                  provider repeated after another one already had it.
- *   first_to_find  attempts that were the one to supply an address nothing else
- *                  had. This is the number worth ranking on: a provider that
- *                  re-finds what Kitt already found is not earning its place in
- *                  the chain, and a lab that cannot see that will recommend it.
+ *   found          attempts that returned an answer for the step. Includes answers
+ *                  a provider repeated after another one already had it.
+ *   first_to_find  attempts that were the first for that row on that step, so
+ *                  nobody else had already answered. This is the number worth
+ *                  ranking on: a provider that re-finds what Kitt already found is
+ *                  not earning its place in the chain, and a lab that cannot see
+ *                  that will recommend it.
+ *
+ * Both are per step, and both used to be measured against the row's final email
+ * rather than against the step being looked at. See where creditedRows is built.
  *
  * Cost per first find is the ranking key. Price on its own is misleading — a
  * cheap provider that misses most of the time costs more per successful address
@@ -446,29 +465,29 @@ async function providerStats(db: any, userId: string, body: any) {
     .from('lead_attempts')
     .select('endpoint_id, hit, cost_usd, row_id, run_id')
     .eq('user_id', userId)
-    .eq('step', step);
+    .eq('step', step)
+    // Ascending, and stable. "Which provider supplied this" is decided by who
+    // answered first, so the order the rows come back in is part of the
+    // calculation rather than a display concern.
+    .order('created_at', { ascending: true })
+    .order('id', { ascending: true });
 
   if (error) throw error;
 
-  const { data: rows } = await db
-    .from('lead_rows')
-    .select('id, email, email_provider')
-    .eq('user_id', userId);
-
-  // Who actually supplied each address across the whole workspace.
-  const suppliedBy = new Map<string, string>();
-  for (const r of rows ?? []) {
-    if (r.email && r.email_provider) suppliedBy.set(r.email, r.email_provider);
-  }
-
-  // Row id to the address that row ended up with, built once. The alternative
-  // was a linear scan per attempt, which on a workspace with a few thousand rows
-  // and a few thousand attempts is millions of comparisons for a screen whose
-  // whole job is to answer a question quickly.
-  const emailByRow = new Map<string, string>();
-  for (const r of (rows ?? []) as Array<{ id: string; email: string | null }>) {
-    if (r.email) emailByRow.set(String(r.id), r.email);
-  }
+  // Rows this provider was the first to answer for, on this step. Built as the
+  // loop goes rather than by comparing against the row's final state.
+  //
+  // It used to compare the attempt against `lead_rows.email_provider`, which is
+  // only meaningful for the email and verify steps: those are the only two that
+  // write an address, so on the person, company, phone and enrich tabs
+  // first_to_find was structurally zero. Every provider read as though it had
+  // never found anything, no matter how well it performed, and the lab's whole
+  // claim - rank providers by what one independent find cost - could not be
+  // checked on four of the six steps.
+  //
+  // First hit wins is also the more honest definition of what the waterfall is.
+  // Under the old one, a provider that found a real address which a later
+  // provider then replaced under verify_refind scored nothing for it.
 
   const acc = new Map<string, {
     attempts: number;
@@ -479,10 +498,19 @@ async function providerStats(db: any, userId: string, body: any) {
     rows: Set<string>;
   }>();
 
-  for (const a of (attempts ?? []) as Array<{
+  const rows = (attempts ?? []) as Array<{
     endpoint_id: string; hit: boolean | null; cost_usd: number | null;
     row_id: string | null; run_id: string | null;
-  }>) {
+  }>;
+
+  // Who earned each find. Folded separately because it is the one number with a
+  // definition worth arguing about, and it has its own tests - inline here it
+  // was unreachable by any of them.
+  const finds = foldAttempts(
+    rows.map((a) => ({ endpoint_id: a.endpoint_id, hit: Boolean(a.hit), row_id: a.row_id })),
+  );
+
+  for (const a of rows) {
     const cur = acc.get(a.endpoint_id) ?? {
       attempts: 0, hits: 0, costUsd: 0, firstToFind: 0, runs: new Set<string>(), rows: new Set<string>(),
     };
@@ -491,20 +519,29 @@ async function providerStats(db: any, userId: string, body: any) {
     cur.costUsd += num(a.cost_usd);
     cur.runs.add(String(a.run_id));
     if (a.row_id) cur.rows.add(String(a.row_id));
-
-    // An attempt only counts as the provider's own find if the address the row
-    // ended up with is one nobody else had already supplied.
-    const address = a.row_id ? emailByRow.get(String(a.row_id)) : undefined;
-    if (a.hit && address && suppliedBy.get(address) === a.endpoint_id) cur.firstToFind++;
+    cur.firstToFind = finds.get(a.endpoint_id)?.firstToFind ?? 0;
 
     acc.set(a.endpoint_id, cur);
   }
 
-  // Every endpoint in the registry, whether or not it has ever been called.
-  // A provider that has never run is information: it is in the waterfall and
-  // costing nothing, and hiding it makes the list look shorter than the chain
+  // Every endpoint registered for THIS step, whether or not it has ever been
+  // called. A provider that has never run is information: it is in the waterfall
+  // and costing nothing, and hiding it makes the list look shorter than the chain
   // that actually executes.
-  const ids = new Set<string>([...Object.keys(REGISTRY), ...acc.keys()]);
+  //
+  // Scoped to the step, which it used not to be. The union was the whole
+  // registry, which was harmless while the lab only had one tab - every endpoint
+  // the user could see belonged to the step they were looking at. With a tab per
+  // step it is not: the enrich tab listed twenty-four providers of which one was
+  // an enrich provider, and the "Your spend" figures above the list, summed over
+  // all of them, reported the entire workspace's spend on a step that had spent
+  // nothing.
+  const ids = new Set<string>([
+    ...Object.keys(REGISTRY).filter((id) => REGISTRY[id]?.step === step),
+    // Endpoints that have history but are no longer in the registry, so their
+    // cost is still attributed somewhere rather than vanishing from the totals.
+    ...acc.keys(),
+  ]);
 
   const providers = [...ids].map((id) => {
     const s = acc.get(id);
@@ -906,7 +943,14 @@ async function seedRunRows(
       .filter((d: string) => d !== ''),
   );
 
-  const { companies, costUsd, attempts } = await discoverCompanies(callCfg, run.id, seg!, want, seen);
+  // The user's own order for the company step, ranked by their hit rates. The
+  // same chain every other step gets, and the reason discovery stops reading
+  // DEFAULT_ORDER directly: a saved company order was silently ignored, which
+  // made the lab's company tab a control that did nothing.
+  const chain = await stepChain(db, run, 'company');
+  const { companies, costUsd, attempts } = await discoverCompanies(
+    callCfg, run.id, seg!, want, seen, chain,
+  );
 
   // Each provider call is logged against the run rather than against a row,
   // because there is no row yet. api_usage is written directly for the same

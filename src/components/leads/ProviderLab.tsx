@@ -24,7 +24,7 @@ import {
   providerStyle,
   type ProviderStat,
 } from '../../lib/leads';
-import { DEFAULT_EMAIL_ORDER } from '../../lib/leads';
+import type { LeadStep } from '../../types';
 import { formatUsd } from '../../lib/billing';
 import { Screen, Panel, Button, Segmented, Figure } from './Screen';
 
@@ -50,29 +50,85 @@ import { Screen, Panel, Button, Segmented, Figure } from './Screen';
 
 type Mode = 'default' | 'custom';
 
+/**
+ * Which step the lab is looking at.
+ *
+ * The lab was built for the address waterfall and hardcoded to it, which was
+ * defensible when that was the only waterfall a run used. It is not any more: a
+ * find run looks up the decision maker first, and that step decides who gets
+ * contacted and costs a fifth of a credit a row. A screen that shows the cost
+ * of every provider a run touches, except the one that chooses the person, is
+ * the screen a user trusts least exactly when they need it.
+ *
+ * Company first, because it decides the shape of the run and everything after
+ * it works on whatever it produced. Phone last, because it is opt-in and the
+ * only one a run may not perform at all.
+ */
+const STEPS: Array<{ value: LeadStep; label: string; blurb: string }> = [
+  {
+    value: 'company',
+    label: 'Companies',
+    blurb: 'Finds the companies the search is about. A run does this once, at the start.',
+  },
+  {
+    value: 'person',
+    label: 'Decision makers',
+    blurb: 'Finds who to contact at each company, and ranks them against the titles you asked for.',
+  },
+  {
+    value: 'email',
+    label: 'Addresses',
+    blurb: 'Finds an address for the person. The waterfall every row goes through.',
+  },
+  {
+    value: 'verify',
+    label: 'Verification',
+    blurb: 'Checks whether an address is a real mailbox. Only the clean modes run this.',
+  },
+  {
+    value: 'enrich',
+    label: 'Company details',
+    blurb: "Adds the company's own details. Only the full-enrich mode runs this.",
+  },
+  {
+    value: 'phone',
+    label: 'Phone numbers',
+    blurb: 'Finds a direct number. The most expensive step by a wide margin, and opt-in per run.',
+  },
+];
+
 export const ProviderLab: React.FC = () => {
+  const [step, setStep] = React.useState<LeadStep>('email');
   const [stats, setStats] = React.useState<ProviderStat[] | null>(null);
-  const [order, setOrder] = React.useState<string[]>([...DEFAULT_EMAIL_ORDER]);
+  const [order, setOrder] = React.useState<string[]>([]);
+  const [shipped, setShipped] = React.useState<string[]>([]);
   const [mode, setMode] = React.useState<Mode>('default');
   const [saving, setSaving] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
+  const stepInfo = STEPS.find((s) => s.value === step);
+
   React.useEffect(() => {
     let cancelled = false;
+    // Cleared first, so switching steps shows the loader rather than the previous
+    // step's numbers sitting under the new step's label for the length of a call.
+    setStats(null);
+    setNotice(null);
+    setError(null);
+    setMode('default');
     void (async () => {
-      const [s, w] = await Promise.all([getProviderStats('email'), getWaterfall('email')]);
+      const [s, w] = await Promise.all([getProviderStats(step), getWaterfall(step)]);
       if (cancelled) return;
       setStats(s?.providers ?? []);
-      if (w.order && w.order.length) {
-        setOrder(w.order);
-        setMode('custom');
-      }
+      setShipped(w.defaultOrder);
+      setOrder(w.effectiveOrder.length ? w.effectiveOrder : w.defaultOrder);
+      if (w.order && w.order.length) setMode('custom');
     })();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [step]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -107,12 +163,12 @@ export const ProviderLab: React.FC = () => {
       // order". Storing the default as a custom order would freeze it, and the
       // next provider added to the registry would be invisible to this user
       // forever.
-      const res = await setWaterfall('email', mode === 'custom' ? order : []);
+      const res = await setWaterfall(step, mode === 'custom' ? order : []);
       if (!res.ok) {
         setError(res.error ?? 'Could not save the order.');
         return;
       }
-      setNotice('Order saved. New runs will use it from their next chunk.');
+      setNotice(`Order saved. New runs will use it from their next chunk.`);
     } catch {
       setError('Could not save the order.');
     } finally {
@@ -121,7 +177,7 @@ export const ProviderLab: React.FC = () => {
   };
 
   const reset = () => {
-    setOrder([...DEFAULT_EMAIL_ORDER]);
+    setOrder([...shipped]);
     setMode('default');
     setNotice(null);
     setError(null);
@@ -131,14 +187,14 @@ export const ProviderLab: React.FC = () => {
   // provider that has actually been finding things to the front.
   const worth = React.useMemo(() => {
     if (mode !== 'custom') return null;
-    const defaultOrder = DEFAULT_EMAIL_ORDER;
     const ranked = [...order].filter((id) => byId.get(id)?.cost_per_find != null);
     if (ranked.length === 0) return null;
 
     let better = 0;
     for (const id of ranked) {
       const currentAt = order.indexOf(id);
-      const wasAt = defaultOrder.indexOf(id);
+      const wasAt = shipped.indexOf(id);
+      if (wasAt === -1) continue;
       if (currentAt < wasAt) better++;
     }
     if (better === 0) return null;
@@ -147,7 +203,7 @@ export const ProviderLab: React.FC = () => {
     const dearest = Math.max(...order.map((id) => byId.get(id)?.cost_per_find ?? Infinity));
     const saving = dearest === Infinity || cheapest === dearest ? null : dearest - cheapest;
     return { better, saving };
-  }, [order, mode, byId]);
+  }, [order, mode, byId, shipped]);
 
   const totalCost = (stats ?? []).reduce((n, p) => n + p.cost_usd, 0);
   const totalAttempts = (stats ?? []).reduce((n, p) => n + p.attempts, 0);
@@ -171,6 +227,28 @@ export const ProviderLab: React.FC = () => {
         />
       }
     >
+      <Panel label="Which step">
+        <div className="flex flex-wrap gap-1.5">
+          {STEPS.map((s) => (
+            <button
+              key={s.value}
+              onClick={() => setStep(s.value)}
+              title={s.blurb}
+              className={`px-2.5 py-1 text-[10px] font-mono rounded-none transition-colors cursor-pointer ${
+                step === s.value
+                  ? 'bg-[#141414] text-white'
+                  : 'border border-[#e3e3de] text-[#8a8a86] hover:border-[#141414] hover:text-[#141414]'
+              }`}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+        {stepInfo && (
+          <p className="text-[10px] font-mono text-[#8a8a86] leading-relaxed mt-2.5">{stepInfo.blurb}</p>
+        )}
+      </Panel>
+
       {stats === null ? (
         <div className="py-20 flex justify-center">
           <Loader2 className="w-4 h-4 animate-spin text-[#b5b5ad]" />
@@ -181,9 +259,10 @@ export const ProviderLab: React.FC = () => {
             <div className="flex gap-10 flex-wrap">
               <Figure label="Provider calls" value={totalAttempts.toLocaleString()} size="sm" />
               <Figure
-                label="Addresses found"
+                label="Finds that mattered"
                 value={totalFinds.toLocaleString()}
                 size="sm"
+                sub={step === 'verify' ? 'a real mailbox' : 'supplied by nobody else'}
                 tone={totalFinds > 0 ? 'good' : 'default'}
               />
               <Figure label="Spent at providers" value={formatUsd(totalCost)} size="sm" />
@@ -207,7 +286,7 @@ export const ProviderLab: React.FC = () => {
           )}
 
           <Panel
-            label={`Waterfall order · ${mode === 'custom' ? 'yours' : 'shipped'}`}
+            label={`${stepInfo?.label ?? 'Waterfall'} · ${mode === 'custom' ? 'your order' : 'shipped order'}`}
             aside={
               <div className="flex items-center gap-3">
                 {worth && (
@@ -234,21 +313,29 @@ export const ProviderLab: React.FC = () => {
               </div>
             }
           >
-            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
-              <SortableContext items={order} strategy={verticalListSortingStrategy}>
-                <ul className="-mx-2">
-                  {order.map((id, i) => (
-                    <Row
-                      key={id}
-                      id={id}
-                      position={i + 1}
-                      stat={byId.get(id)}
-                      draggable={mode === 'custom'}
-                    />
-                  ))}
-                </ul>
-              </SortableContext>
-            </DndContext>
+            {/* Nothing to drag. Say so rather than drawing an empty panel, which
+                reads as a broken screen rather than a step with no providers. */}
+            {order.length === 0 ? (
+              <p className="text-xs font-mono text-[#8a8a86] leading-relaxed py-4">
+                No providers are registered for this step.
+              </p>
+            ) : (
+              <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
+                <SortableContext items={order} strategy={verticalListSortingStrategy}>
+                  <ul className="-mx-2">
+                    {order.map((id, i) => (
+                      <Row
+                        key={id}
+                        id={id}
+                        position={i + 1}
+                        stat={byId.get(id)}
+                        draggable={mode === 'custom'}
+                      />
+                    ))}
+                  </ul>
+                </SortableContext>
+              </DndContext>
+            )}
 
             <p className="text-[10px] font-mono text-[#8a8a86] leading-relaxed mt-4 pt-4 border-t border-[#eeeeea]">
               The waterfall stops at each provider&apos;s own success price, so a miss costs

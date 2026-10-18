@@ -14,7 +14,7 @@
  * thousand. What is sold is the company delivered, so that is what is charged.
  */
 
-import { REGISTRY, DEFAULT_ORDER, type LeadStep } from './registry.ts';
+import { type LeadStep, type EndpointEntry } from './registry.ts';
 import { tregCallWithRetry, type TregConfig, type LeadOutcome } from './treg.ts';
 import { readCompanies, type CompanyHit } from './read-lists.ts';
 import { round6 } from './pricing-row.ts';
@@ -178,6 +178,13 @@ export function seedFailureMessage(error: SeedResult['error']): string {
  * Does not write. The caller does, because the row cap and the credit hold are
  * the caller's decisions and this function has no business knowing about either.
  *
+ * The chain is passed in rather than resolved here. It used to read
+ * DEFAULT_ORDER.company directly, which silently ignored two things: the user's
+ * own saved order for the company step, and the measured-hit-rate ranking every
+ * other step gets. A user who reordered their company providers in the lab would
+ * have watched the ordering have no effect on the one step where it mattered
+ * most - and that step decides which companies the entire run is about.
+ *
  * The loop stops on cost as well as on count. Two of these endpoints bill their
  * misses, so an unbounded waterfall is not bounded by anything: without the check
  * a user whose first provider finds nothing pays for every provider in the list.
@@ -188,6 +195,7 @@ export async function discoverCompanies(
   seg: SearchableSegment,
   want: number,
   alreadyHave: Set<string>,
+  chain: EndpointEntry[],
 ): Promise<{
   companies: CompanyHit[];
   costUsd: number;
@@ -203,11 +211,15 @@ export async function discoverCompanies(
   // bill for rows the run will not keep.
   const ceiling = Math.max(want, 1) * 0.02;
 
-  for (const id of DEFAULT_ORDER.company) {
-    if (out.length >= want) break;
+  // An empty chain is a real possibility rather than a bug: a saved order naming
+  // only endpoints since removed from the registry resolves to nothing. Returning
+  // here means the run reports "nothing to search with" rather than looping over
+  // an empty list and calling that a clean search that found nothing on purpose.
+  if (chain.length === 0) return { companies: [], costUsd: 0, attempts };
 
-    const entry = REGISTRY[id];
-    if (!entry) continue;
+  for (const entry of chain) {
+    const id = entry.id;
+    if (out.length >= want) break;
     if (costUsd >= ceiling) break;
 
     const need = want - out.length;

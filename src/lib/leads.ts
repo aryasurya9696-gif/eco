@@ -253,24 +253,48 @@ export interface WaterfallOrder {
   /** Null means "no custom order", which is what the shipped default means. */
   order: string[] | null;
   mode: 'default' | 'smart' | 'custom';
+  /** The shipped order for this step, from the registry. */
+  defaultOrder: string[];
+  /**
+   * What will actually run: the saved order with anything newer appended, or the
+   * shipped one when there is no saved order. Empty when the server could not
+   * answer, so the lab can say so rather than drawing an empty list.
+   */
+  effectiveOrder: string[];
 }
 
 export async function getWaterfall(step: LeadStep): Promise<WaterfallOrder> {
   try {
-    const res = await invokeFunction<{ order: string[] | null; mode: string }>('leads', {
+    const res = await invokeFunction<{
+      order: string[] | null;
+      mode: string;
+      default_order: string[];
+      effective_order: string[];
+    }>('leads', {
       action: 'waterfall_get',
       step,
     });
     return {
       order: res.order ?? null,
       mode: (res.mode as WaterfallOrder['mode']) ?? 'default',
+      defaultOrder: res.default_order ?? [],
+      effectiveOrder: res.effective_order ?? res.default_order ?? [],
     };
   } catch {
     // A screen that cannot read the order shows the shipped default rather than
     // an error, because the default is genuinely what will run. Failing to read
     // is not a reason to tell the user their waterfall is broken when it is
     // working exactly as it did before they opened this page.
-    return { order: null, mode: 'default' };
+    //
+    // The shipped order is still filled in, from the copy this file has always
+    // held for the email step. It is a copy and it can go stale, which is why
+    // it is only the fallback: the server's list is preferred wherever it arrives.
+    return {
+      order: null,
+      mode: 'default',
+      defaultOrder: DEFAULT_EMAIL_ORDER,
+      effectiveOrder: DEFAULT_EMAIL_ORDER,
+    };
   }
 }
 
@@ -550,6 +574,16 @@ const PROVIDER_STYLE: Array<{ match: string; label: string; chip: string; ink: s
   { match: 'leadmagic', label: 'LeadMagic', chip: 'bg-[#e8eef2]', ink: 'text-[#4a6572]' },
   { match: 'dropleads', label: 'Dropleads', chip: 'bg-[#f1ece4]', ink: 'text-[#7a6650]' },
   { match: 'hlrlookup', label: 'HLR Lookup', chip: 'bg-[#f1ece4]', ink: 'text-[#7a6650]' },
+  // The rest of the registry. Every vendor in the catalogue needs an entry,
+  // because the lab now has a tab per step and a row labelled "Provider" is a
+  // row that says we do not know who was just charged. Prospeo in particular is
+  // the only endpoint in the enrich step, so before this the one provider a user
+  // could see on that tab had no name on it.
+  { match: 'prospeo', label: 'Prospeo', chip: 'bg-[#ece5f7]', ink: 'text-[#6a4fa3]' },
+  { match: 'branddev', label: 'BrandDev', chip: 'bg-[#e8eef2]', ink: 'text-[#4a6572]' },
+  { match: 'crustdata', label: 'Crustdata', chip: 'bg-[#f1ece4]', ink: 'text-[#7a6650]' },
+  { match: 'companyenrich', label: 'Company Enrich', chip: 'bg-[#e6efe0]', ink: 'text-[#4f7a3a]' },
+  { match: 'treg', label: 'Treg', chip: 'bg-[#eeeeea]', ink: 'text-[#8a8a86]' },
 ];
 
 const UNKNOWN_PROVIDER = {
@@ -559,17 +593,21 @@ const UNKNOWN_PROVIDER = {
 };
 
 /**
- * The shipped email order, for display only.
+ * The shipped email order, and now only a fallback.
  *
- * The list itself is duplicated from the worker's registry on purpose, and the
- * duplication is bounded deliberately: the worker is authoritative for what it
- * calls, this exists so the cell ladder can show five rungs before any run has
- * been worked. When a user has a saved or smart order, the run view sends that
- * instead — until then the rungs show the default, which is also what the worker
- * would do, so they agree.
+ * The chain the run view draws is the one the server sends: waterfall_get
+ * returns both the shipped order and the effective one, so a user with a saved
+ * order sees their order, and a provider added to the registry since is visible
+ * rather than invisible. This list was what that used to fall back on, and the
+ * registry has since grown steps this copy does not have.
  *
- * The alternative — importing the registry — is not available: it lives in
- * supabase/functions, which the browser bundler does not resolve.
+ * Kept rather than deleted because it is the only thing the lab can show if
+ * waterfall_get itself fails, and showing the shipped order is correct then -
+ * it is what the worker would do. It is now only ever used for the email step.
+ *
+ * The alternative - importing the registry - is not available: it lives in
+ * supabase/functions, which the browser bundler does not resolve. Which is
+ * exactly why the server sends it and this is the backstop.
  */
 export const DEFAULT_EMAIL_ORDER: string[] = [
   'quickenrich.people.email.find',

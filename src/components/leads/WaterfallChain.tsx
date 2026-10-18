@@ -1,7 +1,7 @@
 import React from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import { ArrowRight } from 'lucide-react';
-import type { LeadAttempt } from '../../types';
+import type { LeadAttempt, LeadStep } from '../../types';
 import { providerStyle } from '../../lib/leads';
 import { formatUsd } from '../../lib/billing';
 
@@ -186,18 +186,43 @@ export const WaterfallChain: React.FC<{
 };
 
 /**
+ * The order the steps run in, which is also the order they cost money in.
+ *
+ * Used to draw one chain per step for a row. It was drawn as one chain for the
+ * whole row, which was correct while a row only ever had email attempts in it and
+ * is wrong from the moment it has more: a find run asks for the company, then
+ * the decision maker, then the address, and drawing those as a single ladder of
+ * providers reads as though one waterfall asked five providers for the same
+ * thing. It also made the misses meaningless - three misses across three
+ * different steps looks like one expensive lookup when it is three cheap ones.
+ */
+const STEP_SEQUENCE: LeadStep[] = ['company', 'person', 'email', 'verify', 'phone', 'enrich'];
+
+const STEP_HEADING: Record<LeadStep, string> = {
+  company: 'Finding the company',
+  person: 'Finding the decision maker',
+  email: 'Finding the address',
+  verify: 'Checking the address',
+  phone: 'Finding the number',
+  enrich: "Adding the company's details",
+};
+
+/**
  * The same shape across a whole run.
  *
- * A vertical list of rows, each carrying its own chain, is how a run's economics
+ * A vertical list of rows, each carrying its own chains, is how a run's economics
  * become visible: most rows have one node lit, the expensive ones have four
  * misses in front of it, and the difference between those two rows is what the
  * price is actually made of.
+ *
+ * One chain per step per row rather than one per row, for the reason on STEP_SEQUENCE.
  */
 export const WaterfallColumn: React.FC<{
   rows: Array<{ id: string; attempts: LeadAttempt[] }>;
-  fullOrder?: string[];
+  /** The shipped or saved order, per step. Optional per step, not in total. */
+  fullOrders?: Partial<Record<LeadStep, string[]>>;
   limit?: number;
-}> = ({ rows, fullOrder, limit = 12 }) => {
+}> = ({ rows, fullOrders, limit = 12 }) => {
   const reduce = useReducedMotion();
   const shown = rows.slice(0, limit);
 
@@ -211,17 +236,41 @@ export const WaterfallColumn: React.FC<{
   const foundOn = rows.filter((r) => r.attempts.length > 0).length;
 
   return (
-    <div className="space-y-2">
-      {shown.map((r, i) => (
-        <motion.div
-          key={r.id}
-          initial={reduce ? false : { opacity: 0, x: -4 }}
-          animate={{ opacity: 1, x: 0 }}
-          transition={{ duration: reduce ? 0 : 0.2, delay: i * 0.03 }}
-        >
-          <WaterfallChain attempts={r.attempts} fullOrder={fullOrder} size="sm" compact />
-        </motion.div>
-      ))}
+    <div className="space-y-4">
+      {shown.map((r, i) => {
+        // Steps this row actually has attempts for, in run order. A step with no
+        // attempts is not drawn as an empty chain: an untried step is not a chain
+        // of skipped providers, it is a step the run did not perform.
+        const used = STEP_SEQUENCE.filter((s) => r.attempts.some((a) => a.step === s));
+
+        return (
+          <motion.div
+            key={r.id}
+            initial={reduce ? false : { opacity: 0, x: -4 }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ duration: reduce ? 0 : 0.2, delay: i * 0.03 }}
+            className="space-y-1.5"
+          >
+            {used.length > 1 && (
+              // Only when there is more than one. A single chain says what it is
+              // from the providers in it; a caption on every row would be a line
+              // of text repeating itself down the panel.
+              <p className="text-[9px] font-mono text-[#b5b5ad] uppercase tracking-wider">
+                {used.map((s) => STEP_HEADING[s]).join(' · then ')}
+              </p>
+            )}
+            {used.map((s) => (
+              <WaterfallChain
+                key={s}
+                attempts={r.attempts.filter((a) => a.step === s)}
+                fullOrder={fullOrders?.[s]}
+                size="sm"
+                compact
+              />
+            ))}
+          </motion.div>
+        );
+      })}
 
       <p className="text-[10px] font-mono text-[#8a8a86] pt-2 border-t border-[#eeeeea]">
         {rows.length} row{rows.length === 1 ? '' : 's'} · {foundOn} with any history ·{' '}

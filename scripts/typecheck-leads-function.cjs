@@ -37,6 +37,7 @@ const MODULES = [
   'read-lists.ts',
   'discover.ts',
   'choose-person.ts',
+  'attribution.ts',
   'api-usage.ts',
   'index.ts',
 ];

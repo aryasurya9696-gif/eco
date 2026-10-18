@@ -6,8 +6,7 @@ import {
 import type { LeadsView, LeadRow, LeadRun, LeadAttempt } from '../../types';
 import type { AttemptWithFailure } from '../leads/AttemptHistory';
 import {
-  getRun, bulkAction, isActiveRun, controlRun, addSuppression,
-  DEFAULT_EMAIL_ORDER, providerLabel,
+  getRun, bulkAction, isActiveRun, controlRun, addSuppression, providerLabel,
 } from '../../lib/leads';
 import { fetchBalance, formatUsd } from '../../lib/billing';
 import { supabase } from '../../lib/supabase';
@@ -23,6 +22,8 @@ import { WaterfallColumn } from '../leads/WaterfallChain';
 import { Button } from '../leads/Screen';
 import { EmptyState } from '../leads/Empty';
 import { ExportMenu } from '../leads/ExportMenu';
+import { getWaterfall } from '../../lib/leads';
+import type { LeadStep } from '../../types';
 
 /**
  * The Leads tab.
@@ -138,6 +139,22 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
   // that fetches fifty is a panel nobody opens twice. Eight is enough for the
   // shape to read and cheap enough to fetch on every load.
   const [expensive, setExpensive] = React.useState<Array<{ id: string; attempts: LeadAttempt[] }>>([]);
+  // Every attempt made on the rows currently on the page, by row.
+  //
+  // One query for the page rather than the per-row fetch below, because the same
+  // data answers two questions: which providers earned a row, and what each of
+  // those providers was paid. Both are things the run detail view cannot state
+  // without it.
+  const [attemptsByRow, setAttemptsByRow] = React.useState<Map<string, LeadAttempt[]>>(new Map());
+  // The order each step's providers run in, so an untried provider is drawn as a
+  // rung rather than omitted.
+  //
+  // This is the thing the chain diagram was always supposed to do and never
+  // could: "tried Kitt, then ContactOut, then gave up" is only believable if
+  // there was a plan to be honest to, and without the plan the diagram shows
+  // three providers when five ran and two were never reached. Six steps' worth is
+  // one fetch of six small calls, and it only happens when the panel is on screen.
+  const [stepOrders, setStepOrders] = React.useState<Partial<Record<LeadStep, string[]>>>({});
 
   const fetchPage = React.useCallback(async (id: string) => {
     const res = await getRun(id, { limit: 500, offset: 0 });
@@ -194,6 +211,44 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
     return dispose;
   }, [runId, fetchPage, supabase]);
 
+  // Attempts for whatever is on the page. Refetched when the row ids change,
+  // which is once per page rather than once per row - the alternative was eight
+  // round trips to build one bar.
+  const pageKey = React.useMemo(() => rows.map((r) => r.id).join(','), [rows]);
+
+  React.useEffect(() => {
+    if (!supabase || !rows.length) {
+      setAttemptsByRow(new Map());
+      return;
+    }
+
+    let cancelled = false;
+    const ids = pageKey ? pageKey.split(',') : [];
+
+    void (async () => {
+      const { data } = await supabase
+        .from('lead_attempts')
+        .select('row_id, endpoint_id, step, hit, cost_usd, created_at')
+        .in('row_id', ids)
+        .order('created_at', { ascending: true });
+
+      if (cancelled) return;
+
+      const byRow = new Map<string, LeadAttempt[]>();
+      for (const a of (data ?? []) as LeadAttempt[]) {
+        if (!a.row_id) continue;
+        const list = byRow.get(a.row_id);
+        if (list) list.push(a);
+        else byRow.set(a.row_id, [a]);
+      }
+      setAttemptsByRow(byRow);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [pageKey, rows.length, supabase]);
+
   const stats = React.useMemo(() => summarise(rows), [rows]);
 
   // Status counts for the composition bar, straight off the rows on screen rather
@@ -219,24 +274,46 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
 
   // Who actually supplied each address, in waterfall order rather than by size,
   // so a provider moving in the bar is visibly moving.
+  //
+  // Built from lead_attempts rather than from the row's email_provider. That
+  // column is written by exactly one step, so before this the panel counted the
+  // address providers and nothing else - and on a find run the decision-maker
+  // step is 28% of what the row costs, entirely absent from a bar captioned "a
+  // provider high on this bar is earning its place in the waterfall". It also
+  // credited the whole row's provider cost to whichever step found the address,
+  // which puts a person lookup's money on the email provider's bar.
+  //
+  // First hit per row is what counts, for the same reason it is what the lab
+  // counts on: a provider that repeated what another one had already found did
+  // not earn that row.
   const mix = React.useMemo(() => {
+    const credited = new Set<string>();
     const found = new Map<string, { found: number; costUsd: number }>();
+
     for (const r of rows) {
-      if (!r.email_provider) continue;
-      const cur = found.get(r.email_provider) ?? { found: 0, costUsd: 0 };
-      cur.found++;
-      cur.costUsd += r.treg_cost_usd ?? 0;
-      found.set(r.email_provider, cur);
+      for (const a of attemptsByRow.get(r.id) ?? []) {
+        if (!a.hit) continue;
+        if (credited.has(a.row_id + '|' + a.endpoint_id)) continue;
+        credited.add(a.row_id + '|' + a.endpoint_id);
+        const cur = found.get(a.endpoint_id) ?? { found: 0, costUsd: 0 };
+        cur.found++;
+        cur.costUsd += a.cost_usd ?? 0;
+        found.set(a.endpoint_id, cur);
+      }
     }
 
-    return DEFAULT_EMAIL_ORDER.filter((id) => found.has(id))
-      .map((id) => ({
-        endpointId: id,
-        label: providerLabel(id),
-        found: found.get(id)!.found,
-        costUsd: found.get(id)!.costUsd,
-      }));
-  }, [rows]);
+    // Every step's providers can appear, in no fixed order, ranked by what they
+    // earned. An ordered list keyed on the email default would leave the
+    // decision-maker providers off the end of it.
+    return [...found.entries()]
+      .map(([endpointId, v]) => ({
+        endpointId,
+        label: providerLabel(endpointId),
+        found: v.found,
+        costUsd: v.costUsd,
+      }))
+      .sort((a, b) => b.found - a.found || b.costUsd - a.costUsd);
+  }, [rows, attemptsByRow]);
 
   // Fetched once. Polling the wallet every three seconds alongside the run would
   // be a second realtime channel for a number that changes only when the run
@@ -296,6 +373,20 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
         out.push({ id: r.id, attempts: (data ?? []) as LeadAttempt[] });
       }
       if (!cancelled) setExpensive(out);
+    })();
+
+    // The chains the rows will be drawn against. Fetched here rather than passed
+    // in because they belong to the run detail view, not to a component that
+    // might be mounted for a clean run where two of the six steps are never used.
+    void (async () => {
+      const steps: LeadStep[] = ['company', 'person', 'email', 'verify', 'phone', 'enrich'];
+      const settled = await Promise.all(steps.map((s) => getWaterfall(s)));
+      if (cancelled) return;
+      const orders: Partial<Record<LeadStep, string[]>> = {};
+      settled.forEach((w, i) => {
+        if (w.effectiveOrder.length) orders[steps[i]] = w.effectiveOrder;
+      });
+      setStepOrders(orders);
     })();
 
     return () => {
@@ -555,7 +646,7 @@ const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWith
             The rows that took the most providers to resolve. One dot lit cost the price of one
             lookup; four dots with the last one filled cost four.
           </p>
-          <WaterfallColumn rows={expensive} limit={8} />
+          <WaterfallColumn rows={expensive} fullOrders={stepOrders} limit={8} />
         </div>
       )}
 
