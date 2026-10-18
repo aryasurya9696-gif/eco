@@ -34,6 +34,7 @@ import {
 import { planSteps, shouldFindEmail, worstCasePerRow } from './steps.ts';
 import { creditsForRow, round6 } from './pricing-row.ts';
 import { readEmail, readVerdict, type Verdict } from './read-response.ts';
+import { billingOutcome, errorCodeFor } from './api-usage.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? '';
 const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
@@ -1350,26 +1351,11 @@ async function logAttempt(
 ) {
   const apiUsageKey = `leads:${run.id}:${row.id}:${step}:${endpointId}`;
 
-  await db.from('lead_attempts').insert({
-    user_id: run.user_id,
-    run_id: run.id,
-    row_id: row.id,
-    step,
-    endpoint_id: endpointId,
-    hit,
-    cost_usd: result.costUsd,
-    treg_call_id: result.callId,
-  });
-
   // The operation recorded is the leads step, not the provider id, so the margin
-  // view groups by what was sold rather than by who served it.
-  // The operation recorded is the leads step rather than the provider id, so
-  // the margin view groups by what was sold instead of by who served it. The
-  // three that need naming rather than composing: verification is priced per
-  // check rather than per find, and there is no leads.verify.found operation in
-  // pricing_config — leaving it to compose would write margin rows against an
-  // operation that is not being sold, and the margin view would silently
-  // under-report what verification costs.
+  // view groups by what was sold rather than by who served it. Verification is
+  // priced per check rather than per find, and there is no leads.verify.found in
+  // pricing_config — composing one would write margin rows against an operation
+  // that is not being sold.
   const operation =
     step === 'verify'
       ? 'leads.verify.only'
@@ -1377,20 +1363,78 @@ async function logAttempt(
         ? 'leads.email.verified'
         : `leads.${step}.found`;
 
-  await db.from('api_usage').upsert(
-    {
-      user_id: run.user_id,
-      provider: 'treg',
-      provider_call_id: result.callId,
-      operation,
-      idempotency_key: apiUsageKey,
-      provider_cost_usd: result.costUsd,
-      outcome: result.outcome,
-      metadata: { endpoint: endpointId, step, run_id: run.id, row_id: row.id },
-    },
-    { onConflict: 'idempotency_key', ignoreDuplicates: true },
-  );
+  // api_usage first, then the attempt, then link them.
+  //
+  // The order used to be the other way round and neither write was checked. That
+  // combination is how this table stayed empty: api_usage's CHECK constraint
+  // accepts five billing outcomes and treg reports six, so every 402 and every 429
+  // raised a check violation which nobody read, and the row vanished. api_usage is
+  // what the margin views read, so those failures were invisible in every report —
+  // and the attempt history could not show an HTTP status because there was no row
+  // to read it from. It looked like a feature that had not been built.
+  //
+  // Writing api_usage first also means the link can be filled in: the id only
+  // exists once that row does. The old order left api_usage_id permanently null,
+  // so the column was dead and the two tables could only be related by a
+  // convention that nothing enforced.
+  const { data: usage, error: usageError } = await db
+    .from('api_usage')
+    .upsert(
+      {
+        user_id: run.user_id,
+        provider: 'treg',
+        provider_call_id: result.callId,
+        operation,
+        idempotency_key: apiUsageKey,
+        provider_cost_usd: result.costUsd,
+        outcome: billingOutcome(result),
+        http_status: result.httpStatus ?? null,
+        error_code: errorCodeFor(result),
+        metadata: { endpoint: endpointId, step, run_id: run.id, row_id: row.id },
+      },
+      { onConflict: 'idempotency_key', ignoreDuplicates: true },
+    )
+    .select('id')
+    .maybeSingle();
 
+  if (usageError) {
+    // Not thrown. Throwing here would fail the whole row and lose the lead, and
+    // the lead is worth more than the margin entry — the credits have already
+    // settled through the wallet, which is a separate path and unaffected. What
+    // is lost is one row of cost reporting, so it is logged loudly and the work
+    // continues.
+    //
+    // It was silent for the length of a whole development cycle, so the message
+    // says what to do about it rather than only what happened.
+    console.error(
+      'leads: api_usage write failed — the provider cost for this call will be missing from ' +
+        'every margin report. row=' + row.id + ' endpoint=' + endpointId + ' error=' + usageError.message,
+    );
+  }
+
+  const { error: attemptError } = await db.from('lead_attempts').insert({
+    user_id: run.user_id,
+    run_id: run.id,
+    row_id: row.id,
+    step,
+    endpoint_id: endpointId,
+    hit,
+    cost_usd: result.costUsd,
+    ms: result.ms ?? null,
+    treg_call_id: result.callId,
+    api_usage_id: usage?.id ?? null,
+  });
+
+  if (attemptError) {
+    // Also not thrown, and for the opposite reason. The attempt is what the hit
+    // rates are computed from and what the row receipt is drawn from; losing it
+    // costs a data point rather than a lead. Throwing would discard a found
+    // address to preserve a record of having found it.
+    console.error(
+      'leads: lead_attempts write failed — this call will not count towards the hit rate or ' +
+        'the row receipt. row=' + row.id + ' endpoint=' + endpointId + ' error=' + attemptError.message,
+    );
+  }
 }
 
 

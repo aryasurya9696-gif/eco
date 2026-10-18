@@ -4,8 +4,10 @@ import {
   AlertTriangle, Play, Pause, Square, X,
 } from 'lucide-react';
 import type { LeadsView, LeadRow, LeadRun, LeadAttempt } from '../../types';
+import type { AttemptWithFailure } from '../leads/AttemptHistory';
 import {
   getRun, bulkAction, isActiveRun, controlRun, addSuppression,
+  DEFAULT_EMAIL_ORDER, providerLabel,
 } from '../../lib/leads';
 import { fetchBalance, formatUsd } from '../../lib/billing';
 import { supabase } from '../../lib/supabase';
@@ -16,7 +18,7 @@ import { NewSearch } from '../leads/NewSearch';
 import { ProviderLab } from '../leads/ProviderLab';
 import { OptOuts } from '../leads/OptOuts';
 import { LeadsTable } from '../leads/LeadsTable';
-import { CompositionBar, RunStrip, MeterFigure } from '../leads/Data';
+import { CompositionBar, RunStrip, MeterFigure, ProviderMix } from '../leads/Data';
 import { WaterfallColumn } from '../leads/WaterfallChain';
 import { Button } from '../leads/Screen';
 import { EmptyState } from '../leads/Empty';
@@ -215,6 +217,27 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
     return out;
   }, [rows]);
 
+  // Who actually supplied each address, in waterfall order rather than by size,
+  // so a provider moving in the bar is visibly moving.
+  const mix = React.useMemo(() => {
+    const found = new Map<string, { found: number; costUsd: number }>();
+    for (const r of rows) {
+      if (!r.email_provider) continue;
+      const cur = found.get(r.email_provider) ?? { found: 0, costUsd: 0 };
+      cur.found++;
+      cur.costUsd += r.treg_cost_usd ?? 0;
+      found.set(r.email_provider, cur);
+    }
+
+    return DEFAULT_EMAIL_ORDER.filter((id) => found.has(id))
+      .map((id) => ({
+        endpointId: id,
+        label: providerLabel(id),
+        found: found.get(id)!.found,
+        costUsd: found.get(id)!.costUsd,
+      }));
+  }, [rows]);
+
   // Fetched once. Polling the wallet every three seconds alongside the run would
   // be a second realtime channel for a number that changes only when the run
   // spends something, and the run's own figures already show that.
@@ -319,15 +342,42 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
   };
 
   // Attempt history is fetched per expanded row rather than with the page.
-  const attemptsFor = React.useCallback(async (rowId: string): Promise<LeadAttempt[]> => {
-    if (!supabase) return [];
-    const { data } = await supabase
-      .from('lead_attempts')
-      .select('*')
-      .eq('row_id', rowId)
-      .order('created_at', { ascending: true });
-    return (data ?? []) as LeadAttempt[];
-  }, []);
+  // One query, because the foreign key now exists.
+//
+// Before it did not — api_usage_id was uuid and api_usage.id is bigint, so the two
+// could never reference each other — and every attempt had it null. That is why a
+// refused call could not be shown: there was no row to carry its status, and no
+// way to have found one. Two columns in api_usage exist for exactly this and
+// neither was reachable from a lead.
+const attemptsFor = React.useCallback(async (rowId: string): Promise<AttemptWithFailure[]> => {
+  if (!supabase) return [];
+
+  const { data, error } = await supabase
+    .from('lead_attempts')
+    .select('*, api_usage:api_usage_id(http_status, error_code)')
+    .eq('row_id', rowId)
+    .order('created_at', { ascending: true });
+
+  if (error) {
+    // Left to the caller's empty placeholder. A row that cannot show its history
+    // says so; it does not claim to have none.
+    console.warn('leads: attempt history unavailable', error.message);
+    return [];
+  }
+
+  return ((data ?? []) as Array<AttemptWithFailure & { api_usage: { http_status: number | null; error_code: string | null } | null }>).map(
+    (a) => ({
+      ...a,
+      // PostgREST returns the embed as an object or as null depending on whether
+      // the FK was set. Both shapes have to flatten to the same thing, or half
+      // the rows would show an error and half would not — which is worse than
+      // showing neither.
+      http_status: a.api_usage?.http_status ?? null,
+      error_code: a.api_usage?.error_code ?? null,
+      api_usage: undefined,
+    }),
+  );
+}, []);
 
   if (!runId) {
     return <EmptyState title="No run selected" body="Pick a run from the list." />;
@@ -478,6 +528,20 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
           >
             <X className="w-3 h-3" />
           </button>
+        </div>
+      )}
+
+      {/* ---- Who actually did the work ----------------------------------- */}
+      {mix.length > 0 && (
+        <div className="border border-[#e3e3de] bg-white p-5">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-1">
+            Who found them
+          </span>
+          <p className="text-[11px] font-mono text-[#b5b5ad] mb-4 leading-relaxed">
+            Of the rows on this page. A provider high on this bar is earning its place in the
+            waterfall; one at the end is costing money on every call it is asked about.
+          </p>
+          <ProviderMix mix={mix} />
         </div>
       )}
 

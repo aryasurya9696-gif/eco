@@ -13,12 +13,12 @@ import {
   ArrowUp, ArrowDown, Search, X, Columns3, ShieldOff,
   RefreshCw, Trash2, Loader2, ChevronRight,
 } from 'lucide-react';
-import type { LeadRow, LeadAttempt } from '../../types';
+import type { LeadRow } from '../../types';
 import { providerStyle } from '../../lib/leads';
-import { StatusBadge } from './StatusBadge';
+import { RowStateBadge, AddressBadge } from './RowState';
+import { AttemptHistory, type AttemptWithFailure } from './AttemptHistory';
 import { formatCredits, formatUsd } from '../../lib/billing';
 import { ProviderChip } from './ProviderChip';
-import { WaterfallChain } from './WaterfallChain';
 import { EmptyState, RowSkeleton } from './Empty';
 
 /**
@@ -43,7 +43,7 @@ interface LeadsTableProps {
   rows: LeadRow[];
   total: number;
   loading?: boolean;
-  attemptsFor?: (rowId: string) => Promise<LeadAttempt[]>;
+  attemptsFor?: (rowId: string) => Promise<AttemptWithFailure[]>;
   onBulk?: (action: 'delete' | 'reverify', rowIds: string[]) => Promise<{ ok: boolean; error?: string }>;
   /** Suppressed on selection, because that is an opt-out not a bulk edit. */
   onSuppress?: (rowIds: string[]) => void;
@@ -61,7 +61,8 @@ const ALL_COLUMNS: Array<{ id: string; label: string; always?: boolean }> = [
   { id: 'company', label: 'Company', always: true },
   { id: 'person', label: 'Person' },
   { id: 'email', label: 'Email' },
-  { id: 'status', label: 'Status' },
+  { id: 'state', label: 'Doing' },
+  { id: 'status', label: 'Address' },
   { id: 'provider', label: 'Found by' },
   { id: 'credits', label: 'Cost' },
   { id: 'title', label: 'Title' },
@@ -79,7 +80,8 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
   const [sorting, setSorting] = React.useState<SortingState>([]);
   const [query, setQuery] = React.useState('');
   const [expanded, setExpanded] = React.useState<string | null>(null);
-  const [attempts, setAttempts] = React.useState<Record<string, LeadAttempt[]>>({});
+  const [attempts, setAttempts] = React.useState<Record<string, AttemptWithFailure[]>>({});
+  const [fetching, setFetching] = React.useState<string | null>(null);
   const [picked, setPicked] = React.useState<Set<string>>(new Set());
   const [hidden, setHidden] = React.useState<Set<string>>(new Set());
   const [dense, setDense] = React.useState(false);
@@ -184,10 +186,23 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
         },
       }),
 
+      // Two columns rather than one, because they answer different questions.
+      // "What is this row doing" and "what did the address we have turn out to
+      // be" are separate, and one cell cannot be both — a row being looked up
+      // right now has no outcome yet, and drawing "Unchecked" beside one suggests
+      // it has been checked and the answer is pending.
+      col.accessor('state', {
+        id: 'state',
+        header: 'Doing',
+        cell: (info) => <RowStateBadge row={info.row.original} />,
+        sortingFn: (a, b) =>
+          STATE_RANK[a.original.state] - STATE_RANK[b.original.state],
+      }),
+
       col.accessor('email_status', {
         id: 'status',
-        header: 'Status',
-        cell: (info) => <StatusBadge status={info.getValue()} />,
+        header: 'Address',
+        cell: (info) => <AddressBadge row={info.row.original} />,
         // Sort by usefulness, not by the alphabet the enum happens to use, so
         // "worst first" is one click and lands on what needs attention.
         sortingFn: (a, b) => STATUS_RANK[a.original.email_status] - STATUS_RANK[b.original.email_status],
@@ -296,6 +311,7 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
       // previous state, and awaiting inside one means the state it reads is not
       // the state it was called with.
       setAttempts((p) => ({ ...p, [id]: [] }));
+      setFetching(id);
       try {
         const fetched = await attemptsFor(id);
         setAttempts((p) => ({ ...p, [id]: fetched }));
@@ -303,6 +319,8 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
         // Left as the empty placeholder. A row that cannot show its history shows
         // "no provider history" rather than an error, because the address above
         // it is still real and correct.
+      } finally {
+        setFetching(null);
       }
     }
   };
@@ -515,6 +533,7 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
                   <Expanded
                     row={r}
                     attempts={attempts[r.id] ?? []}
+                    loading={fetching === r.id}
                     onClose={() => setExpanded(null)}
                     top={vi.start + rowH}
                   />
@@ -539,12 +558,29 @@ const GRID: Record<string, string> = {
   title: 'minmax(0,0.9fr)',
   domain: 'minmax(0,1fr)',
   email: 'minmax(0,1.6fr)',
-  status: '110px',
+  state: '132px',
+  status: '104px',
   provider: '130px',
   credits: '92px',
 };
 
-/** Worst first, because that is the order anybody sorting by status wants. */
+/**
+ * Worst first for the address, and in-flight first for the state.
+ *
+ * Both orders are chosen so one click lands on what needs attention. Sorting by
+ * the alphabet the enum happens to be in would put "Catch-all" above "Verified"
+ * and tell nobody anything.
+ */
+const STATE_RANK: Record<string, number> = {
+  failed: 0,
+  trying: 1,
+  miss: 2,
+  queued: 3,
+  skipped: 4,
+  found: 5,
+  done: 6,
+};
+
 const STATUS_RANK: Record<string, number> = {
   invalid: 0,
   not_found: 1,
@@ -638,18 +674,18 @@ const HeaderCell: React.FC<{ header: ReturnType<ReturnType<typeof useReactTable<
 /**
  * What sits under a row when it opens.
  *
- * The waterfall is the reason to open it. The company details underneath are
- * there because they are what somebody actually wants to read, but they are
- * secondary and laid out as key-value text rather than given equal weight — a row
- * that leads with a chart and follows it with a paragraph would be making the
- * chart optional.
+ * The attempt history, and the company's details beneath it. The history comes
+ * first because it is what somebody opened the row to see, and the details are
+ * there because they are what they will actually want to read once the receipt
+ * has made sense.
  */
 const Expanded: React.FC<{
   row: LeadRow;
-  attempts: LeadAttempt[];
+  attempts: AttemptWithFailure[];
+  loading: boolean;
   onClose: () => void;
   top: number;
-}> = ({ row, attempts, onClose, top }) => {
+}> = ({ row, attempts, loading, onClose, top }) => {
   const facts = Object.entries(row.company_data ?? {}).slice(0, 8);
 
   return (
@@ -659,14 +695,8 @@ const Expanded: React.FC<{
       onClick={(e) => e.stopPropagation()}
     >
       <div className="flex items-start justify-between gap-6">
-        <div className="min-w-0">
-          {attempts.length > 0 ? (
-            <WaterfallChain attempts={attempts} />
-          ) : (
-            <p className="text-[10px] font-mono text-[#8a8a86] py-2">
-              {row.email ? 'No provider history for this row.' : 'No provider tried yet.'}
-            </p>
-          )}
+        <div className="min-w-0 flex-1">
+          <AttemptHistory attempts={attempts} loading={loading} />
         </div>
 
         <button

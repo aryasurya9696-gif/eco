@@ -34,6 +34,7 @@ const MODULES = [
   'registry.ts',
   'treg.ts',
   'read-response.ts',
+  'api-usage.ts',
   'index.ts',
 ];
 

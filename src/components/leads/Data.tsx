@@ -1,6 +1,8 @@
 import React from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import type { LeadEmailStatus, LeadRunStatus } from '../../types';
+import { providerStyle } from '../../lib/leads';
+import { formatUsd } from '../../lib/billing';
 
 /**
  * What a run actually produced, as one bar.
@@ -155,6 +157,83 @@ export const RunStrip: React.FC<{ status: LeadRunStatus; pauseReason?: string | 
     </span>
   );
 };
+
+/**
+ * Which providers are actually finding things.
+ *
+ * Counts who supplied each address, not who was asked. A provider that re-finds an
+ * address somebody else already had is not contributing, and a bar that counted
+ * attempts would show it contributing — which is how a provider nobody needs stays
+ * in a waterfall for years because it is always asked and occasionally happens to
+ * answer second.
+ *
+ * Segments are in the same order as the segments themselves rather than by size,
+ * so the bar reads as one position per provider and a provider moving in it is
+ * visibly moving.
+ */
+export const ProviderMix: React.FC<{
+  mix: Array<{ endpointId: string; label: string; found: number; costUsd: number }>;
+}> = ({ mix }) => {
+  const reduce = useReducedMotion();
+  const total = mix.reduce((n, p) => n + p.found, 0);
+  if (total === 0) return null;
+
+  return (
+    <div className="space-y-3">
+      {/* One bar, segmented by provider. Readable at a glance as a shape and
+          precise underneath as a list. */}
+      <div className="flex w-full h-2.5">
+        {mix.map((p, i) => {
+          const pct = (p.found / total) * 100;
+          return (
+            <motion.div
+              key={p.endpointId}
+              initial={reduce ? false : { scaleX: 0 }}
+              animate={{ scaleX: 1 }}
+              transition={{ duration: reduce ? 0 : 0.45, delay: i * 0.05, ease: [0.22, 1, 0.36, 1] }}
+              style={{ width: `${pct}%`, backgroundColor: colourFor(p.endpointId), originX: 0 }}
+              className={i === 0 ? 'rounded-l-sm' : ''}
+              title={`${p.label}: ${p.found} found · ${formatUsd(p.costUsd)}`}
+            />
+          );
+        })}
+      </div>
+
+      <div className="flex flex-wrap gap-x-5 gap-y-1.5">
+        {mix.map((p) => {
+          const style = providerStyle(p.endpointId);
+          return (
+            <span key={p.endpointId} className="inline-flex items-center gap-1.5">
+              <span
+                className="w-2 h-2 rounded-sm flex-shrink-0"
+                style={{ backgroundColor: colourFor(p.endpointId) }}
+              />
+              <span className="text-[10px] font-mono uppercase tracking-wider" style={{ color: style.ink }}>
+                {p.label}
+              </span>
+              <span className="text-[10px] font-mono text-[#141414] tabular-nums">{p.found}</span>
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+/**
+ * A readable fill for each provider.
+ *
+ * The chip pastel is far too light to draw a bar in — on white it would read as
+ * an empty segment. These are the same hues, saturated enough to hold their own
+ * next to one another, and derived from the chip so the two never drift.
+ */
+function colourFor(endpointId: string): string {
+  const s = providerStyle(endpointId);
+  // The chip classes carry the hue; take it rather than restating the palette
+  // here, which is how a second list of provider colours comes to exist.
+  const m = s.chip.match(/bg-\[#([0-9a-f]{6})\]/i);
+  return m ? `#${m[1]}` : '#8a8a86';
+}
 
 /**
  * A figure with its share of a ceiling drawn underneath.
