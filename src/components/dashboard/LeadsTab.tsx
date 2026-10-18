@@ -7,7 +7,7 @@ import type { LeadsView, LeadRow, LeadRun, LeadAttempt } from '../../types';
 import {
   getRun, bulkAction, isActiveRun, controlRun, addSuppression,
 } from '../../lib/leads';
-import { fetchBalance } from '../../lib/billing';
+import { fetchBalance, formatUsd } from '../../lib/billing';
 import { supabase } from '../../lib/supabase';
 import { subscribeToRun, mergeRow, summarise } from '../../lib/leads-live';
 import { RunsList } from '../leads/RunsList';
@@ -127,6 +127,7 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
   // confidently wrong is worse than no balance figure, because it is the one
   // number somebody checks before starting a run.
   const [balance, setBalance] = React.useState<number | null>(null);
+  const [reserved, setReserved] = React.useState<number | null>(null);
   const [notice, setNotice] = React.useState<string | null>(null);
 
   // The eight rows that cost the most to resolve, with their attempt history.
@@ -197,6 +198,15 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
   // than off the run's denormalised counters. During a run the row list is the
   // thing being looked at, and the counters are written a chunk at a time, so the
   // two disagree for minutes at a time and the bar would lag the table beside it.
+  // What the providers actually charged, across the rows on screen. Shown beside
+  // the credits because a per-result waterfall's whole claim is that the charge is
+  // the measured provider cost at a mark-up, and a mark-up nobody can see is one
+  // they have to take on trust.
+  const providerUsd = React.useMemo(
+    () => rows.reduce((n, r) => n + (r.treg_cost_usd ?? 0), 0),
+    [rows],
+  );
+
   const statusCounts = React.useMemo(() => {
     const out: Record<string, number> = {
       verified: 0, catch_all: 0, invalid: 0, unknown: 0, not_found: 0,
@@ -212,7 +222,12 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
     let cancelled = false;
     fetchBalance()
       .then((b) => {
-        if (!cancelled) setBalance(b?.wallet?.available ?? null);
+        if (cancelled) return;
+        setBalance(b?.wallet?.available ?? null);
+        // What is held right now is one chunk's worst case, not the run's ceiling.
+        // Conflating the two is precisely what makes a balance look wrong to
+        // somebody reading it: the ceiling is checked once, at the start.
+        setReserved(b?.wallet?.reserved ?? 0);
       })
       .catch(() => {
         // Left null, which renders a dash. The meter is drawn against the run's
@@ -393,25 +408,33 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
           />
         </div>
 
-        <div className="border border-[#e3e3de] bg-white p-5">
+        <div className="border border-[#e3e3de] bg-white p-5 flex flex-col">
           <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] block mb-3">
             What it cost
           </span>
+
           <div className="flex gap-8">
             <MeterFigure
               label="Spent"
               value={stats.credits}
-              display={round2(stats.credits)}
+              display={`${round2(stats.credits)} cr`}
               of={run?.max_credits ?? null}
-              tone={
-                run?.max_credits && stats.credits > run.max_credits ? 'warn' : 'default'
-              }
-              sub={run?.max_credits ? `of ${round2(run.max_credits)} at most` : undefined}
+              tone={run?.max_credits && stats.credits > run.max_credits ? 'warn' : 'default'}
+              sub={providerUsd > 0 ? `${formatUsd(providerUsd, { decimals: 4 })} at providers` : undefined}
             />
+
+            <MeterFigure
+              label="Held now"
+              value={reserved ?? 0}
+              display={reserved === null ? '—' : `${round2(reserved)} cr`}
+              tone={reserved !== null && reserved > 0 ? 'warn' : 'default'}
+              sub="released as each batch finishes"
+            />
+
             <MeterFigure
               label="Balance"
               value={balance ?? 0}
-              display={balance === null ? '—' : Math.round(balance)}
+              display={balance === null ? '—' : `${Math.round(balance)} cr`}
               of={run?.max_credits ?? null}
               tone={
                 balance !== null && run?.max_credits && balance < run.max_credits
@@ -429,6 +452,19 @@ const RunView: React.FC<{ runId: string | null; onBack: () => void }> = ({ runId
               }
             />
           </div>
+
+          {/* The sentence.
+              We have reserved the worst case and settled down since the first
+              migration and this screen has never said so. A user who watches
+              credits leave their balance and is never told what happens next has
+              every reason to think the worst, and this is the line that prevents
+              it. It is the cheapest and most load-bearing sentence in the app. */}
+          <p className="text-[10px] font-mono text-[#8a8a86] leading-relaxed mt-5 pt-3 border-t border-[#eeeeea]">
+            {run?.max_credits
+              ? `This run can cost at most ${round2(run.max_credits)} credits, and that figure is what was checked against your balance before it started. ` +
+                `Each batch holds only what it might spend and returns the rest as it finishes, so the balance moves in steps rather than dropping all at once.`
+              : 'Each batch holds only what it might spend and returns the rest as it finishes.'}
+          </p>
         </div>
       </div>
 

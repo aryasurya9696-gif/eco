@@ -388,17 +388,44 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
             </div>
           )}
 
-          <div className="flex items-center gap-4 pt-1">
-            <Button onClick={() => void start()} disabled={busy || pricing || !estimate} className="!px-6">
-              {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
-              Find {target.toLocaleString()} leads
-            </Button>
+          <div className="flex items-center gap-4 pt-1 flex-wrap">
+            <div className="flex items-stretch">
+              <Button onClick={() => void start()} disabled={busy || pricing || !estimate} className="!px-6">
+                {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                Find {target.toLocaleString()} leads
+              </Button>
+
+              {/* The unit price on the button, because it answers a different
+                  question from the total and is the one that decides whether the
+                  thing is worth doing. Fifty credits is "can I afford this"; the
+                  per-lead figure is "is this worth doing". */}
+              {estimate && !pricing && (
+                <span className="inline-flex items-center px-3 bg-[#141414] text-white text-[10px] font-mono border-l border-white/20 whitespace-nowrap">
+                  about {formatUnitPrice(estimate.expected_credits, target)} each
+                </span>
+              )}
+            </div>
+
             {estimate && (
               <span className="text-[10px] font-mono text-[#8a8a86]">
-                charged as it is found — a miss costs nothing
+                a miss costs nothing
               </span>
             )}
           </div>
+
+          {/* The hold, stated in one sentence.
+              We reserve the worst case before the first provider call and settle
+              down afterwards, and until now the screen said nothing about it. A
+              user who reads "at most 61 credits", watches 61 leave their balance,
+              and is never told otherwise has every reason to think we took the
+              money and did not do the work. This is the line that prevents that,
+              and it is the cheapest thing on this page. */}
+          {estimate && !pricing && (
+            <p className="text-[11px] font-mono text-[#8a8a86] leading-relaxed pt-4 border-t border-[#eeeeea]">
+              The most it can cost is held when the search starts, and whatever it does not spend
+              comes straight back when it ends. You are only charged for what it finds.
+            </p>
+          )}
 
           {error && (
             <div className="flex items-start gap-2 px-3 py-2.5 bg-[#fdf2f2] border border-[#f0c4c4]">
@@ -419,6 +446,26 @@ export const NewSearch: React.FC<NewSearchProps> = ({ onStarted }) => {
 };
 
 // ---------------------------------------------------------------------------
+
+/**
+ * The price of one lead.
+ *
+ * Rounded to one decimal because the second one is noise on a screen where the
+ * total is sitting two inches above — 16.6 tells you the order of magnitude and
+ * whether it is worth it, and 16.63 pretends to a precision the estimate does not
+ * have. A hit rate of 70% cannot tell you the price of the eleventh lead.
+ *
+ * Zero is shown as "less than one", not as 0. Because that is what it means: the
+ * expected total came out under one credit for the whole search, and a rounded
+ * "0 each" reads as free when it is merely cheap.
+ */
+function formatUnitPrice(total: number, count: number): string {
+  if (count <= 0) return '—';
+  const each = total / count;
+  if (each === 0) return 'less than one';
+  if (each < 0.05) return each.toFixed(2);
+  return each.toFixed(1);
+}
 
 /** "51-200" to the pair the database stores. */
 function sizeBounds(value: string): [number, number] {

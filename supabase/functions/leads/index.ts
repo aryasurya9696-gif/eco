@@ -32,7 +32,7 @@ import {
   type LeadPrices,
 } from './billing.ts';
 import { planSteps, shouldFindEmail, worstCasePerRow } from './steps.ts';
-import { creditsForRow } from './pricing-row.ts';
+import { creditsForRow, round6 } from './pricing-row.ts';
 import { readEmail, readVerdict, type Verdict } from './read-response.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? '';
@@ -1301,6 +1301,10 @@ async function processRow(
     plan,
   );
 
+  // One write, so credits and cost can never disagree. Two writes would leave a
+  // window in which a row is charged but not costed, or costed but not charged,
+  // and neither is visible from the outside — the user sees one number and the
+  // margin report sees the other.
   await db
     .from('lead_rows')
     .update({
@@ -1311,6 +1315,7 @@ async function processRow(
       email_provider: emailFound ? emailProvider : (row.email_provider ?? null),
       email_status: status,
       credits,
+      treg_cost_usd: round6(costUsd),
       locked_at: null,
     })
     .eq('id', row.id);

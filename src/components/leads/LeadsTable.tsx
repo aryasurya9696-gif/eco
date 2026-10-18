@@ -15,7 +15,8 @@ import {
 } from 'lucide-react';
 import type { LeadRow, LeadAttempt } from '../../types';
 import { providerStyle } from '../../lib/leads';
-import { StatusBadge, CreditsCell } from './StatusBadge';
+import { StatusBadge } from './StatusBadge';
+import { formatCredits, formatUsd } from '../../lib/billing';
 import { ProviderChip } from './ProviderChip';
 import { WaterfallChain } from './WaterfallChain';
 import { EmptyState, RowSkeleton } from './Empty';
@@ -62,7 +63,7 @@ const ALL_COLUMNS: Array<{ id: string; label: string; always?: boolean }> = [
   { id: 'email', label: 'Email' },
   { id: 'status', label: 'Status' },
   { id: 'provider', label: 'Found by' },
-  { id: 'credits', label: 'Credits' },
+  { id: 'credits', label: 'Cost' },
   { id: 'title', label: 'Title' },
   { id: 'domain', label: 'Domain' },
 ];
@@ -204,10 +205,33 @@ export const LeadsTable: React.FC<LeadsTableProps> = ({
 
       col.accessor('credits', {
         id: 'credits',
-        header: 'Credits',
-        cell: (info) => (
-          <CreditsCell credits={info.getValue() as number} worked={!isWorking(info.row.original)} />
-        ),
+        header: 'Cost',
+        cell: (info) => {
+          const r = info.row.original;
+          // A row that has not been worked has no provider cost and no credits.
+          // Both render as a dash rather than as 0 — a queued row is not free,
+          // it is not started, and 0.00 next to a queued row is a promise about a
+          // number that has not happened yet.
+          if (isWorking(r)) return <Dash />;
+
+          return (
+            <div className="leading-tight">
+              <span className="block text-[11px] font-mono text-[#141414] tabular-nums">
+                {formatCredits(r.credits)}
+              </span>
+              {r.treg_cost_usd !== null && r.treg_cost_usd !== undefined ? (
+                <span
+                  className="block text-[9px] font-mono text-[#b5b5ad] tabular-nums"
+                  title="What the provider charged for this row. The difference between that and the credits above is Echo's margin."
+                >
+                  {formatUsd(r.treg_cost_usd, { decimals: 4 })}
+                </span>
+              ) : (
+                <span className="block text-[9px] font-mono text-[#d5d5cf]">not worked</span>
+              )}
+            </div>
+          );
+        },
       }),
     ],
     [],
@@ -517,7 +541,7 @@ const GRID: Record<string, string> = {
   email: 'minmax(0,1.6fr)',
   status: '110px',
   provider: '130px',
-  credits: '70px',
+  credits: '92px',
 };
 
 /** Worst first, because that is the order anybody sorting by status wants. */

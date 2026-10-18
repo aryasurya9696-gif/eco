@@ -76,24 +76,3 @@ export const RunStatusPill: React.FC<{
     </span>
   );
 };
-
-/**
- * Credits on a row, and what they were spent on.
- *
- * "0" is shown as "no charge" rather than as a zero, because the difference
- * between "this cost nothing" and "this row has not been worked yet" is the
- * difference between a free miss and an unfinished job.
- */
-export const CreditsCell: React.FC<{ credits: number; worked: boolean }> = ({
-  credits,
-  worked,
-}) => {
-  if (!worked) return <span className="text-[#b5b5ad] text-[10px] font-mono">—</span>;
-  if (credits <= 0) return <span className="text-[#8a8a86] text-[10px] font-mono">no charge</span>;
-
-  return (
-    <span className="text-[10px] font-mono tabular-nums text-[#4a4a47]">
-      {Number.isInteger(credits) ? credits : credits.toFixed(2)}
-    </span>
-  );
-};

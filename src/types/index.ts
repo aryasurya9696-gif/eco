@@ -161,6 +161,15 @@ export interface LeadRow {
   company_data: Record<string, unknown>;
   extra: Record<string, unknown>;
   credits: number;
+  /**
+   * What the provider charged for this row, in dollars.
+   *
+   * Null until the row has been worked. Null and zero are different and the UI
+   * has to tell them apart: zero means the provider call was free, null means
+   * there has not been one. Rendering null as 0.00 would tell a user a queued
+   * row cost nothing, which is true today and will not be true in a minute.
+   */
+  treg_cost_usd: number | null;
   state: LeadRowState;
   step: LeadStep | null;
   current_provider: string | null;
