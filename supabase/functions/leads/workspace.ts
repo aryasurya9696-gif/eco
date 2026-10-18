@@ -45,6 +45,8 @@ export interface CreateRunInput {
   name: string | null;
   hold: string | null;
   extraOptions?: Record<string, unknown>;
+  /** Refuse, before anything is inserted, when the estimate's maximum is above this. */
+  ceilingCredits?: number;
 }
 
 const isUuid = (v: unknown): v is string =>
@@ -104,7 +106,7 @@ const LEAD_STATUSES = ['new', 'qualified', 'contacted', 'nurture', 'disqualified
 // Search (LeadsForge: free search, free count)
 // ===========================================================================
 
-export async function searchPeople(db: Db, ctx: WorkspaceCtx, userId: string, body: any) {
+export async function searchPeople(db: Db, ctx: WorkspaceCtx, userId: string, body: any, opts?: { log?: boolean }) {
   const filters = cleanPeopleFilters(body?.filters);
   if (!hasAnyPeopleFilter(filters)) return { ok: false, error: 'no_filters' };
 
@@ -155,7 +157,8 @@ export async function searchPeople(db: Db, ctx: WorkspaceCtx, userId: string, bo
     }
   }
 
-  if (!cursor) {
+  // An automation's searches are not the user's, so they stay out of history.
+  if (!cursor && opts?.log !== false) {
     await db.from('lead_search_log').insert({ user_id: userId, filters, total: null });
   }
 
@@ -379,6 +382,11 @@ function contactsFilter(db: Db, userId: string, f: any, select: string, opts?: {
   }
 
   return q;
+}
+
+/** Contacts matching a People view's filters, for automations. Paged past PostgREST's row cap. */
+export async function matchingContacts<T = any>(db: Db, userId: string, filters: any, select: string, max: number): Promise<T[]> {
+  return allRows<T>(() => contactsFilter(db, userId, filters ?? {}, select).order('id'), max);
 }
 
 export async function queryContacts(db: Db, userId: string, body: any) {
@@ -899,7 +907,7 @@ const STALE_COMPANY_DAYS = 90;
  * others are skipped. Shared by the estimate and the start, so the price shown
  * is the price for exactly the rows that will run.
  */
-async function enrichPlan(db: Db, userId: string, body: any) {
+export async function enrichPlan(db: Db, userId: string, body: any) {
   // `enrich`, not `action`: `action` is the route this request arrived on.
   const action = str(body?.enrich, 20) as EnrichAction;
   if (!ACTION_MODE[action]) return { error: 'bad_action' as const };
@@ -1014,6 +1022,7 @@ export async function runFromRows(
   rows: any[],
   requestId: string,
   skipped?: Record<string, number>,
+  opts?: { extraOptions?: Record<string, unknown>; ceilingCredits?: number },
 ) {
   const label: Record<EnrichAction, string> = {
     verify: 'Verify emails', find_email: 'Find emails', phone: 'Find phones', company: 'Company details',
@@ -1026,7 +1035,8 @@ export async function runFromRows(
     icpId: null,
     name: `${label[action]} · ${rows.length} ${action === 'company' ? 'companies' : 'leads'}`,
     hold: 'importing',
-    extraOptions: { request_id: requestId, source: 'database', action },
+    extraOptions: { ...(opts?.extraOptions ?? {}), request_id: requestId, source: 'database', action },
+    ceilingCredits: opts?.ceilingCredits,
   });
   if (!started?.ok) return started;
   // Lost a race with the same request: the other one is writing the rows.

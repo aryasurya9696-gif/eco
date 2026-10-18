@@ -103,6 +103,17 @@ check('wallet_settle sends p_provider_cost', named('wallet_settle').every((c) =>
 check('wallet_release sends p_reason', named('wallet_release').every((c) => !c.keys.includes('p_note')));
 check('estimate_lead_run always sends p_user', named('estimate_lead_run').length > 0 && named('estimate_lead_run').every((c) => c.keys.includes('p_user')));
 
+// Automations (20261120). Both are called from automations.ts and must be the
+// service-role functions the migration defines.
+check('lead_automations_claim_due is called', named('lead_automations_claim_due').length === 1);
+check('lead_automations_claim_due sends p_limit and p_seconds',
+  named('lead_automations_claim_due').every((c) => c.keys.includes('p_limit') && c.keys.includes('p_seconds')));
+check('lead_automation_month_committed is called', named('lead_automation_month_committed').length >= 1);
+check('lead_automation_month_committed sends p_automation and p_since',
+  named('lead_automation_month_committed').every((c) => c.keys.includes('p_automation') && c.keys.includes('p_since')));
+check('lead_automations_claim_due defined in 20261120', signatures.get('lead_automations_claim_due')?.file === '20261120_lead_automations.sql');
+check('lead_automation_month_committed defined in 20261120', signatures.get('lead_automation_month_committed')?.file === '20261120_lead_automations.sql');
+
 // A PostgREST builder is a thenable: an async function that returns one, or an
 // await on one, runs the query and yields its result instead of the builder.
 // contactsFilter shipped that way once, which broke every People query.

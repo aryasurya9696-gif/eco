@@ -345,6 +345,112 @@ export const usageSummary = (days = 30) =>
   }>>('usage', { days });
 
 // ---------------------------------------------------------------------------
+// Automations
+// ---------------------------------------------------------------------------
+
+export type AutomationKind = 'saved_search_refresh' | 'auto_enrich' | 'auto_tag';
+export type AutomationRunStatus = 'running' | 'succeeded' | 'skipped' | 'refused' | 'failed';
+
+export interface AutomationConfig {
+  saved_search_id?: string;
+  /** saved_search_refresh */
+  list_id?: string | null;
+  max_people?: number;
+  /** saved_search_refresh: 'none' | 'find_email'. auto_enrich: the enrichment. */
+  enrich?: 'none' | 'find_email' | 'verify' | 'phone';
+  /** auto_enrich */
+  max_rows?: number;
+  skip_recent_days?: number;
+  /** auto_tag */
+  add_tags?: string[];
+  remove_tags?: string[];
+}
+
+export interface AutomationSchedule {
+  frequency: 'daily' | 'weekly';
+  /** UTC */
+  hour: number;
+  /** 0 = Sunday, weekly only */
+  weekday: number | null;
+}
+
+export interface Automation {
+  id: string;
+  name: string;
+  kind: AutomationKind;
+  config: AutomationConfig;
+  status: 'active' | 'paused';
+  pause_reason: string | null;
+  frequency: 'daily' | 'weekly';
+  hour: number;
+  weekday: number | null;
+  max_credits_per_run: number;
+  max_credits_per_month: number;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_status: AutomationRunStatus | null;
+  failure_count: number;
+  saved_search: { name: string; kind: string } | null;
+  /** Charged this month, counting a run still working at its maximum. */
+  month_committed: number;
+}
+
+export interface AutomationRun {
+  id: string;
+  automation_id: string;
+  status: AutomationRunStatus;
+  started_at: string;
+  finished_at: string | null;
+  people_found: number;
+  people_added: number;
+  people_skipped: number;
+  contacts_matched: number;
+  contacts_tagged: number;
+  credits_estimated_max: number | null;
+  credits_charged: number;
+  run_id: string | null;
+  run_status: string | null;
+  error: string | null;
+  detail: Record<string, any>;
+}
+
+export interface AutomationDraft {
+  id?: string;
+  name: string;
+  kind: AutomationKind;
+  config: AutomationConfig;
+  schedule: AutomationSchedule;
+  max_credits_per_run: number;
+  max_credits_per_month: number;
+}
+
+export interface AutomationEstimate {
+  ok: boolean;
+  error?: string;
+  paid?: boolean;
+  rows?: number;
+  estimate?: RunEstimate | null;
+  fits_run_cap?: boolean;
+  runs_per_month_cap?: number | null;
+}
+
+/** Whether an automation can start paid work: the same rule as the function's isPaid. */
+export const automationIsPaid = (kind: AutomationKind, config: AutomationConfig) =>
+  kind === 'auto_enrich' || (kind === 'saved_search_refresh' && config.enrich === 'find_email');
+
+export const getAutomations = () => call<Ok<{ automations: Automation[] }>>('automations');
+export const saveAutomation = (a: AutomationDraft) =>
+  call<Ok<{ automation: Automation }> | Fail>('automation_save', { ...a });
+export const pauseAutomation = (id: string) => call<{ ok: boolean; error?: string }>('automation_pause', { id });
+export const resumeAutomation = (id: string) => call<{ ok: boolean; error?: string }>('automation_resume', { id });
+export const deleteAutomation = (id: string) => call<{ ok: boolean; error?: string }>('automation_delete', { id });
+export const runAutomationNow = (id: string) => call<{ ok: boolean; error?: string }>('automation_run_now', { id });
+export const automationEstimate = (a: Pick<AutomationDraft, 'kind' | 'config' | 'max_credits_per_run' | 'max_credits_per_month'>) =>
+  call<AutomationEstimate>('automation_estimate', { ...a });
+export const automationHistory = (automationId?: string, limit = 50) =>
+  call<Ok<{ runs: AutomationRun[] }>>('automation_history', { automation_id: automationId, limit });
+
+// ---------------------------------------------------------------------------
 // Presentation
 // ---------------------------------------------------------------------------
 
@@ -376,6 +482,27 @@ export function errorCopy(error: string | undefined): string {
       return 'That name is already used.';
     case 'search_failed':
       return 'The search provider did not answer. Nothing was charged. Try again in a moment.';
+    case 'saved_search_required':
+    case 'saved_search_not_found':
+      return 'Pick a saved search. Save one from Search or People first.';
+    case 'cap_required':
+      return 'An automation that spends credits needs a cap per run and a cap per month.';
+    case 'run_cap_over_month_cap':
+      return 'The cap per run cannot be more than the cap per month.';
+    case 'bad_cap':
+      return 'Caps must be zero or more credits.';
+    case 'tags_required':
+      return 'Add at least one tag to add or remove.';
+    case 'list_not_found':
+      return 'That list no longer exists.';
+    case 'not_active':
+      return 'Resume the automation first.';
+    case 'over_run_cap':
+      return 'The run could cost more than the cap per run.';
+    case 'over_month_cap':
+      return "The run could cost more than what is left of this month's cap.";
+    case 'no_cap':
+      return 'No spending cap was set, so no paid run was started.';
     default:
       return error ? `That did not work (${error}).` : 'That did not work.';
   }

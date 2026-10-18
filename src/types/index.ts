@@ -70,6 +70,7 @@ export type LeadsView =
   | 'clean'
   | 'lab'
   | 'optouts'
+  | 'automations'
   | 'run';
 
 export interface LeadIcp {

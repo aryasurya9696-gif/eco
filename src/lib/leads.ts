@@ -67,7 +67,7 @@ export function tabFromHash(hash: string = window.location.hash): string | null 
 const DEFAULT_VIEW: LeadsView = 'people';
 
 const KNOWN_VIEWS: LeadsView[] = [
-  'search', 'people', 'companies', 'lists', 'usage', 'runs', 'new', 'clean', 'lab', 'optouts', 'run',
+  'search', 'people', 'companies', 'lists', 'usage', 'runs', 'new', 'clean', 'lab', 'optouts', 'automations', 'run',
 ];
 
 /**

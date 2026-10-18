@@ -40,6 +40,8 @@ const MODULES = [
   'endpoints.ts',
   'scoring.ts',
   'workspace.ts',
+  'automation-rules.ts',
+  'automations.ts',
   'index.ts',
 ];
 

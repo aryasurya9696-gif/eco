@@ -113,6 +113,7 @@ Apply in order. All four are also appended to `supabase/deploy-all.sql`.
 | `20261117_estimate_for_user.sql` | `estimate_lead_run(…, p_user)`; drops the four-argument version; modes `phone_only`, `enrich_only` |
 | `20261118_lead_database.sql` | `lead_rows` statuses `unchecked`, `disposable`, plus `email_checked_at`, `email_verifier`, `generation`; tables `lead_companies`, `lead_contacts`, `lead_lists`, `lead_list_members`, `lead_saved_searches`, `lead_search_log`, `lead_scoring` (RLS select-own, writes via the function only); `lead_contact_merge`, `lead_contact_upsert_from_row`, `lead_contacts_merge`, `lead_company_upsert`; `lead_companies_summary` view; unique paid-request index on `lead_runs`; `leads.search` pricing row at 0 credits; backfill of every finished row |
 | `20261119_leads_economics.sql` | `v_leads_run_economics`, `v_leads_endpoint_economics` (service role only) |
+| `20261120_lead_automations.sql` | `lead_automations`, `lead_automation_runs` (RLS select-own); `lead_automations_claim_due`, `lead_automation_month_committed` (service role); the `lead_runs_automation_guard` insert trigger; the `echo-leads-automations` cron job (every 10 minutes, worker secret) |
 
 The backfill also relabels imported addresses that never had a verify attempt
 from `unknown` to `unchecked`.
@@ -165,7 +166,7 @@ Also checked:
 ## 7. Not implemented, and why
 
 - **Natural-language search.** The documented options are Fiber AI NL search ($0.02 per result plus 2 credits a page) and Findymail IntelliMatch (async, price unpublished). Neither was wired, because the price could not be shown before running. The free structured search covers the same filters.
-- **Scheduled discovery and automations** (saved-search refresh, auto-enrich imports, auto-tag rules, notifications). Not built. They need a job table with caps and a cost budget per schedule, and are the natural next step on top of saved searches and the run worker.
+- **Notifications** for automations (email or in-app when a run is refused or fails). The history shows them; nothing pushes them yet.
 - **Team assignment.** Echo has no teams or roles; ownership is per user.
 - **Sandbox.** Treg documents no test mode. `POST /demo/sandbox` exists without documentation and was not used.
 - **LeadsForge paging cursor.** The cursor is a documented *request* parameter, but the response field that carries it is not in the catalog example. The reader accepts `cursor`, `nextCursor` and `next_cursor`. If none is present, "Load more" does not appear.
@@ -174,9 +175,33 @@ Also checked:
 - **Large target-account lists.** Filtering Companies by a target-account list uses its first 1000 members.
 - **Mobile layout of the dashboard shell.** The existing sidebar takes most of a phone screen on every tab. The new Leads views wrap and scroll, but the shell itself was not changed.
 
+## 7a. Automations
+
+Leads → Automations (`AutomationsView.tsx`, `functions/leads/automations.ts`, rules in `automation-rules.ts`).
+
+| Kind | Reads | Does | Cost |
+|---|---|---|---|
+| `saved_search_refresh` | a saved people search | re-runs it on LeadsForge, skips people already held (provider id, or name at domain) and opted-out addresses and domains, saves up to N new people, optionally into a list; optionally starts a find-email run over just those | search free; find-email priced |
+| `auto_enrich` | a saved People view | find emails, verify or find phones for matching people not enriched in the last N days, up to N per run | priced |
+| `auto_tag` | a saved People view | adds and removes tags | free |
+
+Schedules are daily or weekly at an hour, in UTC. The cron tick (`action: automations_tick`, worker secret) claims due automations under a lease, so a "Run now" and the tick cannot run one twice.
+
+**Budget.** A paid automation cannot be saved without a cap per run and a cap per month, and the run cap cannot exceed the month's. Before a run is created:
+- its estimate is taken at the actual number of rows;
+- it is refused if the maximum is over the run cap, or if this month's committed credits plus that maximum are over the month cap. Committed means charged for finished runs, and the approved maximum for runs still working;
+- `createRun` is given a ceiling of min(run cap, month remaining) and refuses a maximum above it before inserting;
+- the `lead_runs_automation_guard` trigger checks both caps again on the insert, with the automation row locked.
+
+A refusal is recorded in the history with the numbers. Nothing is charged, and it does not count as a failure.
+
+**Idempotency.** A slot's request id is derived from the automation id and its `next_run_at`, so a tick that dies before rescheduling gets the same run back. An `auto_enrich` waits while its previous run is still queued, running or paused, so the same people are never paid for twice. Three failed runs in a row, or a deleted saved search or list, pause the automation with the reason shown.
+
+Tests: `lead-automation-rules-tests` (90: validation, schedules, the budget, including 5,000 random inputs, and dedupe) and `lead-automations-tick-tests` (73: the tick end to end against an in-memory database and a stubbed provider). `lead-rpc-signature-tests` covers the two new RPCs.
+
 ## 8. Needs a real environment before it is relied on
 
-1. Apply migrations `20261116` → `20261119` (or `deploy-all.sql`), then deploy the `leads` function with `node scripts/deploy-functions.cjs leads`. Deploy order matters: the new function needs the new SQL, and fails closed (`lease_unavailable`) without it.
+1. Apply migrations `20261116` → `20261120` (or `deploy-all.sql`), then deploy the `leads` function with `node scripts/deploy-functions.cjs leads`. Deploy order matters: the new function needs the new SQL, and fails closed (`lease_unavailable`) without it.
 2. `TREG_TOKEN` and `LEADS_WORKER_SECRET` (or `service_secrets.leads_worker_secret`) must be set; the cron job from `20261110` must be active.
 3. Run one small find run and one 5-row verify on a real token. Then compare `v_leads_run_economics` with Treg's own call log (`GET /calls/{id}`) and set `pricing_config.cost_verified` where the costs agree.
 4. The SQL acceptance suites (`credit_wallet_acceptance`, `credit_wallet_concurrency`) need psql against the project. Nothing in this change was executed against a database.

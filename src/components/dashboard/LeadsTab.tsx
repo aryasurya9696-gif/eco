@@ -1,7 +1,7 @@
 import React from 'react';
 import {
   ListChecks, Plus, Search, FlaskConical, ShieldOff, ArrowLeft,
-  AlertTriangle, Play, Pause, Square, X, Users, Building2, List, Upload, Receipt,
+  AlertTriangle, Play, Pause, Square, X, Users, Building2, List, Upload, Receipt, CalendarClock,
 } from 'lucide-react';
 import type { LeadsView, LeadRow, LeadRun, LeadAttempt } from '../../types';
 import type { AttemptWithFailure } from '../leads/AttemptHistory';
@@ -24,6 +24,7 @@ import { EmptyState } from '../leads/Empty';
 import { ExportMenu } from '../leads/ExportMenu';
 import { CostDialog } from '../leads/CostDialog';
 import { SearchView } from '../leads/SearchView';
+import { AutomationsView } from '../leads/AutomationsView';
 import { PeopleView } from '../leads/PeopleView';
 import { CompaniesView, ListsView, UsageView } from '../leads/CompaniesView';
 import type { ContactFilters } from '../../lib/leads-db';
@@ -126,6 +127,8 @@ const LeadsWorkspace: React.FC<{
 
       {view === 'usage' && <UsageView onOpenRun={onOpenRun} />}
 
+      {view === 'automations' && <AutomationsView onOpenRun={onOpenRun} />}
+
       {view === 'runs' && (
         <RunsList
           onOpenRun={onOpenRun}
@@ -158,6 +161,7 @@ const SUB_NAV: Array<{ view: LeadsView; label: string; icon: React.ReactNode; di
   { view: 'runs', label: 'Runs', icon: <ListChecks className="w-3.5 h-3.5" />, divider: true },
   { view: 'new', label: 'Find by profile', icon: <Plus className="w-3.5 h-3.5" /> },
   { view: 'clean', label: 'Import', icon: <Upload className="w-3.5 h-3.5" /> },
+  { view: 'automations', label: 'Automations', icon: <CalendarClock className="w-3.5 h-3.5" /> },
   { view: 'usage', label: 'Usage', icon: <Receipt className="w-3.5 h-3.5" /> },
   { view: 'lab', label: 'Provider lab', icon: <FlaskConical className="w-3.5 h-3.5" /> },
   { view: 'optouts', label: 'Opt-outs', icon: <ShieldOff className="w-3.5 h-3.5" /> },

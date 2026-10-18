@@ -63,6 +63,7 @@ import {
 } from './discover.ts';
 import { billingOutcome, errorCodeFor } from './api-usage.ts';
 import * as ws from './workspace.ts';
+import * as auto from './automations.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? '';
 const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
@@ -176,7 +177,7 @@ function admin() {
 const ORDERABLE_STEPS: LeadStep[] = ['company', 'person', 'email', 'verify', 'phone', 'enrich'];
 
 /** Actions that can start paid work. */
-const PAID_ACTIONS = new Set(['start', 'resume', 'bulk', 'enrich_start', 'import']);
+const PAID_ACTIONS = new Set(['start', 'resume', 'bulk', 'enrich_start', 'import', 'automation_run_now']);
 /** Actions that call a provider for free. */
 const SEARCH_ACTIONS = new Set(['search_people', 'search_count', 'filter_values']);
 
@@ -225,6 +226,23 @@ Deno.serve(async (req) => {
 
     pruneBuckets();
     return json(await workRun(admin(), body));
+  }
+
+  // ---- automations tick: same door, same secret ---------------------------
+  if (action === 'automations_tick') {
+    const provided = req.headers.get('x-leads-worker-secret') ?? '';
+    if (!WORKER_SECRET) {
+      console.error('LEADS_WORKER_SECRET is not configured — refusing to run automations.');
+      return fail('worker not configured', 503);
+    }
+    if (provided !== WORKER_SECRET) return fail('unauthorized', 401);
+    const db = admin();
+    try {
+      return json(await auto.tick(db, wsCtx(db)));
+    } catch (err) {
+      console.error('[leads] automations tick failed:', (err as Error)?.message);
+      return fail('automations tick failed', 500);
+    }
   }
 
   // ---- everything else needs a user --------------------------------------
@@ -465,6 +483,27 @@ Deno.serve(async (req) => {
 
       case 'usage':
         return json(await ws.usageSummary(db, userId, body));
+
+      // ---- automations ----------------------------------------------------
+      case 'automations':
+        return json(await auto.listAutomations(db, userId));
+      case 'automation_save':
+        return json(await auto.saveAutomation(db, userId, body));
+      case 'automation_pause':
+        return json(await auto.setAutomationStatus(db, userId, body, 'paused'));
+      case 'automation_resume':
+        return json(await auto.setAutomationStatus(db, userId, body, 'active'));
+      case 'automation_delete':
+        return json(await auto.deleteAutomation(db, userId, body));
+      case 'automation_estimate':
+        return json(await auto.automationEstimate(db, userId, body));
+      case 'automation_history':
+        return json(await auto.automationHistory(db, userId, body));
+      case 'automation_run_now': {
+        const r = await auto.runAutomationNow(db, userId, body);
+        if (r.ok) kickAutomations();
+        return json(r);
+      }
 
       default:
         return fail('Unknown action', 400);
@@ -880,6 +919,7 @@ async function createRun(
     targetTitles?: string[];
     hold: string | null;
     extraOptions?: Record<string, unknown>;
+    ceilingCredits?: number;
   },
 ) {
   // No run starts without a price on screen, recomputed here rather than
@@ -897,6 +937,18 @@ async function createRun(
   }
 
   const maxCredits = num((est as any).max_credits);
+
+  // An automation's budget: refused before anything is inserted. The insert
+  // trigger from 20261120 checks the automation's caps again under a lock.
+  if (o.ceilingCredits !== undefined && !(maxCredits <= o.ceilingCredits)) {
+    return {
+      ok: false,
+      error: 'over_cap',
+      max_credits: maxCredits,
+      ceiling: round6(o.ceilingCredits),
+      message: 'The most this run could cost is over the budget it was allowed.',
+    };
+  }
 
   // A run that cannot be paid for in full must not start, so this is checked
   // against the maximum, not the expected figure.
@@ -975,6 +1027,20 @@ function kickWorker(runId: string): void {
       'x-leads-worker-secret': WORKER_SECRET ?? '',
     },
     body: JSON.stringify({ action: 'work', run_id: runId }),
+  }).catch(() => {
+    /* the cron tick picks it up */
+  });
+}
+
+/** Runs the automations tick now rather than at the next cron tick. Not awaited. */
+function kickAutomations(): void {
+  void fetch(SUPABASE_URL + '/functions/v1/leads', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-leads-worker-secret': WORKER_SECRET ?? '',
+    },
+    body: JSON.stringify({ action: 'automations_tick' }),
   }).catch(() => {
     /* the cron tick picks it up */
   });
