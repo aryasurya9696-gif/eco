@@ -10,12 +10,14 @@
 // Deploy:  supabase functions deploy ai
 // Secret:  supabase secrets set OPENAI_API_KEY=sk-...
 //
-// Request body: { action: 'keywords' | 'draft', ...payload }
+// Request body: { action: 'keywords' | 'draft' | 'lead-filters', ...payload }
 //   action=keywords -> { offerText, website?, existingKeywords?, channels?,
 //                        slots?, lookbackHours? }
 //                     -> { ok, icp, suggestions[], avoid[], source }
 //   action=draft    -> { post, tone, userOffer?, userName? }
 //                     -> { ok, draft, source }
+//   action=lead-filters -> { description }
+//                     -> { ok, filters: { title, keywords[], country, location, company }, source }
 // ============================================================================
 
 const ALLOWED_ORIGIN = Deno.env.get('ALLOWED_ORIGIN') || '*';
@@ -381,6 +383,119 @@ function fallbackDraft(
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// Lead search filters (action=lead-filters)
+// ---------------------------------------------------------------------------
+
+interface LeadFilters {
+  title: string;
+  keywords: string[];
+  country: string;
+  location: string;
+  company: string;
+}
+
+const ISO_CODES = (
+  'AD AE AF AG AI AL AM AO AR AT AU AW AZ BA BB BD BE BF BG BH BI BJ BM BN BO BR BS BT BW BY BZ CA CD CF CG CH CI CL ' +
+  'CM CN CO CR CU CV CY CZ DE DJ DK DM DO DZ EC EE EG ER ES ET FI FJ FR GA GB GD GE GH GI GL GM GN GQ GR GT GY HK HN HR ' +
+  'HT HU ID IE IL IN IQ IR IS IT JM JO JP KE KG KH KM KN KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MG MK ' +
+  'ML MM MN MO MR MT MU MV MW MX MY MZ NA NE NG NI NL NO NP NZ OM PA PE PG PH PK PL PR PS PT PY QA RO RS RU RW SA SC SD ' +
+  'SE SG SI SK SL SN SO SR SV SY SZ TD TG TH TJ TM TN TR TT TW TZ UA UG US UY UZ VE VN YE ZA ZM ZW'
+).split(' ');
+
+const COUNTRY_ALIASES: Record<string, string> = {
+  usa: 'US', 'u.s.': 'US', america: 'US', 'united states': 'US', us: 'US',
+  uk: 'GB', 'u.k.': 'GB', britain: 'GB', england: 'GB', 'united kingdom': 'GB',
+  uae: 'AE', emirates: 'AE', india: 'IN', bharat: 'IN',
+};
+
+let countryNames: Map<string, string> | null = null;
+function countryLookup(): Map<string, string> {
+  if (countryNames) return countryNames;
+  countryNames = new Map(Object.entries(COUNTRY_ALIASES));
+  try {
+    const names = new Intl.DisplayNames(['en'], { type: 'region' });
+    for (const code of ISO_CODES) {
+      const name = names.of(code);
+      if (name && name !== code) countryNames.set(name.toLowerCase(), code);
+    }
+  } catch {
+    // Aliases only.
+  }
+  return countryNames;
+}
+
+const TITLE_WORDS = [
+  'co-founder', 'cofounder', 'founder', 'ceo', 'cto', 'cfo', 'coo', 'cmo', 'cro', 'owner', 'president', 'partner',
+  'managing director', 'vp sales', 'vp marketing', 'vp engineering', 'head of sales', 'head of marketing',
+  'head of growth', 'head of engineering', 'head of product', 'sales director', 'marketing director',
+  'engineering manager', 'product manager', 'sales manager', 'marketing manager', 'recruiter', 'hr manager',
+  'account executive', 'business development', 'director', 'manager', 'engineer', 'consultant',
+];
+
+const KEYWORD_WORDS = [
+  'saas', 'fintech', 'ai', 'artificial intelligence', 'ecommerce', 'e-commerce', 'healthtech', 'healthcare', 'edtech',
+  'real estate', 'insurance', 'logistics', 'marketing agency', 'agency', 'cybersecurity', 'crypto', 'web3', 'b2b',
+  'manufacturing', 'retail', 'hospitality', 'legal', 'consulting', 'construction', 'automotive', 'gaming', 'media',
+  'biotech', 'climate', 'hr tech', 'martech', 'devtools', 'startup', 'restaurant', 'd2c',
+];
+
+function titleCase(s: string): string {
+  return s.replace(/\b([a-z])/g, (m) => m.toUpperCase()).replace(/\b(Ceo|Cto|Cfo|Coo|Cmo|Cro|Vp|Hr)\b/g, (m) => m.toUpperCase());
+}
+
+/** Bounds and validates whatever the model (or the heuristic) produced. */
+function cleanLeadFilters(raw: any): LeadFilters {
+  const str = (v: unknown, max: number) => (typeof v === 'string' ? v.trim().replace(/\s+/g, ' ').slice(0, max) : '');
+  let country = str(raw?.country, 40).toUpperCase();
+  if (country && !/^[A-Z]{2}$/.test(country)) country = countryLookup().get(country.toLowerCase()) ?? '';
+  if (country && !ISO_CODES.includes(country)) country = '';
+  let location = str(raw?.location, 80);
+  // The country is its own filter; repeating it as the location ANDs twice.
+  if (location && countryLookup().get(location.toLowerCase()) === country) location = '';
+  const keywords = Array.isArray(raw?.keywords)
+    ? [...new Set(raw.keywords.map((k: unknown) => str(k, 40).toLowerCase()).filter(Boolean))].slice(0, 5) as string[]
+    : [];
+  return {
+    title: str(raw?.title, 80),
+    keywords,
+    country,
+    location,
+    company: str(raw?.company, 80),
+  };
+}
+
+/** No-AI fallback: pulls a known title, keywords, country, city and domain out of the text. */
+function heuristicLeadFilters(text: string): LeadFilters {
+  const lower = ` ${text.toLowerCase()} `;
+  const title = TITLE_WORDS.find((t) => lower.includes(` ${t}`)) ?? '';
+  // Whole words, singular or plural ("restaurant" matches "restaurants").
+  const keywords = KEYWORD_WORDS.filter((k) => new RegExp(`[^a-z]${k.replace(/[-]/g, '\\-')}s?[^a-z]`).test(lower)).slice(0, 5);
+  let country = '';
+  for (const [name, code] of countryLookup()) {
+    if (name.length > 2 && lower.includes(` ${name}`)) {
+      country = code;
+      break;
+    }
+  }
+  const inMatch = text.match(/\bin\s+([A-Z][\w.'-]*(?:\s+[A-Z][\w.'-]*){0,2})/);
+  let location = inMatch ? inMatch[1] : '';
+  if (location && countryLookup().has(location.toLowerCase())) {
+    country = country || countryLookup().get(location.toLowerCase())!;
+    location = '';
+  }
+  const domain = text.match(/\b([a-z0-9-]+\.(?:com|io|co|ai|so|in|net|org|app|dev))\b/i)?.[1] ?? '';
+  return cleanLeadFilters({
+    // List entries are singular and matched as prefixes, so "founders" -> "Founder".
+    title: title ? titleCase(title) : '',
+    keywords,
+    country,
+    location,
+    company: domain,
+  });
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders() });
   if (req.method !== 'POST') return fail('Method not allowed', 405);
@@ -526,6 +641,48 @@ Deno.serve(async (req) => {
       avoid: [...NOISE_PHRASES].slice(0, 5), source: 'fallback',
       site_fetched: siteText.length > 0,
     });
+  }
+
+  // ---- Lead search filters from a sentence -------------------------------
+  // "Founders of SaaS startups in Bangalore" -> { title, keywords, country,
+  // location, company }. Everything returned is validated, so a model that
+  // invents a field or a non-ISO country cannot reach the leads search.
+  if (action === 'lead-filters') {
+    const description = String(body?.description ?? '').trim().slice(0, 300);
+    if (description.length < 3) return fail('Describe who you want to find.');
+
+    const fallback = heuristicLeadFilters(description);
+    if (!apiKey) return json({ ok: true, filters: fallback, source: 'fallback' });
+
+    try {
+      const text = await chat(
+        apiKey,
+        [
+          {
+            role: 'system',
+            content:
+              'You turn a B2B prospecting request into search filters. Reply with one JSON object only: ' +
+              '{"title": string, "keywords": string[], "country": string, "location": string, "company": string}. ' +
+              'title = one job title (e.g. "Founder", "VP Sales"), empty if none. keywords = up to 5 short industry or ' +
+              'topic terms (e.g. "saas", "fintech"), no job titles, no locations. country = ISO 3166-1 alpha-2 code or "". ' +
+              'location = a city, state or region in plain text or "" (never the country itself). company = a company ' +
+              'name or domain only if one is named, else "". Never invent details that are not in the request.',
+          },
+          { role: 'user', content: description },
+        ],
+        { temperature: 0, maxTokens: 200, jsonMode: true },
+      );
+      if (text) {
+        const parsed = JSON.parse(text.split(FENCE + 'json').join('').split(FENCE).join('').trim());
+        const filters = cleanLeadFilters(parsed);
+        if (filters.title || filters.keywords.length || filters.country || filters.location || filters.company) {
+          return json({ ok: true, filters, source: 'openai' });
+        }
+      }
+    } catch (err) {
+      console.warn('[ai] lead-filters failed:', err);
+    }
+    return json({ ok: true, filters: fallback, source: 'fallback' });
   }
 
   // ---- Outreach draft ----------------------------------------------------

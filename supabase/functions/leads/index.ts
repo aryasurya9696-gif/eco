@@ -124,6 +124,31 @@ function hasRevealedEmail(row: any): boolean {
 }
 
 /**
+ * What an email lookup's verifier said, and whether it may be charged.
+ *
+ * Treg puts the verifier's answer at _treg.verification.verdict: valid,
+ * invalid, catch_all, risky or unknown (or `checked: false` / `pending: true`
+ * when no verdict exists yet). Only a `valid` address is charged. Every other
+ * found address is still shown — labelled unconfirmed — but costs nothing;
+ * an `invalid` one is treated as not found at all. The old code charged every
+ * hit and defaulted a missing verdict to "valid".
+ */
+interface EmailVerdict {
+  status: string;
+  charge: boolean;
+  usable: boolean;
+}
+function classifyEmail(resJson: any): EmailVerdict {
+  const v = resJson?._treg?.verification;
+  const verdict = typeof v?.verdict === 'string' ? v.verdict.toLowerCase() : '';
+  if (verdict === 'valid') return { status: 'valid', charge: true, usable: true };
+  if (verdict === 'invalid') return { status: 'invalid', charge: false, usable: false };
+  if (verdict === 'catch_all') return { status: 'accept_all', charge: false, usable: true };
+  if (verdict === 'risky') return { status: 'risky', charge: false, usable: true };
+  return { status: v?.pending ? 'pending' : 'unknown', charge: false, usable: true };
+}
+
+/**
  * One provider search call.
  *
  * A failure is reported as `null` rather than an empty list so the caller can
@@ -137,6 +162,7 @@ async function tregPeopleSearch(
   payload: Record<string, any>,
   feature: string,
   tagDomain?: string,
+  usage?: UsageLog,
 ): Promise<any[] | null> {
   try {
     const res = await fetch(`${TREG_BASE}/call/treg.people.search`, {
@@ -144,12 +170,14 @@ async function tregPeopleSearch(
       headers: {
         'X-Treg-Token': token,
         'X-Treg-Meta': `customer=${userId}, feature=${feature}`,
+        'X-Treg-Route-Max-Cost': MAX_COST.search,
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
     });
+    usage?.track('treg.people.search', res, { feature, batch: true });
     if (!res.ok) {
       console.warn('[leads] treg.people.search batch failed:', res.status);
       return null;
@@ -159,6 +187,7 @@ async function tregPeopleSearch(
     if (!Array.isArray(people)) return [];
     return tagDomain ? people.map((p: any) => ({ ...p, _searched_domain: tagDomain })) : people;
   } catch (err: any) {
+    usage?.track('treg.people.search', null, { feature, batch: true, error: err?.name || 'error' });
     console.warn('[leads] treg.people.search batch error:', err?.name || err?.message);
     return null;
   }
@@ -245,6 +274,147 @@ async function resolveToken(admin: ReturnType<typeof createClient>): Promise<str
   }
   tregToken = data.value;
   return tregToken;
+}
+
+
+// ---------------------------------------------------------------------------
+// Pricing, cost caps and usage logging
+// ---------------------------------------------------------------------------
+
+/**
+ * Most Treg may spend on one routed call. Treg's default is $1, and the
+ * search route used to send no cap at all — a single 100-person call could
+ * cost $0.30 while the user paid nothing. Each cap leaves at least ~20%
+ * margin on the credit price (1 credit = $0.05): email 1 cr vs $0.04, phone
+ * 2 cr vs $0.08, and a 100-lead search call vs the 2 credits it can earn.
+ */
+const MAX_COST = { search: '0.05', email: '0.04', phone: '0.08' } as const;
+
+/** Leads per search that cost nothing; every further block is charged. */
+const SEARCH_FREE_LEADS = 25;
+const SEARCH_LEADS_PER_BLOCK = 50;
+/** Abuse guard: free searches still cost us provider money. */
+const SEARCH_RATE_LIMIT_PER_HOUR = 30;
+
+interface Prices {
+  email: number;
+  phone: number;
+  searchBlock: number;
+}
+
+// Searching itself is not charged: users pay only for verified contacts found.
+// A search does require a balance, so it can deliver those contacts.
+const FALLBACK_PRICES: Prices = { email: 1, phone: 2, searchBlock: 0 };
+let priceCache: { at: number; prices: Prices } | null = null;
+
+/**
+ * Credit prices come from pricing_config, so changing a price is a data change
+ * rather than a deploy. The constants above are only the fallback when the
+ * table cannot be read; they match the seeded rows.
+ */
+async function loadPrices(admin: any): Promise<Prices> {
+  if (priceCache && Date.now() - priceCache.at < 60_000) return priceCache.prices;
+  const prices = { ...FALLBACK_PRICES };
+  try {
+    const { data, error } = await admin
+      .from('pricing_config')
+      .select('operation, credits, enabled')
+      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'leads.search.extra_50']);
+    if (!error && Array.isArray(data)) {
+      for (const row of data) {
+        const credits = Number(row.credits);
+        if (!row.enabled || !Number.isFinite(credits) || credits < 0) continue;
+        if (row.operation === 'treg.people.email.find') prices.email = credits;
+        if (row.operation === 'treg.people.phone.find') prices.phone = credits;
+        if (row.operation === 'leads.search.extra_50') prices.searchBlock = credits;
+      }
+    }
+  } catch (err: any) {
+    console.warn('[leads] pricing lookup failed, using defaults:', err?.message);
+  }
+  priceCache = { at: Date.now(), prices };
+  return prices;
+}
+
+/** Credits a search returning `leads` people costs: the first 25 are free. */
+function searchCreditsFor(leads: number, prices: Prices): number {
+  return Math.ceil(Math.max(0, leads - SEARCH_FREE_LEADS) / SEARCH_LEADS_PER_BLOCK) * prices.searchBlock;
+}
+
+interface UsageRow {
+  user_id: string;
+  idempotency_key: string;
+  operation: string;
+  provider: string;
+  provider_call_id: string | null;
+  provider_cost_usd: number;
+  credits_charged: number;
+  revenue_usd: number;
+  outcome: 'success' | 'free' | 'upstream_failed' | 'not_billed' | 'uncertain';
+  http_status: number | null;
+  metadata: Record<string, unknown>;
+}
+
+/**
+ * One api_usage row per Treg call, carrying what Treg actually charged
+ * (x-treg-cost-micro). None of the leads calls were recorded before, so the
+ * margin reports could not see a cent of leads spend. Revenue stays in the
+ * wallet ledger (wallet_settle); these rows carry the credits for context.
+ */
+class UsageLog {
+  rows: UsageRow[] = [];
+  constructor(private userId: string) {}
+
+  track(operation: string, res: Response | null, meta: Record<string, unknown> = {}): UsageRow {
+    const costMicro = res ? Number(res.headers.get('x-treg-cost-micro') || 0) : 0;
+    const cost = Number.isFinite(costMicro) && costMicro > 0 ? costMicro / 1e6 : 0;
+    const row: UsageRow = {
+      user_id: this.userId,
+      idempotency_key: `leads:${operation}:${crypto.randomUUID()}`,
+      operation,
+      provider: 'treg',
+      provider_call_id: res?.headers.get('x-treg-call-id') ?? null,
+      provider_cost_usd: Number(cost.toFixed(8)),
+      credits_charged: 0,
+      revenue_usd: 0,
+      outcome: !res ? 'uncertain' : res.ok ? (cost > 0 ? 'success' : 'free') : cost > 0 ? 'upstream_failed' : 'not_billed',
+      http_status: res?.status ?? null,
+      metadata: meta,
+    };
+    this.rows.push(row);
+    return row;
+  }
+
+  async flush(admin: any) {
+    if (this.rows.length === 0) return;
+    const rows = this.rows;
+    this.rows = [];
+    const { error } = await admin.from('api_usage').upsert(rows, { onConflict: 'idempotency_key', ignoreDuplicates: true });
+    if (error) console.error('[leads] usage record failed:', error.message);
+  }
+}
+
+/** Credits this user can spend right now (balance minus held credits). */
+async function walletAvailable(admin: any, userId: string): Promise<number> {
+  const { data, error } = await admin.from('wallet').select('balance, reserved').eq('user_id', userId).maybeSingle();
+  if (error || !data) return 0;
+  return Math.max(0, Number(data.balance ?? 0) - Number(data.reserved ?? 0));
+}
+
+/** Searches this user ran in the last hour (one api_usage row per search). */
+async function recentSearchCount(admin: any, userId: string): Promise<number> {
+  const since = new Date(Date.now() - 3600_000).toISOString();
+  const { count, error } = await admin
+    .from('api_usage')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('operation', 'leads.search')
+    .gte('created_at', since);
+  if (error) {
+    console.warn('[leads] rate-limit count failed:', error.message);
+    return 0;
+  }
+  return count ?? 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +854,28 @@ Deno.serve(async (req: Request) => {
   }
 
   const action = body.action || 'search';
+  const usage = new UsageLog(userId);
+  try {
+    return await handleAction();
+  } finally {
+    await usage.flush(admin);
+  }
+
+  async function handleAction(): Promise<Response> {
+  // =========================================================================
+  // ACTION 0: PRICING — what the UI quotes, from the same source the charges use
+  // =========================================================================
+  if (action === 'pricing') {
+    const prices = await loadPrices(admin);
+    return json({
+      ok: true,
+      email_credits: prices.email,
+      phone_credits: prices.phone,
+      search_free_leads: SEARCH_FREE_LEADS,
+      search_block_leads: SEARCH_LEADS_PER_BLOCK,
+      search_block_credits: prices.searchBlock,
+    });
+  }
 
   // =========================================================================
   // ACTION 1: SEARCH (Directory Prospecting with Batch & Bulk Limits)
@@ -696,6 +888,11 @@ Deno.serve(async (req: Request) => {
     const country = cleanFilter(body.country).toUpperCase();
     const industry = cleanFilter(body.industry);
     const requestedLimit = sanitizeSearchLimit(body.limit);
+    // Treg's documented `keywords` list filter. Bounded so a client cannot
+    // send an unbounded payload upstream.
+    const keywords: string[] = Array.isArray(body.keywords)
+      ? [...new Set(body.keywords.map((k: unknown) => cleanFilter(k).slice(0, 60)).filter(Boolean))].slice(0, 10) as string[]
+      : [];
 
     // The provider expects an ISO 3166-1 alpha-2 code. A free-text value such
     // as "United States" was forwarded as-is and silently matched nobody.
@@ -712,9 +909,61 @@ Deno.serve(async (req: Request) => {
     const domainList = targetParts.filter((d: string) => d.includes('.'));
     const companyNames = targetParts.filter((d: string) => !d.includes('.'));
 
-    if (domainList.length === 0 && companyNames.length === 0 && !title && !query && !location && !country && !industry) {
+    if (domainList.length === 0 && companyNames.length === 0 && !title && !query && !location && !country && !industry && keywords.length === 0) {
       return fail('Please provide search criteria (persona, title, company, or country).');
     }
+
+    // A search only makes sense with credits to reveal what it finds: every
+    // result is checked for a verified email/phone and charged per hit. With
+    // an empty wallet the provider search would be paid for and shown nothing.
+    const prices = await loadPrices(admin);
+    const minimumCredits = Math.max(1, Math.min(prices.email, prices.phone));
+    if ((await walletAvailable(admin, userId)) < minimumCredits) {
+      return fail('Add credits to search. You pay only for verified emails and phone numbers that are found.', 402, {
+        insufficient_credits: true,
+        needs_credits_to_search: true,
+      });
+    }
+
+    // Searches cost provider money even when nothing is found, so they are
+    // rate-limited.
+    if ((await recentSearchCount(admin, userId)) >= SEARCH_RATE_LIMIT_PER_HOUR) {
+      return fail(
+        `You have run ${SEARCH_RATE_LIMIT_PER_HOUR} searches in the last hour. Please wait a few minutes and try again.`,
+        429,
+        { rate_limited: true },
+      );
+    }
+
+    // The first SEARCH_FREE_LEADS leads are free; each further block of 50 is
+    // held up front at the most the search can cost, then settled on what was
+    // actually returned — a search that comes back short is refunded.
+    const maxSearchCredits = searchCreditsFor(requestedLimit, prices);
+    const searchKey = `search_${userId}_${crypto.randomUUID()}`;
+    let searchHold: Reservation | null = null;
+    let billableLeads = 0;
+    if (maxSearchCredits > 0) {
+      const hold = await reserveCredits(admin, userId, maxSearchCredits, searchKey, {
+        feature: 'leads_search',
+        requested_limit: requestedLimit,
+      });
+      if ('shortfall' in hold) {
+        const blocks = prices.searchBlock > 0 ? Math.floor(Math.max(0, hold.available) / prices.searchBlock) : 0;
+        return fail(
+          `This search needs up to ${maxSearchCredits} credits; you have ${hold.available}.`,
+          402,
+          {
+            insufficient_credits: true,
+            required: maxSearchCredits,
+            available: hold.available,
+            affordable_limit: Math.min(requestedLimit, SEARCH_FREE_LEADS + blocks * SEARCH_LEADS_PER_BLOCK),
+          },
+        );
+      }
+      searchHold = hold;
+    }
+    const searchRow = usage.track('leads.search', null, { requested_limit: requestedLimit });
+    searchRow.outcome = 'free';
 
     try {
       let allRawPeople: any[] = [];
@@ -750,12 +999,13 @@ Deno.serve(async (req: Request) => {
           if (country) payload.country = country;
           if (location) payload.location = location;
           if (industry) payload.industry = industry;
+          if (keywords.length) payload.keywords = keywords;
           const variants =
             rounds > 1 ? buildSearchVariations(payload, rounds - 1) : [];
           return [
-            tregPeopleSearch(token, userId, payload, 'leads-multi-domain', domain),
+            tregPeopleSearch(token, userId, payload, 'leads-multi-domain', domain, usage),
             ...variants.map((v) =>
-              tregPeopleSearch(token, userId, v, 'leads-multi-domain', domain),
+              tregPeopleSearch(token, userId, v, 'leads-multi-domain', domain, usage),
             ),
           ];
         });
@@ -782,6 +1032,7 @@ Deno.serve(async (req: Request) => {
         if (combinedQuery) payload.q = combinedQuery;
         if (country) payload.country = country;
         if (location) payload.location = location;
+        if (keywords.length) payload.keywords = keywords;
 
         let tregRes: Response;
         try {
@@ -790,13 +1041,16 @@ Deno.serve(async (req: Request) => {
             headers: {
               'X-Treg-Token': token,
               'X-Treg-Meta': `customer=${userId}, feature=leads-search`,
+              'X-Treg-Route-Max-Cost': MAX_COST.search,
               'Content-Type': 'application/json',
               Accept: 'application/json',
             },
             body: JSON.stringify(payload),
             signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
           });
+          usage.track('treg.people.search', tregRes, { feature: 'leads-search' });
         } catch (err: any) {
+          usage.track('treg.people.search', null, { feature: 'leads-search', error: err?.name || 'error' });
           console.error('[leads] treg.people.search unreachable:', err?.name || err?.message);
           return fail('The lead search provider did not respond in time. Please try again.', 504);
         }
@@ -822,7 +1076,7 @@ Deno.serve(async (req: Request) => {
             );
             const variations = buildSearchVariations(payload, extraCalls);
             const extraResults = await Promise.all(
-              variations.map((v) => tregPeopleSearch(token, userId, v, 'leads-search-p2')),
+              variations.map((v) => tregPeopleSearch(token, userId, v, 'leads-search-p2', undefined, usage)),
             );
             for (const batch of extraResults) {
               if (batch === null) failedBatches++;
@@ -923,6 +1177,8 @@ Deno.serve(async (req: Request) => {
       // =======================================================================
       let creditsCharged = 0;
       let enrichedCount = 0;
+      // Of those, the ones the verifier confirmed — the only ones charged.
+      let verifiedCount = 0;
       let enrichmentPending = 0;
       // Why some contacts were left unenriched: the per-search cap, or the
       // wallet. The client words its notice differently for each.
@@ -992,13 +1248,14 @@ Deno.serve(async (req: Request) => {
                         'X-Treg-Token': token,
                         'X-Treg-Meta': `customer=${userId}, feature=auto-enrich`,
                         'X-Treg-Route-Verify': 'true',
-                        'X-Treg-Route-Max-Cost': '0.05',
+                        'X-Treg-Route-Max-Cost': MAX_COST.email,
                         'Content-Type': 'application/json',
                         Accept: 'application/json',
                       },
                       body: JSON.stringify(emailPayload),
                       signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
                     });
+                    const autoRow = usage.track('treg.people.email.find', res, { feature: 'auto-enrich' });
 
                     if (!res.ok) {
                       // Not a miss: the lookup itself failed, so the row keeps
@@ -1008,12 +1265,17 @@ Deno.serve(async (req: Request) => {
                     {
                       const data = await res.json();
                       const rawEmail = data?.output?.email || data?.raw?.data?.email || null;
-                      const email = isEmailAddress(rawEmail) ? rawEmail.trim() : null;
+                      const verdict = classifyEmail(data);
+                      const email = isEmailAddress(rawEmail) && verdict.usable ? rawEmail.trim() : null;
                       if (email) {
                         enrichedCount++;
+                        if (verdict.charge) {
+                          verifiedCount++;
+                          autoRow.credits_charged = prices.email;
+                        }
                         lead.revealed_email = email;
                         lead.work_email = email;
-                        lead.email_status = data?._treg?.verification?.verdict || 'valid';
+                        lead.email_status = verdict.status;
                         lead.is_saved = true;
 
                         // Upsert into user_leads
@@ -1057,7 +1319,7 @@ Deno.serve(async (req: Request) => {
             // thrown mid-run used to skip the settle entirely, and a held
             // reservation is money the user can see as available and cannot
             // spend. Whatever happened, the hold is closed here.
-            creditsCharged = enrichedCount;
+            creditsCharged = verifiedCount * prices.email;
             if ('id' in hold) {
               await settleCredits(
                 admin,
@@ -1072,13 +1334,19 @@ Deno.serve(async (req: Request) => {
         }
       }
 
+      billableLeads = normalized.length;
+      const searchCredits = searchCreditsFor(billableLeads, prices);
+      searchRow.credits_charged = searchCredits;
+      searchRow.metadata = { ...searchRow.metadata, returned: billableLeads };
       return json({
         ok: true,
         people: normalized,
         count: normalized.length,
         requested_limit: requestedLimit,
+        free_leads: Math.min(SEARCH_FREE_LEADS, normalized.length),
+        search_credits_charged: searchCredits,
         enriched_count: enrichedCount,
-        credits_charged: creditsCharged,
+        credits_charged: creditsCharged + searchCredits,
         enrichment_pending: enrichmentPending,
         enrichment_limited_by: enrichmentLimitedBy,
         skipped_domains: skippedDomains,
@@ -1087,6 +1355,20 @@ Deno.serve(async (req: Request) => {
     } catch (err: any) {
       console.error('[leads] search execution error:', err.message);
       return fail('Internal lead search error', 500);
+    } finally {
+      // Every exit — success, provider error, exception — closes the hold, and
+      // only leads actually returned past the free allowance are charged.
+      if (searchHold) {
+        const charge = searchCreditsFor(billableLeads, prices);
+        await settleCredits(
+          admin,
+          searchHold.id,
+          charge,
+          0,
+          searchKey,
+          `Lead search: ${billableLeads} leads (${Math.min(SEARCH_FREE_LEADS, billableLeads)} free)`,
+        );
+      }
     }
   }
 
@@ -1129,7 +1411,7 @@ Deno.serve(async (req: Request) => {
     }
 
     // 2. Reserve 1 credit in user's wallet
-    const CREDITS_REQUIRED = 1;
+    const CREDITS_REQUIRED = (await loadPrices(admin)).email;
     const runKey = `reveal_email_${userId}_${resolvedDomain}_${Date.now()}`;
     const hold = await reserveCredits(admin, userId, CREDITS_REQUIRED, runKey, {
       feature: 'lead_email_reveal',
@@ -1146,6 +1428,8 @@ Deno.serve(async (req: Request) => {
 
     // 3. Call Treg Email Finder with auto verification
     let emailFound: string | null = null;
+    // Credits this reveal costs: the full price only for a verified address.
+    let emailCharge = 0;
     let emailStatus: string = 'unknown';
     let emailConfidence = 0.9;
     let providerCostUsd = 0.0048;
@@ -1166,7 +1450,7 @@ Deno.serve(async (req: Request) => {
           'X-Treg-Token': token,
           'X-Treg-Meta': `customer=${userId}, feature=lead-email`,
           'X-Treg-Route-Verify': 'true',
-          'X-Treg-Route-Max-Cost': '0.05',
+          'X-Treg-Route-Max-Cost': MAX_COST.email,
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
@@ -1176,12 +1460,16 @@ Deno.serve(async (req: Request) => {
 
       const costMicro = Number(tregRes.headers.get('x-treg-cost-micro') || 0);
       if (costMicro > 0) providerCostUsd = costMicro / 1e6;
+      const emailRow = usage.track('treg.people.email.find', tregRes, { feature: 'lead-email' });
 
       if (tregRes.ok) {
         const resJson = await tregRes.json();
         const rawEmail = resJson?.output?.email || resJson?.raw?.data?.email || null;
-        emailFound = isEmailAddress(rawEmail) ? rawEmail.trim() : null;
-        emailStatus = resJson?._treg?.verification?.verdict || (resJson?.output?.verified ? 'valid' : 'deliverable');
+        const verdict = classifyEmail(resJson);
+        emailFound = isEmailAddress(rawEmail) && verdict.usable ? rawEmail.trim() : null;
+        emailCharge = emailFound && verdict.charge ? CREDITS_REQUIRED : 0;
+        emailRow.credits_charged = emailCharge;
+        emailStatus = verdict.status;
         emailConfidence = resJson?.output?.confidence || 0.95;
 
         // Auto-extract domain & company info from Treg if empty
@@ -1201,7 +1489,14 @@ Deno.serve(async (req: Request) => {
 
     // 4. Settle credit hold
     if (emailFound) {
-      await settleCredits(admin, hold.id, CREDITS_REQUIRED, providerCostUsd, runKey, `Revealed email for ${resolvedName}`);
+      await settleCredits(
+        admin,
+        hold.id,
+        emailCharge,
+        providerCostUsd,
+        runKey,
+        emailCharge > 0 ? `Revealed verified email for ${resolvedName}` : `Unconfirmed email for ${resolvedName} - not charged`,
+      );
     } else {
       await settleCredits(admin, hold.id, 0, 0, runKey, `No email found - refund`);
       return fail('No verified email found for this lead. Zero credits charged.', 404, { no_hit: true });
@@ -1244,7 +1539,7 @@ Deno.serve(async (req: Request) => {
       return json({
         ok: true,
         lead: { ...leadRecord, full_name: 'Unknown contact', is_saved: false },
-        credits_charged: CREDITS_REQUIRED,
+        credits_charged: emailCharge,
         persisted: false,
       });
     }
@@ -1262,7 +1557,8 @@ Deno.serve(async (req: Request) => {
     return json({
       ok: true,
       lead: savedLead || leadRecord,
-      credits_charged: CREDITS_REQUIRED,
+      credits_charged: emailCharge,
+      verified: emailCharge > 0,
       persisted: !saveErr,
     });
   }
@@ -1345,7 +1641,8 @@ Deno.serve(async (req: Request) => {
     }
 
     // Reserve credits for the batch
-    const creditsToHold = Math.min(neededLeads.length, MAX_BULK);
+    const emailPrice = (await loadPrices(admin)).email;
+    const creditsToHold = Math.min(neededLeads.length, MAX_BULK) * emailPrice;
     const runKey = `bulk_reveal_${userId}_${Date.now()}`;
     const hold = await reserveCredits(admin, userId, creditsToHold, runKey, {
       feature: 'bulk_lead_email_reveal',
@@ -1361,14 +1658,19 @@ Deno.serve(async (req: Request) => {
     }
 
     // Execute email finds concurrently (batches of 5)
-    const batch = neededLeads.slice(0, creditsToHold);
+    const batch = neededLeads.slice(0, Math.min(neededLeads.length, MAX_BULK));
     let successfulReveals = 0;
+    // Only verified addresses are charged; unconfirmed ones are returned free.
+    let verifiedReveals = 0;
     let totalProviderCostUsd = 0;
     const updatedRecords: any[] = [];
     // Leads the provider answered for but had no address. A failed or timed-out
     // lookup is deliberately not listed: the client marks these rows "Not
     // found", and that must not happen to a row that was never really tried.
     const notFoundKeys: string[] = [];
+    // Lookups that errored or timed out. Reported separately so the client
+    // can offer a retry instead of claiming the person has no email.
+    const failedKeys: string[] = [];
 
     const batchSize = 5;
     for (let i = 0; i < batch.length; i += batchSize) {
@@ -1387,17 +1689,23 @@ Deno.serve(async (req: Request) => {
                 'X-Treg-Token': token,
                 'X-Treg-Meta': `customer=${userId}, feature=bulk-email`,
                 'X-Treg-Route-Verify': 'true',
-                'X-Treg-Route-Max-Cost': '0.05',
+                'X-Treg-Route-Max-Cost': MAX_COST.email,
                 'Content-Type': 'application/json',
               },
               body: JSON.stringify(emailPayload),
               signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
             });
 
+            const bulkRow = usage.track('treg.people.email.find', tregRes, { feature: 'bulk-email' });
             if (tregRes.ok) {
               const resJson = await tregRes.json();
               const rawEmail = resJson?.output?.email || resJson?.raw?.data?.email;
-              const email = isEmailAddress(rawEmail) ? rawEmail.trim() : null;
+              const verdict = classifyEmail(resJson);
+              const email = isEmailAddress(rawEmail) && verdict.usable ? rawEmail.trim() : null;
+              if (email && verdict.charge) {
+                verifiedReveals++;
+                bulkRow.credits_charged = emailPrice;
+              }
               const costMicro = Number(tregRes.headers.get('x-treg-cost-micro') || 0);
               totalProviderCostUsd += costMicro > 0 ? costMicro / 1e6 : 0.0048;
 
@@ -1418,8 +1726,8 @@ Deno.serve(async (req: Request) => {
                   linkedin_url: lead.linkedin_url || null,
                   location: lead.location || null,
                   work_email: email,
-                  email_status: resJson?._treg?.verification?.verdict || 'valid',
-                  email_confidence: 0.95,
+                  email_status: verdict.status,
+                  email_confidence: verdict.charge ? 0.95 : 0.5,
                   // Carry the existing stage forward. Hardcoding 'new' moved a
                   // prospect the user had already marked "Replied" back to the
                   // top of the pipeline every time its email was re-resolved.
@@ -1427,23 +1735,26 @@ Deno.serve(async (req: Request) => {
                   updated_at: new Date().toISOString(),
                 });
               }
+            } else {
+              failedKeys.push(`${(lead.company_domain || '').toLowerCase().trim()}::${(lead.full_name || '').toLowerCase().trim()}`);
             }
           } catch (err: any) {
-            console.warn('[leads] bulk email item failed:', err.message);
+            failedKeys.push(`${(lead.company_domain || '').toLowerCase().trim()}::${(lead.full_name || '').toLowerCase().trim()}`);
+            console.warn('[leads] bulk email item failed:', err?.name || err?.message);
           }
         })
       );
     }
 
     // Settle credits: ONLY charge for successful reveals!
-    const creditsCharged = successfulReveals * 1;
+    const creditsCharged = verifiedReveals * emailPrice;
     await settleCredits(
       admin,
       hold.id,
       creditsCharged,
       totalProviderCostUsd,
       runKey,
-      `Bulk revealed ${successfulReveals} emails (${batch.length - successfulReveals} missed/refunded)`
+      `Bulk revealed ${successfulReveals} emails, ${verifiedReveals} verified and charged (${batch.length - verifiedReveals} not charged)`
     );
 
     // Save all successful records to user_leads
@@ -1474,10 +1785,194 @@ Deno.serve(async (req: Request) => {
       processed_count: batch.length,
       capped_count: Math.max(0, neededLeads.length - batch.length),
       revealed_count: successfulReveals,
+      verified_count: verifiedReveals,
       credits_charged: creditsCharged,
       skipped_count: neededLeads.length - batch.length,
       updated_records: updatedRecords,
+      // Leads in this request whose address was already on file. Returned so
+      // the client can show them without a second round trip.
+      existing_records: leadsToReveal
+        .map((l: any) => existingMap.get(`${(l.company_domain || '').toLowerCase().trim()}::${(l.full_name || '').toLowerCase().trim()}`))
+        .filter(Boolean),
       not_found_keys: notFoundKeys,
+      failed_keys: failedKeys,
+    });
+  }
+
+  // =========================================================================
+  // ACTION 3b: BULK REVEAL PHONES (2 credits per number found)
+  // -------------------------------------------------------------------------
+  // Same contract as bulk-reveal-email: credits are held for the batch up
+  // front, only numbers actually found are charged, and the response says per
+  // lead whether it was found, not found, or failed. The provider has no batch
+  // endpoint, so the batch is small and the lookups run five at a time.
+  // =========================================================================
+  if (action === 'bulk-reveal-phone') {
+    const MAX_BULK_PHONE = 25;
+    const PHONE_CREDITS = (await loadPrices(admin)).phone;
+    const keyOf = (l: any) =>
+      `${(l.company_domain || '').toLowerCase().trim()}::${(l.full_name || '').toLowerCase().trim()}`;
+
+    const requested: any[] = (Array.isArray(body.leads) ? body.leads : [])
+      .slice(0, 2000)
+      .filter(
+        (l: any) =>
+          typeof l?.full_name === 'string' &&
+          l.full_name.trim() &&
+          (cleanDomain(l.company_domain) || l.linkedin_url || isEmailAddress(l.work_email)),
+      );
+    if (requested.length === 0) return fail('No leads provided for phone lookup');
+
+    const domains = [...new Set(requested.map((l: any) => cleanDomain(l.company_domain)).filter(Boolean))];
+    let existingRows: any[] = [];
+    if (domains.length > 0) {
+      const { data } = await admin
+        .from('user_leads')
+        .select('*')
+        .eq('user_id', userId)
+        .in('company_domain', domains);
+      if (data) existingRows = data;
+    }
+    const existingByKey = new Map<string, any>();
+    existingRows.forEach((r: any) => existingByKey.set(keyOf(r), r));
+
+    // A number already on file is never bought twice.
+    const known = requested.filter((l: any) => existingByKey.get(keyOf(l))?.phone_number);
+    const needed = requested.filter((l: any) => !existingByKey.get(keyOf(l))?.phone_number);
+    const batch = needed.slice(0, MAX_BULK_PHONE);
+    const existingRecords = known.map((l: any) => existingByKey.get(keyOf(l)));
+
+    if (batch.length === 0) {
+      return json({
+        ok: true,
+        revealed_count: 0,
+        credits_charged: 0,
+        processed_count: 0,
+        capped_count: 0,
+        updated_records: [],
+        existing_records: existingRecords,
+        not_found_keys: [],
+        failed_keys: [],
+      });
+    }
+
+    const runKey = `bulk_phone_${userId}_${Date.now()}`;
+    const hold = await reserveCredits(admin, userId, batch.length * PHONE_CREDITS, runKey, {
+      feature: 'bulk_lead_phone_reveal',
+      count: batch.length,
+    });
+    if ('shortfall' in hold) {
+      return fail(`Insufficient credits. Needed: ${hold.required}, Available: ${hold.available}`, 402, {
+        insufficient_credits: true,
+        required: hold.required,
+        available: hold.available,
+      });
+    }
+
+    const updatedRecords: any[] = [];
+    const notFoundKeys: string[] = [];
+    const failedKeys: string[] = [];
+    let providerCostUsd = 0;
+
+    try {
+      for (let i = 0; i < batch.length; i += 5) {
+        await Promise.all(
+          batch.slice(i, i + 5).map(async (lead: any) => {
+            const key = keyOf(lead);
+            try {
+              const domain = cleanDomain(lead.company_domain);
+              const email = isEmailAddress(lead.work_email) ? lead.work_email.trim() : '';
+              const payload: Record<string, string> = { full_name: lead.full_name.trim() };
+              if (lead.linkedin_url) payload.linkedin_url = lead.linkedin_url;
+              if (email) payload.email = email;
+              if (domain) payload.domain = domain;
+
+              const res = await fetch(`${TREG_BASE}/call/treg.people.phone.find`, {
+                method: 'POST',
+                headers: {
+                  'X-Treg-Token': token,
+                  'X-Treg-Meta': `customer=${userId}, feature=bulk-phone`,
+                  'X-Treg-Route-Max-Cost': MAX_COST.phone,
+                  'Content-Type': 'application/json',
+                  Accept: 'application/json',
+                },
+                body: JSON.stringify(payload),
+                signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
+              });
+              const costMicro = Number(res.headers.get('x-treg-cost-micro') || 0);
+              if (costMicro > 0) providerCostUsd += costMicro / 1e6;
+              const phoneRow = usage.track('treg.people.phone.find', res, { feature: 'bulk-phone' });
+              if (!res.ok) {
+                failedKeys.push(key);
+                return;
+              }
+              const data = await res.json();
+              const phone = data?.output?.phone || data?.raw?.data?.employee_phone || null;
+              if (typeof phone !== 'string' || !phone.trim()) {
+                notFoundKeys.push(key);
+                return;
+              }
+              phoneRow.credits_charged = PHONE_CREDITS;
+              updatedRecords.push({
+                user_id: userId,
+                full_name: lead.full_name.trim(),
+                first_name: lead.first_name || lead.full_name.trim().split(' ')[0] || '',
+                last_name: lead.last_name || lead.full_name.trim().split(' ').slice(1).join(' ') || '',
+                title: lead.title || 'Executive',
+                company_name: lead.company_name || (domain ? domain.split('.')[0] : ''),
+                company_domain: domain,
+                linkedin_url: lead.linkedin_url || null,
+                location: lead.location || null,
+                // Omitted when unknown: on a conflict an explicit null would
+                // erase the address this row already had.
+                ...(email ? { work_email: email } : {}),
+                phone_number: phone.trim(),
+                phone_type: data?.output?.line_type || 'mobile',
+                updated_at: new Date().toISOString(),
+              });
+            } catch (err: any) {
+              failedKeys.push(key);
+              console.warn('[leads] bulk phone item failed:', err?.name || err?.message);
+            }
+          }),
+        );
+      }
+    } finally {
+      // Settled from `finally` so an exception mid-batch cannot leave the
+      // hold open. Only numbers actually found are charged.
+      await settleCredits(
+        admin,
+        hold.id,
+        updatedRecords.length * PHONE_CREDITS,
+        providerCostUsd,
+        runKey,
+        `Bulk revealed ${updatedRecords.length} phones (${batch.length - updatedRecords.length} not charged)`,
+      );
+    }
+
+    if (updatedRecords.length > 0) {
+      const { data: savedRows, error: saveErr } = await admin
+        .from('user_leads')
+        .upsert(updatedRecords, { onConflict: 'user_id,company_domain,full_name' })
+        .select('id, company_domain, full_name');
+      if (saveErr) console.error('[leads] bulk phone upsert failed:', saveErr.message);
+      const idByKey = new Map<string, string>();
+      (savedRows || []).forEach((r: any) => idByKey.set(keyOf(r), r.id));
+      updatedRecords.forEach((r: any) => {
+        r.id = idByKey.get(keyOf(r)) || r.id;
+      });
+    }
+
+    return json({
+      ok: true,
+      revealed_count: updatedRecords.length,
+      credits_charged: updatedRecords.length * PHONE_CREDITS,
+      processed_count: batch.length,
+      capped_count: Math.max(0, needed.length - batch.length),
+      updated_records: updatedRecords,
+      existing_records: existingRecords,
+      not_found_keys: notFoundKeys,
+      failed_keys: failedKeys,
     });
   }
 
@@ -1513,7 +2008,7 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    const CREDITS_REQUIRED = 2;
+    const CREDITS_REQUIRED = (await loadPrices(admin)).phone;
     const runKey = `reveal_phone_${userId}_${Date.now()}`;
     const hold = await reserveCredits(admin, userId, CREDITS_REQUIRED, runKey, {
       feature: 'lead_phone_reveal',
@@ -1544,7 +2039,7 @@ Deno.serve(async (req: Request) => {
         headers: {
           'X-Treg-Token': token,
           'X-Treg-Meta': `customer=${userId}, feature=lead-phone`,
-          'X-Treg-Route-Max-Cost': '0.10',
+          'X-Treg-Route-Max-Cost': MAX_COST.phone,
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
@@ -1554,11 +2049,13 @@ Deno.serve(async (req: Request) => {
 
       const costMicro = Number(tregRes.headers.get('x-treg-cost-micro') || 0);
       if (costMicro > 0) providerCostUsd = costMicro / 1e6;
+      const singlePhoneRow = usage.track('treg.people.phone.find', tregRes, { feature: 'lead-phone' });
 
       if (tregRes.ok) {
         const resJson = await tregRes.json();
         phoneFound = resJson?.output?.phone || resJson?.raw?.data?.employee_phone || null;
         phoneType = resJson?.output?.line_type || 'mobile';
+        if (phoneFound) singlePhoneRow.credits_charged = CREDITS_REQUIRED;
       }
     } catch (err: any) {
       console.warn('[leads] phone find error:', err.message);
@@ -1744,8 +2241,23 @@ Deno.serve(async (req: Request) => {
       .upsert(uniqueRecords, { onConflict: 'user_id,company_domain,full_name' })
       .select();
 
-    if (error) return fail('Failed to save leads', 500);
-    return json({ ok: true, saved_count: data?.length || 0, leads: data });
+    if (error) {
+      console.error('[leads] bulk save failed:', error.message);
+      return fail('Failed to save leads', 500);
+    }
+    // How many were already in the pipeline, so the client can say "3 added,
+    // 2 already saved" instead of claiming every row was newly saved.
+    const alreadySaved = uniqueRecords.filter((r) =>
+      existingMap.has(`${r.company_domain}::${(r.full_name || '').toLowerCase().trim()}`),
+    ).length;
+    return json({
+      ok: true,
+      saved_count: data?.length || 0,
+      new_count: Math.max(0, (data?.length || 0) - alreadySaved),
+      already_saved_count: alreadySaved,
+      skipped_count: leadsToSave.length - records.length,
+      leads: data,
+    });
   }
 
   // =========================================================================
@@ -1934,4 +2446,5 @@ Deno.serve(async (req: Request) => {
   }
 
   return fail(`Unknown action: ${action}`);
+  }
 });

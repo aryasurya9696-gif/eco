@@ -1,327 +1,422 @@
-import React, { useState } from 'react';
+import React, { useId, useState } from 'react';
 import type { B2BLead, B2BPipelineStatus } from '../../types';
 import { LeadCard } from './LeadCard';
-import {
-  Zap,
-  Building2,
-  User,
-  Sparkles,
-  ArrowRight,
-  ShieldCheck,
-  CheckCircle2,
-  Loader2,
-} from 'lucide-react';
-
-const LinkedinIcon: React.FC<{ className?: string }> = ({ className = 'w-3.5 h-3.5' }) => (
-  <svg className={className} viewBox="0 0 24 24" fill="currentColor">
-    <path d="M19 3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14m-.5 15.5v-5.3a3.26 3.26 0 0 0-3.26-3.26c-.85 0-1.84.52-2.28 1.3v-1.11h-2.79v8.37h2.79v-4.93c0-.77.62-1.4 1.39-1.4a1.4 1.4 0 0 1 1.4 1.4v4.93h2.75M6.88 8.56a1.68 1.68 0 0 0 1.68-1.68c0-.93-.75-1.69-1.68-1.69a1.69 1.69 0 0 0-1.69 1.69c0 .93.76 1.68 1.69 1.68m1.39 9.94v-8.37H5.5v8.37h2.77z"/>
-  </svg>
-);
+import { LinkedinIcon } from './LeadCells';
+import type { RevealOutcome } from './LeadsTab';
+import { EMAIL_REVEAL_CREDITS, PHONE_REVEAL_CREDITS, leadKey, revealedEmail, revealedPhone } from './lead-utils';
+import { User, Building2, Search, Loader2, AlertCircle, SearchX, RefreshCw, CheckCircle2 } from 'lucide-react';
 
 interface QuickLookupViewProps {
-  /** Returns the persisted lead so the card can render what was actually found. */
-  onRevealEmail: (lead: B2BLead) => Promise<B2BLead | null>;
-  onRevealPhone: (lead: B2BLead) => Promise<B2BLead | null>;
+  onReveal: (lead: B2BLead, kind: 'email' | 'phone') => Promise<RevealOutcome>;
   onSaveLead: (lead: B2BLead) => Promise<B2BLead | null>;
   onStatusChange: (lead: B2BLead, status: B2BPipelineStatus) => Promise<boolean | void>;
-  revealingEmailIds: ReadonlySet<string>;
-  revealingPhoneIds: ReadonlySet<string>;
+  /** Checked first, so a contact already in the pipeline costs nothing and needs no request. */
+  savedLeads: B2BLead[];
+  availableCredits: number | null;
+  onNavigateBilling?: () => void;
 }
 
-/**
- * Turns a LinkedIn slug into something a person can read.
- *
- * "patrickcollison" was previously sent through as the literal full name, so
- * every LinkedIn lookup saved a row called "LinkedIn Prospect" with an empty
- * domain — junk that then showed up in the pipeline and could never be matched
- * against a later search. Splitting the camel-cased slug keeps one lookup from
- * colliding with another.
- */
+type Mode = 'linkedin' | 'name';
+
+type Result =
+  | { kind: 'idle' }
+  | { kind: 'loading'; label: string }
+  | { kind: 'found'; lead: B2BLead; note: string }
+  | { kind: 'not_found'; label: string; phoneTried: boolean }
+  | { kind: 'no_credits' }
+  | { kind: 'error'; message: string };
+
+const LINKEDIN_RE = /^(https?:\/\/)?([a-z]{2,3}\.)?linkedin\.com\/(in|pub)\/[^/?#\s]+/i;
+const DOMAIN_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
+
+function cleanDomain(raw: string): string {
+  // Mirrors cleanDomain() on the server: the unique key is case-sensitive,
+  // so "Stripe.com" here would become a second row for "stripe.com".
+  return raw.trim().replace(/^https?:\/\//i, '').replace(/^www\./i, '').split('/')[0].toLowerCase();
+}
+
+function linkedinSlug(url?: string | null): string | null {
+  const m = (url || '').match(/linkedin\.com\/(?:in|pub)\/([^/?#\s]+)/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+/** "patrick-collison" → Patrick Collison, so a LinkedIn lookup saves a readable row. */
 function nameFromLinkedinSlug(url: string): { first: string; last: string; full: string } | null {
-  const match = url.match(/linkedin\.com\/in\/([^/?#]+)/i);
-  const slug = match?.[1];
+  const slug = url.match(/linkedin\.com\/(?:in|pub)\/([^/?#]+)/i)?.[1];
   if (!slug) return null;
-  const spaced = slug.replace(/[-_]+/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2').trim();
-  const parts = spaced.split(/\s+/).filter(Boolean);
+  const parts = slug
+    .replace(/[-_]+/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/\b[0-9a-f]{6,}\b/gi, '') // trailing hash LinkedIn adds to duplicate names
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
   if (parts.length === 0) return null;
   const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
   const first = cap(parts[0]);
-  const last = cap(parts.slice(1).join(' '));
+  const last = parts.slice(1).map(cap).join(' ');
   return { first, last, full: `${first}${last ? ' ' + last : ''}` };
 }
 
 export const QuickLookupView: React.FC<QuickLookupViewProps> = ({
-  onRevealEmail,
-  onRevealPhone,
+  onReveal,
   onSaveLead,
   onStatusChange,
-  revealingEmailIds,
-  revealingPhoneIds,
+  savedLeads,
+  availableCredits,
+  onNavigateBilling,
 }) => {
-  const [mode, setMode] = useState<'linkedin' | 'name'>('linkedin');
+  const ids = useId();
+  const [mode, setMode] = useState<Mode>('linkedin');
   const [linkedinUrl, setLinkedinUrl] = useState('');
   const [fullName, setFullName] = useState('');
   const [companyDomain, setCompanyDomain] = useState('');
-  const [lookupLead, setLookupLead] = useState<B2BLead | null>(null);
-  const [isSearching, setIsSearching] = useState(false);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [alsoPhone, setAlsoPhone] = useState(false);
+  const [errors, setErrors] = useState<Partial<Record<'linkedin' | 'name' | 'domain', string>>>({});
+  const [result, setResult] = useState<Result>({ kind: 'idle' });
+  const [lastQuery, setLastQuery] = useState<B2BLead | null>(null);
 
-  const handleLookup = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (isSearching) return;
-    setErrorMsg(null);
+  const busy = result.kind === 'loading';
+  const walletEmpty = availableCredits !== null && availableCredits <= 0;
+  const maxCost = EMAIL_REVEAL_CREDITS + (alsoPhone ? PHONE_REVEAL_CREDITS : 0);
 
-    const cleanUrl = linkedinUrl.trim();
-    const cleanName = fullName.trim();
-    // Mirrors cleanDomain() on the server: the unique key is case-sensitive,
-    // so "Stripe.com" here would become a second row for "stripe.com" and a
-    // later lookup would charge for the same contact again.
-    const cleanDomain = companyDomain
-      .trim()
-      .replace(/^https?:\/\//i, '')
-      .replace(/^www\./i, '')
-      .split('/')[0]
-      .toLowerCase();
-
-    if (mode === 'linkedin' && !cleanUrl) {
-      setErrorMsg('Please enter a valid LinkedIn profile URL');
-      return;
+  const validate = (): B2BLead | null => {
+    const next: typeof errors = {};
+    const url = linkedinUrl.trim();
+    const name = fullName.trim().replace(/\s+/g, ' ');
+    const domain = cleanDomain(companyDomain);
+    if (mode === 'linkedin') {
+      if (!url) next.linkedin = 'Enter a LinkedIn profile URL.';
+      else if (!LINKEDIN_RE.test(url)) next.linkedin = 'Use a profile URL like linkedin.com/in/jane-doe.';
+    } else {
+      if (!name) next.name = 'Enter the person’s full name.';
+      else if (name.split(' ').length < 2) next.name = 'Enter first and last name.';
+      if (!domain) next.domain = 'Enter the company’s website domain.';
+      else if (!DOMAIN_RE.test(domain)) next.domain = 'Use a domain like stripe.com.';
     }
-    if (mode === 'linkedin' && !/^https?:\/\/(www\.)?linkedin\.com\/(in|pub)\//i.test(cleanUrl)) {
-      setErrorMsg('That does not look like a LinkedIn profile URL (expected linkedin.com/in/…).');
-      return;
-    }
-    if (mode === 'name' && (!cleanName || !cleanDomain)) {
-      setErrorMsg('Both full name and company domain are required');
-      return;
-    }
+    setErrors(next);
+    if (Object.keys(next).length > 0) return null;
 
-    // The id is derived from the input rather than Date.now(): a fresh id on
-    // every submit meant the per-lead loading flag could never match the card
-    // that was on screen, so a second click was possible while the first
-    // request was still in flight — and a second request is a second credit.
-    const identity = mode === 'linkedin' ? cleanUrl : `${cleanDomain}::${cleanName}`.toLowerCase();
-    const derived = mode === 'linkedin' ? nameFromLinkedinSlug(cleanUrl) : null;
-    const nameParts = derived ? [derived.first, derived.last] : cleanName.split(/\s+/);
-    const resolvedName = derived ? derived.full : cleanName;
-
-    const lead: B2BLead = {
+    const normalizedUrl = mode === 'linkedin' ? (url.startsWith('http') ? url : `https://${url}`) : null;
+    const derived = normalizedUrl ? nameFromLinkedinSlug(normalizedUrl) : null;
+    const resolvedName = derived ? derived.full : name;
+    const parts = derived ? [derived.first, derived.last] : resolvedName.split(' ');
+    // The id comes from the input, so the same query is always the same lead.
+    const identity = mode === 'linkedin' ? `li:${linkedinSlug(normalizedUrl)}` : `${domain}::${name.toLowerCase()}`;
+    return {
       id: `quick_${identity}`,
-      first_name: nameParts[0] || '',
-      last_name: nameParts.slice(1).join(' ') || '',
-      full_name: resolvedName || 'LinkedIn Prospect',
-      title: 'Target Decision Maker',
-      company_name: cleanDomain ? cleanDomain.split('.')[0].toUpperCase() : 'Target Company',
-      company_domain: cleanDomain,
-      linkedin_url: mode === 'linkedin' ? cleanUrl : null,
-      has_email: true,
-      has_phone: true,
+      first_name: parts[0] || '',
+      last_name: parts.slice(1).join(' '),
+      full_name: resolvedName,
+      title: '',
+      company_name: '',
+      company_domain: mode === 'name' ? domain : '',
+      linkedin_url: normalizedUrl,
       is_saved: false,
     };
+  };
 
-    // The result card used to be mounted before the request was made, so a
-    // lookup that found nothing still rendered an "Enriched Contact Result"
-    // panel over a contact with no email. Only a real result creates the card.
-    setLookupLead(null);
-    // The spinner used to be cleared before the request was even made, so the
-    // only visible effect of clicking the button was a toast.
-    setIsSearching(true);
-    try {
-      await handleRevealEmail(lead);
-    } finally {
-      setIsSearching(false);
+  const describe = (lead: B2BLead) =>
+    lead.linkedin_url ? lead.linkedin_url.replace(/^https?:\/\/(www\.)?/, '') : `${lead.full_name} at ${lead.company_domain}`;
+
+  /** A contact already in the pipeline is shown from there — no request, no credits. */
+  const findSaved = (lead: B2BLead): B2BLead | undefined => {
+    const slug = linkedinSlug(lead.linkedin_url);
+    return savedLeads.find(
+      (s) => (slug && linkedinSlug(s.linkedin_url) === slug) || (lead.company_domain && leadKey(s) === leadKey(lead)),
+    );
+  };
+
+  const run = async (query: B2BLead) => {
+    if (busy) return;
+    setLastQuery(query);
+    const label = describe(query);
+
+    const saved = findSaved(query);
+    if (saved && revealedEmail(saved) && (!alsoPhone || revealedPhone(saved))) {
+      setResult({ kind: 'found', lead: { ...saved }, note: 'Already in your pipeline — no credits used.' });
+      return;
     }
+
+    setResult({ kind: 'loading', label });
+    const email = await onReveal(saved ? { ...query, ...saved, id: query.id } : query, 'email');
+    if (email.kind === 'no_credits') return setResult({ kind: 'no_credits' });
+    if (email.kind === 'error') return setResult({ kind: 'error', message: email.message });
+
+    let lead = email.kind === 'found' ? email.lead : null;
+    let phoneNote = '';
+    let phoneTried = false;
+    if (alsoPhone && !(lead && revealedPhone(lead))) {
+      phoneTried = true;
+      const phone = await onReveal(lead ?? query, 'phone');
+      if (phone.kind === 'found') lead = { ...(lead ?? query), ...phone.lead };
+      else if (phone.kind === 'not_found') phoneNote = ' No direct phone found (not charged).';
+      else if (phone.kind === 'no_credits') phoneNote = ' Phone skipped — not enough credits.';
+      else phoneNote = ` Phone lookup failed: ${phone.message}`;
+    }
+
+    if (!lead) return setResult({ kind: 'not_found', label, phoneTried });
+    const credits = email.kind === 'found' ? email.credits : 0;
+    setResult({
+      kind: 'found',
+      lead,
+      note:
+        (email.kind === 'found' && email.cached
+          ? 'Already on file — no credits used.'
+          : email.kind === 'found'
+            ? `Found and saved to your pipeline · ${credits} credit${credits === 1 ? '' : 's'}.`
+            : 'No work email found (not charged).') + phoneNote,
+    });
   };
 
-  const handleRevealEmail = async (lead: B2BLead) => {
-  // Wrapped rather than passed straight through: the shared handler updates the
-    // Prospector's result list, which this view does not own, so its own card
-    // would have kept showing "unlisted" after paying for the reveal.
-    const revealed = await onRevealEmail(lead);
-    if (revealed) setLookupLead(revealed);
-    return revealed;
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const query = validate();
+    if (query) void run(query);
   };
 
-  const handleRevealPhone = async () => {
-    if (!lookupLead) return;
-    const revealed = await onRevealPhone(lookupLead);
-    if (revealed) setLookupLead(revealed);
-  };
+  const updateFound = (patch: (l: B2BLead) => B2BLead) =>
+    setResult((prev) => (prev.kind === 'found' ? { ...prev, lead: patch(prev.lead) } : prev));
 
-  const handleSaveLead = async (lead: B2BLead) => {
-    const saved = await onSaveLead(lead);
-    setLookupLead((prev) =>
-      prev && prev.id === lead.id
-        ? {
-            ...prev,
-            is_saved: saved !== null,
-            db_id: saved?.id || (saved === null ? null : prev.db_id),
-          }
-        : prev
-    );
-    return saved;
-  };
-
-  const handleStatusChange = async (lead: B2BLead, status: B2BPipelineStatus) => {
-    // The shared handler catches its own errors and reports a boolean, so the
-    // card must not move to the new stage when the write was rejected.
-    const applied = await onStatusChange(lead, status);
-    if (applied === false) return;
-    setLookupLead((prev) =>
-      prev && prev.id === lead.id ? { ...prev, status, is_saved: true } : prev
-    );
-  };
+  const inputCls = (error?: string) =>
+    `w-full h-10 pl-9 pr-3 bg-white border text-sm text-ink placeholder:text-muted outline-none focus:ring-2 focus:ring-ink/10 disabled:opacity-50 ${
+      error ? 'border-danger focus:border-danger' : 'border-line hover:border-line-strong focus:border-ink'
+    }`;
+  const fieldError = (id: string, msg?: string) =>
+    msg ? (
+      <p id={id} className="mt-1 text-xs text-danger flex items-center gap-1">
+        <AlertCircle className="w-3.5 h-3.5" aria-hidden />
+        {msg}
+      </p>
+    ) : null;
 
   return (
-    <div className="max-w-2xl space-y-4">
-      {/* Panel header — same shape as the Prospector panel so the two tabs
-          read as one tool rather than two different products. */}
-      <div className="bg-white border border-[#e3e3de] px-4 py-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-        <div className="flex items-center gap-2">
-          <Zap className="w-4 h-4 text-[#141414]" />
-          <h2 className="text-xs font-semibold text-[#141414] uppercase tracking-wider">
-            Single Lead Fast Reveal
-          </h2>
-        </div>
-        <p className="text-[11px] font-mono text-[#8a8a86]">
-          Resolve a verified work email, deliverability check and direct mobile for one contact.
-        </p>
-      </div>
+    <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,560px)_minmax(0,1fr)] gap-5 items-start">
+      <section className="bg-white border border-line" aria-labelledby={`${ids}-title`}>
+        <header className="px-4 sm:px-6 pt-5 pb-4 border-b border-line-soft">
+          <h2 id={`${ids}-title`} className="text-lg font-semibold text-ink">Quick lookup</h2>
+          <p className="mt-0.5 text-sm text-ink-2">Find the work email (and optionally phone) for one person you already know.</p>
+        </header>
 
-      {/* Lookup Card */}
-      <div className="bg-white border border-[#e3e3de] p-4 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
-        {/* Toggle Mode */}
-        <div className="flex border-b border-[#eeeeea] mb-5">
-          <button
-            type="button"
-            onClick={() => { setMode('linkedin'); setErrorMsg(null); }}
-            className={`pb-2.5 px-4 font-mono text-xs font-medium border-b-2 transition-all cursor-pointer flex items-center gap-2 ${
-              mode === 'linkedin'
-                ? 'border-[#141414] text-[#141414]'
-                : 'border-transparent text-[#8a8a86] hover:text-[#141414]'
-            }`}
-          >
-            <LinkedinIcon className="w-3.5 h-3.5" />
-            <span>Via LinkedIn URL</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => { setMode('name'); setErrorMsg(null); }}
-            className={`pb-2.5 px-4 font-mono text-xs font-medium border-b-2 transition-all cursor-pointer flex items-center gap-2 ${
-              mode === 'name'
-                ? 'border-[#141414] text-[#141414]'
-                : 'border-transparent text-[#8a8a86] hover:text-[#141414]'
-            }`}
-          >
-            <User className="w-3.5 h-3.5" />
-            <span>Via Name &amp; Domain</span>
-          </button>
-        </div>
+        <form onSubmit={handleSubmit} noValidate className="px-4 sm:px-6 py-5 space-y-4">
+          <div className="inline-flex border border-line" role="tablist" aria-label="Look up by">
+            {([
+              ['linkedin', 'LinkedIn URL', <LinkedinIcon key="i" className="w-4 h-4" />],
+              ['name', 'Name & company', <User key="u" className="w-4 h-4" aria-hidden />],
+            ] as const).map(([id, label, icon]) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={mode === id}
+                onClick={() => {
+                  setMode(id);
+                  setErrors({});
+                }}
+                disabled={busy}
+                className={`h-9 px-3 text-sm flex items-center gap-2 border-r border-line last:border-r-0 cursor-pointer ${
+                  mode === id ? 'bg-ink text-white font-medium' : 'bg-white text-ink-2 hover:bg-fill'
+                }`}
+              >
+                {icon}
+                {label}
+              </button>
+            ))}
+          </div>
 
-        <form onSubmit={handleLookup} className="space-y-4">
           {mode === 'linkedin' ? (
             <div>
-              <label className="block text-[11px] font-mono font-medium text-[#8a8a86] mb-1.5 uppercase tracking-wider">
-                LinkedIn Profile URL
-              </label>
+              <label htmlFor={`${ids}-li`} className="block text-[13px] font-medium text-ink-2 mb-1.5">LinkedIn profile URL</label>
               <div className="relative">
-                <LinkedinIcon className="w-4 h-4 text-[#8a8a86] absolute left-3 top-1/2 -translate-y-1/2" />
+                <LinkedinIcon className="w-4 h-4 text-muted absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
+                  id={`${ids}-li`}
                   type="url"
+                  inputMode="url"
                   value={linkedinUrl}
                   onChange={(e) => setLinkedinUrl(e.target.value)}
-                  placeholder="https://www.linkedin.com/in/patrickcollison"
-                  className="w-full pl-9 pr-3 py-2 bg-[#fafaf8] border border-[#e3e3de] focus:border-[#141414] focus:bg-white text-sm text-[#141414] placeholder-[#8a8a86] font-mono outline-none"
+                  placeholder="linkedin.com/in/jane-doe"
+                  disabled={busy}
+                  aria-invalid={Boolean(errors.linkedin)}
+                  aria-describedby={errors.linkedin ? `${ids}-li-err` : undefined}
+                  className={inputCls(errors.linkedin)}
                 />
               </div>
+              {fieldError(`${ids}-li-err`, errors.linkedin)}
             </div>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
-                <label className="block text-[11px] font-mono font-medium text-[#8a8a86] mb-1.5 uppercase tracking-wider">
-                  Executive Full Name
-                </label>
+                <label htmlFor={`${ids}-name`} className="block text-[13px] font-medium text-ink-2 mb-1.5">Full name</label>
                 <div className="relative">
-                  <User className="w-4 h-4 text-[#8a8a86] absolute left-3 top-1/2 -translate-y-1/2" />
+                  <User className="w-4 h-4 text-muted absolute left-3 top-1/2 -translate-y-1/2" aria-hidden />
                   <input
+                    id={`${ids}-name`}
                     type="text"
+                    autoComplete="off"
                     value={fullName}
                     onChange={(e) => setFullName(e.target.value)}
-                    placeholder="Patrick Collison"
-                    className="w-full pl-9 pr-3 py-2 bg-[#fafaf8] border border-[#e3e3de] focus:border-[#141414] focus:bg-white text-sm text-[#141414] placeholder-[#8a8a86] font-mono outline-none"
+                    placeholder="Jane Doe"
+                    disabled={busy}
+                    aria-invalid={Boolean(errors.name)}
+                    aria-describedby={errors.name ? `${ids}-name-err` : undefined}
+                    className={inputCls(errors.name)}
                   />
                 </div>
+                {fieldError(`${ids}-name-err`, errors.name)}
               </div>
               <div>
-                <label className="block text-[11px] font-mono font-medium text-[#8a8a86] mb-1.5 uppercase tracking-wider">
-                  Company Domain
-                </label>
+                <label htmlFor={`${ids}-domain`} className="block text-[13px] font-medium text-ink-2 mb-1.5">Company domain</label>
                 <div className="relative">
-                  <Building2 className="w-4 h-4 text-[#8a8a86] absolute left-3 top-1/2 -translate-y-1/2" />
+                  <Building2 className="w-4 h-4 text-muted absolute left-3 top-1/2 -translate-y-1/2" aria-hidden />
                   <input
+                    id={`${ids}-domain`}
                     type="text"
+                    autoComplete="off"
                     value={companyDomain}
                     onChange={(e) => setCompanyDomain(e.target.value)}
                     placeholder="stripe.com"
-                    className="w-full pl-9 pr-3 py-2 bg-[#fafaf8] border border-[#e3e3de] focus:border-[#141414] focus:bg-white text-sm text-[#141414] placeholder-[#8a8a86] font-mono outline-none"
+                    disabled={busy}
+                    aria-invalid={Boolean(errors.domain)}
+                    aria-describedby={errors.domain ? `${ids}-domain-err` : undefined}
+                    className={inputCls(errors.domain)}
                   />
                 </div>
+                {fieldError(`${ids}-domain-err`, errors.domain)}
               </div>
             </div>
           )}
 
-          {errorMsg && (
-            <p className="text-xs text-rose-600 font-mono">{errorMsg}</p>
-          )}
+          <label className="flex items-center gap-2.5 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={alsoPhone}
+              onChange={(e) => setAlsoPhone(e.target.checked)}
+              disabled={busy}
+              className="w-4 h-4 accent-ink"
+            />
+            <span className="text-sm text-ink">Also find a direct phone number</span>
+            <span className="text-xs text-muted">{PHONE_REVEAL_CREDITS} cr</span>
+          </label>
 
-          <div className="flex items-center justify-between pt-2">
-            <div className="flex items-center gap-1.5 text-[11px] text-[#8a8a86] font-mono">
-              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-              <span>Includes mailbox deliverability check</span>
-            </div>
-
+          <div className="pt-1 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3">
+            <p className="text-xs text-muted">
+              {walletEmpty ? (
+                <span className="text-warn">
+                  Your balance is 0 credits.{' '}
+                  {onNavigateBilling && (
+                    <button type="button" onClick={onNavigateBilling} className="underline underline-offset-2 cursor-pointer">
+                      Top up
+                    </button>
+                  )}
+                </span>
+              ) : (
+                `Charged only when found. Contacts already in your pipeline are free.`
+              )}
+            </p>
             <button
               type="submit"
-              disabled={isSearching}
-              className="py-2 px-5 bg-[#141414] hover:bg-black text-[#f6f6f4] text-xs font-mono font-semibold flex items-center gap-2 cursor-pointer transition-all disabled:opacity-50"
+              disabled={busy}
+              className="h-10 px-5 bg-ink hover:bg-black text-white text-sm font-semibold flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
             >
-              {isSearching ? (
-                <>
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  <span>RESOLVING...</span>
-                </>
-              ) : (
-                <>
-                  <Sparkles className="w-3.5 h-3.5 text-amber-300" />
-                  <span>REVEAL CONTACT (1 CR)</span>
-                  <ArrowRight className="w-3.5 h-3.5" />
-                </>
-              )}
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" aria-hidden /> : <Search className="w-4 h-4" aria-hidden />}
+              {busy ? 'Looking up…' : `Find contact · up to ${maxCost} cr`}
             </button>
           </div>
         </form>
-      </div>
+      </section>
 
-      {/* Display Result if fetched */}
-      {lookupLead && (
-        <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-            <span className="text-xs font-mono font-semibold text-[#141414] uppercase tracking-wider">
-              Enriched Contact Result
-            </span>
+      <div aria-live="polite" className="min-w-0">
+        {result.kind === 'idle' && (
+          <div className="bg-white border border-dashed border-line-strong px-6 py-12 text-center text-sm text-ink-2">
+            The contact you look up appears here.
           </div>
-          <LeadCard
-            lead={lookupLead}
-            onRevealEmail={handleRevealEmail}
-            onRevealPhone={handleRevealPhone}
-            onSaveLead={handleSaveLead}
-            onStatusChange={handleStatusChange}
-            isRevealingEmail={revealingEmailIds.has(lookupLead.id)}
-            isRevealingPhone={revealingPhoneIds.has(lookupLead.id)}
-          />
-        </div>
-      )}
+        )}
+
+        {result.kind === 'loading' && (
+          <div className="bg-white border border-line px-6 py-12 flex items-center justify-center gap-2 text-sm text-ink-2" role="status">
+            <Loader2 className="w-4 h-4 animate-spin" aria-hidden />
+            Looking up <span className="font-medium text-ink truncate">{result.label}</span>…
+          </div>
+        )}
+
+        {result.kind === 'found' && (
+          <div className="space-y-2">
+            <p className="flex items-start gap-1.5 text-[13px] text-ink-2">
+              <CheckCircle2 className="w-4 h-4 text-ok shrink-0 mt-0.5" aria-hidden />
+              <span>{result.note}</span>
+            </p>
+            <LeadCard
+              lead={result.lead}
+              wantPhone={alsoPhone}
+              onRevealPhone={async (l) => {
+                const r = await onReveal(l, 'phone');
+                if (r.kind === 'found') updateFound((prev) => ({ ...prev, ...r.lead }));
+                else updateFound((prev) => ({ ...prev, phone_lookup: r.kind === 'no_credits' ? 'no_credits' : r.kind === 'error' ? 'failed' : 'not_found' }));
+              }}
+              onSaveLead={async (l) => {
+                const saved = await onSaveLead(l);
+                updateFound((prev) => ({ ...prev, is_saved: l.is_saved ? false : saved !== null, db_id: saved?.id ?? (l.is_saved ? null : prev.db_id) }));
+                return saved;
+              }}
+              onStatusChange={async (l, status) => {
+                const ok = await onStatusChange(l, status);
+                if (ok !== false) updateFound((prev) => ({ ...prev, status, is_saved: true }));
+                return ok;
+              }}
+            />
+          </div>
+        )}
+
+        {result.kind === 'not_found' && (
+          <div className="bg-white border border-line px-5 py-6">
+            <div className="flex items-start gap-3">
+              <SearchX className="w-5 h-5 text-muted shrink-0" aria-hidden />
+              <div className="min-w-0">
+                <h3 className="font-semibold text-ink">No contact details found</h3>
+                <p className="mt-1 text-sm text-ink-2 break-words">
+                  The provider has no work email{result.phoneTried ? ' or phone' : ''} for <span className="font-medium text-ink">{result.label}</span>. You were not charged.
+                </p>
+                <p className="mt-2 text-[13px] text-muted">
+                  {mode === 'linkedin'
+                    ? 'Try “Name & company” with their current company domain.'
+                    : 'Check the spelling, or try their LinkedIn profile URL instead.'}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {result.kind === 'no_credits' && (
+          <div className="bg-warn-bg border border-warn-line px-5 py-5 flex flex-wrap items-center justify-between gap-3" role="alert">
+            <p className="text-sm text-ink">Not enough credits for this lookup. Nothing was charged.</p>
+            {onNavigateBilling && (
+              <button type="button" onClick={onNavigateBilling} className="h-9 px-3 bg-ink hover:bg-black text-white text-sm font-medium cursor-pointer">
+                Top up
+              </button>
+            )}
+          </div>
+        )}
+
+        {result.kind === 'error' && (
+          <div className="bg-danger-bg border border-danger-line px-5 py-5 flex flex-wrap items-center justify-between gap-3" role="alert">
+            <p className="text-sm text-danger-ink flex items-start gap-2 min-w-0">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" aria-hidden />
+              <span className="break-words">Lookup failed: {result.message} Nothing was charged.</span>
+            </p>
+            {lastQuery && (
+              <button
+                type="button"
+                onClick={() => void run(lastQuery)}
+                className="h-9 px-3 bg-danger-strong hover:bg-danger text-white text-sm font-medium flex items-center gap-1.5 cursor-pointer"
+              >
+                <RefreshCw className="w-4 h-4" aria-hidden />
+                Retry
+              </button>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 };

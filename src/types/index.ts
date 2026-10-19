@@ -61,6 +61,8 @@ export interface MonitoredPost {
 
 export type DashboardTab = 'feed' | 'leads' | 'keywords' | 'settings' | 'billing';
 
+export type B2BLookupState = 'queued' | 'processing' | 'not_found' | 'failed' | 'no_credits';
+
 export type B2BPipelineStatus = 'new' | 'contacted' | 'replied' | 'dismissed';
 
 export interface B2BLead {
@@ -100,8 +102,14 @@ export interface B2BLead {
   preview_email?: string | null;
   phone_number?: string | null;
   phone_type?: string | null;
-  /** Client-only: set when a phone lookup came back empty (and was refunded). */
-  phone_lookup?: 'not_found' | null;
+  /**
+   * Client-only progress of an automatic or manual lookup. Absent when no
+   * lookup has run. `not_found` = the provider answered with nothing (free),
+   * `failed` = the lookup itself errored and can be retried, `no_credits` =
+   * skipped because the wallet could not cover it.
+   */
+  email_lookup?: B2BLookupState | null;
+  phone_lookup?: B2BLookupState | null;
   revealed_email?: string | null;
   revealed_phone?: string | null;
   email_status?: string | null;

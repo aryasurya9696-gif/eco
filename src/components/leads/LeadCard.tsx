@@ -1,7 +1,7 @@
 import React from 'react';
 import type { B2BLead, B2BPipelineStatus } from '../../types';
 import { ExternalLink, MapPin, Users, TrendingUp, Bookmark, BookmarkCheck } from 'lucide-react';
-import { EmailCell, PhoneCell, StageSelect, LinkedinIcon } from './LeadCells';
+import { EmailCell, PhoneCell, StageSelect, LinkedinIcon, ContactStatusBadge } from './LeadCells';
 import { initialsOf, linkedinHref } from './lead-utils';
 
 interface LeadCardProps {
@@ -15,6 +15,11 @@ interface LeadCardProps {
   /** When provided, the card shows a selection checkbox (bulk actions on mobile). */
   isSelected?: boolean;
   onToggleSelect?: (lead: B2BLead) => void;
+  /** Whether phones were part of the lookup, for the status line. */
+  wantPhone?: boolean;
+  /** Wallet empty: show "Top up to reveal" instead of find actions. */
+  locked?: boolean;
+  onTopUp?: () => void;
 }
 
 /**
@@ -32,6 +37,9 @@ export const LeadCard: React.FC<LeadCardProps> = ({
   isRevealingPhone,
   isSelected,
   onToggleSelect,
+  wantPhone = false,
+  locked,
+  onTopUp,
 }) => {
   const selectable = Boolean(onToggleSelect);
 
@@ -75,6 +83,7 @@ export const LeadCard: React.FC<LeadCardProps> = ({
             )}
           </div>
           <p className="text-[13px] text-ink-2 truncate" title={lead.title}>{lead.title || '—'}</p>
+          <ContactStatusBadge lead={lead} wantPhone={wantPhone} />
           <p className="mt-0.5 text-[13px] text-ink truncate">
             <span className="font-medium">{lead.company_name || '—'}</span>
             {lead.company_domain && (
@@ -136,11 +145,11 @@ export const LeadCard: React.FC<LeadCardProps> = ({
       <dl className="grid grid-cols-[auto_1fr] items-start gap-x-3 gap-y-2.5 pt-3 border-t border-line-soft">
         <dt className="text-xs text-muted pt-1.5">Email</dt>
         <dd className="min-w-0">
-          <EmailCell lead={lead} onReveal={onRevealEmail} isRevealing={isRevealingEmail} />
+          <EmailCell lead={lead} onReveal={onRevealEmail} isRevealing={isRevealingEmail} locked={locked} onTopUp={onTopUp} />
         </dd>
         <dt className="text-xs text-muted pt-1.5">Phone</dt>
         <dd className="min-w-0">
-          <PhoneCell lead={lead} onReveal={onRevealPhone} isRevealing={isRevealingPhone} />
+          <PhoneCell lead={lead} onReveal={onRevealPhone} isRevealing={isRevealingPhone} locked={locked} onTopUp={onTopUp} />
         </dd>
         {onStatusChange && (
           <>

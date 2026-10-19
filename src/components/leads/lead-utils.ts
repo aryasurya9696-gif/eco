@@ -26,7 +26,7 @@ export function leadKey(lead: Pick<B2BLead, 'company_domain' | 'full_name'>): st
 
 /** The person's resolved work email, or null. Never a preview or placeholder. */
 export function revealedEmail(lead: B2BLead): string | null {
-  if (lead.email_status === 'preview') return null;
+  if (lead.email_status === 'preview' || lead.email_status === 'invalid') return null;
   const email = lead.revealed_email || lead.work_email;
   return isEmailAddress(email) ? email.trim() : null;
 }
@@ -38,7 +38,9 @@ export function revealedPhone(lead: B2BLead): string | null {
 
 /** The provider's unverified company address, when there is one. */
 export function previewEmail(lead: B2BLead): string | null {
-  const email = lead.preview_email || (lead.email_status === 'preview' ? lead.revealed_email : null);
+  // Saved rows from before the preview/verified split carry it in work_email.
+  const email =
+    lead.preview_email || (lead.email_status === 'preview' ? lead.revealed_email || lead.work_email : null);
   return isEmailAddress(email) ? email.trim() : null;
 }
 
@@ -57,23 +59,24 @@ export type EmailState =
  */
 export function emailState(lead: B2BLead): EmailState {
   const email = revealedEmail(lead);
-  if (email) {
-    const status = (lead.email_status || '').toLowerCase();
+  const status = (lead.email_status || '').toLowerCase();
+  // The verifier said this address bounces: it is not a usable email.
+  if (email && status !== 'invalid') {
     if (status === 'valid' || status === 'deliverable' || status === 'verified') {
       return { kind: 'verified', email, label: 'Verified' };
     }
+    // Found but not confirmed deliverable. Only verified addresses are
+    // charged, so these are labelled free.
     const label =
       status === 'accept_all' || status === 'catch_all'
-        ? 'Catch-all'
+        ? 'Catch-all · free'
         : status === 'risky'
-          ? 'Risky'
-          : status === 'invalid'
-            ? 'Invalid'
-            : 'Unconfirmed';
+          ? 'Risky · free'
+          : 'Unconfirmed · free';
     return { kind: 'unconfirmed', email, label };
   }
-  const status = (lead.email_status || '').toLowerCase();
-  if (status === 'not_found' || status === 'unlisted') return { kind: 'not_found' };
+  if (status === 'invalid') return { kind: 'not_found' };
+  if (status === 'not_found' || status === 'unlisted' || lead.email_lookup === 'not_found') return { kind: 'not_found' };
   return { kind: 'none' };
 }
 
@@ -90,4 +93,40 @@ export function initialsOf(name?: string | null): string {
 
 export function linkedinHref(url: string): string {
   return url.startsWith('http') ? url : `https://${url}`;
+}
+
+export type ContactStatus = 'processing' | 'enriched' | 'partial' | 'none' | 'failed' | 'skipped' | 'not_started';
+
+/**
+ * One status per row, from what the lookups actually returned. `wantPhone`
+ * says whether a phone was part of the job; without it, an email alone is a
+ * complete result rather than a partial one.
+ */
+export function contactStatus(lead: B2BLead, wantPhone: boolean): ContactStatus {
+  const busy = (s?: B2BLead['email_lookup']) => s === 'queued' || s === 'processing';
+  if (busy(lead.email_lookup) || busy(lead.phone_lookup)) return 'processing';
+  const email = Boolean(revealedEmail(lead));
+  const phone = Boolean(revealedPhone(lead));
+  if (email && (phone || !wantPhone)) return 'enriched';
+  if (email || phone) return 'partial';
+  if (lead.email_lookup === 'failed' || lead.phone_lookup === 'failed') return 'failed';
+  if (lead.email_lookup === 'no_credits' || lead.phone_lookup === 'no_credits') return 'skipped';
+  const emailMissed = emailState(lead).kind === 'not_found' || lead.email_lookup === 'not_found';
+  if (emailMissed && (!wantPhone || lead.phone_lookup === 'not_found')) return 'none';
+  return 'not_started';
+}
+
+export const CONTACT_STATUS_LABEL: Record<ContactStatus, string> = {
+  processing: 'Finding contacts…',
+  enriched: 'Enriched',
+  partial: 'Partially enriched',
+  none: 'No contact info found',
+  failed: 'Lookup failed',
+  skipped: 'Needs credits',
+  not_started: 'Not enriched',
+};
+
+/** A lead worth showing in the default results view: a verified email or a phone. */
+export function hasVerifiedContact(lead: B2BLead): boolean {
+  return emailState(lead).kind === 'verified' || Boolean(revealedPhone(lead));
 }

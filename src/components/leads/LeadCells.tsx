@@ -1,12 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Check, Copy, Loader2, Mail, Phone, CheckCircle2, AlertTriangle, RotateCcw } from 'lucide-react';
+import { Check, Copy, Loader2, Mail, Phone, CheckCircle2, AlertTriangle, RotateCcw, Clock, CircleDashed, Lock } from 'lucide-react';
 import type { B2BLead, B2BPipelineStatus } from '../../types';
 import {
   emailState,
   previewEmail,
   revealedPhone,
+  contactStatus,
+  CONTACT_STATUS_LABEL,
   EMAIL_REVEAL_CREDITS,
   PHONE_REVEAL_CREDITS,
+  type ContactStatus,
 } from './lead-utils';
 
 // ============================================================================
@@ -51,16 +54,80 @@ export const CopyButton: React.FC<{ value: string; label: string }> = ({ value, 
   );
 };
 
-const revealBtn =
-  'inline-flex items-center gap-1.5 h-8 px-2.5 text-[13px] font-medium whitespace-nowrap transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-wait focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ink';
+/**
+ * Manual "find" action for a row automatic enrichment has not covered. Kept
+ * as a quiet text link: contacts are normally found automatically after a
+ * search, so a solid button on every row read as a required step.
+ */
+const findLink =
+  'inline-flex items-center gap-1.5 text-[13px] font-medium text-ink-2 hover:text-ink underline-offset-2 hover:underline whitespace-nowrap cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ink';
+
+/** Shown instead of a find action while the wallet is empty. */
+const LockedLine: React.FC<{ onTopUp?: () => void }> = ({ onTopUp }) => (
+  <span className="inline-flex items-center gap-1.5 text-[13px] text-muted">
+    <Lock className="w-3.5 h-3.5" aria-hidden />
+    {onTopUp ? (
+      <button type="button" onClick={onTopUp} className="underline underline-offset-2 hover:text-ink cursor-pointer">
+        Top up to reveal
+      </button>
+    ) : (
+      'Top up to reveal'
+    )}
+  </span>
+);
+
+/** Shared "in progress / failed / skipped" line for a lookup that has no value yet. */
+const LookupLine: React.FC<{
+  state: B2BLead['email_lookup'];
+  what: string;
+  onRetry?: () => unknown;
+  retryTitle: string;
+}> = ({ state, what, onRetry, retryTitle }) => {
+  if (state === 'queued') {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-[13px] text-muted">
+        <Clock className="w-3.5 h-3.5" aria-hidden />
+        Queued
+      </span>
+    );
+  }
+  if (state === 'processing') {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-[13px] text-ink-2" role="status">
+        <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden />
+        Finding {what}…
+      </span>
+    );
+  }
+  const label = state === 'failed' ? 'Lookup failed' : state === 'no_credits' ? 'Not enough credits' : `No ${what} found`;
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      <span className={`text-[13px] ${state === 'failed' ? 'text-danger' : 'text-muted'}`}>{label}</span>
+      {onRetry && (
+        <button
+          type="button"
+          onClick={() => onRetry()}
+          className="inline-flex items-center gap-1 text-xs text-ink-2 hover:text-ink underline underline-offset-2 cursor-pointer"
+          title={retryTitle}
+        >
+          <RotateCcw className="w-3 h-3" aria-hidden />
+          Retry
+        </button>
+      )}
+    </div>
+  );
+};
 
 interface EmailCellProps {
   lead: B2BLead;
   onReveal?: (lead: B2BLead) => unknown;
   isRevealing?: boolean;
+  /** The wallet is empty: show "Top up to reveal" instead of a find action. */
+  locked?: boolean;
+  onTopUp?: () => void;
 }
 
-export const EmailCell: React.FC<EmailCellProps> = ({ lead, onReveal, isRevealing }) => {
+export const EmailCell: React.FC<EmailCellProps> = ({ lead, onReveal, isRevealing, locked, onTopUp }) => {
   const state = emailState(lead);
   const preview = previewEmail(lead);
 
@@ -80,7 +147,11 @@ export const EmailCell: React.FC<EmailCellProps> = ({ lead, onReveal, isRevealin
         </div>
         <span
           className={`mt-0.5 inline-flex items-center gap-1 text-xs font-medium ${verified ? 'text-ok' : 'text-warn'}`}
-          title={verified ? 'Verified deliverable by the email verifier' : 'Found, but the verifier could not confirm it is deliverable'}
+          title={
+            verified
+              ? 'Verified deliverable by the email verifier (charged)'
+              : 'Found, but the verifier could not confirm it is deliverable — not charged'
+          }
         >
           {verified ? <CheckCircle2 className="w-3.5 h-3.5" aria-hidden /> : <AlertTriangle className="w-3.5 h-3.5" aria-hidden />}
           {state.label}
@@ -89,35 +160,30 @@ export const EmailCell: React.FC<EmailCellProps> = ({ lead, onReveal, isRevealin
     );
   }
 
+  const lookup = lead.email_lookup ?? (isRevealing ? 'processing' : state.kind === 'not_found' ? 'not_found' : null);
+  const busy = lookup === 'queued' || lookup === 'processing';
+
   return (
     <div className="min-w-0 space-y-1">
-      {state.kind === 'not_found' ? (
-        <div className="flex items-center gap-2">
-          <span className="text-[13px] text-muted">No email found</span>
-          {onReveal && (
-            <button
-              type="button"
-              onClick={() => onReveal(lead)}
-              disabled={isRevealing}
-              className="inline-flex items-center gap-1 text-xs text-ink-2 hover:text-ink underline underline-offset-2 cursor-pointer disabled:opacity-60"
-              title={`Try again — ${EMAIL_REVEAL_CREDITS} credit only if an email is found`}
-            >
-              {isRevealing ? <Loader2 className="w-3 h-3 animate-spin" aria-hidden /> : <RotateCcw className="w-3 h-3" aria-hidden />}
-              Retry
-            </button>
-          )}
-        </div>
+      {locked && !busy && lookup !== 'not_found' ? (
+        <LockedLine onTopUp={onTopUp} />
+      ) : lookup ? (
+        <LookupLine
+          state={lookup}
+          what="email"
+          onRetry={!busy && onReveal ? () => onReveal(lead) : undefined}
+          retryTitle={`Try again — ${EMAIL_REVEAL_CREDITS} credit only if a verified email is found`}
+        />
       ) : onReveal ? (
         <button
           type="button"
           onClick={() => onReveal(lead)}
-          disabled={isRevealing}
-          className={`${revealBtn} bg-ink hover:bg-black text-white`}
-          title={`Find this person's verified work email — ${EMAIL_REVEAL_CREDITS} credit, charged only if one is found`}
-          aria-label={`Reveal email for ${lead.full_name || 'this lead'} (${EMAIL_REVEAL_CREDITS} credit)`}
+          className={findLink}
+          title={`Find this person's work email — ${EMAIL_REVEAL_CREDITS} credit only if it is verified`}
+          aria-label={`Find email for ${lead.full_name || 'this lead'} (${EMAIL_REVEAL_CREDITS} credit if verified)`}
         >
-          {isRevealing ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden /> : <Mail className="w-3.5 h-3.5" aria-hidden />}
-          <span>{isRevealing ? 'Revealing…' : `Reveal · ${EMAIL_REVEAL_CREDITS} cr`}</span>
+          <Mail className="w-3.5 h-3.5" aria-hidden />
+          <span>Find email</span>
         </button>
       ) : (
         <span className="text-[13px] text-muted">Not revealed</span>
@@ -135,9 +201,11 @@ interface PhoneCellProps {
   lead: B2BLead;
   onReveal?: (lead: B2BLead) => unknown;
   isRevealing?: boolean;
+  locked?: boolean;
+  onTopUp?: () => void;
 }
 
-export const PhoneCell: React.FC<PhoneCellProps> = ({ lead, onReveal, isRevealing }) => {
+export const PhoneCell: React.FC<PhoneCellProps> = ({ lead, onReveal, isRevealing, locked, onTopUp }) => {
   const phone = revealedPhone(lead);
   if (phone) {
     return (
@@ -152,22 +220,62 @@ export const PhoneCell: React.FC<PhoneCellProps> = ({ lead, onReveal, isRevealin
       </div>
     );
   }
-  if (lead.phone_lookup === 'not_found') {
-    return <span className="text-[13px] text-muted whitespace-nowrap">No phone found</span>;
+  const lookup = lead.phone_lookup ?? (isRevealing ? 'processing' : null);
+  const phoneBusy = lookup === 'queued' || lookup === 'processing';
+  if (locked && !phoneBusy && lookup !== 'not_found') return <LockedLine onTopUp={onTopUp} />;
+  if (lookup) {
+    const busy = lookup === 'queued' || lookup === 'processing';
+    return (
+      <LookupLine
+        state={lookup}
+        what="phone"
+        onRetry={!busy && onReveal ? () => onReveal(lead) : undefined}
+        retryTitle={`Try again — ${PHONE_REVEAL_CREDITS} credits only if a number is found`}
+      />
+    );
   }
   if (!onReveal) return <span className="text-[13px] text-muted">—</span>;
   return (
     <button
       type="button"
       onClick={() => onReveal(lead)}
-      disabled={isRevealing}
-      className={`${revealBtn} bg-white border border-line-strong hover:border-ink text-ink`}
+      className={findLink}
       title={`Find a direct phone number — ${PHONE_REVEAL_CREDITS} credits, charged only if one is found`}
-      aria-label={`Reveal phone for ${lead.full_name || 'this lead'} (${PHONE_REVEAL_CREDITS} credits)`}
+      aria-label={`Find phone for ${lead.full_name || 'this lead'} (${PHONE_REVEAL_CREDITS} credits if found)`}
     >
-      {isRevealing ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden /> : <Phone className="w-3.5 h-3.5" aria-hidden />}
-      <span>{isRevealing ? 'Revealing…' : `Reveal · ${PHONE_REVEAL_CREDITS} cr`}</span>
+      <Phone className="w-3.5 h-3.5" aria-hidden />
+      <span>Find phone</span>
     </button>
+  );
+};
+
+const STATUS_TONE: Record<ContactStatus, string> = {
+  processing: 'text-info',
+  enriched: 'text-ok',
+  partial: 'text-warn',
+  none: 'text-muted',
+  failed: 'text-danger',
+  skipped: 'text-warn',
+  not_started: 'text-muted',
+};
+
+/** One-line enrichment status for a row; text and icon, never colour alone. */
+export const ContactStatusBadge: React.FC<{ lead: B2BLead; wantPhone: boolean }> = ({ lead, wantPhone }) => {
+  const status = contactStatus(lead, wantPhone);
+  if (status === 'not_started') return null;
+  const Icon =
+    status === 'processing'
+      ? Loader2
+      : status === 'enriched'
+        ? CheckCircle2
+        : status === 'none'
+          ? CircleDashed
+          : AlertTriangle;
+  return (
+    <span className={`inline-flex items-center gap-1 text-xs font-medium ${STATUS_TONE[status]}`}>
+      <Icon className={`w-3.5 h-3.5 ${status === 'processing' ? 'animate-spin' : ''}`} aria-hidden />
+      {CONTACT_STATUS_LABEL[status]}
+    </span>
   );
 };
 

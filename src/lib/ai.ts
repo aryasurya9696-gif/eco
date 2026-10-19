@@ -8,6 +8,7 @@
  */
 import type { MonitoredPost } from '../types';
 import { invokeFunction } from './api';
+import { parseLeadQueryLocally } from './lead-suggestions';
 
 export type DraftTone = 'professional' | 'casual' | 'consultative' | 'direct';
 
@@ -105,6 +106,49 @@ export async function generateAiKeywordsFromOffer(
     console.warn('[ai] keyword suggestions unavailable, using heuristics:', err);
   }
   return fallback();
+}
+
+export interface LeadQueryFilters {
+  title: string;
+  keywords: string[];
+  /** ISO 3166-1 alpha-2, or empty. */
+  country: string;
+  location: string;
+  company: string;
+}
+
+/**
+ * Turns "Founders of SaaS startups in Bangalore" into lead search filters.
+ * Uses the `ai` function when it is deployed and falls back to the same
+ * local parser the suggestions use, so the feature never just fails.
+ */
+export async function parseLeadQuery(
+  description: string,
+): Promise<{ filters: LeadQueryFilters; source: 'openai' | 'fallback' }> {
+  const fallback = () => ({ ok: true, filters: parseLeadQueryLocally(description), source: 'fallback' as const });
+  try {
+    const res = await invokeFunction<{ ok: boolean; filters: LeadQueryFilters; source: 'openai' | 'fallback' }>(
+      'ai',
+      { action: 'lead-filters', description: description.slice(0, 300) },
+      { fallback, timeoutMs: 15000 },
+    );
+    if (res?.ok && res.filters) {
+      const f = res.filters;
+      return {
+        filters: {
+          title: String(f.title ?? ''),
+          keywords: Array.isArray(f.keywords) ? f.keywords.map(String).slice(0, 5) : [],
+          country: /^[A-Z]{2}$/.test(String(f.country ?? '')) ? String(f.country) : '',
+          location: String(f.location ?? ''),
+          company: String(f.company ?? ''),
+        },
+        source: res.source ?? 'fallback',
+      };
+    }
+  } catch (err) {
+    console.warn('[ai] lead filters unavailable, using local parser:', err);
+  }
+  return { filters: parseLeadQueryLocally(description), source: 'fallback' };
 }
 
 /**
