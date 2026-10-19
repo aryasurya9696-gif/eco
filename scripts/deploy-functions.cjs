@@ -43,10 +43,6 @@ const FUNCTIONS = {
   billing: true,
   'daily-sweep': false,
   'billing-webhook': false,
-  // Cron-driven, like daily-sweep. It was marked true when the tab was built,
-  // before the function existed, and that value would have 401'd the worker
-  // every minute while cron reported success.
-  leads: false,
 };
 
 const only = process.argv.slice(2);

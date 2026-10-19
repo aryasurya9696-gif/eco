@@ -1,0 +1,252 @@
+{
+  "_meta": {
+    "description": "Backup of the Leads tables taken before 20261121_remove_leads.sql dropped them.",
+    "project_ref": "fteoyqhogzuapfdledeg",
+    "captured_at": "2026-10-19",
+    "captured_by": "pre-removal sweep of the Leads feature",
+    "row_counts": {
+      "lead_runs": 1,
+      "lead_icps": 1,
+      "lead_rows": 6,
+      "lead_attempts": 3,
+      "lead_suppressions": 0,
+      "lead_waterfall_orders": 0,
+      "lead_filter_cache": 0,
+      "pricing_config_leads_operations": 8
+    },
+    "note": "Every row belongs to a single user (231f8d14-488f-4413-a1db-bb34a910ec1c) and every domain is under the reserved .example TLD, so this is seed data from development rather than real people. Backed up because the repository keeps a backup before any destructive migration, not because real records are at risk.",
+    "also_dropped_but_empty": [
+      "lead_suppressions",
+      "lead_waterfall_orders",
+      "lead_filter_cache"
+    ],
+    "not_backed_up": {
+      "credit_ledger": "Left in place on purpose. The wallet is not part of Leads; the 46 credits this run charged are real ledger entries and dropping them would rewrite billing history.",
+      "api_usage": "Left in place. Append-only provider log read by v_margin_by_operation.",
+      "profiles.leads_terms_accepted_at": "Consent timestamp, dropped with the column. Not restored anywhere."
+    }
+  },
+
+  "lead_runs": [
+    {
+      "id": "78fb7e5c-aad1-4af9-9df1-bbc71ee26eb6",
+      "user_id": "231f8d14-488f-4413-a1db-bb34a910ec1c",
+      "icp_id": null,
+      "name": "UK accounting firms",
+      "kind": "find",
+      "target": 50,
+      "mode": null,
+      "options": {},
+      "status": "done",
+      "pause_reason": null,
+      "last_error": null,
+      "est_credits": null,
+      "max_credits": "61.000000",
+      "charged_credits": "46.000000",
+      "treg_cost_usd": "0.000000",
+      "counters": { "found": 4, "verified": 1, "catch_all": 1 },
+      "started_at": null,
+      "finished_at": "2026-10-17 18:03:02.000278+00",
+      "created_at": "2026-10-17 20:03:02.000278+00",
+      "updated_at": "2026-10-17 20:03:37.390563+00"
+    }
+  ],
+
+  "lead_icps": [
+    {
+      "id": "ac7158e2-f830-4d24-b0b7-5d21673300c9",
+      "user_id": "231f8d14-488f-4413-a1db-bb34a910ec1c",
+      "website": "https://agentinbox.in/",
+      "offer": "Agent inbox for B2B sales teams — a shared inbox where AI agents and SDRs reply to leads across email and social, with buyer-intent monitoring",
+      "inputs": {},
+      "pages": [],
+      "brand": null,
+      "json": {
+        "summary": "Accountants and bookkeepers who take on year-end work they would rather not do themselves.",
+        "segments": [
+          {
+            "name": "UK accounting firms",
+            "pains": ["Unpaid work", "Chasing clients for documents"],
+            "keywords": ["year-end accounts", "VAT", "corporation tax"],
+            "countries": ["GB"],
+            "seniority": [],
+            "industries": ["Accounting", "Bookkeeping"],
+            "whyTheyBuy": "Peak season is short and they are losing billable hours to admin.",
+            "openingAngle": "",
+            "targetTitles": ["Owner", "Founder", "Practice Manager"],
+            "employeeRange": [1, 10],
+            "excludeKeywords": ["franchise"]
+          }
+        ],
+        "confidence": 0.72,
+        "assumptions": [
+          {
+            "why": "A wrong country sends the whole run at people who cannot buy.",
+            "text": "United Kingdom only, taken from the site copy rather than asked for.",
+            "severity": "high"
+          },
+          {
+            "why": "That is the segment the site leads with; other verticals are mentioned once.",
+            "text": "Primary focus is trades and home services rather than financial services.",
+            "severity": "medium"
+          },
+          {
+            "why": "No firm size is stated anywhere on the site.",
+            "text": "Most buyers will be one to ten people.",
+            "severity": "medium"
+          },
+          {
+            "why": "Sole traders often have no profile, so those rows will come back empty.",
+            "text": "LinkedIn coverage of very small firms is thin.",
+            "severity": "low"
+          }
+        ],
+        "primarySegment": 0
+      },
+      "version": 1,
+      "note": null,
+      "approved_at": "2026-10-18 17:26:00.079+00",
+      "created_at": "2026-10-18 07:03:11.696321+00",
+      "updated_at": "2026-10-18 17:26:00.196838+00"
+    }
+  ],
+
+  "lead_rows": [
+    {
+      "id": "0fbd7357-3be5-464f-9af8-63c07e0b1634",
+      "run_id": "78fb7e5c-aad1-4af9-9df1-bbc71ee26eb6",
+      "company_name": "Fenwick & Co",
+      "domain": "fenwick.example",
+      "person_name": "Alison Fenwick",
+      "title": "Managing Partner",
+      "email": "alison@fenwick.example",
+      "email_status": "verified",
+      "email_provider": "quickenrich.people.email.find",
+      "company_data": { "industry": "Accounting", "headcount": 34 },
+      "credits": "1.000000",
+      "state": "done",
+      "step": null,
+      "treg_cost_usd": null
+    },
+    {
+      "id": "15f5d904-1572-4afe-95d4-d290930aa0b0",
+      "run_id": "78fb7e5c-aad1-4af9-9df1-bbc71ee26eb6",
+      "company_name": "Hartley Ledger",
+      "domain": "hartley.example",
+      "person_name": "Raj Patel",
+      "title": "CEO",
+      "email": "raj@hartley.example",
+      "email_status": "catch_all",
+      "email_provider": "trykitt.people.email.find",
+      "credits": "0.400000",
+      "state": "done",
+      "step": null,
+      "treg_cost_usd": "0.005800"
+    },
+    {
+      "id": "e942a7b5-7323-4916-90a3-ba5d9f69b259",
+      "run_id": "78fb7e5c-aad1-4af9-9df1-bbc71ee26eb6",
+      "company_name": "Northgate Books",
+      "domain": "northgate.example",
+      "person_name": "Sam Oyelaran",
+      "title": "Founder",
+      "email": "sam@northgate.example",
+      "email_status": "invalid",
+      "email_provider": "tomba.people.email.find",
+      "credits": "1.000000",
+      "state": "done",
+      "step": null,
+      "treg_cost_usd": null
+    },
+    {
+      "id": "2999f34d-3390-4377-ac4f-594f30fd4bc2",
+      "run_id": "78fb7e5c-aad1-4af9-9df1-bbc71ee26eb6",
+      "company_name": "Quill & Vane",
+      "domain": "quillvane.example",
+      "person_name": "Dana Quill",
+      "title": "Owner",
+      "email": null,
+      "email_status": "not_found",
+      "email_provider": null,
+      "credits": "0.200000",
+      "state": "done",
+      "step": null,
+      "treg_cost_usd": "0.000000"
+    },
+    {
+      "id": "23429052-9f01-404b-9881-4a7ddda41926",
+      "run_id": "78fb7e5c-aad1-4af9-9df1-bbc71ee26eb6",
+      "company_name": "Ashcroft Tax",
+      "domain": "ashcroft.example",
+      "person_name": "Mo Ashcroft",
+      "title": "Partner",
+      "email": null,
+      "email_status": "not_found",
+      "email_provider": null,
+      "credits": "0.200000",
+      "state": "trying",
+      "step": "email",
+      "current_provider": "leadsforge.people.email.find",
+      "treg_cost_usd": null
+    },
+    {
+      "id": "c3f1030f-2305-428f-bee5-bb7834093ad9",
+      "run_id": "78fb7e5c-aad1-4af9-9df1-bbc71ee26eb6",
+      "company_name": "Pemberton & Gray",
+      "domain": "pemberton.example",
+      "person_name": null,
+      "title": null,
+      "email": null,
+      "email_status": "not_found",
+      "email_provider": null,
+      "credits": "0.020000",
+      "state": "queued",
+      "step": null,
+      "treg_cost_usd": null
+    }
+  ],
+
+  "lead_attempts": [
+    {
+      "row_id": "0fbd7357-3be5-464f-9af8-63c07e0b1634",
+      "step": "email",
+      "endpoint_id": "quickenrich.people.email.find",
+      "hit": false,
+      "cost_usd": "0.000000",
+      "ms": null,
+      "treg_call_id": null,
+      "api_usage_id": null
+    },
+    {
+      "row_id": "0fbd7357-3be5-464f-9af8-63c07e0b1634",
+      "step": "email",
+      "endpoint_id": "aiark.people.email.find",
+      "hit": false,
+      "cost_usd": "0.000000",
+      "ms": null,
+      "treg_call_id": null,
+      "api_usage_id": null
+    },
+    {
+      "row_id": "0fbd7357-3be5-464f-9af8-63c07e0b1634",
+      "step": "email",
+      "endpoint_id": "trykitt.people.email.find",
+      "hit": true,
+      "cost_usd": "0.005000",
+      "ms": null,
+      "treg_call_id": null,
+      "api_usage_id": null
+    }
+  ],
+
+  "pricing_config_leads_operations": [
+    { "operation": "leads.company.enrich",  "display_name": "Company data column",     "credits": "1.000000", "provider_endpoint": "prospeo.companies.enrich",       "provider_cost_usd": "0.02450000" },
+    { "operation": "leads.company.found",   "display_name": "Company found",           "credits": "0.020000", "provider_endpoint": "tomba.companies.search.reveal",   "provider_cost_usd": "0.00017800" },
+    { "operation": "leads.email.catch_all", "display_name": "Catch-all email",         "credits": "0.400000", "provider_endpoint": "quickenrich.people.email.find",    "provider_cost_usd": "0.00480000" },
+    { "operation": "leads.email.verified",  "display_name": "Verified email",          "credits": "1.000000", "provider_endpoint": "quickenrich.people.email.find",    "provider_cost_usd": "0.00480000" },
+    { "operation": "leads.icp.generate",   "display_name": "Ideal customer profile",  "credits": "0.000000", "provider_endpoint": "treg.web.extract",                "provider_cost_usd": "0.03000000" },
+    { "operation": "leads.person.found",    "display_name": "Decision maker found",    "credits": "0.200000", "provider_endpoint": "icypeas.people.search",            "provider_cost_usd": "0.00038000" },
+    { "operation": "leads.phone.found",     "display_name": "Phone found and live",    "credits": "8.000000", "provider_endpoint": "aiark.people.phone.find",          "provider_cost_usd": "0.02600000" },
+    { "operation": "leads.verify.only",     "display_name": "Email verified (existing)","credits": "0.100000", "provider_endpoint": "contactout.people.email.verify",   "provider_cost_usd": "0.00000000" }
+  ]
+}

@@ -6,11 +6,9 @@ import { FeedTab } from '../components/dashboard/FeedTab';
 import { KeywordsTab } from '../components/dashboard/KeywordsTab';
 import { SettingsTab } from '../components/dashboard/SettingsTab';
 import { BillingTab } from '../components/dashboard/BillingTab';
-import { LeadsTab } from '../components/dashboard/LeadsTab';
 import { OnboardingModal } from '../components/onboarding/OnboardingModal';
-import type { DashboardTab, LeadsView } from '../types';
-import { leadsRouteFromHash, tabFromHash, hashForTab, type LeadsRoute } from '../lib/leads';
-import { supabase } from '../lib/supabase';
+import type { DashboardTab } from '../types';
+import { tabFromHash } from '../lib/tab-routing';
 import { RefreshCw, Radio } from 'lucide-react';
 
 interface DashboardPageProps {
@@ -24,56 +22,11 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const { profile } = useAuth();
   const { isSweeping, runSweep, keywords } = useEcho();
   // Read the tab out of the hash on first paint rather than always starting on
-  // the feed. Without this a refresh on #dashboard/leads/run/<id> came up showing
-  // the feed with the hash still pointing at Leads, which reads as a broken link.
+  // the feed, so a refresh on #dashboard/billing comes up on Billing rather than
+  // the feed.
   const [activeTab, setActiveTab] = useState<DashboardTab>(
     () => (tabFromHash() as DashboardTab) ?? 'feed',
   );
-
-  // The Leads sub-view, also from the hash, so a run link survives a refresh.
-  const [leadsRoute, setLeadsRoute] = useState<LeadsRoute>(
-    () => leadsRouteFromHash(),
-  );
-
-  /**
-   * Unfinished runs, for the sidebar badge.
-   *
-   * Held on the page rather than fetched inside the sidebar, so the count keeps
-   * updating while the user is on the feed and the run list is unmounted.
-   *
-   * lead_active_run_count() takes no arguments and is not SECURITY DEFINER: it
-   * reads auth.uid() and RLS still applies, so this cannot be pointed at another
-   * workspace. A failed poll deliberately leaves the previous number rather than
-   * setting zero — a transient blip should not make work in progress vanish.
-   */
-  const [activeLeadRuns, setActiveLeadRuns] = useState(0);
-
-  useEffect(() => {
-    const client = supabase;
-    if (!client) return;
-
-    let cancelled = false;
-
-    const poll = async () => {
-      try {
-        const { count, error } = await client.rpc('lead_active_run_count');
-        if (cancelled || error) return;
-        setActiveLeadRuns(count ?? 0);
-      } catch {
-        /* keep the last known count */
-      }
-    };
-
-    void poll();
-    // 15s is slow enough not to matter and fast enough that a run started on
-    // another tab shows its badge here within one poll.
-    const timer = setInterval(poll, 15000);
-
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, []);
 
   // Sidebar collapse state with localStorage persistence
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() => {
@@ -110,12 +63,11 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   }, []);
 
   // The hash can change without this component remounting: the browser Back
-  // button, or a link from elsewhere in the app. Keep both in step with it.
+  // button, or a link from elsewhere in the app. Keep it in step.
   useEffect(() => {
     const syncFromHash = () => {
       const tab = tabFromHash() as DashboardTab | null;
       if (tab) setActiveTab(tab);
-      setLeadsRoute(leadsRouteFromHash());
     };
 
     window.addEventListener('hashchange', syncFromHash);
@@ -123,9 +75,8 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   }, []);
 
   // replaceState rather than assigning location.hash: assigning pushes a history
-  // entry, so Back after switching Leads panels would walk back through every
-  // panel click instead of leaving the dashboard. Switching panels is not
-  // navigation, and neither is switching tabs.
+  // entry, so Back after switching tabs would walk back through every tab click
+  // instead of leaving the dashboard. Switching tabs is not navigation.
   const replaceHash = (hash: string) => {
     window.history.replaceState(
       null,
@@ -136,28 +87,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
   const handleTabChange = (tab: DashboardTab) => {
     setActiveTab(tab);
-    if (tab === 'leads') {
-      replaceHash(hashForTab('leads', leadsRoute));
-    } else {
-      replaceHash(`#dashboard/${tab}`);
-    }
-  };
-
-  const handleLeadsViewChange = (view: LeadsView, subMode?: string | null) => {
-    // Switching away from a run clears the id, so returning to Runs does not
-    // leave the previous run id in the hash ready to be reopened by Back.
-    const route: LeadsRoute = { view, subMode: subMode ?? null, runId: null };
-    setLeadsRoute(route);
-    replaceHash(hashForTab('leads', route));
-  };
-
-  // Opening a specific run writes the run id into the hash, so the link works
-  // and Back returns to the list. The id is checked as a uuid rather than
-  // concatenated blindly: it ends up in a query string the browser will send.
-  const handleOpenRun = (id: string) => {
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) return;
-    setLeadsRoute({ view: 'run', runId: id });
-    replaceHash(`#dashboard/leads/run/${id}`);
+    replaceHash(`#dashboard/${tab}`);
   };
 
   // Check if onboarding needs to be shown
@@ -172,7 +102,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         onNavigateHome={onNavigateHome}
         isCollapsed={isSidebarCollapsed}
         onToggleCollapse={toggleSidebar}
-        activeLeadRuns={activeLeadRuns}
       />
 
       {/* Main Content Area with 58px Grid Pattern */}
@@ -188,8 +117,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                   ? 'Monitored Mentions Feed'
                   : activeTab === 'keywords'
                   ? 'Keyword Management'
-                  : activeTab === 'leads'
-                  ? 'Leads'
                   : activeTab === 'billing'
                   ? 'Credits & Billing'
                   : 'Workspace Settings'}
@@ -229,15 +156,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         >
           {activeTab === 'feed' && <FeedTab />}
           {activeTab === 'keywords' && <KeywordsTab />}
-          {activeTab === 'leads' && (
-            <LeadsTab
-              view={leadsRoute.view}
-              subMode={leadsRoute.subMode}
-              runId={leadsRoute.runId}
-              onViewChange={handleLeadsViewChange}
-              onOpenRun={handleOpenRun}
-            />
-          )}
           {activeTab === 'billing' && <BillingTab />}
           {activeTab === 'settings' && <SettingsTab />}
         </main>
