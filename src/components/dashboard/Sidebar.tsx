@@ -5,6 +5,7 @@ import { useEcho } from '../../context/EchoContext';
 import type { DashboardTab } from '../../types';
 import {
   Inbox,
+  Users,
   Tag,
   Settings,
   Wallet,
@@ -67,6 +68,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
           label: 'Feed',
           icon: <Inbox className="w-4 h-4" />,
           count: posts.length,
+        },
+        {
+          id: 'leads',
+          label: 'Leads',
+          icon: <Users className="w-4 h-4" />,
         },
         {
           id: 'keywords',

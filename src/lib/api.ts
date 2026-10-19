@@ -47,12 +47,17 @@ export async function invokeFunction<T = unknown>(
     });
 
     if (error) {
-      // Supabase surfaces function errors as a non-2xx Error with the body text.
+      // Supabase surfaces function errors as a non-2xx Error whose context is
+      // the Response. The status code has to come from that Response: hardcoding
+      // 500 (as before) made every 402/404 look like a server error, so the
+      // "insufficient credits" and "no hit, refunded" toasts never fired.
+      const status =
+        error.context instanceof Response ? error.context.status : 500;
       const message =
         error.context instanceof Response
           ? await readErrorBody(error.context)
           : error.message;
-      throw new ApiError(message || `Request to "${name}" failed.`, 500);
+      throw new ApiError(message || `Request to "${name}" failed.`, status || 500);
     }
 
     return data as T;

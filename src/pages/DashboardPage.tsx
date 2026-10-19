@@ -3,6 +3,7 @@ import { useAuth } from '../context/AuthContext';
 import { useEcho } from '../context/EchoContext';
 import { Sidebar } from '../components/dashboard/Sidebar';
 import { FeedTab } from '../components/dashboard/FeedTab';
+import { LeadsTab } from '../components/leads/LeadsTab';
 import { KeywordsTab } from '../components/dashboard/KeywordsTab';
 import { SettingsTab } from '../components/dashboard/SettingsTab';
 import { BillingTab } from '../components/dashboard/BillingTab';
@@ -37,6 +38,18 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       return false;
     }
   });
+
+  // Below the md breakpoint the full 256px sidebar left a phone ~130px of
+  // content, so it is shown collapsed there regardless of the saved setting.
+  const [isNarrow, setIsNarrow] = useState<boolean>(
+    () => typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)');
+    const onChange = (e: MediaQueryListEvent) => setIsNarrow(e.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
 
   const toggleSidebar = () => {
     setIsSidebarCollapsed((prev) => {
@@ -100,12 +113,12 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         activeTab={activeTab}
         onTabChange={handleTabChange}
         onNavigateHome={onNavigateHome}
-        isCollapsed={isSidebarCollapsed}
+        isCollapsed={isSidebarCollapsed || isNarrow}
         onToggleCollapse={toggleSidebar}
       />
 
       {/* Main Content Area with 58px Grid Pattern */}
-      <div className="flex-1 flex flex-col h-screen overflow-hidden bg-grid-58 relative">
+      <div className="flex-1 min-w-0 flex flex-col h-screen overflow-hidden bg-grid-58 relative">
         {/* Top Header Bar */}
         <header className="h-16 bg-[#ffffff]/90 backdrop-blur-md border-b border-[#e3e3de] px-6 sm:px-8 flex items-center justify-between flex-shrink-0 z-20">
           <div className="flex items-center gap-3">
@@ -115,6 +128,8 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               <h1 className="text-sm sm:text-base font-bold tracking-tight text-[#141414]">
                 {activeTab === 'feed'
                   ? 'Monitored Mentions Feed'
+                  : activeTab === 'leads'
+                  ? 'B2B Leads & Prospecting'
                   : activeTab === 'keywords'
                   ? 'Keyword Management'
                   : activeTab === 'billing'
@@ -132,29 +147,34 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           </div>
 
           <div className="flex items-center gap-3">
-            <span className="hidden md:inline-flex items-center gap-1.5 text-[10px] font-mono text-emerald-800 bg-emerald-50 px-2.5 py-1 border border-emerald-200">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-              Live Radar Active
-            </span>
+            {activeTab === 'feed' && (
+              <span className="hidden md:inline-flex items-center gap-1.5 text-[10px] font-mono text-emerald-800 bg-emerald-50 px-2.5 py-1 border border-emerald-200">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                Live Radar Active
+              </span>
+            )}
 
-            <button
-              onClick={runSweep}
-              disabled={isSweeping}
-              className="inline-flex items-center gap-2 px-3.5 py-1.5 bg-[#121212] hover:bg-black text-white text-xs font-mono rounded-none transition-colors cursor-pointer disabled:opacity-50 shadow-xs"
-            >
-              <RefreshCw className={`w-3 h-3 ${isSweeping ? 'animate-spin' : ''}`} />
-              <span>{isSweeping ? 'Sweeping...' : 'Trigger Sweep'}</span>
-            </button>
+            {activeTab === 'feed' && (
+              <button
+                onClick={runSweep}
+                disabled={isSweeping}
+                className="inline-flex items-center gap-2 px-3.5 py-1.5 bg-[#121212] hover:bg-black text-white text-xs font-mono rounded-none transition-colors cursor-pointer disabled:opacity-50 shadow-xs"
+              >
+                <RefreshCw className={`w-3 h-3 ${isSweeping ? 'animate-spin' : ''}`} />
+                <span>{isSweeping ? 'Sweeping...' : 'Trigger Sweep'}</span>
+              </button>
+            )}
           </div>
         </header>
 
         {/* Content Pane */}
         <main
-          className={`flex-1 overflow-y-auto p-6 sm:p-8 ${
+          className={`flex-1 ${activeTab === 'leads' ? 'p-0 flex flex-col overflow-hidden' : 'p-6 sm:p-8 overflow-y-auto'} ${
             showOnboarding ? 'pointer-events-none select-none blur-[1px]' : ''
           }`}
         >
           {activeTab === 'feed' && <FeedTab />}
+          {activeTab === 'leads' && <LeadsTab onNavigateBilling={() => handleTabChange('billing')} />}
           {activeTab === 'keywords' && <KeywordsTab />}
           {activeTab === 'billing' && <BillingTab />}
           {activeTab === 'settings' && <SettingsTab />}

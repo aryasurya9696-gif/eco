@@ -41,6 +41,7 @@ const FUNCTIONS = {
   'social-search': true,
   ai: true,
   billing: true,
+  leads: true,
   'daily-sweep': false,
   'billing-webhook': false,
 };

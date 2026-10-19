@@ -15,6 +15,7 @@
 
 const TABS: Record<string, string> = {
   feed: 'feed',
+  leads: 'leads',
   keywords: 'keywords',
   billing: 'billing',
   settings: 'settings',
