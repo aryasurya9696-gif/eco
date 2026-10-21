@@ -11,6 +11,7 @@ import {
   MessageSquare,
 } from 'lucide-react';
 import type { MonitoredPost, LeadStatus } from '../../types';
+import { safeHttpUrl } from '../../lib/url';
 
 interface FeedCardProps {
   post: MonitoredPost;
@@ -297,9 +298,11 @@ export const FeedCard: React.FC<FeedCardProps> = ({
             <span className="hidden sm:inline">Draft reply</span>
           </button>
 
-          <GhostButton title="Open the original post" href={post.post_url}>
-            <ExternalLink className="w-3 h-3" />
-          </GhostButton>
+          {safeHttpUrl(post.post_url) && (
+            <GhostButton title="Open the original post" href={safeHttpUrl(post.post_url) ?? undefined}>
+              <ExternalLink className="w-3 h-3" />
+            </GhostButton>
+          )}
         </div>
       </div>
     </article>

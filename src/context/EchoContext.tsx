@@ -11,6 +11,7 @@ import { invokeSearchSweep } from '../lib/sweep';
 import type { KeywordSuggestionResult } from '../lib/ai';
 import { generateAiOutreachDraft, generateAiKeywordsFromOffer } from '../lib/ai';
 import { useAuth } from './AuthContext';
+import { downloadCsv, downloadTextFile } from '../lib/csv';
 import type { Keyword, MonitoredPost, Platform, LeadStatus } from '../types';
 
 interface ToastMessage {
@@ -95,7 +96,10 @@ const channelLabel = (platform: Platform): string => {
 };
 
 export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { user, profile } = useAuth();
+  const { user, profile, patchProfile } = useAuth();
+  // Effects key on the id, not the object: a token refresh or a new object for
+  // the same account must not reload data or reset unsaved settings.
+  const userId = user?.id ?? null;
 
   // --- Data -----------------------------------------------------------------
   const [keywords, setKeywords] = useState<Keyword[]>([]);
@@ -158,7 +162,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // --- Loading --------------------------------------------------------------
 
   const loadKeywords = useCallback(async () => {
-    if (!user) return;
+    if (!userId) return;
     setIsLoadingKeywords(true);
 
     if (isConfigured && supabase) {
@@ -166,7 +170,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const { data, error } = await supabase
           .from('keywords')
           .select('*')
-          .eq('user_id', user.id)
+          .eq('user_id', userId)
           .eq('is_active', true)
           .order('created_at', { ascending: true });
 
@@ -175,7 +179,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         console.error('Error loading Supabase keywords:', err);
       }
     } else {
-      const saved = localStorage.getItem(`${LOCAL_STORAGE_KEYWORDS_KEY}_${user.id}`);
+      const saved = localStorage.getItem(`${LOCAL_STORAGE_KEYWORDS_KEY}_${userId}`);
       if (saved) {
         try {
           setKeywords(JSON.parse(saved));
@@ -187,10 +191,10 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     }
     setIsLoadingKeywords(false);
-  }, [user]);
+  }, [userId]);
 
   const loadPosts = useCallback(async () => {
-    if (!user) return;
+    if (!userId) return;
     setIsLoadingPosts(true);
 
     if (isConfigured && supabase) {
@@ -198,7 +202,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const { data, error } = await supabase
           .from('monitored_posts')
           .select('*')
-          .eq('user_id', user.id)
+          .eq('user_id', userId)
           // nullsFirst:false keeps web-search rows (no date) at the bottom
           // instead of letting Postgres float them to the top of the feed.
           .order('posted_at', { ascending: false, nullsFirst: false })
@@ -209,7 +213,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         console.error('Error loading Supabase monitored posts:', err);
       }
     } else {
-      const saved = localStorage.getItem(`${LOCAL_STORAGE_POSTS_KEY}_${user.id}`);
+      const saved = localStorage.getItem(`${LOCAL_STORAGE_POSTS_KEY}_${userId}`);
       if (saved) {
         try {
           setPosts(JSON.parse(saved));
@@ -221,13 +225,27 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     }
     setIsLoadingPosts(false);
-  }, [user]);
+  }, [userId]);
 
-  const loadSettings = useCallback(() => {
-    if (!user) return;
+  /**
+   * Copies the saved preferences into the editable settings state, once per
+   * signed-in user as soon as that user's profile is available. It used to run
+   * on every profile change, which overwrote unsaved edits and, right after a
+   * save, reverted them to the stale profile copy.
+   */
+  // Adjusted during render (React's "storing information from previous
+  // renders" pattern) rather than in an effect, so there is no extra pass
+  // showing defaults before the saved values.
+  const [hydratedFor, setHydratedFor] = useState<string | null>(null);
+  const profileForUser = profile && userId && profile.id === userId ? profile : null;
+
+  if (!userId && hydratedFor !== null) setHydratedFor(null);
+  if (userId && profileForUser && hydratedFor !== userId) {
+    setHydratedFor(userId);
+    const profile = profileForUser;
 
     // Server-persisted profile fields are authoritative in connected mode.
-    if (profile) {
+    {
       if (profile.lookback_hours !== undefined && profile.lookback_hours !== null) {
         setLookbackHours(profile.lookback_hours);
       }
@@ -246,9 +264,9 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     }
 
-    // Local sandbox preferences overlay (mock mode only for server fields).
-    const saved = localStorage.getItem(`${LOCAL_STORAGE_SETTINGS_KEY}_${user.id}`);
-    if (saved && !isConfigured) {
+    // Local sandbox preferences overlay (mock mode only).
+    const saved = isConfigured ? null : localStorage.getItem(`${LOCAL_STORAGE_SETTINGS_KEY}_${userId}`);
+    if (saved) {
       try {
         const parsed = JSON.parse(saved);
         if (parsed.lookbackHours !== undefined) setLookbackHours(parsed.lookbackHours);
@@ -267,11 +285,11 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         console.error('Error loading settings:', err);
       }
     }
-  }, [user, profile]);
+  }
 
   // --- Bootstrapping --------------------------------------------------------
   useEffect(() => {
-    if (!user) {
+    if (!userId) {
       setKeywords([]);
       setPosts([]);
       setIsLoadingKeywords(false);
@@ -281,8 +299,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     void loadKeywords();
     void loadPosts();
-    loadSettings();
-  }, [user, profile, loadKeywords, loadPosts, loadSettings]);
+  }, [userId, loadKeywords, loadPosts]);
 
   // --- Keywords -------------------------------------------------------------
 
@@ -350,11 +367,19 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setKeywords(previous.filter((k) => k.id !== id));
 
       if (isConfigured && supabase) {
-        const { error } = await supabase.from('keywords').delete().eq('id', id);
-        if (error) {
+        const { data, error } = await supabase
+          .from('keywords')
+          .delete()
+          .eq('id', id)
+          .eq('user_id', user.id)
+          .select('id');
+        // RLS turns a refused delete into zero affected rows, not an error.
+        const message =
+          error?.message ?? (!data || data.length === 0 ? 'keyword not found.' : null);
+        if (message) {
           setKeywords(previous);
-          addToast(`Failed to delete keyword: ${error.message}`, 'error');
-          return { success: false, error: error.message };
+          addToast(`Failed to delete keyword: ${message}`, 'error');
+          return { success: false, error: message };
         }
       } else {
         const updated = previous.filter((k) => k.id !== id);
@@ -489,25 +514,14 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       const result = await invokeSearchSweep();
 
-      if (isConfigured) {
-        // The edge function already persisted anything new. Re-read so the feed
-        // shows the database truth.
-        await loadPosts();
-        setMentionsFound((prev) => prev + result.posts.length);
-      } else if (result.posts.length > 0) {
-        setPosts((prev) => {
-          const seen = new Set(prev.map((p) => p.post_url.toLowerCase()));
-          const fresh = result.posts.filter(
-            (p) => p.post_url && !seen.has(p.post_url.toLowerCase()),
-          );
-          return [...fresh, ...prev];
-        });
-      }
+      // The edge function already persisted anything new. Re-read so the feed
+      // shows the database truth. (Without Supabase, invokeSearchSweep throws,
+      // so there is no local merge path.)
+      await loadPosts();
+      setMentionsFound((prev) => prev + result.posts.length);
 
       setIsSweeping(false);
 
-      // treg bills USD per call, so surface the spend.
-      const spend = result.usd_spent ? ` (~$${result.usd_spent.toFixed(4)})` : '';
       const housekeeping = [
         result.dropped_stale ? `${result.dropped_stale} out-of-window result(s) dropped` : '',
         result.pruned ? `${result.pruned} expired mention(s) cleaned up` : '',
@@ -517,12 +531,12 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (result.posts.length > 0) {
         addToast(
-          `Sweep complete — ${result.posts.length} new mention(s) found${spend}.`,
+          `Sweep complete — ${result.posts.length} new mention(s) found.`,
           'success',
         );
       } else {
         addToast(
-          `Sweep finished. Nothing new above your ${minIntentThreshold}% intent threshold${spend}.`,
+          `Sweep finished. Nothing new above your ${minIntentThreshold}% intent threshold.`,
           'info',
         );
       }
@@ -568,7 +582,8 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // --- Settings persistence -------------------------------------------------
 
   /**
-   * Writes preferences locally, then to the database.
+   * Writes preferences to the database (or localStorage in sandbox mode) and
+   * merges them into the AuthContext profile.
    *
    * Deliberately silent. It used to toast on both paths, and every caller toasts
    * too — pressing Save produced two "saved" notifications, and pruning produced
@@ -577,43 +592,45 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
    * single message, which is the only one that can describe what the user tried
    * to do.
    *
-   * A server rejection is still a partial success: localStorage already took the
-   * write, so this is reported as a warning about the server, not as a failure of
-   * the save.
+   * A server rejection is a failure (ok: false): nothing else stores the
+   * settings in connected mode.
    */
   const saveSettings = useCallback(async (): Promise<{ ok: boolean; warning?: string }> => {
     if (!user) return { ok: false, warning: 'Not signed in.' };
 
-    localStorage.setItem(
-      `${LOCAL_STORAGE_SETTINGS_KEY}_${user.id}`,
-      JSON.stringify({
-        lookbackHours,
-        sweepTime,
-        sweepCadence,
-        minIntentThreshold,
-        enabledChannels,
-      }),
-    );
+    const fields = {
+      lookback_hours: lookbackHours,
+      sweep_time_utc: sweepTime,
+      sweep_frequency: sweepCadence,
+      enabled_channels: enabledChannels,
+      min_intent_threshold: minIntentThreshold,
+      feed_retention_days: feedRetentionDays,
+    };
 
     if (isConfigured && supabase) {
-      const { error } = await supabase
-        .from('profiles')
-        .update({
-          lookback_hours: lookbackHours,
-          sweep_time_utc: sweepTime,
-          sweep_frequency: sweepCadence,
-          enabled_channels: enabledChannels,
-          min_intent_threshold: minIntentThreshold,
-          feed_retention_days: feedRetentionDays,
-        })
-        .eq('id', user.id);
-
+      const { error } = await supabase.from('profiles').update(fields).eq('id', user.id);
       if (error) {
         console.error('Error syncing profile settings to database:', error);
-        return { ok: true, warning: `Saved on this device, but the server rejected them: ${error.message}` };
+        return { ok: false, warning: `Could not save your settings: ${error.message}` };
       }
+    } else {
+      // Sandbox mode only: localStorage is the store there.
+      localStorage.setItem(
+        `${LOCAL_STORAGE_SETTINGS_KEY}_${user.id}`,
+        JSON.stringify({
+          lookbackHours,
+          sweepTime,
+          sweepCadence,
+          minIntentThreshold,
+          feedRetentionDays,
+          enabledChannels,
+        }),
+      );
     }
 
+    // Keep the shared profile in step, so anything reading it (and any later
+    // re-hydration) sees what was just saved rather than the old values.
+    patchProfile(fields);
     return { ok: true };
   }, [
     user,
@@ -623,6 +640,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     minIntentThreshold,
     feedRetentionDays,
     enabledChannels,
+    patchProfile,
   ]);
 
   // --- Feed cleanup -----------------------------------------------------
@@ -673,7 +691,9 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const exportPostsToCsv = useCallback(
     (customPosts?: MonitoredPost[]) => {
-      const targetPosts = customPosts && customPosts.length > 0 ? customPosts : posts;
+      // A passed (filtered) list is exported as-is even when empty: falling
+      // back to every post would export exactly what the user filtered out.
+      const targetPosts = customPosts ?? posts;
       if (targetPosts.length === 0) {
         addToast('No mentions available to export.', 'error');
         return;
@@ -693,32 +713,21 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         'Content / Body',
       ];
 
-      const esc = (v: string | null | undefined) =>
-        `"${String(v ?? '').replace(/"/g, '""').replace(/\r?\n/g, ' ')}"`;
+      const rows = targetPosts.map((p) => [
+        p.platform,
+        p.channel_source,
+        p.author_name,
+        p.author_handle,
+        p.matched_keyword,
+        p.intent_score ?? 0,
+        p.intent_level ?? '',
+        p.status || 'new',
+        p.posted_at,
+        p.post_url,
+        p.body,
+      ]);
 
-      const rows = targetPosts.map((p) =>
-        [
-          esc(p.platform),
-          esc(p.channel_source),
-          esc(p.author_name),
-          esc(p.author_handle),
-          esc(p.matched_keyword),
-          String(p.intent_score ?? 0),
-          esc(p.intent_level ?? ''),
-          esc(p.status || 'new'),
-          esc(p.posted_at),
-          esc(p.post_url),
-          esc(p.body),
-        ].join(','),
-      );
-
-      const csvString =
-        '\uFEFF' + [headers.map((h) => esc(h)).join(','), ...rows].join('\r\n');
-
-      downloadBlob(
-        new Blob([csvString], { type: 'text/csv;charset=utf-8;' }),
-        `echo_mentions_${new Date().toISOString().slice(0, 10)}.csv`,
-      );
+      downloadCsv(`echo_mentions_${new Date().toISOString().slice(0, 10)}.csv`, [headers, ...rows]);
 
       addToast(`Exported ${targetPosts.length} mentions as CSV.`, 'success');
     },
@@ -727,17 +736,16 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const exportPostsToJson = useCallback(
     (customPosts?: MonitoredPost[]) => {
-      const targetPosts = customPosts && customPosts.length > 0 ? customPosts : posts;
+      const targetPosts = customPosts ?? posts;
       if (targetPosts.length === 0) {
         addToast('No mentions available to export.', 'error');
         return;
       }
 
-      downloadBlob(
-        new Blob([JSON.stringify(targetPosts, null, 2)], {
-          type: 'application/json;charset=utf-8;',
-        }),
+      downloadTextFile(
         `echo_mentions_${new Date().toISOString().slice(0, 10)}.json`,
+        JSON.stringify(targetPosts, null, 2),
+        'application/json',
       );
 
       addToast(`Exported ${targetPosts.length} mentions as JSON.`, 'success');
@@ -831,20 +839,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     <EchoContext.Provider value={value}>{children}</EchoContext.Provider>
   );
 };
-
-/** Triggers a client-side file download and cleans up the object URL. */
-function downloadBlob(blob: Blob, filename: string): void {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.setAttribute('download', filename);
-  document.body.appendChild(link);
-  link.click();
-  setTimeout(() => {
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  }, 200);
-}
 
 export const useEcho = (): EchoContextType => {
   const context = useContext(EchoContext);

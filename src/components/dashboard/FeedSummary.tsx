@@ -97,16 +97,18 @@ export const FeedSummary: React.FC<FeedSummaryProps> = ({
             <button
               type="button"
               onClick={onExportCsv}
-              title="Export as CSV"
-              className="p-1.5 border border-[#e3e3de] bg-white text-[#4a4a47] hover:border-[#b5b5b0] hover:bg-[#f6f6f4] transition-all duration-150 cursor-pointer active:scale-[0.97]"
+              title={filteredCount === 0 ? 'Nothing to export' : 'Export as CSV'}
+              disabled={filteredCount === 0}
+              className="p-1.5 border border-[#e3e3de] bg-white text-[#4a4a47] hover:border-[#b5b5b0] hover:bg-[#f6f6f4] transition-all duration-150 cursor-pointer active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-white disabled:hover:border-[#e3e3de]"
             >
               <Download className="w-3 h-3" />
             </button>
             <button
               type="button"
               onClick={onExportJson}
-              title="Export as JSON"
-              className="p-1.5 border border-[#e3e3de] bg-white text-[#4a4a47] hover:border-[#b5b5b0] hover:bg-[#f6f6f4] transition-all duration-150 cursor-pointer active:scale-[0.97]"
+              title={filteredCount === 0 ? 'Nothing to export' : 'Export as JSON'}
+              disabled={filteredCount === 0}
+              className="p-1.5 border border-[#e3e3de] bg-white text-[#4a4a47] hover:border-[#b5b5b0] hover:bg-[#f6f6f4] transition-all duration-150 cursor-pointer active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-white disabled:hover:border-[#e3e3de]"
             >
               <Code className="w-3 h-3" />
             </button>

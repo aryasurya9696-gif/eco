@@ -90,5 +90,5 @@ for (const name of targets) {
 // Prove the cron-driven one is actually reachable the way cron reaches it, and
 // still refuses an anonymous caller. Deploying is not the same as working.
 if (FUNCTIONS['daily-sweep'] === false && !only.length) {
-  console.log('\nverifying the cron path (run: node scripts/verify-sweep-cron.mjs)');
+  console.log('\nverifying the cron path (run: node scripts/verify-sweep-cron.cjs)');
 }

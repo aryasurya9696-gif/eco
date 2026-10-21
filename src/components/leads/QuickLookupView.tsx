@@ -3,7 +3,8 @@ import type { B2BLead, B2BPipelineStatus } from '../../types';
 import { LeadCard } from './LeadCard';
 import { LinkedinIcon } from './LeadCells';
 import type { RevealOutcome } from './LeadsTab';
-import { EMAIL_REVEAL_CREDITS, PHONE_REVEAL_CREDITS, leadKey, revealedEmail, revealedPhone } from './lead-utils';
+import { leadKey, revealedEmail, revealedPhone } from './lead-utils';
+import { useLeadPricing } from './leads-store';
 import { User, Building2, Search, Loader2, AlertCircle, SearchX, RefreshCw, CheckCircle2 } from 'lucide-react';
 
 interface QuickLookupViewProps {
@@ -76,9 +77,10 @@ export const QuickLookupView: React.FC<QuickLookupViewProps> = ({
   const [result, setResult] = useState<Result>({ kind: 'idle' });
   const [lastQuery, setLastQuery] = useState<B2BLead | null>(null);
 
+  const pricing = useLeadPricing();
   const busy = result.kind === 'loading';
   const walletEmpty = availableCredits !== null && availableCredits <= 0;
-  const maxCost = EMAIL_REVEAL_CREDITS + (alsoPhone ? PHONE_REVEAL_CREDITS : 0);
+  const maxCost = pricing.email + (alsoPhone ? pricing.phone : 0);
 
   const validate = (): B2BLead | null => {
     const next: typeof errors = {};
@@ -296,7 +298,7 @@ export const QuickLookupView: React.FC<QuickLookupViewProps> = ({
               className="w-4 h-4 accent-ink"
             />
             <span className="text-sm text-ink">Also find a direct phone number</span>
-            <span className="text-xs text-muted">{PHONE_REVEAL_CREDITS} cr</span>
+            <span className="text-xs text-muted">{pricing.phone} cr</span>
           </label>
 
           <div className="pt-1 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3">

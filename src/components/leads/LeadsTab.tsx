@@ -12,6 +12,9 @@ import { leadsStore, useLeadsStore } from './leads-store';
 import { leadKey, revealedEmail, revealedPhone } from './lead-utils';
 import { Search, Zap, Bookmark, Wallet as WalletIcon, Plus } from 'lucide-react';
 
+/** Largest batch the leads function's bulk-save accepts (400 max_leads above it). */
+const BULK_SAVE_MAX = 500;
+
 interface LeadsTabProps {
   onNavigateBilling?: () => void;
 }
@@ -151,16 +154,30 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ onNavigateBilling }) => {
   // ---- Pipeline -----------------------------------------------------------
   const handleBulkSave = async (selected: B2BLead[]) => {
     if (selected.length === 0) return null;
+    type BulkSaveResponse = {
+      ok: boolean;
+      saved_count: number;
+      new_count?: number;
+      already_saved_count?: number;
+      skipped_count?: number;
+      leads?: B2BLead[];
+    };
     try {
-      const res = await invokeFunction<{
-        ok: boolean;
-        saved_count: number;
-        new_count?: number;
-        already_saved_count?: number;
-        skipped_count?: number;
-        leads?: B2BLead[];
-      }>('leads', { action: 'bulk-save', leads: selected });
-      if (!res?.ok) throw new Error('The save was rejected.');
+      // The server accepts at most BULK_SAVE_MAX leads per call, so a large
+      // "save all" goes in batches and the counts are summed.
+      const res: BulkSaveResponse = { ok: true, saved_count: 0, new_count: 0, already_saved_count: 0, skipped_count: 0, leads: [] };
+      for (let i = 0; i < selected.length; i += BULK_SAVE_MAX) {
+        const part = await invokeFunction<BulkSaveResponse>('leads', {
+          action: 'bulk-save',
+          leads: selected.slice(i, i + BULK_SAVE_MAX),
+        });
+        if (!part?.ok) throw new Error('The save was rejected.');
+        res.saved_count += part.saved_count ?? 0;
+        res.new_count = (res.new_count ?? 0) + (part.new_count ?? part.saved_count ?? 0);
+        res.already_saved_count = (res.already_saved_count ?? 0) + (part.already_saved_count ?? 0);
+        res.skipped_count = (res.skipped_count ?? 0) + (part.skipped_count ?? 0);
+        res.leads = [...(res.leads ?? []), ...(part.leads ?? [])];
+      }
 
       const savedIds = new Set(selected.map((l) => l.id));
       leadsStore.setLeads((prev) =>
@@ -213,15 +230,23 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ onNavigateBilling }) => {
   const handleBulkDeleteSavedLeads = async (leadsToDelete: B2BLead[]) => {
     if (leadsToDelete.length === 0) return;
     try {
-      const ids = leadsToDelete
-        .map((l) => l.db_id || l.id)
-        .filter((id): id is string => typeof id === 'string' && id.length === 36);
+      const withId = leadsToDelete.filter((l) => {
+        const id = l.db_id || l.id;
+        return typeof id === 'string' && id.length === 36;
+      });
+      const ids = withId.map((l) => (l.db_id || l.id) as string);
+      // The server deletes by id only; a row without one cannot be targeted.
+      if (ids.length === 0) {
+        addToast('Could not identify those leads. Refresh the pipeline and try again.', 'error');
+        void leadsStore.loadSaved();
+        return;
+      }
       const res = await invokeFunction<{ ok: boolean; deleted_count: number }>('leads', {
         action: 'delete-saved',
         lead_ids: ids,
       });
       if (res?.ok) {
-        const deletedKeys = new Set(leadsToDelete.map(leadKey));
+        const deletedKeys = new Set(withId.map(leadKey));
         const deletedIds = new Set(ids);
         const isDeleted = (l: B2BLead) =>
           deletedIds.has(l.id) || deletedIds.has(l.db_id || '') || deletedKeys.has(leadKey(l));

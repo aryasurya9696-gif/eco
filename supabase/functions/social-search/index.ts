@@ -26,7 +26,9 @@
 //           can read, so the token is never exposed to the browser)
 //
 // Request body: { keyword?: string }   (optional — sweeps all active keywords)
-// Response:     { ok, posts, scanned, channels, lookback_hours, usd_spent, ... }
+// Response:     { ok, posts, scanned, channels, lookback_hours, served_by, billing, ... }
+//               (provider spend is not returned to the browser; it lives in
+//                api_usage and wallet settlement only)
 // ============================================================================
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
@@ -64,6 +66,8 @@ async function requireUserId(req: Request): Promise<string | null> {
   try {
     const res = await fetch(supabaseUrl + '/auth/v1/user', {
       headers: { Authorization: authHeader, apikey: anonKey },
+      // A hung auth call would otherwise hold the request open indefinitely.
+      signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) return null;
     const user = await res.json();
@@ -73,22 +77,58 @@ async function requireUserId(req: Request): Promise<string | null> {
   }
 }
 
-const buckets = new Map<string, { count: number; resetAt: number }>();
-
-function rateLimit(key: string, limit: number, windowMs: number): boolean {
-  const now = Date.now();
-  const bucket = buckets.get(key);
-  if (!bucket || now > bucket.resetAt) {
-    buckets.set(key, { count: 1, resetAt: now + windowMs });
-    return true;
+/**
+ * Durable rate limit backed by take_rate_limit(). The old in-memory buckets
+ * were per-isolate and reset on every cold start, so they bounded nothing under
+ * real load. Fails CLOSED: a limiter we cannot reach is treated as "no".
+ */
+async function takeRateLimit(
+  admin: ReturnType<typeof createClient>,
+  userId: string,
+  bucket: string,
+  limit: number,
+  windowSeconds: number,
+): Promise<boolean> {
+  try {
+    const { data, error } = await admin.rpc('take_rate_limit', {
+      p_user_id: userId,
+      p_bucket: bucket,
+      p_limit: limit,
+      p_window_seconds: windowSeconds,
+    });
+    if (error) {
+      console.warn('[social-search] take_rate_limit failed:', error.message);
+      return false;
+    }
+    return data === true;
+  } catch (err) {
+    console.warn('[social-search] take_rate_limit threw:', err);
+    return false;
   }
-  if (bucket.count >= limit) return false;
-  bucket.count += 1;
-  return true;
 }
 
 const TREG_BASE = 'https://treg.to';
 const MAX_KEYWORDS_PER_SWEEP = 25;
+/** Used when sweep_shape() cannot be read; match keyword_limit()/channel_limit(). */
+const FALLBACK_MAX_KEYWORDS = 8;
+const FALLBACK_MAX_CHANNELS = 3;
+
+/**
+ * Hard ceiling treg enforces per call (README: every call carries one). A
+ * search that would cost more is refused with a 402 and nothing is charged,
+ * so a provider repricing cannot silently run up the bill on a sweep.
+ */
+const ROUTE_MAX_COST_USD = '0.01';
+
+/**
+ * Per-request counters. These used to be module-level `let`s, so two sweeps
+ * running concurrently in the same isolate reset and added to each other's
+ * figures.
+ */
+interface RunStats {
+  usdSpent: number;
+  callsMade: number;
+}
 
 // ---------------------------------------------------------------------------
 // Platform -> pricing operation
@@ -120,6 +160,9 @@ async function tregBalanceUsd(): Promise<number | null> {
   try {
     const res = await fetch(`${TREG_BASE}/billing`, {
       headers: { 'X-Treg-Token': tregToken, Accept: 'application/json' },
+      // A pre-flight check must not be the thing that hangs the sweep; on
+      // timeout the balance is simply unknown (see catch).
+      signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) return null;
     const body = await res.json();
@@ -128,10 +171,6 @@ async function tregBalanceUsd(): Promise<number | null> {
     return null; // unknown balance is not a reason to stop working
   }
 }
-
-let usdSpent = 0;
-/** Provider calls issued, for the run telemetry. */
-let callsMade = 0;
 
 interface KeywordRow {
   id: string;
@@ -392,6 +431,8 @@ async function tregCall(
     idempotencyKey?: string;
     /** Tagged onto the call in treg's own ledger for per-customer attribution. */
     customerId?: string;
+    /** This request's counters; never shared with a concurrent sweep. */
+    stats: RunStats;
   },
 ): Promise<TregResult> {
   if (!tregToken) return emptyResult();
@@ -407,7 +448,7 @@ async function tregCall(
   // default sits comfortably above that. Cutting it close turns a slow provider
   // into an uncertain charge, which is the expensive kind of wrong.
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 45000);
-  callsMade++;
+  opts.stats.callsMade++;
 
   try {
     const res = await fetch(url.toString(), {
@@ -415,6 +456,7 @@ async function tregCall(
       headers: {
         'X-Treg-Token': tregToken,
         Accept: 'application/json',
+        'X-Treg-Route-Max-Cost': ROUTE_MAX_COST_USD,
         ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
         ...(opts.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : {}),
         ...(opts.customerId ? { 'X-Treg-Meta': `customer=${opts.customerId}` } : {}),
@@ -435,7 +477,7 @@ async function tregCall(
     // The charge is whatever treg says it is. Zero means free, whatever the
     // status was.
     const billable: Billable = costMicro > 0 ? 'billed' : 'free';
-    usdSpent += costMicro / 1e6;
+    opts.stats.usdSpent += costMicro / 1e6;
 
     if (!res.ok) {
       // 409 and 410 mean treg still holds the call: 409 is it running, 410 is
@@ -502,7 +544,8 @@ function mapTwitter(t: any, kw: KeywordRow): RawPost | null {
     post_url: postUrl,
     author_name: t?.authorName ?? null,
     author_handle: handle,
-    author_avatar_url: t?.authorImage ?? null,
+    // Rendered as an <img src>, so it gets the same scheme check as the link.
+    author_avatar_url: safePostUrl(t?.authorImage),
     body: t?.text ?? null,
     posted_at: parseWhen(t?.createdUtc ?? t?.createdAt),
     engagement: {
@@ -546,12 +589,15 @@ function mapRedditTikhub(p: any, kw: KeywordRow): RawPost | null {
   const d = p?.data ?? p;
   const raw = d?.url ?? d?.permalink ?? d?.post_url ?? null;
   if (!raw) return null;
+  // Checked, not cast: the old `as string` let a rejected URL through as null.
+  const postUrl = safePostUrl(String(raw).startsWith('http') ? raw : `https://www.reddit.com${raw}`);
+  if (!postUrl) return null;
   return basePost({
     keyword_id: kw.id,
     matched_keyword: kw.keyword,
     platform: 'reddit',
     channel_source: d?.subreddit_name ?? d?.subreddit ?? 'r/reddit',
-    post_url: safePostUrl(String(raw).startsWith('http') ? raw : `https://www.reddit.com${raw}`) as string,
+    post_url: postUrl,
     author_name: d?.author ?? null,
     author_handle: d?.author ? `@${d.author}` : null,
     author_avatar_url: null,
@@ -612,11 +658,15 @@ function mapNews(r: any, kw: KeywordRow): RawPost | null {
 // ---------------------------------------------------------------------------
 // Credit accounting
 // ---------------------------------------------------------------------------
-// The sweep is charged per operation, not per provider call, so what decides a
-// charge is whether that channel produced any billable call at all. A channel
-// where every call came back free — no results, or an error treg never charges
-// for — costs the customer nothing, which is the promise the old system broke
-// by billing for the retry.
+// The sweep is charged per (keyword, operation), not per provider call: a
+// keyword is charged for a channel when any call it made there was billed or
+// uncertain. A keyword where every call came back free — no results, or an
+// error treg never charges for — costs the customer nothing, even if another
+// keyword on the same channel was billed (the old code charged price x all
+// keywords as soon as any one billed). Retries behind a billed call are not
+// charged again either.
+//
+// Prices are read with the service role: pricing_config is not client-readable.
 //
 // Prices come from pricing_config, never from the request. A client that could
 // name its own price would not need the table.
@@ -633,20 +683,28 @@ interface OperationTally {
   upstreamFailed: boolean;
   callIds: string[];
   errorCodes: string[];
+  /**
+   * Keywords that produced at least one billed or uncertain call on this
+   * operation. The charge is price x this count: one keyword that billed must
+   * not make every other keyword on the sweep chargeable too.
+   */
+  chargeableKeywords: Set<string>;
 }
 
 function newTally(operation: string): OperationTally {
   return {
     operation, calls: 0, costMicro: 0, billed: false,
     uncertain: false, upstreamFailed: false, callIds: [], errorCodes: [],
+    chargeableKeywords: new Set(),
   };
 }
 
-function record(tally: OperationTally, r: TregResult): void {
+function record(tally: OperationTally, r: TregResult, keywordId: string): void {
   tally.calls += 1;
   tally.costMicro += r.costMicro;
   if (r.billable === 'billed') tally.billed = true;
   if (r.billable === 'uncertain') tally.uncertain = true;
+  if (r.billable !== 'free') tally.chargeableKeywords.add(keywordId);
   if (r.upstreamFailed) tally.upstreamFailed = true;
   if (r.callId) tally.callIds.push(r.callId);
   if (r.errorCode) tally.errorCodes.push(r.errorCode);
@@ -782,6 +840,7 @@ async function recordUsage(
         calls: t.calls,
         billed: t.billed,
         upstream_failed: t.upstreamFailed,
+        chargeable_keywords: t.chargeableKeywords.size,
         call_ids: t.callIds,
         errors: t.errorCodes,
       },
@@ -817,11 +876,12 @@ async function searchChannel(
   tally: OperationTally,
   userId: string,
   runNonce: string,
+  stats: RunStats,
 ): Promise<RawPost[]> {
   // Stable within a sweep so an internal retry is free, and different between
   // sweeps so a deliberate second search is charged normally.
   const idem = `ss:${runNonce}:${kw.id}:${platform}`;
-  const common = { customerId: userId, idempotencyKey: idem };
+  const common = { customerId: userId, idempotencyKey: idem, stats };
 
   // ── Twitter ────────────────────────────────────────────────────────────
   if (platform === 'twitter') {
@@ -832,7 +892,7 @@ async function searchChannel(
       // posts, which is what put a 2021 tweet into the feed.
       body: { query: kw.keyword, queryType: 'Latest', limit: 20 },
     });
-    record(tally, t);
+    record(tally, t, kw.id);
     const items = t.data?.output?.data?.items ?? [];
     if (items.length) {
       served.twitter = 'anyapi.x.search.posts';
@@ -857,7 +917,7 @@ async function searchChannel(
         need_format: 'true',
       },
     });
-    record(tally, tk);
+    record(tally, tk, kw.id);
     const tkItems = tk.data?.data?.posts ?? tk.data?.posts ?? [];
     if (Array.isArray(tkItems) && tkItems.length) {
       served.reddit = 'tikhub.x.reddit-app-fetch-dynamic-search';
@@ -876,7 +936,7 @@ async function searchChannel(
         limit: 25,
       },
     });
-    record(tally, sc);
+    record(tally, sc, kw.id);
     const scItems = sc.data?.posts ?? [];
     if (Array.isArray(scItems) && scItems.length) {
       served.reddit = 'scrapecreators.reddit.search.posts';
@@ -891,7 +951,7 @@ async function searchChannel(
       ...common,
       query: { q: kw.keyword, rich: 1 },
     });
-    record(tally, r);
+    record(tally, r, kw.id);
     const items = r.data?.results ?? [];
     if (Array.isArray(items) && items.length) {
       served.google = 'crawl4ai.web.search.rich';
@@ -910,7 +970,7 @@ async function searchChannel(
         after_date: sinceDate(lookbackHours),
       },
     });
-    record(tally, r);
+    record(tally, r, kw.id);
     const items = r.data?.results ?? [];
     if (Array.isArray(items) && items.length) {
       served.news = 'tinyfish.web.search.news';
@@ -933,15 +993,17 @@ Deno.serve(async (req) => {
   const userId = await requireUserId(req);
   if (!userId) return fail('Unauthorized', 401);
 
-  if (!rateLimit('search:' + userId, 30, 60 * 60 * 1000)) {
-    return fail('Search rate limit reached. Please try again in a few minutes.', 429);
-  }
-
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
   const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
   const admin = createClient(supabaseUrl, serviceKey, {
     auth: { persistSession: false },
   });
+
+  // 20 manual sweeps / hour / user, counted in the database so the limit holds
+  // across isolates and cold starts.
+  if (!(await takeRateLimit(admin, userId, 'social-search', 20, 3600))) {
+    return fail('Search rate limit reached. Please try again in a few minutes.', 429);
+  }
 
   if (!await resolveToken(admin)) {
     return fail('Search is not configured on this deployment.', 503);
@@ -960,8 +1022,7 @@ Deno.serve(async (req) => {
   // Captured BEFORE any search runs. prune_feed() uses this so the batch this
   // sweep is about to write is never deleted by the retention pass.
   const sweepStartedAt = new Date().toISOString();
-  usdSpent = 0;
-  callsMade = 0;
+  const stats: RunStats = { usdSpent: 0, callsMade: 0 };
 
   // --- Load authoritative user settings (service role bypasses RLS) --------
   let profile: any = null;
@@ -993,10 +1054,16 @@ Deno.serve(async (req) => {
     return fail('Workspace profile not found', 404);
   }
 
+  // The plan's ceilings come from sweep_shape(), the same numbers the billing
+  // page prices from. Without this a profile edited past the UI could enable
+  // every channel and every keyword and the sweep would reserve and run them all.
+  const shape = await loadSweepShape(admin);
+
   const ALL: Platform[] = ['twitter', 'reddit', 'google', 'news'];
-  const enabledChannels: Platform[] = Array.isArray(profile?.enabled_channels)
-    ? profile.enabled_channels.filter((c: string): c is Platform => ALL.includes(c as Platform))
-    : ['twitter', 'reddit', 'google'];
+  const enabledChannels: Platform[] = (Array.isArray(profile?.enabled_channels)
+    ? [...new Set(profile.enabled_channels.filter((c: string): c is Platform => ALL.includes(c as Platform)))] as Platform[]
+    : ['twitter', 'reddit', 'google'] as Platform[]
+  ).slice(0, shape.maxChannels);
   const lookbackHours = Number(profile?.lookback_hours) || 24;
   const minIntent = Number(profile?.min_intent_threshold) || 0;
 
@@ -1007,7 +1074,7 @@ Deno.serve(async (req) => {
     .eq('user_id', userId)
     .eq('is_active', true)
     .order('created_at', { ascending: true })
-    .limit(MAX_KEYWORDS_PER_SWEEP);
+    .limit(Math.min(MAX_KEYWORDS_PER_SWEEP, shape.maxKeywords));
 
   let body: any = {};
   try {
@@ -1016,7 +1083,7 @@ Deno.serve(async (req) => {
     /* optional body */
   }
   if (typeof body?.keyword === 'string' && body.keyword.trim()) {
-    keywordQuery = keywordQuery.eq('keyword', body.keyword.trim().toLowerCase());
+    keywordQuery = keywordQuery.eq('keyword', body.keyword.trim().toLowerCase().slice(0, 200));
   }
 
   const { data: keywordRows, error: kwError } = await keywordQuery;
@@ -1029,7 +1096,7 @@ Deno.serve(async (req) => {
   if (keywords.length === 0) {
     return json({
       ok: true, posts: [], scanned: 0, channels: enabledChannels,
-      lookback_hours: lookbackHours, usd_spent: 0, served_by: {},
+      lookback_hours: lookbackHours, served_by: {},
     });
   }
 
@@ -1046,6 +1113,7 @@ Deno.serve(async (req) => {
   const runKey = `ss:${Date.now().toString(36)}:${userId}`;
   const runNonce = runKey.slice(3);
 
+  // Service-role client: pricing_config is no longer readable by clients.
   const pricing = await loadPricing(admin);
 
   // Realised price per credit, from the live packages. Used for the usage
@@ -1106,74 +1174,102 @@ Deno.serve(async (req) => {
   for (const op of wanted) tallies.set(op, newTally(op));
   const billableChannels = enabledChannels.filter((c) => pricing.has(OPERATION_OF[c]));
 
-  for (const kw of keywords) {
-    // Channels run in parallel; providers inside a channel run in sequence so a
-    // fallback only costs money once the cheaper one has actually failed.
-    const perChannel = await Promise.all(
-      billableChannels.map((ch) => {
-        const tally = tallies.get(OPERATION_OF[ch])!;
-        return searchChannel(ch, kw, lookbackHours, served, tally, userId, runNonce);
-      }),
-    );
-
-    for (const post of perChannel.flat()) {
-      if (!withinLookback(post.posted_at)) {
-        droppedStale++;
-        continue;
-      }
-      if (post.intent_score < minIntent) continue;
-
-      const normalizedUrl = post.post_url.trim().toLowerCase();
-      if (seenUrls.has(normalizedUrl)) continue;
-      seenUrls.add(normalizedUrl);
-      collected.push(post);
-    }
-  }
-
-  // ---- Settle for what actually billed ------------------------------------
-  //
-  // A channel that produced no billable call costs nothing. This is the second
-  // half of the predictability promise: the customer pays for searches that
-  // were paid for, not for the ones that were free or for the retries behind
-  // them.
   let creditsCharged = 0;
   let providerCostUsd = 0;
   const perOperation: Record<string, number> = {};
-  const charges = new Map<string, { credits: number; revenueUsd: number }>();
-
-  for (const [op, t] of tallies) {
-    providerCostUsd += t.costMicro / 1e6;
-    // An operation whose calls were all billed, or whose fate we cannot
-    // determine, is charged. One that was entirely free is not.
-    const charged = (t.billed || t.uncertain) ? (pricing.get(op) ?? 0) * keywords.length : 0;
-    creditsCharged += charged;
-    perOperation[op] = charged;
-    // What the usage ledger records, so it carries the same figures the wallet
-    // was debited rather than a hardcoded zero. Revenue at the rate these
-    // credits were bought for, which is what wallet_settle works out.
-    charges.set(op, { credits: charged, revenueUsd: charged * pricePerCredit });
-  }
-
   let balanceAfter: number | null = null;
   let charged = false;
+  // Set once the hold has been settled or released, so the finally block below
+  // only acts on a sweep that threw before reaching that point.
+  let holdClosed = false;
 
-  if (creditsCharged > 0) {
-    // Checked. settleSweep returns null when the RPC fails, and this used to set
-    // charged = true regardless — the response then said "charged" with
-    // balance_after null while the hold stayed put, quietly reducing what this
-    // workspace could spend on every future search.
-    balanceAfter = await settleSweep(
-      admin, hold.id, creditsCharged, providerCostUsd,
-      `${runKey}:settle`, `${keywords.length} keywords across ${billableChannels.length} channels`,
-    );
-    charged = balanceAfter !== null;
-  } else {
-    // Nothing billable happened: no results, or every call failed in a way treg
-    // does not charge for. The hold goes back in full.
-    await releaseSweep(admin, hold.id, 'no billable provider calls');
+  /**
+   * Works out what is owed from the tallies, writes the usage rows, then
+   * settles (or releases) the hold. Usage is recorded first so a settle that
+   * fails still leaves the measured cost on the ledger for reconciliation.
+   */
+  const closeHold = async (note: string): Promise<void> => {
+    if (holdClosed) return;
+    holdClosed = true;
+
+    creditsCharged = 0;
+    providerCostUsd = 0;
+    const charges = new Map<string, { credits: number; revenueUsd: number }>();
+    for (const [op, t] of tallies) {
+      providerCostUsd += t.costMicro / 1e6;
+      // Charged per keyword, not per sweep: price x the number of keywords that
+      // had at least one billed or uncertain call on this operation. Keywords
+      // whose calls were all free cost nothing, even when another keyword on
+      // the same channel was billed.
+      const opCredits = (pricing.get(op) ?? 0) * t.chargeableKeywords.size;
+      creditsCharged += opCredits;
+      perOperation[op] = opCredits;
+      // What the usage ledger records, so it carries the same figures the
+      // wallet was debited. Revenue at the rate these credits were bought for,
+      // which is what wallet_settle works out.
+      charges.set(op, { credits: opCredits, revenueUsd: opCredits * pricePerCredit });
+    }
+
+    await recordUsage(admin, userId, runKey, tallies, hold.id, charges);
+
+    if (creditsCharged > 0) {
+      // Checked. settleSweep returns null when the RPC fails, and this used to
+      // set charged = true regardless — the response then said "charged" with
+      // balance_after null while the hold stayed put.
+      balanceAfter = await settleSweep(
+        admin, hold.id, creditsCharged, providerCostUsd, `${runKey}:settle`, note,
+      );
+      charged = balanceAfter !== null;
+    } else {
+      // Nothing billable happened: no results, or every call failed in a way
+      // treg does not charge for. The hold goes back in full.
+      await releaseSweep(admin, hold.id, 'no billable provider calls');
+    }
+  };
+
+  try {
+    for (const kw of keywords) {
+      // Channels run in parallel; providers inside a channel run in sequence so
+      // a fallback only costs money once the cheaper one has actually failed.
+      const perChannel = await Promise.all(
+        billableChannels.map((ch) => {
+          const tally = tallies.get(OPERATION_OF[ch])!;
+          return searchChannel(ch, kw, lookbackHours, served, tally, userId, runNonce, stats);
+        }),
+      );
+
+      for (const post of perChannel.flat()) {
+        if (!withinLookback(post.posted_at)) {
+          droppedStale++;
+          continue;
+        }
+        if (post.intent_score < minIntent) continue;
+
+        const normalizedUrl = post.post_url.trim().toLowerCase();
+        if (seenUrls.has(normalizedUrl)) continue;
+        seenUrls.add(normalizedUrl);
+        collected.push(post);
+      }
+    }
+
+    // ---- Settle for what actually billed ----------------------------------
+    //
+    // A keyword/channel pair that produced no billable call costs nothing. The
+    // customer pays for searches that were paid for, not for the ones that were
+    // free or for the retries behind them.
+    await closeHold(`${keywords.length} keywords across ${billableChannels.length} channels`);
+  } finally {
+    // An exception mid-sweep used to leave the hold reserved forever (and the
+    // calls already billed unrecorded). Whatever was billed up to the throw is
+    // recorded and settled; if nothing was, the hold is released.
+    if (!holdClosed) {
+      try {
+        await closeHold('sweep aborted by an error; charged for calls already billed');
+      } catch (err) {
+        console.error('[billing] closing hold after error failed:', err);
+      }
+    }
   }
-
-  await recordUsage(admin, userId, runKey, tallies, hold.id, charges);
 
   // --- Persist to monitored_posts (service role) ---------------------------
   if (collected.length > 0) {
@@ -1213,6 +1309,12 @@ Deno.serve(async (req) => {
   const allCallsFailed =
     providerErrors.length > 0 && [...tallies.values()].every((t) => t.calls > 0 && !t.billed);
 
+  // Measured spend stays server-side: it is our cost price, not the customer's
+  // business, and it is already on the api_usage rows.
+  console.log(
+    `[social-search] ${userId}: ${stats.callsMade} calls, $${stats.usdSpent.toFixed(6)} provider cost`,
+  );
+
   // --- Retention pass ------------------------------------------------------
   const pruned = await pruneOldMentions(admin, userId, sweepStartedAt);
 
@@ -1231,9 +1333,7 @@ Deno.serve(async (req) => {
     dropped_stale: droppedStale,
     pruned,
     served_by: served,
-    // Measured from treg's own cost headers, not from a rate card.
-    usd_spent: Number(usdSpent.toFixed(6)),
-    calls_made: callsMade,
+    calls_made: stats.callsMade,
     billing: {
       charged,
       // Surfaced so a client can tell "charged and it worked" from "charged and
@@ -1241,12 +1341,37 @@ Deno.serve(async (req) => {
       provider_errors: providerErrors.slice(0, 8),
       credits_charged: creditsCharged,
       credits_required: creditsRequired,
-      provider_cost_usd: Number(providerCostUsd.toFixed(8)),
       per_operation: perOperation,
       balance_after: balanceAfter,
     },
   });
 });
+
+/**
+ * Plan ceilings from sweep_shape(). Falls back to the smallest plan's numbers
+ * rather than to "unlimited" if the RPC is unavailable.
+ */
+async function loadSweepShape(
+  admin: ReturnType<typeof createClient>,
+): Promise<{ maxKeywords: number; maxChannels: number }> {
+  const fallback = { maxKeywords: FALLBACK_MAX_KEYWORDS, maxChannels: FALLBACK_MAX_CHANNELS };
+  try {
+    const { data, error } = await admin.rpc('sweep_shape');
+    if (error) {
+      console.warn('[social-search] sweep_shape failed:', error.message);
+      return fallback;
+    }
+    const k = Number((data as any)?.max_keywords);
+    const c = Number((data as any)?.max_channels);
+    return {
+      maxKeywords: Number.isFinite(k) && k > 0 ? Math.floor(k) : fallback.maxKeywords,
+      maxChannels: Number.isFinite(c) && c > 0 ? Math.floor(c) : fallback.maxChannels,
+    };
+  } catch (err) {
+    console.warn('[social-search] sweep_shape threw:', err);
+    return fallback;
+  }
+}
 
 /**
  * Retention pass. Removes mentions older than the workspace's retention window,

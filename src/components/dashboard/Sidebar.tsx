@@ -12,7 +12,9 @@ import {
   LogOut,
   PanelLeftClose,
   PanelLeftOpen,
+  Mail,
 } from 'lucide-react';
+import { useMailStore } from '../mail/mail-store';
 
 interface NavItem {
   id: DashboardTab;
@@ -59,6 +61,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
     return 'EC';
   };
 
+  const { threads, activeMailboxId } = useMailStore();
+  const unreadMailCount = threads.filter(
+    (t) => t.mailbox_id === activeMailboxId && t.folder === 'inbox' && t.unread_count > 0
+  ).length;
+
   const navItems: { group: string; items: NavItem[] }[] = [
     {
       group: 'MAIN',
@@ -73,6 +80,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
           id: 'leads',
           label: 'Leads',
           icon: <Users className="w-4 h-4" />,
+        },
+        {
+          id: 'mail',
+          label: 'Mail',
+          icon: <Mail className="w-4 h-4" />,
+          count: unreadMailCount > 0 ? unreadMailCount : undefined,
         },
         {
           id: 'keywords',
@@ -258,7 +271,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </div>
 
             <button
-              onClick={() => signOut()}
+              onClick={() => void signOut().finally(onNavigateHome)}
               title="Log out"
               className="p-1.5 text-[#8a8a86] hover:text-[#141414] hover:bg-[#eeeeea] rounded-none transition-colors cursor-pointer"
             >
@@ -274,7 +287,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               {getInitials()}
             </div>
             <button
-              onClick={() => signOut()}
+              onClick={() => void signOut().finally(onNavigateHome)}
               title="Log out"
               className="p-1.5 text-[#8a8a86] hover:text-[#141414] hover:bg-[#eeeeea] transition-colors cursor-pointer"
             >

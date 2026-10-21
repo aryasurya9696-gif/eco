@@ -179,17 +179,136 @@ async function resolveSecret(admin: ReturnType<typeof createClient>): Promise<st
   return webhookSecret;
 }
 
-/** Pulls the amount Dodo actually collected, if the payload carries one. */
-function extractAmount(data: any): { gross?: number; fee?: number; net?: number } {
-  const total = data?.total_amount ?? data?.amount;
-  const fee = data?.fee_amount ?? data?.processing_fee ?? data?.fees;
-  const gross = num(total);
-  const feeNum = fee === undefined || fee === null ? null : num(fee);
+// ISO 4217 minor-unit exponents that are not 2. Dodo sends amounts as integers
+// in the currency's smallest unit, so 1000 is $10.00 but ¥1000.
+const ZERO_DECIMAL = new Set([
+  'BIF', 'CLP', 'DJF', 'GNF', 'ISK', 'JPY', 'KMF', 'KRW', 'PYG',
+  'RWF', 'UGX', 'UYI', 'VND', 'VUV', 'XAF', 'XOF', 'XPF',
+]);
+const THREE_DECIMAL = new Set(['BHD', 'IQD', 'JOD', 'KWD', 'LYD', 'OMR', 'TND']);
+
+function currencyExponent(currency: unknown): number {
+  const c = String(currency ?? '').toUpperCase();
+  if (ZERO_DECIMAL.has(c)) return 0;
+  if (THREE_DECIMAL.has(c)) return 3;
+  return 2;
+}
+
+/** Minor units -> major units. null stays null so "absent" is never read as 0. */
+function toMajor(minor: unknown, currency: unknown): number | null {
+  if (minor === undefined || minor === null || minor === '') return null;
+  const n = Number(minor);
+  if (!Number.isFinite(n)) return null;
+  return n / 10 ** currencyExponent(currency);
+}
+
+/**
+ * What Dodo actually collected, in major units of the payment currency.
+ *
+ * Passed to the database as-is: treating cents as dollars made a $10 payment
+ * read as $1000 paid, which no amount check could ever catch.
+ */
+function extractAmount(data: any): { gross: number | null; fee: number | null; net: number | null; currency: string | null } {
+  const currency = typeof data?.currency === 'string' ? data.currency.toUpperCase() : null;
+  const gross = toMajor(data?.total_amount ?? data?.amount, currency);
+  const fee = toMajor(data?.fee_amount ?? data?.processing_fee ?? data?.fees, currency);
   return {
-    gross: gross || undefined,
-    fee: feeNum === null ? undefined : feeNum,
-    net: feeNum === null ? undefined : Math.max(gross - feeNum, 0),
+    gross,
+    fee,
+    net: fee === null || gross === null ? null : Math.max(gross - fee, 0),
+    currency,
   };
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Provider ids are interpolated into a PostgREST or() filter, where a comma or
+// parenthesis would change the filter itself. Anything else is not an id.
+const SAFE_REF_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+interface OrderRow {
+  id: string;
+  status: string;
+  gross_usd: number;
+  currency: string;
+  refunded_usd: number;
+}
+
+const ORDER_COLUMNS = 'id, status, gross_usd, currency, refunded_usd';
+
+/**
+ * Finds the order an event is about.
+ *
+ * The metadata we put on the checkout session is the reliable join; the
+ * provider ids are the fallback for events that do not echo metadata back
+ * (refunds and disputes usually carry only payment_id). A metadata id that is
+ * not a real order falls through to the refs rather than being trusted.
+ */
+async function findOrder(admin: ReturnType<typeof createClient>, data: any): Promise<OrderRow | null> {
+  const metaId = data?.metadata?.order_id;
+  if (typeof metaId === 'string' && UUID_RE.test(metaId)) {
+    const { data: row, error } = await admin
+      .from('payment_orders').select(ORDER_COLUMNS).eq('id', metaId).maybeSingle();
+    if (error) throw new Error(`order lookup failed: ${error.message}`);
+    if (row) return row as unknown as OrderRow;
+  }
+
+  const refs = [data?.payment_id, data?.id]
+    .filter((r): r is string => typeof r === 'string' && SAFE_REF_RE.test(r));
+  for (const ref of refs) {
+    const { data: found, error } = await admin
+      .from('payment_orders')
+      .select(ORDER_COLUMNS)
+      .or(`provider_order_id.eq.${ref},provider_ref.eq.${ref}`)
+      .limit(1);
+    if (error) throw new Error(`order lookup failed: ${error.message}`);
+    if (found?.[0]) return found[0] as unknown as OrderRow;
+  }
+  return null;
+}
+
+/**
+ * Revokes credits from every grant an order produced.
+ *
+ * `fraction` of each grant's ORIGINAL credits (1 = everything left). Each
+ * revocation is tagged with `reason`, and a grant that already has a ledger
+ * row with that tag is skipped — so a retried webhook that half-finished
+ * the first time does not take the same refund twice.
+ */
+async function revokeOrderGrants(
+  admin: ReturnType<typeof createClient>,
+  orderId: string,
+  reason: string,
+  fraction: number | null,
+): Promise<{ failures: number; revoked: number }> {
+  const { data: grants, error } = await admin
+    .from('credit_grants')
+    .select('id, credits')
+    .eq('payment_order_id', orderId);
+  if (error) throw new Error(`grant lookup failed: ${error.message}`);
+
+  let failures = 0;
+  let revoked = 0;
+  for (const g of grants ?? []) {
+    const { count: already } = await admin
+      .from('credit_ledger')
+      .select('id', { count: 'exact', head: true })
+      .eq('grant_id', g.id)
+      .eq('note', reason);
+    if ((already ?? 0) > 0) continue;
+
+    const { data: out, error: revokeError } = await admin.rpc('wallet_revoke_grant', {
+      p_grant_id: g.id,
+      p_reason: reason,
+      p_credits: fraction === null ? null : num(g.credits) * fraction,
+    });
+    if (revokeError || out?.ok === false) {
+      failures++;
+      console.error('[webhook] revoke failed:', revokeError?.message ?? out?.error);
+    } else {
+      revoked += num(out?.revoked);
+    }
+  }
+  return { failures, revoked };
 }
 
 Deno.serve(async (req) => {
@@ -274,126 +393,211 @@ Deno.serve(async (req) => {
     }
   }
 
+  // One place that closes out the delivery record, so every branch reports
+  // the same way.
+  const markEvent = (status: 'processed' | 'failed' | 'ignored', lastError: string | null = null) =>
+    admin.from('webhook_events')
+      .update({
+        status,
+        last_error: lastError,
+        processed_at: status === 'processed' ? new Date().toISOString() : null,
+      })
+      .eq('webhook_id', webhookId);
+
   try {
     const data = event?.data ?? {};
+    const providerRef: string | null = data?.payment_id ?? data?.id ?? null;
 
     if (eventType === 'payment.succeeded') {
-      const providerRef = data?.payment_id ?? data?.id ?? null;
-
       // The reliable join is the metadata we put on the checkout session
       // ourselves. The alternative — matching provider_order_id against the
       // payment id — compares two different identifiers, because checkout stored
       // a checkout-session id there, and could therefore never match. Both are
       // tried; the metadata is simply the one that works.
-      let orderId = data?.metadata?.order_id ?? null;
-      if (!orderId && providerRef) {
-        const { data: found } = await admin
-          .from('payment_orders')
-          .select('id')
-          .or(`provider_order_id.eq.${providerRef},provider_ref.eq.${providerRef}`)
-          .limit(1);
-        orderId = found?.[0]?.id ?? null;
-      }
+      const order = await findOrder(admin, data);
 
-      if (!orderId) {
+      if (!order) {
         // A payment we have no order for. Recorded as ignored rather than
         // failed: retrying will not produce an order.
-        await admin.from('webhook_events')
-          .update({ status: 'ignored', last_error: 'no matching order' })
-          .eq('webhook_id', webhookId);
+        await markEvent('ignored', 'no matching order');
         console.warn(`[webhook] ${eventType} with no matching order; provider ref ${providerRef}`);
         return json({ ok: true, matched: false });
       }
 
+      const amount = extractAmount(data);
       const { data: settle, error: settleError } = await admin.rpc('wallet_topup_from_order', {
-        p_order_id: orderId,
-        p_fee_usd: extractAmount(data).fee ?? null,
-        p_net_usd: extractAmount(data).net ?? null,
+        p_order_id: order.id,
+        p_fee_usd: amount.fee,
+        p_net_usd: amount.net,
         p_provider_ref: providerRef,
         p_idempotency_key: `dodo:${webhookId}`,
+        p_paid_usd: amount.gross,
+        p_paid_currency: amount.currency,
       });
 
       if (settleError) throw new Error(`topup failed: ${settleError.message}`);
 
-      await admin.from('webhook_events')
-        .update({ status: 'processed', processed_at: new Date().toISOString() })
-        .eq('webhook_id', webhookId);
+      if (settle?.ok === false) {
+        if (settle.error === 'amount_mismatch' || settle.error === 'currency_mismatch') {
+          // The database has parked the order in 'review'. Retrying cannot
+          // change what was paid, so this is final for the webhook: processed,
+          // with the reason kept for whoever reviews it.
+          await markEvent('processed', `review: ${settle.error}`);
+          console.error(
+            `[webhook] order ${order.id} held for review: ${settle.error} ` +
+            `(paid ${amount.gross} ${amount.currency}, expected ${order.gross_usd} ${order.currency})`,
+          );
+          return json({ ok: true, settled: false, review: settle.error });
+        }
+        // Anything else (missing package, zero-credit package) is a config
+        // problem a retry can succeed after, once someone fixes it.
+        throw new Error(`topup refused: ${settle.error}`);
+      }
 
-      console.log(`[webhook] payment.settled order=${orderId} ${JSON.stringify(settle)}`);
+      await markEvent('processed');
+      console.log(`[webhook] payment.settled order=${order.id} ${JSON.stringify(settle)}`);
       return json({ ok: true, settled: true });
     }
 
     if (eventType === 'refund.succeeded' || eventType === 'payment.refunded') {
-      const providerRef = data?.payment_id ?? data?.id ?? null;
-      let orderId = data?.metadata?.order_id ?? null;
-      if (!orderId && providerRef) {
-        const { data: found } = await admin
-          .from('payment_orders')
-          .select('id')
-          .or(`provider_order_id.eq.${providerRef},provider_ref.eq.${providerRef}`)
-          .limit(1);
-        orderId = found?.[0]?.id ?? null;
+      const order = await findOrder(admin, data);
+
+      if (!order) {
+        // Not "processed": a refund we cannot attach to an order means money
+        // went back and credits may not have. Failed, so it shows up for a
+        // human. Answered 200 because a provider retry cannot produce the order.
+        await markEvent('failed', 'refund_order_not_found');
+        console.error(`[webhook] ${eventType} with no matching order; provider ref ${providerRef}`);
+        return json({ ok: false, error: 'refund_order_not_found' });
       }
+
+      const gross = num(order.gross_usd);
+      const alreadyRefunded = num(order.refunded_usd);
+      // A refund event carries its own amount; a payment.refunded carries the
+      // payment, whose total is the whole order. If neither is present the
+      // remainder is assumed — over-revoking a refunded customer is the
+      // recoverable direction.
+      const refundCurrency = data?.currency ?? order.currency;
+      let refundAmount = eventType === 'refund.succeeded'
+        ? toMajor(data?.amount ?? data?.refund_amount, refundCurrency)
+        : toMajor(data?.refund_amount ?? data?.total_amount, refundCurrency);
+      if (refundAmount === null) {
+        console.warn(`[webhook] ${eventType} for order ${order.id} has no amount; treating as full refund`);
+        refundAmount = Math.max(gross - alreadyRefunded, 0);
+      }
+      if (data?.currency && String(data.currency).toUpperCase() !== String(order.currency).toUpperCase()) {
+        console.warn(`[webhook] refund currency ${data.currency} differs from order currency ${order.currency}`);
+      }
+
+      // Revoke the same share of each grant's original credits as the share of
+      // the order that was refunded. A $5 refund on a $20 pack takes a quarter,
+      // not the whole pack.
+      const fraction = gross > 0 ? Math.min(refundAmount / gross, 1) : 1;
 
       // Revoke before marking the order refunded, and treat a failure as a
-      // failure. Doing it the other way round — mark first, then try — meant a
-      // revoke that errored left the order looking refunded with the credits
-      // still there, and the provider was answered 200 so it never came back.
-      let revokeFailures = 0;
-
-      if (orderId) {
-        const { data: grants } = await admin
-          .from('credit_grants')
-          .select('id')
-          .eq('payment_order_id', orderId);
-
-        for (const g of grants ?? []) {
-          const { error } = await admin.rpc('wallet_revoke_grant', {
-            p_grant_id: g.id,
-            p_reason: 'refund',
-          });
-          if (error) {
-            revokeFailures++;
-            console.error('[webhook] revoke failed:', error.message);
-          }
-        }
-
-        if (revokeFailures > 0) {
-          // 500 so the provider retries, and the order is left untouched so a
-          // human can see it still needs finishing.
-          await admin.from('webhook_events')
-            .update({ status: 'failed', last_error: `${revokeFailures} grant revocation(s) failed` })
-            .eq('webhook_id', webhookId);
-          return json({ ok: false, error: 'revoke_failed' }, 500);
-        }
-
-        await admin.from('payment_orders').update({ status: 'refunded' }).eq('id', orderId);
+      // failure. Doing it the other way round meant a revoke that errored left
+      // the order looking refunded with the credits still there.
+      const { failures } = await revokeOrderGrants(admin, order.id, `refund:${webhookId}`, fraction);
+      if (failures > 0) {
+        // 500 so the provider retries, and the order is left untouched so a
+        // human can see it still needs finishing.
+        await markEvent('failed', `${failures} grant revocation(s) failed`);
+        return json({ ok: false, error: 'revoke_failed' }, 500);
       }
 
-      await admin.from('webhook_events')
-        .update({ status: 'processed', processed_at: new Date().toISOString() })
-        .eq('webhook_id', webhookId);
-      return json({ ok: true, refunded: !!orderId });
+      const refundedTotal = Math.min(alreadyRefunded + refundAmount, gross);
+      const { error: orderError } = await admin.from('payment_orders')
+        .update({
+          refunded_usd: refundedTotal,
+          status: refundedTotal + 0.005 >= gross ? 'refunded' : 'partially_refunded',
+        })
+        .eq('id', order.id);
+      if (orderError) throw new Error(`order update failed: ${orderError.message}`);
+
+      await markEvent('processed');
+      console.log(`[webhook] refund order=${order.id} amount=${refundAmount} total=${refundedTotal}/${gross}`);
+      return json({ ok: true, refunded: true, fraction });
     }
 
-    if (eventType === 'payment.failed' || eventType === 'dispute.created' || eventType === 'dispute.opened') {
-      const providerRef = data?.payment_id ?? data?.id ?? null;
-      if (providerRef) {
-        await admin.from('payment_orders')
+    if (eventType === 'payment.failed') {
+      const order = await findOrder(admin, data);
+      if (order) {
+        // Only an order still waiting can fail. A late or out-of-order
+        // payment.failed must not overwrite an order that already settled.
+        const { error } = await admin.from('payment_orders')
           .update({ status: 'failed' })
-          .or(`provider_order_id.eq.${providerRef},provider_ref.eq.${providerRef}`);
+          .eq('id', order.id)
+          .in('status', ['created', 'pending']);
+        if (error) throw new Error(`order update failed: ${error.message}`);
       }
-      await admin.from('webhook_events')
-        .update({ status: 'processed', processed_at: new Date().toISOString() })
-        .eq('webhook_id', webhookId);
-      return json({ ok: true });
+      await markEvent('processed', order ? null : 'no matching order');
+      return json({ ok: true, matched: !!order });
+    }
+
+    if (eventType === 'dispute.opened' || eventType === 'dispute.created') {
+      const order = await findOrder(admin, data);
+      if (!order) {
+        await markEvent('ignored', 'no matching order');
+        console.warn(`[webhook] ${eventType} with no matching order; provider ref ${providerRef}`);
+        return json({ ok: true, matched: false });
+      }
+
+      // Freeze: the money is contested, so the unspent credits it bought stop
+      // being spendable now rather than after the dispute is decided.
+      const { failures, revoked } = await revokeOrderGrants(admin, order.id, `dispute:${order.id}`, null);
+      if (failures > 0) {
+        await markEvent('failed', `${failures} grant revocation(s) failed`);
+        return json({ ok: false, error: 'revoke_failed' }, 500);
+      }
+
+      const { error } = await admin.from('payment_orders')
+        .update({ status: 'disputed' })
+        .eq('id', order.id);
+      if (error) throw new Error(`order update failed: ${error.message}`);
+
+      await markEvent('processed');
+      console.warn(`[webhook] dispute opened order=${order.id}; froze ${revoked} credits`);
+      return json({ ok: true, disputed: true });
+    }
+
+    if (eventType === 'dispute.won') {
+      const order = await findOrder(admin, data);
+      if (order && order.status === 'disputed') {
+        const { error } = await admin.from('payment_orders')
+          .update({ status: 'succeeded' })
+          .eq('id', order.id);
+        if (error) throw new Error(`order update failed: ${error.message}`);
+        // Deliberately not automatic: a re-grant creates credits, and this
+        // webhook only creates credits on payment.succeeded.
+        console.warn(`[webhook] dispute won order=${order.id}; frozen credits are NOT re-granted automatically - restore manually`);
+      }
+      await markEvent('processed', order ? null : 'no matching order');
+      return json({ ok: true, matched: !!order });
+    }
+
+    if (eventType === 'dispute.lost' || eventType === 'dispute.accepted') {
+      const order = await findOrder(admin, data);
+      if (order) {
+        // Anything that became spendable since the freeze (a hold released) is
+        // taken too. Credits a grant no longer has are simply not taken.
+        const { failures } = await revokeOrderGrants(admin, order.id, 'dispute_lost', null);
+        if (failures > 0) {
+          await markEvent('failed', `${failures} grant revocation(s) failed`);
+          return json({ ok: false, error: 'revoke_failed' }, 500);
+        }
+        const { error } = await admin.from('payment_orders')
+          .update({ status: 'refunded', refunded_usd: num(order.gross_usd) })
+          .eq('id', order.id);
+        if (error) throw new Error(`order update failed: ${error.message}`);
+        console.warn(`[webhook] dispute lost order=${order.id}`);
+      }
+      await markEvent('processed', order ? null : 'no matching order');
+      return json({ ok: true, matched: !!order });
     }
 
     // Recorded and acknowledged. An event type we do not act on yet should not
     // make the provider retry it eight times.
-    await admin.from('webhook_events')
-      .update({ status: 'ignored', last_error: `unhandled type ${eventType}` })
-      .eq('webhook_id', webhookId);
+    await markEvent('ignored', `unhandled type ${eventType}`);
     console.log(`[webhook] ignored ${eventType}`);
     return json({ ok: true, ignored: true });
   } catch (err) {

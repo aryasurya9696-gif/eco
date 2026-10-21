@@ -7,9 +7,11 @@ import { LeadsTab } from '../components/leads/LeadsTab';
 import { KeywordsTab } from '../components/dashboard/KeywordsTab';
 import { SettingsTab } from '../components/dashboard/SettingsTab';
 import { BillingTab } from '../components/dashboard/BillingTab';
+import { MailTab } from '../components/mail/MailTab';
+import { Composer } from '../components/mail/Composer';
 import { OnboardingModal } from '../components/onboarding/OnboardingModal';
 import type { DashboardTab } from '../types';
-import { tabFromHash } from '../lib/tab-routing';
+import { hashForTab, tabFromHash } from '../lib/tab-routing';
 import { RefreshCw, Radio } from 'lucide-react';
 
 interface DashboardPageProps {
@@ -20,14 +22,22 @@ interface DashboardPageProps {
 export const DashboardPage: React.FC<DashboardPageProps> = ({
   onNavigateHome,
 }) => {
-  const { profile } = useAuth();
+  const { profile, profileError, retryProfile } = useAuth();
   const { isSweeping, runSweep, keywords } = useEcho();
   // Read the tab out of the hash on first paint rather than always starting on
   // the feed, so a refresh on #dashboard/billing comes up on Billing rather than
-  // the feed.
-  const [activeTab, setActiveTab] = useState<DashboardTab>(
-    () => (tabFromHash() as DashboardTab) ?? 'feed',
-  );
+  // the feed. A package picked on the landing page ("Buy") wins: the visitor
+  // arrives here to pay, whichever route (sign-in, sign-up, already signed in)
+  // brought them.
+  const [activeTab, setActiveTab] = useState<DashboardTab>(() => {
+    try {
+      if (sessionStorage.getItem('echo_intended_package')) return 'billing';
+    } catch {
+      // Storage unavailable: fall back to the hash.
+    }
+    return (tabFromHash() as DashboardTab) ?? 'feed';
+  });
+  const [isRetryingProfile, setIsRetryingProfile] = useState(false);
 
   // Sidebar collapse state with localStorage persistence
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() => {
@@ -100,8 +110,21 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
   const handleTabChange = (tab: DashboardTab) => {
     setActiveTab(tab);
-    replaceHash(`#dashboard/${tab}`);
+    replaceHash(hashForTab(tab));
   };
+
+  // Keep the URL naming the tab actually shown (e.g. Billing chosen from an
+  // intended package while the hash still said #/dashboard). A no-op whenever
+  // the tab came from the hash or from handleTabChange.
+  useEffect(() => {
+    if (tabFromHash() !== activeTab) {
+      window.history.replaceState(
+        null,
+        '',
+        `${window.location.pathname}${window.location.search}${hashForTab(activeTab)}`,
+      );
+    }
+  }, [activeTab]);
 
   // Check if onboarding needs to be shown
   const showOnboarding = Boolean(profile && !profile.onboarding_completed);
@@ -130,6 +153,8 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                   ? 'Monitored Mentions Feed'
                   : activeTab === 'leads'
                   ? 'B2B Leads & Prospecting'
+                  : activeTab === 'mail'
+                  ? 'Mailbox & Outreach'
                   : activeTab === 'keywords'
                   ? 'Keyword Management'
                   : activeTab === 'billing'
@@ -169,12 +194,30 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
         {/* Content Pane */}
         <main
-          className={`flex-1 ${activeTab === 'leads' ? 'p-0 flex flex-col overflow-hidden' : 'p-6 sm:p-8 overflow-y-auto'} ${
+          className={`flex-1 ${activeTab === 'leads' || activeTab === 'mail' ? 'p-0 flex flex-col overflow-hidden' : 'p-6 sm:p-8 overflow-y-auto'} ${
             showOnboarding ? 'pointer-events-none select-none blur-[1px]' : ''
           }`}
         >
+          {profileError && !profile && (
+            <div role="alert" className="mb-6 p-4 border border-[#f0c4c4] bg-[#fdf2f2] text-xs text-[#8a2a2a] flex items-center justify-between gap-4 pointer-events-auto">
+              <span>Could not load your workspace profile: {profileError}</span>
+              <button
+                type="button"
+                disabled={isRetryingProfile}
+                onClick={async () => {
+                  setIsRetryingProfile(true);
+                  await retryProfile();
+                  setIsRetryingProfile(false);
+                }}
+                className="px-3 py-1.5 border border-[#8a2a2a] text-[#8a2a2a] hover:bg-[#8a2a2a] hover:text-white transition-colors cursor-pointer disabled:opacity-50"
+              >
+                {isRetryingProfile ? 'Retrying...' : 'Retry'}
+              </button>
+            </div>
+          )}
           {activeTab === 'feed' && <FeedTab />}
           {activeTab === 'leads' && <LeadsTab onNavigateBilling={() => handleTabChange('billing')} />}
+          {activeTab === 'mail' && <MailTab />}
           {activeTab === 'keywords' && <KeywordsTab />}
           {activeTab === 'billing' && <BillingTab />}
           {activeTab === 'settings' && <SettingsTab />}
@@ -188,6 +231,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           setActiveTab('feed');
         }}
       />
+
+      {/* Global Mail Outreach Slide-Over Drawer */}
+      <Composer mode="drawer" />
     </div>
   );
 };

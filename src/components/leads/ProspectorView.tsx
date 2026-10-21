@@ -74,18 +74,19 @@ export const ProspectorView: React.FC<ProspectorViewProps> = (props) => {
     void onSearch(p);
   };
 
-  const walletEmpty = availableCredits !== null && availableCredits <= 0;
+  const walletEmpty = availableCredits !== null && availableCredits < Math.max(1, pricing.searchCredits);
+  const searchFee = `${pricing.searchCredits} credit${pricing.searchCredits === 1 ? '' : 's'} per search`;
   const notice: React.ComponentProps<typeof SearchBar>['notice'] = walletEmpty
     ? {
         tone: 'warn',
-        text: `You need credits to search. You pay only for what is found: ${pricing.email} credit per verified email, ${pricing.phone} per phone.`,
+        text: `You need credits to search: ${searchFee}, then ${pricing.email} credit per verified email and ${pricing.phone} per phone found.`,
       }
     : !hasCriteria(form)
       ? { tone: 'info', text: 'Type a job title to start — keywords, company and country are optional.' }
       : availableCredits !== null && cost > availableCredits
         ? {
             tone: 'info',
-            text: `Up to ${cost} credits if every lead is verified; you have ${availableCredits}. Lookups stop when your balance runs out.`,
+            text: `Up to ${cost} credits (${searchFee} plus every lead verified); you have ${availableCredits}. Lookups stop when your balance runs out.`,
           }
         : changed && !isSearching
         ? { tone: 'info', text: 'Filters changed — press Search to update the results below.' }
@@ -195,7 +196,7 @@ const EmptyState: React.FC<{ pricing: LeadPricing; onExample: (text: string) => 
         {
           icon: <Search className="w-4 h-4" />,
           title: 'Search',
-          text: 'Pick a role and location. You need credits in your account to search.'
+          text: `Pick a role and location. Each search costs ${pricing.searchCredits} credit${pricing.searchCredits === 1 ? '' : 's'}.`,
         },
         {
           icon: <Sparkles className="w-4 h-4" />,

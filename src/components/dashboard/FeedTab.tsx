@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useEcho } from '../../context/EchoContext';
 import type { MonitoredPost } from '../../types';
+import { safeHttpUrl } from '../../lib/url';
 import { FeedCard } from './FeedCard';
 import { FeedSummary, FeedSkeleton } from './FeedSummary';
 import { Search, X, Sparkles, Clock, Trash2 } from 'lucide-react';
@@ -118,17 +119,25 @@ export const FeedTab: React.FC = () => {
   const toggleExpand = (id: string) =>
     setExpandedCards((prev) => ({ ...prev, [id]: !prev[id] }));
 
+  // Each draft request takes a number; only the latest may write its result,
+  // so a slow reply for an earlier tone (or post) cannot overwrite a newer one.
+  const draftSeqRef = useRef(0);
+
   const handleOpenAiDraft = async (post: MonitoredPost) => {
+    const seq = ++draftSeqRef.current;
     setAiDraftModalPost(post);
     setCopiedDraft(false);
     setIsGeneratingDraft(true);
     setDraftText('AI is drafting a personalised reply...');
     try {
-      setDraftText(await generateAiDraft(post, draftTone));
-    } catch {
+      const text = await generateAiDraft(post, draftTone);
+      if (seq === draftSeqRef.current) setDraftText(text);
+    } catch (err) {
+      if (seq !== draftSeqRef.current) return;
       setDraftText('');
+      addToast(`Could not draft a reply: ${(err as Error)?.message || 'unknown error'}`, 'error');
     } finally {
-      setIsGeneratingDraft(false);
+      if (seq === draftSeqRef.current) setIsGeneratingDraft(false);
     }
   };
 
@@ -137,13 +146,18 @@ export const FeedTab: React.FC = () => {
   ) => {
     setDraftTone(tone);
     if (aiDraftModalPost) {
+      const seq = ++draftSeqRef.current;
       setIsGeneratingDraft(true);
       try {
-        setDraftText(await generateAiDraft(aiDraftModalPost, tone));
-      } catch {
-        /* keep previous draft */
+        const text = await generateAiDraft(aiDraftModalPost, tone);
+        if (seq === draftSeqRef.current) setDraftText(text);
+      } catch (err) {
+        // The previous draft stays; say why it did not change.
+        if (seq === draftSeqRef.current) {
+          addToast(`Could not redraft in that tone: ${(err as Error)?.message || 'unknown error'}`, 'error');
+        }
       } finally {
-        setIsGeneratingDraft(false);
+        if (seq === draftSeqRef.current) setIsGeneratingDraft(false);
       }
     }
   };
@@ -621,14 +635,18 @@ export const FeedTab: React.FC = () => {
               </div>
 
               <div className="flex items-center justify-between">
-                <a
-                  href={aiDraftModalPost.post_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1.5 text-[11px] font-mono text-[#4a4a47] hover:text-[#141414]"
-                >
-                  Open original
-                </a>
+                {safeHttpUrl(aiDraftModalPost.post_url) ? (
+                  <a
+                    href={safeHttpUrl(aiDraftModalPost.post_url) ?? undefined}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 text-[11px] font-mono text-[#4a4a47] hover:text-[#141414]"
+                  >
+                    Open original
+                  </a>
+                ) : (
+                  <span />
+                )}
                 <button
                   type="button"
                   onClick={() => void handleCopyDraft()}

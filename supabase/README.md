@@ -61,6 +61,11 @@ Idempotent: safe to run more than once.
 | 14 | `20261105_billing_reports.sql` | `v_margin_by_operation`, `v_platform_totals`, `v_margin_by_user`, `v_treg_reconciliation`, `v_stale_reservations` |
 | 15 | `20261106_welcome_credits.sql` | 20 welcome credits on signup |
 | 16 | `20261107_audit_fixes.sql` | Fee-safe top-up, stale-hold reaper, request-level feed guards, `sweep_shape()` |
+| — | `20261108`–`20261120` | Deleted. The old Leads feature; `20261121` drops whatever it left behind. |
+| 17 | `20261121_remove_leads.sql` | Drops the old Leads objects |
+| 18 | `20261122_user_leads.sql` | `user_leads` + lead reveal prices |
+| 19 | `20261123_leads_search_pricing.sql` | Lead price and cost estimates |
+| 20 | `20261124_audit_fixes.sql` | Margin views private, `take_rate_limit()`, paid-amount check, partial refunds and disputes, reaper fix, `user_leads` write lock-down, retention job |
 
 </details>
 
@@ -84,11 +89,24 @@ supabase secrets set SWEEP_CRON_SECRET="$(openssl rand -hex 32)"
 | `OPENAI_API_KEY` | `ai` | returns 503, client falls back to templates |
 | `DODO_PAYMENTS_API_KEY` | `billing` | checkout returns 503 (`payments_not_configured`) |
 | `DODO_PAYMENTS_WEBHOOK_KEY` | `billing-webhook` | every payment event is refused as unsigned |
-| `APP_ORIGIN` | `billing` | return URLs broken |
-| `SWEEP_CRON_SECRET` | `daily-sweep` | sweep refuses to run at all |
+| `DODO_ENVIRONMENT` | `billing` | anything but `live_mode` sends checkouts to Dodo's test environment |
+| `APP_ORIGIN` | `billing` | checkout refuses to start (no return URL) |
+| `SWEEP_CRON_SECRET` | `daily-sweep` | sweep refuses to run at all (min. 32 characters) |
 
-Optional: `ALLOWED_ORIGIN` (CORS origin, defaults `*`), `OPENAI_MODEL`
-(defaults `gpt-4o-mini`).
+Optional: `ALLOWED_ORIGIN` (CORS origin, defaults `*` — set it in production),
+`OPENAI_MODEL` (defaults `gpt-4o-mini`).
+
+**Dodo product ids** are stored per package, not as secrets. Checkout refuses a
+package whose `provider_ref` is empty:
+
+```sql
+update public.topup_packages set provider_ref = 'pdt_...' where code = 'starter_200';
+update public.topup_packages set provider_ref = 'pdt_...' where code = 'standard_500';
+update public.topup_packages set provider_ref = 'pdt_...' where code = 'pack_1000';
+```
+
+Webhook URL to register in Dodo:
+`https://<project-ref>.supabase.co/functions/v1/billing-webhook`.
 
 Secrets that must survive a redeploy of the whole project also live in the
 `service_secrets` table, which only the service role can read. `daily-sweep`

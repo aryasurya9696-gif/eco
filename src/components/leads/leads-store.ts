@@ -2,7 +2,7 @@ import { useSyncExternalStore } from 'react';
 import type { B2BLead } from '../../types';
 import { invokeFunction, ApiError } from '../../lib/api';
 import { fetchBalance, type Wallet } from '../../lib/billing';
-import { leadKey, revealedEmail, revealedPhone, emailState, EMAIL_REVEAL_CREDITS, PHONE_REVEAL_CREDITS } from './lead-utils';
+import { leadKey, revealedEmail, revealedPhone, emailState } from './lead-utils';
 import {
   DEFAULT_PRICING,
   type LeadPricing,
@@ -200,6 +200,7 @@ export const leadsStore = {
         search_free_leads: number;
         search_block_leads: number;
         search_block_credits: number;
+        searchCredits?: number;
       }>('leads', { action: 'pricing' });
       if (res?.ok) {
         const n = (v: unknown, d: number) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d);
@@ -210,6 +211,7 @@ export const leadsStore = {
             freeLeads: n(res.search_free_leads, DEFAULT_PRICING.freeLeads),
             blockLeads: Math.max(1, n(res.search_block_leads, DEFAULT_PRICING.blockLeads)),
             blockCredits: n(res.search_block_credits, DEFAULT_PRICING.blockCredits),
+            searchCredits: n(res.searchCredits, DEFAULT_PRICING.searchCredits),
           },
         });
       }
@@ -245,6 +247,29 @@ export const leadsStore = {
     applySavedRows([saved]);
   },
 
+  /**
+   * Forgets everything belonging to the signed-in user: in-flight searches and
+   * enrichment runs are superseded, memory is cleared, and the per-user
+   * sessionStorage snapshots are removed. Called on sign-out.
+   */
+  reset() {
+    searchSeq++;
+    runSeq++;
+    runActive = false;
+    window.clearTimeout(persistTimer);
+    persistTimer = undefined;
+    try {
+      for (let i = sessionStorage.length - 1; i >= 0; i--) {
+        const key = sessionStorage.key(i);
+        if (key && key.startsWith(STORAGE_PREFIX)) sessionStorage.removeItem(key);
+      }
+    } catch {
+      // Storage blocked: nothing was persisted there either.
+    }
+    state = initialState();
+    listeners.forEach((l) => l());
+  },
+
   search,
   enrichLeads,
   stopEnrichment() {
@@ -256,6 +281,16 @@ export const leadsStore = {
 
 export function useLeadsStore(): LeadsState {
   return useSyncExternalStore(leadsStore.subscribe, leadsStore.getSnapshot);
+}
+
+const getPricing = () => state.pricing;
+
+/**
+ * Just the server prices. The reference only changes when pricing is reloaded,
+ * so per-row cells can read it without re-rendering on every store update.
+ */
+export function useLeadPricing(): LeadPricing {
+  return useSyncExternalStore(leadsStore.subscribe, getPricing);
 }
 
 /**
@@ -283,8 +318,15 @@ async function search(params: ProspectorSearchParams, opts: { email: boolean; ph
   if (state.searchStatus.kind === 'searching') return;
   // Searching needs credits to reveal what it finds (the server enforces the
   // same rule); refuse here too so no request is made on an empty wallet.
-  if (state.wallet && Number(state.wallet.available) <= 0) {
-    emit({ searchStatus: { kind: 'error', message: 'Add credits to search. You pay only for verified emails and phones found.', params } });
+  const minimum = Math.max(1, state.pricing.searchCredits);
+  if (state.wallet && Number(state.wallet.available) < minimum) {
+    emit({
+      searchStatus: {
+        kind: 'error',
+        message: `Add credits to search. Each search costs ${state.pricing.searchCredits} credit${state.pricing.searchCredits === 1 ? '' : 's'}, plus verified emails and phones found.`,
+        params,
+      },
+    });
     return;
   }
   const seq = ++searchSeq;
@@ -337,7 +379,7 @@ async function search(params: ProspectorSearchParams, opts: { email: boolean; ph
       searchStatus: { kind: 'done' },
       enrichment: null,
     });
-    // A search past the free allowance spends credits.
+    // Every search spends its flat fee (and any per-lead block fee).
     if (res.search_credits_charged) void leadsStore.loadBalance();
 
     if (leads.length === 0) {
@@ -359,7 +401,7 @@ async function search(params: ProspectorSearchParams, opts: { email: boolean; ph
       // unaffordable; offer the size the balance covers when it is on.
       const p = state.pricing;
       if (p.blockCredits > 0) {
-        const credits = state.wallet ? Math.max(0, Number(state.wallet.available)) : 0;
+        const credits = state.wallet ? Math.max(0, Number(state.wallet.available) - p.searchCredits) : 0;
         affordableLimit = Math.min(params.limit - 1, p.freeLeads + Math.floor(credits / p.blockCredits) * p.blockLeads);
       }
     } else if (err instanceof ApiError && err.status === 429) {
@@ -505,8 +547,8 @@ async function runQueue(runId: number) {
     let emailTargets = group.filter((l) => l.email_lookup === 'queued');
     if (emailTargets.length > 0) {
       const credits = await availableCredits();
-      if (credits !== null && credits < EMAIL_REVEAL_CREDITS) return finishRun(runId, 'no_credits');
-      if (credits !== null) emailTargets = emailTargets.slice(0, Math.floor(credits / EMAIL_REVEAL_CREDITS));
+      if (credits !== null && credits < state.pricing.email) return finishRun(runId, 'no_credits');
+      if (credits !== null) emailTargets = emailTargets.slice(0, Math.floor(credits / Math.max(1, state.pricing.email)));
       const emailIds = new Set(emailTargets.map((l) => l.id));
       patchRows((l) => emailIds.has(l.id), () => ({ email_lookup: 'processing' }));
 
@@ -534,8 +576,8 @@ async function runQueue(runId: number) {
     let phoneTargets = state.leads.filter((l) => ids.has(l.id) && l.phone_lookup === 'queued');
     if (phoneTargets.length > 0 && consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
       const credits = await availableCredits();
-      if (credits !== null && credits < PHONE_REVEAL_CREDITS) return finishRun(runId, 'no_credits');
-      if (credits !== null) phoneTargets = phoneTargets.slice(0, Math.min(PHONE_BATCH, Math.floor(credits / PHONE_REVEAL_CREDITS)));
+      if (credits !== null && credits < state.pricing.phone) return finishRun(runId, 'no_credits');
+      if (credits !== null) phoneTargets = phoneTargets.slice(0, Math.min(PHONE_BATCH, Math.floor(credits / Math.max(1, state.pricing.phone))));
       const phoneIds = new Set(phoneTargets.map((l) => l.id));
       patchRows((l) => phoneIds.has(l.id), () => ({ phone_lookup: 'processing' }));
 

@@ -7,10 +7,10 @@ import {
   revealedPhone,
   contactStatus,
   CONTACT_STATUS_LABEL,
-  EMAIL_REVEAL_CREDITS,
-  PHONE_REVEAL_CREDITS,
   type ContactStatus,
 } from './lead-utils';
+import { useLeadPricing } from './leads-store';
+import { mailStore } from '../mail/mail-store';
 
 // ============================================================================
 // Contact cells shared by the results table, the cards view and Quick Lookup.
@@ -128,6 +128,7 @@ interface EmailCellProps {
 }
 
 export const EmailCell: React.FC<EmailCellProps> = ({ lead, onReveal, isRevealing, locked, onTopUp }) => {
+  const pricing = useLeadPricing();
   const state = emailState(lead);
   const preview = previewEmail(lead);
 
@@ -135,7 +136,7 @@ export const EmailCell: React.FC<EmailCellProps> = ({ lead, onReveal, isRevealin
     const verified = state.kind === 'verified';
     return (
       <div className="min-w-0">
-        <div className="flex items-center gap-1 min-w-0">
+        <div className="flex items-center gap-1.5 min-w-0">
           <a
             href={`mailto:${state.email}`}
             className="font-mono text-[13px] text-ink hover:underline truncate"
@@ -143,6 +144,25 @@ export const EmailCell: React.FC<EmailCellProps> = ({ lead, onReveal, isRevealin
           >
             {state.email}
           </a>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              mailStore.openComposer({
+                leadId: lead.id,
+                to: state.email,
+                name: lead.first_name,
+                company: lead.company_name,
+                subject: lead.company_name ? `Quick intro // ${lead.company_name}` : '',
+              });
+            }}
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-mono font-medium bg-[#1b7f3b] text-white hover:bg-[#15662f] transition-colors cursor-pointer shrink-0 rounded-xs"
+            title="Send 1-Click Outreach via Echo Mail"
+          >
+            <Mail className="w-3 h-3" />
+            <span>Email</span>
+          </button>
           <CopyButton value={state.email} label="email" />
         </div>
         <span
@@ -172,15 +192,15 @@ export const EmailCell: React.FC<EmailCellProps> = ({ lead, onReveal, isRevealin
           state={lookup}
           what="email"
           onRetry={!busy && onReveal ? () => onReveal(lead) : undefined}
-          retryTitle={`Try again — ${EMAIL_REVEAL_CREDITS} credit only if a verified email is found`}
+          retryTitle={`Try again — ${pricing.email} credit${pricing.email === 1 ? '' : 's'} only if a verified email is found`}
         />
       ) : onReveal ? (
         <button
           type="button"
           onClick={() => onReveal(lead)}
           className={findLink}
-          title={`Find this person's work email — ${EMAIL_REVEAL_CREDITS} credit only if it is verified`}
-          aria-label={`Find email for ${lead.full_name || 'this lead'} (${EMAIL_REVEAL_CREDITS} credit if verified)`}
+          title={`Find this person's work email — ${pricing.email} credit${pricing.email === 1 ? '' : 's'} only if it is verified`}
+          aria-label={`Find email for ${lead.full_name || 'this lead'} (${pricing.email} credit${pricing.email === 1 ? '' : 's'} if verified)`}
         >
           <Mail className="w-3.5 h-3.5" aria-hidden />
           <span>Find email</span>
@@ -206,6 +226,7 @@ interface PhoneCellProps {
 }
 
 export const PhoneCell: React.FC<PhoneCellProps> = ({ lead, onReveal, isRevealing, locked, onTopUp }) => {
+  const pricing = useLeadPricing();
   const phone = revealedPhone(lead);
   if (phone) {
     return (
@@ -230,7 +251,7 @@ export const PhoneCell: React.FC<PhoneCellProps> = ({ lead, onReveal, isRevealin
         state={lookup}
         what="phone"
         onRetry={!busy && onReveal ? () => onReveal(lead) : undefined}
-        retryTitle={`Try again — ${PHONE_REVEAL_CREDITS} credits only if a number is found`}
+        retryTitle={`Try again — ${pricing.phone} credit${pricing.phone === 1 ? '' : 's'} only if a number is found`}
       />
     );
   }
@@ -240,8 +261,8 @@ export const PhoneCell: React.FC<PhoneCellProps> = ({ lead, onReveal, isRevealin
       type="button"
       onClick={() => onReveal(lead)}
       className={findLink}
-      title={`Find a direct phone number — ${PHONE_REVEAL_CREDITS} credits, charged only if one is found`}
-      aria-label={`Find phone for ${lead.full_name || 'this lead'} (${PHONE_REVEAL_CREDITS} credits if found)`}
+      title={`Find a direct phone number — ${pricing.phone} credit${pricing.phone === 1 ? '' : 's'}, charged only if one is found`}
+      aria-label={`Find phone for ${lead.full_name || 'this lead'} (${pricing.phone} credit${pricing.phone === 1 ? '' : 's'} if found)`}
     >
       <Phone className="w-3.5 h-3.5" aria-hidden />
       <span>Find phone</span>

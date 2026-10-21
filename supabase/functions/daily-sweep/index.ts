@@ -8,7 +8,9 @@
 //
 // SECURITY: runs with the service role key and spends real money on API
 // credits, so it is NOT publicly invokable. Callers must present the
-// SWEEP_CRON_SECRET header (pg_net / dashboard schedule / your own cron).
+// SWEEP_CRON_SECRET in the x-sweep-secret header (pg_net / dashboard schedule /
+// your own cron). A ?secret= query parameter is no longer accepted: URLs end up
+// in access logs, proxies and pg_net's request table.
 //
 // NOTE: this file is intentionally SELF-CONTAINED. Do not split shared helpers
 // into an underscore-prefixed folder — Supabase's bundler skips `_`-prefixed
@@ -31,7 +33,65 @@ const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
  */
 let SWEEP_CRON_SECRET = Deno.env.get('SWEEP_CRON_SECRET') || '';
 
+/** Anything shorter is guessable enough that we would rather not run at all. */
+const MIN_CRON_SECRET_LENGTH = 32;
+
+const encoder = new TextEncoder();
+
+/**
+ * Constant-time string comparison (same approach as billing-webhook). A plain
+ * !== returns at the first differing byte, which leaks how much of a guess was
+ * right through response timing.
+ */
+function timingSafeEqual(a: string, b: string): boolean {
+  const ab = encoder.encode(a);
+  const bb = encoder.encode(b);
+  if (ab.length !== bb.length) return false;
+
+  let diff = 0;
+  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i];
+  return diff === 0;
+}
+
+/**
+ * Resolves the cron secret once per isolate: the edge secret, else the single
+ * sweep_cron_secret row. Only that row is read; the old query pulled every
+ * service secret into memory just to find one.
+ */
+async function resolveCronSecret(admin: ReturnType<typeof createClient>): Promise<string> {
+  if (SWEEP_CRON_SECRET) return SWEEP_CRON_SECRET;
+  const { data, error } = await admin
+    .from('service_secrets')
+    .select('value')
+    .eq('name', 'sweep_cron_secret')
+    .maybeSingle();
+  if (error) {
+    console.error('[sweep] cron secret lookup failed:', error.message);
+    return '';
+  }
+  SWEEP_CRON_SECRET = typeof data?.value === 'string' ? data.value : '';
+  return SWEEP_CRON_SECRET;
+}
+
+/** Provider token, read only after the caller has authenticated. */
+async function resolveTregToken(admin: ReturnType<typeof createClient>): Promise<string> {
+  if (tregToken) return tregToken;
+  const { data, error } = await admin
+    .from('service_secrets')
+    .select('value')
+    .eq('name', 'treg_token')
+    .maybeSingle();
+  if (error) {
+    console.error('[sweep] treg token lookup failed:', error.message);
+    return '';
+  }
+  tregToken = typeof data?.value === 'string' ? data.value : '';
+  return tregToken;
+}
+
 const TREG_BASE = 'https://treg.to';
+/** Per-call cost ceiling sent as X-Treg-Route-Max-Cost; matches social-search. */
+const ROUTE_MAX_COST_USD = '0.01';
 
 /** Hard caps so one busy day can never run away. */
 const MAX_USERS_PER_RUN = 500;
@@ -327,6 +387,9 @@ async function tregCall(
       headers: {
         'X-Treg-Token': tregToken,
         Accept: 'application/json',
+        // Hard per-call ceiling (README: every call carries one). Over it, treg
+        // answers 402 and charges nothing.
+        'X-Treg-Route-Max-Cost': ROUTE_MAX_COST_USD,
         ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
         ...(opts.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : {}),
         ...(opts.customerId ? { 'X-Treg-Meta': `customer=${opts.customerId}` } : {}),
@@ -407,6 +470,9 @@ async function tregBalanceUsd(): Promise<number | null> {
   try {
     const res = await fetch(`${TREG_BASE}/billing`, {
       headers: { 'X-Treg-Token': tregToken, Accept: 'application/json' },
+      // A pre-flight check must not be what hangs the run; on timeout the
+      // balance is simply unknown (see catch).
+      signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) return null;
     const body = await res.json();
@@ -424,12 +490,33 @@ let callsMade = 0;
 // Mappers
 // ---------------------------------------------------------------------------
 
+/**
+ * A URL that came from an external provider is only kept if it is http or https
+ * (copied from social-search). Without it a provider returning `javascript:...`
+ * becomes a clickable link, or an <img src>, in the feed. Returns null for
+ * anything rejected so the mapper drops the row (or the avatar).
+ */
+function safePostUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    // Credentials in a URL are a phishing lure at best.
+    if (parsed.username || parsed.password) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
 function row(input: Omit<PostRow, 'status'>): PostRow {
   return { ...input, status: 'new' };
 }
 
 function mapTwitter(t: any, userId: string, kwId: string, kw: string): PostRow | null {
-  const postUrl = t?.url ?? (t?.id ? `https://x.com/i/status/${t.id}` : null);
+  const postUrl = safePostUrl(t?.url) ?? (t?.id ? safePostUrl(`https://x.com/i/status/${t.id}`) : null);
   if (!postUrl) return null;
   const handle = t?.authorUsername ? `@${String(t.authorUsername).replace(/^@/, '')}` : null;
   const body = t?.text ?? null;
@@ -437,7 +524,7 @@ function mapTwitter(t: any, userId: string, kwId: string, kw: string): PostRow |
     user_id: userId, keyword_id: kwId, matched_keyword: kw, platform: 'twitter',
     channel_source: 'X / Twitter', post_url: postUrl,
     author_name: t?.authorName ?? null, author_handle: handle,
-    author_avatar_url: t?.authorImage ?? null, body,
+    author_avatar_url: safePostUrl(t?.authorImage), body,
     posted_at: parseWhen(t?.createdUtc ?? t?.createdAt),
     intent_score: calculateIntentScore(body || ''),
     engagement: {
@@ -449,7 +536,7 @@ function mapTwitter(t: any, userId: string, kwId: string, kw: string): PostRow |
 }
 
 function mapRedditScrapecreators(p: any, userId: string, kwId: string, kw: string): PostRow | null {
-  const postUrl = p?.url ?? (p?.permalink ? `https://www.reddit.com${p.permalink}` : null);
+  const postUrl = safePostUrl(p?.url) ?? (p?.permalink ? safePostUrl(`https://www.reddit.com${p.permalink}`) : null);
   if (!postUrl) return null;
   const body = `${p?.title || ''} ${p?.selftext || ''}`.trim() || null;
   return row({
@@ -471,11 +558,13 @@ function mapRedditTikhub(p: any, userId: string, kwId: string, kw: string): Post
   const d = p?.data ?? p;
   const raw = d?.url ?? d?.permalink ?? d?.post_url ?? null;
   if (!raw) return null;
+  const postUrl = safePostUrl(String(raw).startsWith('http') ? String(raw) : `https://www.reddit.com${raw}`);
+  if (!postUrl) return null;
   const body = `${d?.title || ''} ${d?.selftext || ''}`.trim() || null;
   return row({
     user_id: userId, keyword_id: kwId, matched_keyword: kw, platform: 'reddit',
     channel_source: d?.subreddit_name ?? d?.subreddit ?? 'r/reddit',
-    post_url: String(raw).startsWith('http') ? String(raw) : `https://www.reddit.com${raw}`,
+    post_url: postUrl,
     author_name: d?.author ?? null,
     author_handle: d?.author ? `@${d.author}` : null, author_avatar_url: null, body,
     posted_at: parseWhen(d?.created_at ?? d?.created_utc ?? d?.post_time),
@@ -485,7 +574,7 @@ function mapRedditTikhub(p: any, userId: string, kwId: string, kw: string): Post
 }
 
 function mapWeb(r: any, userId: string, kwId: string, kw: string): PostRow | null {
-  const postUrl = r?.url;
+  const postUrl = safePostUrl(r?.url);
   if (!postUrl) return null;
   let domain = 'Web';
   try {
@@ -504,7 +593,7 @@ function mapWeb(r: any, userId: string, kwId: string, kw: string): PostRow | nul
 }
 
 function mapNews(r: any, userId: string, kwId: string, kw: string): PostRow | null {
-  const postUrl = r?.url;
+  const postUrl = safePostUrl(r?.url);
   if (!postUrl) return null;
   let domain = r?.site_name ?? 'News';
   try {
@@ -525,14 +614,15 @@ function mapNews(r: any, userId: string, kwId: string, kw: string): PostRow | nu
 // ---------------------------------------------------------------------------
 // Credit accounting
 // ---------------------------------------------------------------------------
-// The sweep is charged per operation, not per provider call, so what decides a
-// charge is whether that channel produced any billable call at all. A channel
-// where every call came back free — no results, or an error treg never charges
-// for — costs the customer nothing, which is the promise the old system broke
-// by billing for the retry.
+// The sweep is charged per (keyword, operation), not per provider call: a
+// keyword is charged for a channel when any call it made there was billed or
+// uncertain. A keyword where every call came back free — no results, or an
+// error treg never charges for — costs the customer nothing, even if another
+// keyword on the same channel was billed (the old code charged price x all
+// keywords as soon as any one billed). Retries are not charged again.
 //
-// Prices come from pricing_config, never from the request. A client that could
-// name its own price would not need the table.
+// Prices come from pricing_config, never from the request, and are read with
+// the service role: pricing_config is not client-readable.
 
 interface OperationTally {
   operation: string;
@@ -546,20 +636,28 @@ interface OperationTally {
   upstreamFailed: boolean;
   callIds: string[];
   errorCodes: string[];
+  /**
+   * Keywords that produced at least one billed or uncertain call on this
+   * operation. The charge is price x this count: one keyword that billed must
+   * not make every other keyword in the workspace chargeable too.
+   */
+  chargeableKeywords: Set<string>;
 }
 
 function newTally(operation: string): OperationTally {
   return {
     operation, calls: 0, costMicro: 0, billed: false,
     uncertain: false, upstreamFailed: false, callIds: [], errorCodes: [],
+    chargeableKeywords: new Set(),
   };
 }
 
-function record(tally: OperationTally, r: TregResult): void {
+function record(tally: OperationTally, r: TregResult, keywordId: string): void {
   tally.calls += 1;
   tally.costMicro += r.costMicro;
   if (r.billable === 'billed') tally.billed = true;
   if (r.billable === 'uncertain') tally.uncertain = true;
+  if (r.billable !== 'free') tally.chargeableKeywords.add(keywordId);
   if (r.upstreamFailed) tally.upstreamFailed = true;
   if (r.callId) tally.callIds.push(r.callId);
   if (r.errorCode) tally.errorCodes.push(r.errorCode);
@@ -695,6 +793,7 @@ async function recordUsage(
         calls: t.calls,
         billed: t.billed,
         upstream_failed: t.upstreamFailed,
+        chargeable_keywords: t.chargeableKeywords.size,
         call_ids: t.callIds,
         errors: t.errorCodes,
       },
@@ -738,7 +837,7 @@ async function searchChannel(
       // is what once put a 2021 tweet into the feed.
       body: { query: kw, queryType: 'Latest', limit: 20 },
     });
-    record(tally, t);
+    record(tally, t, kwId);
     const items = t.data?.output?.data?.items ?? [];
     return items.length
       ? items.map((x: any) => mapTwitter(x, userId, kwId, kw)).filter((r: any): r is PostRow => !!r)
@@ -755,7 +854,7 @@ async function searchChannel(
         sort: 'RELEVANCE', time_range: redditTimeframe(lookbackHours), need_format: 'true',
       },
     });
-    record(tally, tk);
+    record(tally, tk, kwId);
     const tkItems = tk.data?.data?.posts ?? tk.data?.posts ?? [];
     if (Array.isArray(tkItems) && tkItems.length) {
       return tkItems.map((x: any) => mapRedditTikhub(x, userId, kwId, kw)).filter((r: any): r is PostRow => !!r);
@@ -768,7 +867,7 @@ async function searchChannel(
       idempotencyKey: `${idem}:fb`,
       query: { query: kw, timeframe: redditTimeframe(lookbackHours), sort: 'relevance', limit: 25 },
     });
-    record(tally, sc);
+    record(tally, sc, kwId);
     const scItems = sc.data?.posts ?? [];
     return Array.isArray(scItems) && scItems.length
       ? scItems.map((x: any) => mapRedditScrapecreators(x, userId, kwId, kw)).filter((r: any): r is PostRow => !!r)
@@ -780,7 +879,7 @@ async function searchChannel(
       ...common,
       query: { q: kw, rich: 1 },
     });
-    record(tally, r);
+    record(tally, r, kwId);
     const items = r.data?.results ?? [];
     return Array.isArray(items) && items.length
       ? items.map((x: any) => mapWeb(x, userId, kwId, kw)).filter((r2): r2 is PostRow => !!r2)
@@ -792,7 +891,7 @@ async function searchChannel(
       ...common,
       query: { query: kw, domain_type: 'news', after_date: sinceDate(lookbackHours) },
     });
-    record(tally, r);
+    record(tally, r, kwId);
     const items = r.data?.results ?? [];
     return Array.isArray(items) && items.length
       ? items.map((x: any) => mapNews(x, userId, kwId, kw)).filter((r2): r2 is PostRow => !!r2)
@@ -807,36 +906,32 @@ async function searchChannel(
 // ---------------------------------------------------------------------------
 
 Deno.serve(async (req) => {
-  const provided =
-    req.headers.get('x-sweep-secret') ??
-    new URL(req.url).searchParams.get('secret') ??
-    '';
+  // Header only (see the file header for why the query parameter was dropped).
+  const provided = req.headers.get('x-sweep-secret') ?? '';
 
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
-  // Edge secrets win; fall back to the service-role-only secrets table. This is
-  // resolved before the gate check below so a deployment that only has the
-  // table configured still authenticates its own cron caller.
-  if (!SWEEP_CRON_SECRET || !tregToken) {
-    const { data: secrets } = await supabase
-      .from('service_secrets')
-      .select('name, value');
-    for (const s of secrets ?? []) {
-      if (s.name === 'sweep_cron_secret' && !SWEEP_CRON_SECRET) SWEEP_CRON_SECRET = s.value;
-      if (s.name === 'treg_token' && !tregToken) tregToken = s.value;
-    }
-  }
+  // Edge secret wins; fall back to the service-role-only secrets table, so a
+  // deployment that only has the table configured still authenticates its own
+  // cron caller.
+  const expected = await resolveCronSecret(supabase);
 
-  if (!SWEEP_CRON_SECRET) {
+  if (!expected) {
     console.error('SWEEP_CRON_SECRET is not configured — refusing to run.');
     return json({ ok: false, error: 'sweep not configured' }, 503);
   }
+  if (expected.length < MIN_CRON_SECRET_LENGTH) {
+    // A short secret is a misconfiguration, not a credential. Refuse loudly
+    // rather than gate a money-spending endpoint behind something brute-forceable.
+    console.error(`SWEEP_CRON_SECRET is shorter than ${MIN_CRON_SECRET_LENGTH} characters — refusing to run.`);
+    return json({ ok: false, error: 'sweep not configured' }, 503);
+  }
 
-  if (provided !== SWEEP_CRON_SECRET) {
+  if (!timingSafeEqual(provided, expected)) {
     return json({ ok: false, error: 'unauthorized' }, 401);
   }
 
-  if (!tregToken) {
+  if (!await resolveTregToken(supabase)) {
     return json({ ok: false, error: 'search provider not configured' }, 503);
   }
 
@@ -1055,82 +1150,107 @@ Deno.serve(async (req) => {
     const tallies = new Map<string, OperationTally>();
     for (const op of wantedOps) tallies.set(op, newTally(op));
 
-    for (const kw of userKeywords) {
-      const perChannel = await Promise.all(
-        billableChannels.map((ch) => {
-          const tally = tallies.get(OPERATION_OF[ch])!;
-          return searchChannel(ch, kw, userId, lookbackHours, tally, runNonce);
-        }),
-      );
+    // Set once the hold has been settled or released, so the finally block
+    // below only acts on a sweep that threw before reaching that point.
+    let holdClosed = false;
 
-      for (const r of perChannel.flat()) {
-        // Exact cutoff: the endpoints only accept coarse windows, so drop
-        // anything outside the real lookback. Rows with no date cannot be
-        // judged and are kept.
-        if (r.posted_at && Date.parse(r.posted_at) < cutoffMs) {
-          droppedStale++;
-          continue;
+    /**
+     * Works out what is owed from the tallies, writes the usage rows, then
+     * settles (or releases) the hold. Usage is recorded first so a settle that
+     * fails still leaves the measured cost on the ledger for reconciliation.
+     */
+    const closeHold = async (note: string): Promise<void> => {
+      if (holdClosed) return;
+      holdClosed = true;
+
+      let creditsCharged = 0;
+      let providerCostUsd = 0;
+      const charges = new Map<string, { credits: number; revenueUsd: number }>();
+
+      for (const [op, t] of tallies) {
+        providerCostUsd += t.costMicro / 1e6;
+        // Charged per keyword: price x the keywords that had at least one billed
+        // or uncertain call on this operation. A keyword whose calls were all
+        // free costs nothing, even when another keyword on the channel billed.
+        const opCredits = (pricing.get(op) ?? 0) * t.chargeableKeywords.size;
+        creditsCharged += opCredits;
+        // What the usage ledger records, so it carries the same figures the
+        // wallet was debited. Revenue is reconstructed at the rate these credits
+        // were bought for, which is what wallet_settle works out — the two
+        // records then agree instead of diverging.
+        charges.set(op, { credits: opCredits, revenueUsd: opCredits * pricePerCredit });
+      }
+
+      totalProviderCostUsd += providerCostUsd;
+      for (const [op, t] of tallies) {
+        for (const code of t.errorCodes) {
+          providerFailures.push({ user: userId, operation: op, code });
         }
-        if (r.intent_score < minIntent) continue;
-        const key = r.post_url.trim().toLowerCase();
-        if (seenUrls.has(key)) continue;
-        seenUrls.add(key);
-        rowsToUpsert.push(r);
       }
-    }
+      await recordUsage(supabase, userId, runKey, tallies, hold.id, charges);
 
-    // ---- Settle for what actually billed ----------------------------------
-    let creditsCharged = 0;
-    let providerCostUsd = 0;
-    const perOperation: Record<string, number> = {};
-    const charges = new Map<string, { credits: number; revenueUsd: number }>();
-
-    for (const [op, t] of tallies) {
-      providerCostUsd += t.costMicro / 1e6;
-      // Charged if any of its calls billed, or if any outcome is unknown. Not
-      // charged when the whole channel came back free.
-      const charged = (t.billed || t.uncertain) ? (pricing.get(op) ?? 0) * userKeywords.length : 0;
-      creditsCharged += charged;
-      perOperation[op] = charged;
-      // What the usage ledger records, so it carries the same figures the wallet
-      // was debited rather than a hardcoded zero. Revenue is reconstructed at the
-      // rate these credits were bought for, which is what wallet_settle works
-      // out — the two records then agree instead of diverging.
-      charges.set(op, {
-        credits: charged,
-        revenueUsd: charged * pricePerCredit,
-      });
-    }
-
-    let charged = false;
-    if (creditsCharged > 0) {
-      // The result is checked. settleSweep returns null when the RPC fails;
-      // ignoring that reported a charge that never happened and left the hold in
-      // place forever, shrinking this workspace's balance on every later sweep.
-      const balanceAfter = await settleSweep(
-        supabase, hold.id, creditsCharged, providerCostUsd, `${runKey}:settle`,
-        `${userKeywords.length} keywords across ${billableChannels.length} channels`,
-      );
-      charged = balanceAfter !== null;
-      if (charged) {
-        totalCreditsCharged += creditsCharged;
+      if (creditsCharged > 0) {
+        // The result is checked. settleSweep returns null when the RPC fails;
+        // ignoring that reported a charge that never happened and left the hold
+        // in place forever, shrinking this workspace's balance on every later
+        // sweep.
+        const balanceAfter = await settleSweep(
+          supabase, hold.id, creditsCharged, providerCostUsd, `${runKey}:settle`, note,
+        );
+        if (balanceAfter !== null) {
+          totalCreditsCharged += creditsCharged;
+        } else {
+          errors.push({
+            user: userId, kw: '*', platform: '*',
+            message: 'credit settlement failed; reservation left held for the reaper',
+          });
+        }
       } else {
-        errors.push({
-          user: userId, kw: '*', platform: '*',
-          message: 'credit settlement failed; reservation left held for the reaper',
-        });
+        await releaseSweep(supabase, hold.id, 'no billable provider calls');
       }
-    } else {
-      await releaseSweep(supabase, hold.id, 'no billable provider calls');
-    }
+    };
 
-    totalProviderCostUsd += providerCostUsd;
-    for (const [op, t] of tallies) {
-      for (const code of t.errorCodes) {
-        providerFailures.push({ user: userId, operation: op, code });
+    try {
+      for (const kw of userKeywords) {
+        const perChannel = await Promise.all(
+          billableChannels.map((ch) => {
+            const tally = tallies.get(OPERATION_OF[ch])!;
+            return searchChannel(ch, kw, userId, lookbackHours, tally, runNonce);
+          }),
+        );
+
+        for (const r of perChannel.flat()) {
+          // Exact cutoff: the endpoints only accept coarse windows, so drop
+          // anything outside the real lookback. Rows with no date cannot be
+          // judged and are kept.
+          if (r.posted_at && Date.parse(r.posted_at) < cutoffMs) {
+            droppedStale++;
+            continue;
+          }
+          if (r.intent_score < minIntent) continue;
+          const key = r.post_url.trim().toLowerCase();
+          if (seenUrls.has(key)) continue;
+          seenUrls.add(key);
+          rowsToUpsert.push(r);
+        }
+      }
+
+      // ---- Settle for what actually billed --------------------------------
+      await closeHold(`${userKeywords.length} keywords across ${billableChannels.length} channels`);
+    } catch (sweepErr) {
+      // One workspace throwing must not abort the whole run, and must not leave
+      // its hold reserved until the reaper finds it. The finally below charges
+      // for whatever was billed before the throw, or releases the hold.
+      errors.push({ user: userId, kw: '*', platform: '*', message: `sweep: ${String(sweepErr)}` });
+    } finally {
+      if (!holdClosed) {
+        try {
+          await closeHold('sweep aborted by an error; charged for calls already billed');
+        } catch (closeErr) {
+          errors.push({ user: userId, kw: '*', platform: '*', message: `close hold: ${String(closeErr)}` });
+        }
       }
     }
-    await recordUsage(supabase, userId, runKey, tallies, hold.id, charges);
 
     if (rowsToUpsert.length > 0) {
       const { error: upsertError } = await supabase

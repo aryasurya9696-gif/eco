@@ -73,11 +73,23 @@ export async function invokeFunction<T = unknown>(
   }
 }
 
-/** Supabase packs function error details into a Response on the error object. */
+/**
+ * Supabase packs function error details into a Response on the error object.
+ *
+ * Throttling and duplicate-request refusals get a plain-language message; for
+ * anything else the human `message` wins over the machine `error` code
+ * (e.g. checkout's { error: 'rate_limited', message: '…' }).
+ */
 async function readErrorBody(res: Response): Promise<string> {
   try {
     const body = await res.clone().json();
-    return body?.error || body?.message || '';
+    if (body?.duplicate_request) {
+      return 'Already in progress — this request is still being processed.';
+    }
+    if (body?.rate_limited) {
+      return 'Too many requests. Please try again in a minute.';
+    }
+    return body?.message || body?.error || '';
   } catch {
     return '';
   }

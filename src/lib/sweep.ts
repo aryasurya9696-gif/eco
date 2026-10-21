@@ -18,8 +18,6 @@ export interface SweepResult {
   dropped_stale?: number;
   /** Mentions the retention pass removed after this sweep. */
   pruned?: number;
-  /** Approximate treg spend for this sweep, in USD. */
-  usd_spent?: number;
   /** Which treg endpoint actually answered for each channel. */
   served_by?: Record<string, string>;
   errors?: string[];
@@ -48,7 +46,6 @@ export async function invokeSearchSweep(
     lookback_hours: res?.lookback_hours,
     dropped_stale: res?.dropped_stale,
     pruned: res?.pruned,
-    usd_spent: res?.usd_spent,
     served_by: res?.served_by,
     errors: res?.errors,
   };

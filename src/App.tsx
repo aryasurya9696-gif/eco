@@ -2,7 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { EchoProvider } from './context/EchoContext';
 import { LandingPage } from './pages/LandingPage';
-import { AuthPage } from './pages/AuthPage';
+import { AuthPage, SetNewPasswordPage } from './pages/AuthPage';
+import { arrivedFromAuthCallback, configError } from './lib/supabase';
 import { DashboardPage } from './pages/DashboardPage';
 import { ToastContainer } from './components/common/Toast';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
@@ -10,8 +11,11 @@ import { ErrorBoundary } from './components/common/ErrorBoundary';
 type Route = '/' | '/auth' | '/dashboard';
 
 const MainRouter: React.FC = () => {
-  const { user, isLoading } = useAuth();
+  const { user, isLoading, passwordRecovery } = useAuth();
   const [currentRoute, setCurrentRoute] = useState<Route>(() => {
+    // Returning from an email link (confirmation or reset): the session is
+    // being established from the URL, so this is a dashboard arrival.
+    if (arrivedFromAuthCallback) return '/dashboard';
     const rawHash = window.location.hash.replace(/^#\/?/, '');
     if (rawHash.startsWith('auth')) return '/auth';
     if (rawHash.startsWith('dashboard') || rawHash.includes('access_token')) return '/dashboard';
@@ -58,6 +62,12 @@ const MainRouter: React.FC = () => {
         </div>
       </div>
     );
+  }
+
+  // Arrived from a password-reset link: set the new password before anything
+  // else, then continue to the dashboard.
+  if (passwordRecovery && user) {
+    return <SetNewPasswordPage onDone={() => navigate('/dashboard')} />;
   }
 
   // Route protection
@@ -109,6 +119,17 @@ const MainRouter: React.FC = () => {
 };
 
 export default function App() {
+  if (configError) {
+    return (
+      <div className="min-h-screen bg-[#f6f6f4] flex items-center justify-center p-6 font-mono text-xs text-[#8a2a2a]">
+        <div role="alert" className="max-w-md border border-[#f0c4c4] bg-[#fdf2f2] p-5 space-y-2">
+          <p className="font-semibold">Configuration error</p>
+          <p>{configError}</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <ErrorBoundary>
       <AuthProvider>

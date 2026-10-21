@@ -55,6 +55,5 @@ VALUES
 ON CONFLICT (operation) DO UPDATE 
 SET 
     display_name = EXCLUDED.display_name,
-    credits = EXCLUDED.credits,
     enabled = EXCLUDED.enabled,
     updated_at = now();

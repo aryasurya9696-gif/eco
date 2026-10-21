@@ -20,7 +20,7 @@ INSERT INTO public.pricing_config (
     cost_verified, cost_source, credits, enabled, version, effective_from, updated_at
 )
 VALUES
-    ('treg.people.search', 'People search (requires credits, not charged)', 'treg.people.search', 0.05000000, true, 'catalog', 0.000000, true, 2, now(), now()),
+    ('treg.people.search', 'People search', 'treg.people.search', 0.05000000, true, 'catalog', 0.000000, true, 2, now(), now()),
     ('leads.search.extra_50', 'People search: per-50-leads fee (off)', 'treg.people.search', 0.05000000, true, 'catalog', 0.000000, true, 1, now(), now()),
     ('treg.people.email.find', 'Verified Work Email', 'treg.people.email.find', 0.04000000, true, 'catalog', 1.000000, true, 2, now(), now()),
     ('treg.people.phone.find', 'Direct Mobile Reveal', 'treg.people.phone.find', 0.08000000, true, 'catalog', 2.000000, true, 2, now(), now())
@@ -28,7 +28,6 @@ ON CONFLICT (operation) DO UPDATE
 SET
     display_name = EXCLUDED.display_name,
     provider_cost_usd = EXCLUDED.provider_cost_usd,
-    credits = EXCLUDED.credits,
     enabled = EXCLUDED.enabled,
     version = EXCLUDED.version,
     updated_at = now();

@@ -23,15 +23,20 @@ const NEEDS_QUOTING = /[",\r\n]/;
  *
  * Exported lead data comes from a third-party provider, so a company name like
  * `=HYPERLINK("http://…")` would run when the file is opened in Excel or
- * Sheets. A leading `+` or `-` followed by a digit, space or bracket is left
- * alone so phone numbers such as "+1 (415) 555-0100" survive intact.
+ * Sheets. Any value starting with = + - @ tab or CR is neutralised with a
+ * leading apostrophe, except a plain phone number or number (digits, spaces,
+ * brackets, dots and dashes with an optional leading +), so values such as
+ * "+1 (415) 555-0100" or "-3" survive intact. `-1+cmd|…` or `+A1` do not.
  */
-const FORMULA_PREFIX = /^(?:[=@\t\r]|[+-](?![\d\s(]))/;
+const FORMULA_PREFIX = /^[=+\-@\t\r]/;
+// A literal space, not \s: \s would also admit a leading tab or CR.
+const PLAIN_NUMBER = /^[+-]?[\d ().-]+$/;
 
 /** One cell. A real quote inside a value is doubled, per RFC 4180. */
 function escapeCell(value: CsvCell): string {
   const raw = value === null || value === undefined ? '' : String(value);
-  const s = FORMULA_PREFIX.test(raw) ? `'${raw}` : raw;
+  const isFormula = FORMULA_PREFIX.test(raw) && !(typeof value === 'number' || PLAIN_NUMBER.test(raw));
+  const s = isFormula ? `'${raw}` : raw;
   return NEEDS_QUOTING.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 

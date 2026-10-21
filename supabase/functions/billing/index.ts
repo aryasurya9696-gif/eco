@@ -86,6 +86,56 @@ const OPERATION_OF: Record<string, string> = {
 };
 
 /**
+ * The caps the cron actually applies, read from the database so every quote
+ * here agrees with what a sweep will reserve. 8/3 is the fallback only for a
+ * database that predates sweep_shape.
+ */
+async function readSweepShape(
+  admin: ReturnType<typeof createClient>,
+): Promise<{ maxKeywords: number; maxChannels: number }> {
+  const { data: shape } = await admin.rpc('sweep_shape');
+  const k = Number(shape?.max_keywords);
+  const c = Number(shape?.max_channels);
+  return {
+    maxKeywords: Number.isFinite(k) && k > 0 ? k : 8,
+    maxChannels: Number.isFinite(c) && c > 0 ? c : 3,
+  };
+}
+
+// Logged once per isolate, not per request: enough to notice a production
+// deploy still pointed at the sandbox without flooding the logs.
+let warnedTestMode = false;
+
+function dodoBaseUrl(): string {
+  if (Deno.env.get('DODO_ENVIRONMENT') === 'live_mode') return 'https://live.dodopayments.com';
+  if (!warnedTestMode) {
+    warnedTestMode = true;
+    console.warn('[billing] DODO_ENVIRONMENT is not live_mode - using the Dodo TEST environment');
+  }
+  return 'https://test.dodopayments.com';
+}
+
+const stripSlash = (s: string): string => s.replace(/\/+$/, '');
+
+/**
+ * Where the provider sends the customer back to.
+ *
+ * APP_ORIGIN is authoritative. Without it, the request's Origin is used only
+ * when it is exactly the configured ALLOWED_ORIGIN — echoing an arbitrary
+ * Origin would let any page start a checkout that returns somewhere else.
+ */
+function resolveAppOrigin(req: Request): string | null {
+  const configured = Deno.env.get('APP_ORIGIN');
+  if (configured && configured.trim()) return stripSlash(configured.trim());
+
+  const origin = req.headers.get('Origin');
+  if (origin && ALLOWED_ORIGIN !== '*' && stripSlash(origin) === stripSlash(ALLOWED_ORIGIN)) {
+    return stripSlash(origin);
+  }
+  return null;
+}
+
+/**
  * The wallet summary the Billing tab renders.
  *
  * `available` is what can actually be spent right now: the balance minus
@@ -95,7 +145,9 @@ const OPERATION_OF: Record<string, string> = {
 async function actionBalance(admin: ReturnType<typeof createClient>, userId: string) {
   const { data: wallet, error } = await admin
     .from('wallet')
-    .select('balance, reserved, lifetime_granted, lifetime_consumed, recognised_revenue_usd, service_cost_usd')
+    // Revenue and service cost are our margin, not the customer's business, so
+    // they are not even selected.
+    .select('balance, reserved, lifetime_granted, lifetime_consumed')
     .eq('user_id', userId)
     .maybeSingle();
 
@@ -107,22 +159,29 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
   // the opposite of what someone on zero credits should see.
   if (!wallet) {
     const empty = { balance: 0, reserved: 0, available: 0 };
-    const [profileRes, keywordCount, priceRows] = await Promise.all([
+    // The keyword count comes from `count` — a head:true query has no `data`,
+    // so reading the whole response as a number quoted every empty wallet as
+    // free.
+    const [profileRes, keywordRes, priceRows, shape] = await Promise.all([
       admin.from('profiles').select('enabled_channels').eq('id', userId).maybeSingle(),
       admin.from('keywords').select('id', { count: 'exact', head: true })
         .eq('user_id', userId).eq('is_active', true),
       admin.from('pricing_config').select('operation, credits').eq('enabled', true),
+      readSweepShape(admin),
     ]);
 
-    const channels: string[] = Array.isArray(profileRes.data?.enabled_channels)
+    const enabledChannels: string[] = Array.isArray(profileRes.data?.enabled_channels)
       ? profileRes.data.enabled_channels
       : ['twitter', 'reddit', 'google'];
+    const channels = enabledChannels.slice(0, shape.maxChannels);
+    const configuredKeywords = keywordRes.count ?? 0;
+    const effectiveKeywords = Math.min(configuredKeywords, shape.maxKeywords);
     const priceOf = new Map<string, number>(
       (priceRows.data ?? []).map((p: any) => [p.operation, num(p.credits)]),
     );
 
     let cost = 0;
-    for (const ch of channels) cost += (keywordCount ?? 0) * (priceOf.get(OPERATION_OF[ch]) ?? 0);
+    for (const ch of channels) cost += effectiveKeywords * (priceOf.get(OPERATION_OF[ch]) ?? 0);
 
     return {
       ok: true,
@@ -133,12 +192,12 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
         credits_purchased: 0,
         credits_free: 0,
         search_count: 0,
-        recognised_revenue_usd: 0,
-        service_cost_usd: 0,
       },
       sweep: {
-        keywords: keywordCount ?? 0,
+        keywords: effectiveKeywords,
+        keywords_configured: configuredKeywords,
         channels,
+        channels_configured: enabledChannels,
         credits: cost,
         affordable: cost === 0,
         shortfall: cost,
@@ -173,9 +232,7 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
   // were unlimited told a workspace at the limit that its next sweep cost more
   // than the sweep could ever reserve, and could show "you can afford this"
   // for a sweep the cron then skipped every single night.
-  const { data: shape } = await admin.rpc('sweep_shape');
-  const maxKeywords = Number(shape?.max_keywords ?? 8);
-  const maxChannels = Number(shape?.max_channels ?? 3);
+  const { maxKeywords, maxChannels } = await readSweepShape(admin);
 
   const enabledChannels: string[] = Array.isArray(profile?.enabled_channels)
     ? profile.enabled_channels
@@ -228,9 +285,7 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
       // capped for rendering, and a counter derived from it would read 50 to
       // anyone who has run more than 50 searches — flattering precisely for the
       // people most likely to be checking it.
-      search_count: usageCount ?? 0,
-      recognised_revenue_usd: num(wallet.recognised_revenue_usd),
-      service_cost_usd: num(wallet.service_cost_usd),
+      search_count: usageCount.count ?? 0,
     },
     sweep: {
       // What will actually be swept, not what is stored. A workspace holding 12
@@ -280,7 +335,7 @@ async function actionPackages(admin: ReturnType<typeof createClient>) {
 async function actionHistory(admin: ReturnType<typeof createClient>, userId: string) {
   const [ledger, payments, usage] = await Promise.all([
     admin.from('credit_ledger')
-      .select('id, delta, balance_after, kind, revenue_usd, service_cost_usd, note, created_at')
+      .select('id, delta, balance_after, kind, note, created_at')
       .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .limit(50),
@@ -290,7 +345,7 @@ async function actionHistory(admin: ReturnType<typeof createClient>, userId: str
       .order('created_at', { ascending: false })
       .limit(25),
     admin.from('api_usage')
-      .select('id, operation, provider_cost_usd, credits_charged, revenue_usd, outcome, created_at, metadata')
+      .select('id, operation, credits_charged, outcome, created_at, metadata')
       .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .limit(50),
@@ -300,14 +355,14 @@ async function actionHistory(admin: ReturnType<typeof createClient>, userId: str
     if (res.error) throw new Error(`${name} lookup failed: ${res.error.message}`);
   }
 
+  // Revenue and provider cost are ours, not the customer's: they are left out
+  // of every row, and usage metadata is reduced to the call count.
   return {
     ok: true,
     ledger: (ledger.data ?? []).map((r: any) => ({
       ...r,
       delta: num(r.delta),
       balance_after: num(r.balance_after),
-      revenue_usd: num(r.revenue_usd),
-      service_cost_usd: num(r.service_cost_usd),
     })),
     payments: (payments.data ?? []).map((r: any) => ({
       ...r,
@@ -315,10 +370,11 @@ async function actionHistory(admin: ReturnType<typeof createClient>, userId: str
       credits_granted: num(r.credits_granted),
     })),
     usage: (usage.data ?? []).map((r: any) => ({
-      ...r,
-      provider_cost_usd: num(r.provider_cost_usd),
+      id: r.id,
+      operation: r.operation,
+      outcome: r.outcome,
+      created_at: r.created_at,
       credits_charged: num(r.credits_charged),
-      revenue_usd: num(r.revenue_usd),
       calls: num(r.metadata?.calls),
     })),
   };
@@ -336,16 +392,20 @@ async function actionQuote(
   const opOf: Record<string, string> = OPERATION_OF;
   const ops = channels.map((c) => opOf[c]).filter(Boolean);
 
-  const { data: keywords } = await admin
+  // head:true returns no rows, only `count`. Reading `data` here always gave
+  // null, so every quote was for zero keywords.
+  const { count: keywords } = await admin
     .from('keywords')
     .select('id', { count: 'exact', head: true })
     .eq('user_id', userId)
     .eq('is_active', true);
 
+  const { maxKeywords, maxChannels } = await readSweepShape(admin);
+
   const { data, error } = await admin.rpc('quote_sweep', {
     p_user_id: userId,
-    p_keywords: Math.min(keywords ?? 0, 8),
-    p_operations: ops.slice(0, 3),
+    p_keywords: Math.min(keywords ?? 0, maxKeywords),
+    p_operations: ops.slice(0, maxChannels),
   });
   if (error) throw new Error(`quote failed: ${error.message}`);
 
@@ -362,12 +422,13 @@ async function actionQuote(
  */
 async function actionCheckout(
   admin: ReturnType<typeof createClient>,
+  req: Request,
   userId: string,
   packageCode: string,
 ) {
   const { data: pkg, error } = await admin
     .from('topup_packages')
-    .select('code, display_name, gross_usd, credits, currency')
+    .select('code, display_name, gross_usd, credits, currency, provider_ref')
     .eq('code', packageCode)
     .eq('active', true)
     .maybeSingle();
@@ -375,11 +436,18 @@ async function actionCheckout(
   if (error) throw new Error(`package lookup failed: ${error.message}`);
   if (!pkg) return { __status: 404, ok: false, error: 'unknown_package' };
 
+  // Every configuration check happens before the order row exists, so a
+  // misconfigured deploy does not leave a trail of orphaned 'created' orders.
+  //
+  // provider_ref is the Dodo product id (pdt_...). Our package code is not a
+  // product Dodo knows, so without it the session would be rejected anyway.
   const apiKey = Deno.env.get('DODO_PAYMENTS_API_KEY');
-  if (!apiKey) {
+  const productId = typeof pkg.provider_ref === 'string' ? pkg.provider_ref.trim() : '';
+  if (!apiKey || !productId) {
     // No payment account configured yet. Saying so plainly beats a checkout
     // button that silently does nothing. 503 rather than 400: nothing is wrong
     // with what the customer asked for.
+    if (apiKey && !productId) console.error(`[billing] package ${pkg.code} has no provider_ref (Dodo product id)`);
     return {
       __status: 503,
       ok: false,
@@ -388,9 +456,40 @@ async function actionCheckout(
     };
   }
 
-  const base = Deno.env.get('DODO_ENVIRONMENT') === 'live_mode'
-    ? 'https://live.dodopayments.com'
-    : 'https://test.dodopayments.com';
+  const appOrigin = resolveAppOrigin(req);
+  if (!appOrigin) {
+    console.error('[billing] APP_ORIGIN is not set and the request Origin is not ALLOWED_ORIGIN');
+    return {
+      __status: 503,
+      ok: false,
+      error: 'app_origin_not_configured',
+      message: 'Card payments are not switched on yet.',
+    };
+  }
+
+  // Durable, per user. Each attempt creates an order and a provider session,
+  // so an unbounded loop here is spam on both sides. Fails closed: if the
+  // limiter cannot answer, no checkout is started.
+  const { data: allowed, error: limitError } = await admin.rpc('take_rate_limit', {
+    p_user_id: userId,
+    p_bucket: 'checkout',
+    p_limit: 10,
+    p_window_seconds: 3600,
+  });
+  if (limitError) {
+    console.error('[billing] rate limit check failed:', limitError.message);
+    return { __status: 503, ok: false, error: 'rate_limit_unavailable', message: 'Checkout is temporarily unavailable.' };
+  }
+  if (allowed !== true) {
+    return {
+      __status: 429,
+      ok: false,
+      error: 'rate_limited',
+      message: 'Too many checkout attempts. Please try again later.',
+    };
+  }
+
+  const base = dodoBaseUrl();
 
   const { data: profile } = await admin
     .from('profiles')
@@ -427,12 +526,13 @@ async function actionCheckout(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      product_cart: [{ product_id: pkg.code, quantity: 1 }],
+      product_cart: [{ product_id: productId, quantity: 1 }],
       customer: { email: profile?.email, name: profile?.full_name },
       metadata: { order_id: order.id, package_code: pkg.code },
-      // Returns to the dashboard, not the marketing page, and the hash is what
-      // this app's router reads.
-      return_url: `${Deno.env.get('APP_ORIGIN') ?? ''}/#dashboard?billing=returned`,
+      // Returns to the Billing tab. The flag goes in the real query string,
+      // before the hash: BillingTab reads window.location.search, and a
+      // "?billing=" inside the hash is invisible to it.
+      return_url: `${appOrigin}/?billing=returned#dashboard/billing`,
     }),
   });
 
@@ -515,7 +615,7 @@ Deno.serve(async (req) => {
         result = await actionQuote(admin, userId, Array.isArray(body.channels) ? body.channels : []);
         break;
       case 'checkout':
-        result = await actionCheckout(admin, userId, String(body.packageCode ?? ''));
+        result = await actionCheckout(admin, req, userId, String(body.packageCode ?? ''));
         break;
       case 'status':
         result = await actionStatus(admin, userId, String(body.orderId ?? ''));

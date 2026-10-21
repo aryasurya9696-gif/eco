@@ -47,14 +47,23 @@ export interface LeadPricing {
   freeLeads: number;
   blockLeads: number;
   blockCredits: number;
+  /** Flat credits charged for each people search, whatever it returns. */
+  searchCredits: number;
 }
 
-// Searching is not charged (blockCredits 0); only verified contacts are.
-export const DEFAULT_PRICING: LeadPricing = { email: 1, phone: 2, freeLeads: 25, blockLeads: 50, blockCredits: 0 };
+// Each search costs a flat `searchCredits`; the per-lead block fee is off
+// (blockCredits 0), and contacts are charged only when verified.
+export const DEFAULT_PRICING: LeadPricing = { email: 1, phone: 2, freeLeads: 25, blockLeads: 50, blockCredits: 0, searchCredits: 1 };
 
-/** Credits a search for `leads` people can cost; the first `freeLeads` are free. */
+/**
+ * The most a search for `leads` people can cost: the flat per-search fee plus
+ * any per-lead block fee past the first `freeLeads`.
+ */
 export function searchCost(leads: number, pricing: LeadPricing): number {
-  return Math.ceil(Math.max(0, leads - pricing.freeLeads) / pricing.blockLeads) * pricing.blockCredits;
+  return (
+    pricing.searchCredits +
+    Math.ceil(Math.max(0, leads - pricing.freeLeads) / pricing.blockLeads) * pricing.blockCredits
+  );
 }
 
 /**

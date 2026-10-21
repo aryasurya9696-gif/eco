@@ -39,8 +39,11 @@ async function requireUserId(req: Request): Promise<string | null> {
   if (!supabaseUrl || !anonKey) return null;
 
   try {
+    // Bounded: a hung auth endpoint otherwise holds the request open until the
+    // gateway kills it, and the caller sees a generic failure.
     const res = await fetch(supabaseUrl + '/auth/v1/user', {
       headers: { Authorization: authHeader, apikey: anonKey },
+      signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) return null;
     const user = await res.json();
@@ -293,18 +296,19 @@ const MAX_COST = { search: '0.05', email: '0.04', phone: '0.08' } as const;
 /** Leads per search that cost nothing; every further block is charged. */
 const SEARCH_FREE_LEADS = 25;
 const SEARCH_LEADS_PER_BLOCK = 50;
-/** Abuse guard: free searches still cost us provider money. */
-const SEARCH_RATE_LIMIT_PER_HOUR = 30;
 
 interface Prices {
   email: number;
   phone: number;
+  /** Flat credits per search request (pricing_config `treg.people.search`). */
+  search: number;
   searchBlock: number;
 }
 
-// Searching itself is not charged: users pay only for verified contacts found.
-// A search does require a balance, so it can deliver those contacts.
-const FALLBACK_PRICES: Prices = { email: 1, phone: 2, searchBlock: 0 };
+// A search fans out to several billed provider calls, so it carries a flat
+// per-request price on top of the per-contact charges. The fallback matches
+// the seeded pricing_config row.
+const FALLBACK_PRICES: Prices = { email: 1, phone: 2, search: 1, searchBlock: 0 };
 let priceCache: { at: number; prices: Prices } | null = null;
 
 /**
@@ -319,13 +323,14 @@ async function loadPrices(admin: any): Promise<Prices> {
     const { data, error } = await admin
       .from('pricing_config')
       .select('operation, credits, enabled')
-      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'leads.search.extra_50']);
+      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'treg.people.search', 'leads.search.extra_50']);
     if (!error && Array.isArray(data)) {
       for (const row of data) {
         const credits = Number(row.credits);
         if (!row.enabled || !Number.isFinite(credits) || credits < 0) continue;
         if (row.operation === 'treg.people.email.find') prices.email = credits;
         if (row.operation === 'treg.people.phone.find') prices.phone = credits;
+        if (row.operation === 'treg.people.search') prices.search = credits;
         if (row.operation === 'leads.search.extra_50') prices.searchBlock = credits;
       }
     }
@@ -385,6 +390,22 @@ class UsageLog {
     return row;
   }
 
+  /**
+   * What Treg actually charged (x-treg-cost-micro) for every call tracked since
+   * `start`, hits and misses alike. Settles used to pass literal guesses
+   * (0.0048, 0.02, credits * 0.005), so the ledger's provider cost drifted from
+   * the invoice and misses were recorded as free when they were not.
+   */
+  costSince(start: number, operation?: string, feature?: string): number {
+    let total = 0;
+    for (const row of this.rows.slice(start)) {
+      if (operation && row.operation !== operation) continue;
+      if (feature && row.metadata?.feature !== feature) continue;
+      total += row.provider_cost_usd;
+    }
+    return Number(total.toFixed(8));
+  }
+
   async flush(admin: any) {
     if (this.rows.length === 0) return;
     const rows = this.rows;
@@ -401,20 +422,224 @@ async function walletAvailable(admin: any, userId: string): Promise<number> {
   return Math.max(0, Number(data.balance ?? 0) - Number(data.reserved ?? 0));
 }
 
-/** Searches this user ran in the last hour (one api_usage row per search). */
-async function recentSearchCount(admin: any, userId: string): Promise<number> {
-  const since = new Date(Date.now() - 3600_000).toISOString();
-  const { count, error } = await admin
-    .from('api_usage')
-    .select('id', { count: 'exact', head: true })
-    .eq('user_id', userId)
-    .eq('operation', 'leads.search')
-    .gte('created_at', since);
-  if (error) {
-    console.warn('[leads] rate-limit count failed:', error.message);
-    return 0;
+// ---------------------------------------------------------------------------
+// Rate limits
+// ---------------------------------------------------------------------------
+
+interface RateLimit {
+  bucket: string;
+  limit: number;
+  windowSeconds: number;
+  message: string;
+}
+
+/**
+ * Durable, atomic limits (take_rate_limit). The old search limiter counted
+ * api_usage rows that were only written after the work finished, so a burst of
+ * parallel searches all read the same count and all passed, and a failed count
+ * query let everything through.
+ *
+ * Reveals are limited too. Only `valid` addresses are charged, so a lookup
+ * that returns an unconfirmed or no address costs us the provider fee and the
+ * user nothing. That is deliberate (users never pay for misses); these limits
+ * are what bound how much free provider spend one account can generate.
+ */
+const RATE_LIMITS = {
+  search: {
+    bucket: 'leads.search',
+    limit: 30,
+    windowSeconds: 3600,
+    message: 'You have run 30 searches in the last hour. Please wait a few minutes and try again.',
+  },
+  searchBurst: {
+    bucket: 'leads.search.burst',
+    limit: 3,
+    windowSeconds: 10,
+    message: 'Too many searches at once. Please wait a few seconds and try again.',
+  },
+  reveal: {
+    bucket: 'leads.reveal',
+    limit: 300,
+    windowSeconds: 3600,
+    message: 'You have reached the hourly contact lookup limit. Please try again later.',
+  },
+  revealBurst: {
+    bucket: 'leads.reveal.burst',
+    limit: 10,
+    windowSeconds: 10,
+    message: 'Too many lookups at once. Please wait a few seconds and try again.',
+  },
+  bulkReveal: {
+    bucket: 'leads.bulk-reveal',
+    limit: 30,
+    windowSeconds: 3600,
+    message: 'You have reached the hourly bulk lookup limit. Please try again later.',
+  },
+  bulkRevealBurst: {
+    bucket: 'leads.bulk-reveal.burst',
+    limit: 2,
+    windowSeconds: 10,
+    message: 'A bulk lookup is already running. Please wait a few seconds and try again.',
+  },
+  bulkSave: {
+    bucket: 'leads.bulk-save',
+    limit: 120,
+    windowSeconds: 3600,
+    message: 'Too many saves in the last hour. Please try again later.',
+  },
+} satisfies Record<string, RateLimit>;
+
+/** One slot from a bucket: true taken, false over the limit, null RPC error. */
+async function takeRateLimit(admin: any, userId: string, rl: RateLimit): Promise<boolean | null> {
+  try {
+    const { data, error } = await admin.rpc('take_rate_limit', {
+      p_user_id: userId,
+      p_bucket: rl.bucket,
+      p_limit: rl.limit,
+      p_window_seconds: rl.windowSeconds,
+    });
+    if (error) {
+      console.error('[leads] take_rate_limit failed:', error.message);
+      return null;
+    }
+    return data === true;
+  } catch (err: any) {
+    console.error('[leads] take_rate_limit error:', err?.name || err?.message);
+    return null;
   }
-  return count ?? 0;
+}
+
+/**
+ * Takes a slot from each bucket in order. Fails CLOSED: when the limiter
+ * cannot be reached the request is refused, because the requests it guards
+ * spend provider money.
+ */
+async function enforceRateLimits(admin: any, userId: string, limits: RateLimit[]): Promise<Response | null> {
+  for (const rl of limits) {
+    const ok = await takeRateLimit(admin, userId, rl);
+    if (ok === null) {
+      return fail('The service is busy. Please try again in a moment.', 503, { rate_limited: true });
+    }
+    if (!ok) return fail(rl.message, 429, { rate_limited: true });
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Identity hashing and input sanitising
+// ---------------------------------------------------------------------------
+
+/**
+ * Short, stable, non-reversible reference. Used in ledger notes, reservation
+ * context and idempotency keys instead of names or LinkedIn URLs, which are
+ * personal data that the billing tables should not carry.
+ */
+async function shortHash(value: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(buf).slice(0, 8))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/** Identity of one lead, for hashing: domain, name, LinkedIn slug, email. */
+function leadIdentity(l: any): string {
+  return [
+    cleanDomain(l?.company_domain),
+    String(l?.full_name || '').toLowerCase().trim(),
+    linkedinSlug(l?.linkedin_url) || '',
+    String(l?.work_email || '').toLowerCase().trim(),
+  ].join('|');
+}
+
+/**
+ * Window used in reveal idempotency keys.
+ *
+ * Keys are deterministic per (user, lead, action) so a double-click lands on
+ * the same reservation (wallet_reserve returns the existing hold) instead of
+ * holding and charging twice. The window is needed because reservation keys
+ * are unique forever: without it, retrying a lead after a miss would forever
+ * hit the old, already-settled hold.
+ */
+const REVEAL_KEY_WINDOW_MS = 60_000;
+function revealWindow(): number {
+  return Math.floor(Date.now() / REVEAL_KEY_WINDOW_MS);
+}
+
+const MAX_TEXT_FIELD = 200;
+const MAX_URL_FIELD = 500;
+const MAX_NOTES = 2000;
+const MAX_BULK_SAVE = 500;
+const ALLOWED_STATUS = ['new', 'contacted', 'replied', 'dismissed'];
+
+/** Trimmed, length-capped text; '' for anything that is not text. */
+function clampText(value: unknown, max = MAX_TEXT_FIELD): string {
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value).slice(0, max);
+  return typeof value === 'string' ? value.trim().slice(0, max) : '';
+}
+
+/**
+ * A LinkedIn profile URL we are willing to store or forward: https, on
+ * linkedin.com, an /in/ or /pub/ path, at most 500 characters. Anything else is
+ * dropped, since user_leads is now written only by this function and a stored
+ * javascript: or look-alike URL would be rendered as a link.
+ */
+function safeLinkedin(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > MAX_URL_FIELD * 2) return null;
+  const normalized = normalizeLinkedin(value);
+  if (!normalized) return null;
+  let url: URL;
+  try {
+    url = new URL(normalized.replace(/^http:\/\//i, 'https://'));
+  } catch {
+    return null;
+  }
+  const host = url.hostname.toLowerCase();
+  if (url.protocol !== 'https:') return null;
+  if (host !== 'linkedin.com' && !host.endsWith('.linkedin.com')) return null;
+  if (!/^\/(?:in|pub)\/[^/]+/i.test(url.pathname)) return null;
+  const out = `https://${host}${url.pathname}`.replace(/\/+$/, '');
+  return out.length <= MAX_URL_FIELD ? out : null;
+}
+
+function safeEmail(value: unknown): string | null {
+  return isEmailAddress(value) && value.trim().length <= 254 ? value.trim() : null;
+}
+
+function isAllowedStatus(value: unknown): value is string {
+  return typeof value === 'string' && ALLOWED_STATUS.includes(value);
+}
+
+/** The key the client uses for a lead, computed from what it sent. */
+function clientKeyOf(l: any): string {
+  return `${String(l?.company_domain || '').toLowerCase().trim()}::${String(l?.full_name || '').toLowerCase().trim()}`;
+}
+
+/**
+ * One lead from a request body, with every field clamped. Bulk endpoints map
+ * their input through this before anything reaches the provider or the table.
+ * `client_key` keeps the key the client computed so per-lead results
+ * (not_found_keys, failed_keys) still match its rows.
+ */
+function sanitizeLead(l: any) {
+  const revealed = l?.email_status === 'preview' ? null : safeEmail(l?.revealed_email) || safeEmail(l?.work_email);
+  return {
+    client_key: clientKeyOf(l),
+    full_name: clampText(l?.full_name),
+    first_name: clampText(l?.first_name),
+    last_name: clampText(l?.last_name),
+    title: clampText(l?.title),
+    company_name: clampText(l?.company_name),
+    company_domain: cleanDomain(typeof l?.company_domain === 'string' ? l.company_domain : ''),
+    company_size: clampText(l?.company_size) || null,
+    company_revenue: clampText(l?.company_revenue) || null,
+    company_phone: clampText(l?.company_phone, 50) || null,
+    location: clampText(l?.location) || null,
+    linkedin_url: safeLinkedin(l?.linkedin_url),
+    work_email: revealed,
+    email_status: revealed ? clampText(l?.email_status, 32) || null : null,
+    phone_number: clampText(l?.revealed_phone || l?.phone_number, 50) || null,
+    status: isAllowedStatus(l?.status) ? l.status : null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -422,9 +647,23 @@ async function recentSearchCount(admin: any, userId: string): Promise<number> {
 // ---------------------------------------------------------------------------
 
 interface Reservation {
-  id: string;
+  /** null when nothing needed holding (a zero-credit price). */
+  id: string | null;
   reserved: number;
+  /**
+   * The key already had a hold: this is a duplicate of a request that is in
+   * flight (or just finished). The hold belongs to that request, so this one
+   * must neither use nor settle it.
+   */
+  duplicate: boolean;
 }
+
+/**
+ * Holds that this request opened and has not closed yet. Anything still here
+ * when the request ends (an unexpected exception) is released by the top-level
+ * handler, so a crash cannot leave credits held until the reaper runs.
+ */
+type HoldSet = Set<string>;
 
 async function reserveCredits(
   admin: ReturnType<typeof createClient>,
@@ -432,6 +671,7 @@ async function reserveCredits(
   credits: number,
   key: string,
   context: Record<string, unknown>,
+  holds?: HoldSet,
 ): Promise<Reservation | { shortfall: number; required: number; available: number }> {
   const { data, error } = await admin.rpc('wallet_reserve', {
     p_user_id: userId,
@@ -445,7 +685,10 @@ async function reserveCredits(
   }
   const r = data as any;
   if (r?.ok) {
-    return { id: r.reservation_id, reserved: Number(r.reserved ?? credits) };
+    const id = typeof r.reservation_id === 'string' ? r.reservation_id : null;
+    const duplicate = r.duplicate === true;
+    if (id && !duplicate) holds?.add(id);
+    return { id, reserved: Number(r.reserved ?? credits), duplicate };
   }
   return {
     shortfall: Number(r?.shortfall ?? credits),
@@ -454,14 +697,35 @@ async function reserveCredits(
   };
 }
 
+/** Gives a hold back untouched: nothing was billed by the provider. */
+async function releaseCredits(
+  admin: ReturnType<typeof createClient>,
+  reservationId: string | null,
+  reason: string,
+  holds?: HoldSet,
+): Promise<void> {
+  if (!reservationId) return;
+  holds?.delete(reservationId);
+  const { error } = await admin.rpc('wallet_release', {
+    p_reservation_id: reservationId,
+    p_reason: reason,
+  });
+  if (error) console.error('[billing] wallet_release failed:', error.message);
+}
+
 async function settleCredits(
   admin: ReturnType<typeof createClient>,
-  reservationId: string,
+  reservationId: string | null,
   creditsCharged: number,
   providerCostUsd: number,
   key: string,
   note: string,
+  holds?: HoldSet,
 ): Promise<number | null> {
+  if (!reservationId) return null;
+  // Removed before the call, not after: if the RPC commits but the response is
+  // lost, releasing it again in the crash path would undo a real charge.
+  holds?.delete(reservationId);
   const { data, error } = await admin.rpc('wallet_settle', {
     p_reservation_id: reservationId,
     p_credits_charged: creditsCharged,
@@ -482,11 +746,13 @@ async function settleCredits(
 function cleanDomain(d?: string | null): string {
   if (!d || typeof d !== 'string') return '';
   return d
+    .slice(0, 1000)
     .replace(/^https?:\/\//i, '')
     .replace(/^www\./i, '')
     .split('/')[0]
     .trim()
-    .toLowerCase();
+    .toLowerCase()
+    .slice(0, 253);
 }
 
 function normalizeLinkedin(url?: string | null): string | null {
@@ -787,7 +1053,7 @@ function normalizeLead(p: any, idx: number, fallbackDomain = ''): any {
 
   const hasEmail = Boolean(p.has_email || homePageEmail);
   const hasPhone = Boolean(p.has_phone || p.phone || p.company_phone || p.mobile_phone);
-  const hasLinkedin = Boolean(linkedinUrl);
+  const hasLinkedin = Boolean(safeLinkedin(linkedinUrl));
 
   const id = p.emp_id
     ? String(p.emp_id)
@@ -795,20 +1061,22 @@ function normalizeLead(p: any, idx: number, fallbackDomain = ''): any {
     ? String(p.id)
     : `lead_${idx}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
+  // Provider data is clamped like client input: these values are written to
+  // user_leads by auto-enrich and echoed back by bulk-save.
   return {
-    id,
-    first_name: firstName,
-    last_name: lastName,
-    full_name: fullName,
-    title,
-    company_name: companyName,
+    id: clampText(id, MAX_TEXT_FIELD) || `lead_${idx}`,
+    first_name: clampText(firstName),
+    last_name: clampText(lastName),
+    full_name: clampText(fullName),
+    title: clampText(title),
+    company_name: clampText(companyName),
     company_domain: domain,
-    company_size: companySize,
-    company_revenue: revenue,
-    industry,
-    company_phone: p.company_phone || null,
-    linkedin_url: linkedinUrl,
-    location,
+    company_size: clampText(companySize) || null,
+    company_revenue: clampText(revenue) || null,
+    industry: clampText(industry) || null,
+    company_phone: clampText(p.company_phone, 50) || null,
+    linkedin_url: safeLinkedin(linkedinUrl),
+    location: clampText(location) || null,
     country_code: countryCode,
     has_email: hasEmail,
     has_phone: hasPhone,
@@ -825,15 +1093,31 @@ function normalizeLead(p: any, idx: number, fallbackDomain = ''): any {
 // Main Request Handler
 // ---------------------------------------------------------------------------
 
+/**
+ * Last line of defence. An exception that escaped an action used to surface as
+ * the runtime's bare 500 with no CORS headers, which the browser reports as a
+ * network error rather than a failed request.
+ */
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders() });
   }
+  try {
+    return await handleRequest(req);
+  } catch (err: any) {
+    console.error('[leads] unhandled error:', err?.name || 'error', String(err?.message || '').slice(0, 200));
+    return fail('Internal error', 500);
+  }
+});
 
-  const userId = await requireUserId(req);
-  if (!userId) {
+async function handleRequest(req: Request): Promise<Response> {
+  const maybeUserId = await requireUserId(req);
+  if (!maybeUserId) {
     return fail('Unauthorized', 401);
   }
+  // Re-bound as a plain string: narrowing does not carry into the hoisted
+  // handleAction declaration below.
+  const userId: string = maybeUserId;
 
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
   const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -852,12 +1136,26 @@ Deno.serve(async (req: Request) => {
   } catch {
     return fail('Invalid JSON body');
   }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return fail('Invalid JSON body');
+  }
 
   const action = body.action || 'search';
   const usage = new UsageLog(userId);
+  const openHolds: HoldSet = new Set();
   try {
     return await handleAction();
+  } catch (err: any) {
+    console.error('[leads] action failed:', action, err?.name || 'error', String(err?.message || '').slice(0, 200));
+    return fail('Internal error', 500);
   } finally {
+    // Any hold still open here was abandoned by an unexpected exception.
+    // Releasing it returns the credits now instead of after the reaper's hour.
+    for (const id of [...openHolds]) {
+      await releaseCredits(admin, id, 'leads: released after unexpected error', openHolds).catch((e: any) =>
+        console.error('[billing] release after error failed:', e?.message),
+      );
+    }
     await usage.flush(admin);
   }
 
@@ -874,6 +1172,9 @@ Deno.serve(async (req: Request) => {
       search_free_leads: SEARCH_FREE_LEADS,
       search_block_leads: SEARCH_LEADS_PER_BLOCK,
       search_block_credits: prices.searchBlock,
+      // Flat credits per search request, charged when the search returns
+      // results (or the provider billed for it). Additive field.
+      searchCredits: prices.search,
     });
   }
 
@@ -917,7 +1218,7 @@ Deno.serve(async (req: Request) => {
     // result is checked for a verified email/phone and charged per hit. With
     // an empty wallet the provider search would be paid for and shown nothing.
     const prices = await loadPrices(admin);
-    const minimumCredits = Math.max(1, Math.min(prices.email, prices.phone));
+    const minimumCredits = Math.max(1, prices.search, Math.min(prices.email, prices.phone));
     if ((await walletAvailable(admin, userId)) < minimumCredits) {
       return fail('Add credits to search. You pay only for verified emails and phone numbers that are found.', 402, {
         insufficient_credits: true,
@@ -926,29 +1227,32 @@ Deno.serve(async (req: Request) => {
     }
 
     // Searches cost provider money even when nothing is found, so they are
-    // rate-limited.
-    if ((await recentSearchCount(admin, userId)) >= SEARCH_RATE_LIMIT_PER_HOUR) {
-      return fail(
-        `You have run ${SEARCH_RATE_LIMIT_PER_HOUR} searches in the last hour. Please wait a few minutes and try again.`,
-        429,
-        { rate_limited: true },
-      );
-    }
+    // rate-limited — atomically and before any provider call. The burst bucket
+    // is the concurrency guard: a script firing parallel searches is stopped
+    // at three, not after the hourly count catches up.
+    const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.searchBurst, RATE_LIMITS.search]);
+    if (limited) return limited;
 
-    // The first SEARCH_FREE_LEADS leads are free; each further block of 50 is
-    // held up front at the most the search can cost, then settled on what was
-    // actually returned — a search that comes back short is refunded.
-    const maxSearchCredits = searchCreditsFor(requestedLimit, prices);
+    // The flat per-search price plus, for large requests, each block of 50
+    // past the free allowance is held up front at the most the search can
+    // cost, then settled on what actually happened: the blocks on what was
+    // returned, the flat price only if the search returned results or the
+    // provider billed us. A search where every call failed is released.
+    const maxSearchCredits = prices.search + searchCreditsFor(requestedLimit, prices);
     const searchKey = `search_${userId}_${crypto.randomUUID()}`;
     let searchHold: Reservation | null = null;
     let billableLeads = 0;
+    // Where this search's usage rows start, so the settle can sum the
+    // provider's real charges for exactly these calls.
+    const searchUsageStart = usage.rows.length;
     if (maxSearchCredits > 0) {
       const hold = await reserveCredits(admin, userId, maxSearchCredits, searchKey, {
         feature: 'leads_search',
         requested_limit: requestedLimit,
-      });
+      }, openHolds);
       if ('shortfall' in hold) {
-        const blocks = prices.searchBlock > 0 ? Math.floor(Math.max(0, hold.available) / prices.searchBlock) : 0;
+        const afterFlat = Math.max(0, hold.available - prices.search);
+        const blocks = prices.searchBlock > 0 ? Math.floor(afterFlat / prices.searchBlock) : 0;
         return fail(
           `This search needs up to ${maxSearchCredits} credits; you have ${hold.available}.`,
           402,
@@ -956,7 +1260,10 @@ Deno.serve(async (req: Request) => {
             insufficient_credits: true,
             required: maxSearchCredits,
             available: hold.available,
-            affordable_limit: Math.min(requestedLimit, SEARCH_FREE_LEADS + blocks * SEARCH_LEADS_PER_BLOCK),
+            affordable_limit:
+              hold.available < prices.search
+                ? 0
+                : Math.min(requestedLimit, SEARCH_FREE_LEADS + blocks * SEARCH_LEADS_PER_BLOCK),
           },
         );
       }
@@ -964,6 +1271,12 @@ Deno.serve(async (req: Request) => {
     }
     const searchRow = usage.track('leads.search', null, { requested_limit: requestedLimit });
     searchRow.outcome = 'free';
+
+    /** What this search costs given what came back and what was billed. */
+    const searchChargeFor = (returned: number): number => {
+      const billed = returned > 0 || usage.costSince(searchUsageStart, 'treg.people.search') > 0;
+      return (billed ? prices.search : 0) + searchCreditsFor(returned, prices);
+    };
 
     try {
       let allRawPeople: any[] = [];
@@ -1085,7 +1398,9 @@ Deno.serve(async (req: Request) => {
           }
         } else {
           const errText = await tregRes.text();
-          console.error('[leads] treg.people.search failed:', tregRes.status, errText);
+          // Truncated: provider error bodies can echo the query back, and the
+          // log only needs enough to identify the failure.
+          console.error('[leads] treg.people.search failed:', tregRes.status, errText.slice(0, 200));
           return fail('Lead search provider error. Please try adjusting your filters.', 502);
         }
       }
@@ -1199,29 +1514,43 @@ Deno.serve(async (req: Request) => {
           .slice(0, MAX_AUTO_ENRICH);
 
         if (leadsToEnrich.length > 0) {
-          let runKey = `auto_enrich_${userId}_${Date.now()}`;
-          let hold = await reserveCredits(admin, userId, leadsToEnrich.length, runKey, {
+          // Held at the configured email price per lead. The old hold assumed a
+          // price of 1 credit, so any other price either under-held (and the
+          // settle was clipped to the hold) or over-held.
+          const emailPrice = prices.email;
+          // Derived from this search's own key, so a retried request reuses
+          // the hold rather than stacking a second one.
+          let runKey = `${searchKey}:enrich`;
+          let hold = await reserveCredits(admin, userId, leadsToEnrich.length * emailPrice, runKey, {
             feature: 'auto_enrich_leads',
             requested_count: leadsToEnrich.length,
-          });
+          }, openHolds);
 
           // Short on credits: hold what the wallet can cover instead. The old
           // code fell through to `available` lookups with no hold at all, so
           // those emails were resolved without ever being charged, while the
           // response still reported them as credits charged.
           if ('shortfall' in hold) {
-            const affordable = Math.floor(Math.max(0, Number(hold.available) || 0));
-            if (affordable > 0) {
+            const affordableLeads = emailPrice > 0
+              ? Math.floor(Math.max(0, Number(hold.available) || 0) / emailPrice)
+              : 0;
+            if (affordableLeads > 0) {
               runKey = `${runKey}_partial`;
-              hold = await reserveCredits(admin, userId, affordable, runKey, {
+              hold = await reserveCredits(admin, userId, affordableLeads * emailPrice, runKey, {
                 feature: 'auto_enrich_leads',
                 requested_count: leadsToEnrich.length,
                 partial: true,
-              });
+              }, openHolds);
             }
           }
 
-          const maxAllowed = 'id' in hold ? Math.floor(hold.reserved) : 0;
+          // How many lookups the hold covers. A free price needs no hold.
+          const maxAllowed = 'shortfall' in hold || hold.duplicate
+            ? 0
+            : emailPrice > 0
+              ? Math.floor(hold.reserved / emailPrice)
+              : leadsToEnrich.length;
+          const enrichUsageStart = usage.rows.length;
           if (maxAllowed < leadsToEnrich.length) enrichmentLimitedBy = 'balance';
 
           const targetBatch = leadsToEnrich.slice(0, maxAllowed);
@@ -1319,15 +1648,18 @@ Deno.serve(async (req: Request) => {
             // thrown mid-run used to skip the settle entirely, and a held
             // reservation is money the user can see as available and cannot
             // spend. Whatever happened, the hold is closed here.
-            creditsCharged = verifiedCount * prices.email;
-            if ('id' in hold) {
+            creditsCharged = verifiedCount * emailPrice;
+            if (!('shortfall' in hold) && !hold.duplicate) {
+              // Provider cost is what Treg reported for every lookup in this
+              // run, hits and misses alike.
               await settleCredits(
                 admin,
                 hold.id,
                 creditsCharged,
-                creditsCharged * 0.005,
+                usage.costSince(enrichUsageStart, 'treg.people.email.find', 'auto-enrich'),
                 runKey,
-                `Auto-enriched ${creditsCharged} verified emails for search (${normalized.length} leads)`
+                `Auto-enriched ${verifiedCount} verified emails for search (${normalized.length} leads)`,
+                openHolds,
               );
             }
           }
@@ -1335,7 +1667,7 @@ Deno.serve(async (req: Request) => {
       }
 
       billableLeads = normalized.length;
-      const searchCredits = searchCreditsFor(billableLeads, prices);
+      const searchCredits = searchChargeFor(billableLeads);
       searchRow.credits_charged = searchCredits;
       searchRow.metadata = { ...searchRow.metadata, returned: billableLeads };
       return json({
@@ -1353,21 +1685,29 @@ Deno.serve(async (req: Request) => {
         failed_batches: failedBatches,
       });
     } catch (err: any) {
-      console.error('[leads] search execution error:', err.message);
+      console.error('[leads] search execution error:', err?.name || 'error', String(err?.message || '').slice(0, 200));
       return fail('Internal lead search error', 500);
     } finally {
-      // Every exit — success, provider error, exception — closes the hold, and
-      // only leads actually returned past the free allowance are charged.
-      if (searchHold) {
-        const charge = searchCreditsFor(billableLeads, prices);
-        await settleCredits(
-          admin,
-          searchHold.id,
-          charge,
-          0,
-          searchKey,
-          `Lead search: ${billableLeads} leads (${Math.min(SEARCH_FREE_LEADS, billableLeads)} free)`,
-        );
+      // Every exit — success, provider error, exception — closes the hold.
+      // Nothing returned and nothing billed by the provider: released in full.
+      // Otherwise settled for the flat price plus any blocks returned, with
+      // the provider's actual charge for every search call.
+      if (searchHold && !searchHold.duplicate) {
+        const charge = searchChargeFor(billableLeads);
+        const cost = usage.costSince(searchUsageStart, 'treg.people.search');
+        if (charge === 0 && cost === 0) {
+          await releaseCredits(admin, searchHold.id, 'Lead search: no results, nothing billed', openHolds);
+        } else {
+          await settleCredits(
+            admin,
+            searchHold.id,
+            charge,
+            cost,
+            searchKey,
+            `Lead search: ${billableLeads} leads (${Math.min(SEARCH_FREE_LEADS, billableLeads)} free)`,
+            openHolds,
+          );
+        }
       }
     }
   }
@@ -1376,7 +1716,21 @@ Deno.serve(async (req: Request) => {
   // ACTION 2: REVEAL EMAIL (Single, 1 Credit)
   // =========================================================================
   if (action === 'reveal-email') {
-    const { full_name, first_name, last_name, company_domain, linkedin_url, title, company_name, company_size, company_revenue, location } = body;
+    // Every field clamped before it reaches the provider or user_leads; a
+    // LinkedIn URL that is not an https linkedin.com/in|pub profile is dropped.
+    const input = sanitizeLead(body);
+    const {
+      full_name,
+      first_name,
+      last_name,
+      company_domain,
+      linkedin_url,
+      title,
+      company_name,
+      company_size,
+      company_revenue,
+      location,
+    } = input;
 
     if (!company_domain && !linkedin_url) {
       return fail('Company domain or LinkedIn URL is required to find email.');
@@ -1389,14 +1743,14 @@ Deno.serve(async (req: Request) => {
     // profile slug keeps the saved row identifiable; sending a placeholder like
     // "LinkedIn Prospect" saved a different junk row on every single lookup.
     const derived = !full_name && linkedin_url ? nameFromLinkedinSlug(linkedin_url) : null;
-    const resolvedName = (full_name || derived?.full_name || '').trim();
-    const resolvedFirst = (first_name || derived?.first_name || resolvedName.split(' ')[0] || '').trim();
-    const resolvedLast = (
+    const resolvedName = clampText(full_name || derived?.full_name || '');
+    const resolvedFirst = clampText(first_name || derived?.first_name || resolvedName.split(' ')[0] || '');
+    const resolvedLast = clampText(
       last_name ||
       derived?.last_name ||
       (resolvedName ? resolvedName.split(' ').slice(1).join(' ') : '')
-    ).trim();
-    let resolvedDomain = cleanDomain(company_domain);
+    );
+    let resolvedDomain = company_domain;
 
     // 1. Check if already revealed in local database (idempotent / free)
     const existing = await findExistingLead(admin, userId, { companyDomain: resolvedDomain, fullName: resolvedName, linkedinUrl: linkedin_url });
@@ -1410,13 +1764,21 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // 2. Reserve 1 credit in user's wallet
+    // Only lookups that reach the provider count against the limits; an
+    // already-revealed contact above is free and unlimited.
+    const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.revealBurst, RATE_LIMITS.reveal]);
+    if (limited) return limited;
+
+    // 2. Reserve the email price in user's wallet. The key is deterministic per
+    // (user, lead, action, minute) so a double-click reuses this hold instead
+    // of charging twice; the ledger and reservation carry a hash, not the name.
     const CREDITS_REQUIRED = (await loadPrices(admin)).email;
-    const runKey = `reveal_email_${userId}_${resolvedDomain}_${Date.now()}`;
+    const leadRef = await shortHash(leadIdentity({ company_domain: resolvedDomain, full_name: resolvedName, linkedin_url }));
+    const runKey = `reveal_email:${userId}:${leadRef}:${revealWindow()}`;
     const hold = await reserveCredits(admin, userId, CREDITS_REQUIRED, runKey, {
       feature: 'lead_email_reveal',
-      target: resolvedName || linkedin_url,
-    });
+      lead_ref: leadRef,
+    }, openHolds);
 
     if ('shortfall' in hold) {
       return fail(`Insufficient credits. Required: ${hold.required}, Available: ${hold.available}`, 402, {
@@ -1425,6 +1787,9 @@ Deno.serve(async (req: Request) => {
         available: hold.available,
       });
     }
+    if (hold.duplicate) {
+      return fail('This contact is already being looked up. Please wait a moment.', 409, { duplicate_request: true });
+    }
 
     // 3. Call Treg Email Finder with auto verification
     let emailFound: string | null = null;
@@ -1432,7 +1797,7 @@ Deno.serve(async (req: Request) => {
     let emailCharge = 0;
     let emailStatus: string = 'unknown';
     let emailConfidence = 0.9;
-    let providerCostUsd = 0.0048;
+    const revealUsageStart = usage.rows.length;
 
     try {
       const emailPayload: Record<string, string> = {};
@@ -1458,8 +1823,6 @@ Deno.serve(async (req: Request) => {
         signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
       });
 
-      const costMicro = Number(tregRes.headers.get('x-treg-cost-micro') || 0);
-      if (costMicro > 0) providerCostUsd = costMicro / 1e6;
       const emailRow = usage.track('treg.people.email.find', tregRes, { feature: 'lead-email' });
 
       if (tregRes.ok) {
@@ -1484,10 +1847,12 @@ Deno.serve(async (req: Request) => {
         }
       }
     } catch (err: any) {
-      console.warn('[leads] email find upstream warning:', err.message);
+      console.warn('[leads] email find upstream warning:', err?.name || String(err?.message || '').slice(0, 200));
     }
 
-    // 4. Settle credit hold
+    // 4. Settle credit hold with what Treg actually charged for the lookup —
+    // a miss is free for the user but not for us, and the ledger says so.
+    const providerCostUsd = usage.costSince(revealUsageStart, 'treg.people.email.find');
     if (emailFound) {
       await settleCredits(
         admin,
@@ -1495,10 +1860,11 @@ Deno.serve(async (req: Request) => {
         emailCharge,
         providerCostUsd,
         runKey,
-        emailCharge > 0 ? `Revealed verified email for ${resolvedName}` : `Unconfirmed email for ${resolvedName} - not charged`,
+        emailCharge > 0 ? `Revealed verified email (lead ${leadRef})` : `Unconfirmed email (lead ${leadRef}) - not charged`,
+        openHolds,
       );
     } else {
-      await settleCredits(admin, hold.id, 0, 0, runKey, `No email found - refund`);
+      await settleCredits(admin, hold.id, 0, providerCostUsd, runKey, `No email found (lead ${leadRef}) - refund`, openHolds);
       return fail('No verified email found for this lead. Zero credits charged.', 404, { no_hit: true });
     }
 
@@ -1571,14 +1937,13 @@ Deno.serve(async (req: Request) => {
     // A lead without a name cannot be looked up or saved (full_name is NOT
     // NULL), and one bad row used to fail the batch upsert, leaving every
     // email in it charged but never persisted.
+    // Clamped first: these fields go to the provider and into user_leads.
+    // Keys below use the sanitised values for matching saved rows, and each
+    // lead's `client_key` (what the client computed) for per-lead results.
     const leadsToReveal: any[] = (Array.isArray(body.leads) ? body.leads : [])
       .slice(0, 2000)
-      .filter(
-        (l: any) =>
-          typeof l?.full_name === 'string' &&
-          l.full_name.trim() &&
-          (cleanDomain(l.company_domain) || l.linkedin_url),
-      );
+      .map(sanitizeLead)
+      .filter((l: any) => l.full_name && (l.company_domain || l.linkedin_url));
     if (leadsToReveal.length === 0) {
       return fail('No leads provided for bulk reveal');
     }
@@ -1640,14 +2005,23 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // Reserve credits for the batch
+    const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.bulkRevealBurst, RATE_LIMITS.bulkReveal]);
+    if (limited) return limited;
+
+    // Reserve credits for the batch. The key is deterministic per (user, set of
+    // leads, action, minute): a double-submitted batch lands on the same hold
+    // and is refused below instead of being looked up and charged twice.
     const emailPrice = (await loadPrices(admin)).email;
-    const creditsToHold = Math.min(neededLeads.length, MAX_BULK) * emailPrice;
-    const runKey = `bulk_reveal_${userId}_${Date.now()}`;
+    const batch = neededLeads.slice(0, Math.min(neededLeads.length, MAX_BULK));
+    const creditsToHold = batch.length * emailPrice;
+    const batchRefs = await Promise.all(batch.map((l: any) => shortHash(leadIdentity(l))));
+    const batchRef = await shortHash([...batchRefs].sort().join(','));
+    const runKey = `bulk_reveal_email:${userId}:${batchRef}:${revealWindow()}`;
     const hold = await reserveCredits(admin, userId, creditsToHold, runKey, {
       feature: 'bulk_lead_email_reveal',
-      count: creditsToHold,
-    });
+      count: batch.length,
+      batch_ref: batchRef,
+    }, openHolds);
 
     if ('shortfall' in hold) {
       return fail(`Insufficient credits. Needed: ${hold.required}, Available: ${hold.available}`, 402, {
@@ -1656,13 +2030,18 @@ Deno.serve(async (req: Request) => {
         available: hold.available,
       });
     }
+    if (hold.duplicate) {
+      return fail('This batch is already being looked up. Please wait a moment.', 409, { duplicate_request: true });
+    }
 
     // Execute email finds concurrently (batches of 5)
-    const batch = neededLeads.slice(0, Math.min(neededLeads.length, MAX_BULK));
     let successfulReveals = 0;
     // Only verified addresses are charged; unconfirmed ones are returned free.
+    // That is a product rule (users never pay for a miss or an unconfirmed
+    // address), so the provider cost of those lookups is ours; the rate limits
+    // above are what keep it bounded.
     let verifiedReveals = 0;
-    let totalProviderCostUsd = 0;
+    const bulkUsageStart = usage.rows.length;
     const updatedRecords: any[] = [];
     // Leads the provider answered for but had no address. A failed or timed-out
     // lookup is deliberately not listed: the client marks these rows "Not
@@ -1673,6 +2052,8 @@ Deno.serve(async (req: Request) => {
     const failedKeys: string[] = [];
 
     const batchSize = 5;
+    const creditsCharged = () => verifiedReveals * emailPrice;
+    try {
     for (let i = 0; i < batch.length; i += batchSize) {
       const chunk = batch.slice(i, i + batchSize);
       await Promise.all(
@@ -1706,21 +2087,18 @@ Deno.serve(async (req: Request) => {
                 verifiedReveals++;
                 bulkRow.credits_charged = emailPrice;
               }
-              const costMicro = Number(tregRes.headers.get('x-treg-cost-micro') || 0);
-              totalProviderCostUsd += costMicro > 0 ? costMicro / 1e6 : 0.0048;
-
-              const key = `${(lead.company_domain || '').toLowerCase().trim()}::${(lead.full_name || '').toLowerCase().trim()}`;
-              if (!email) notFoundKeys.push(key);
+              const key = `${lead.company_domain}::${lead.full_name.toLowerCase()}`;
+              if (!email) notFoundKeys.push(lead.client_key);
               if (email) {
                 successfulReveals++;
                 updatedRecords.push({
                   user_id: userId,
-                  first_name: lead.first_name || lead.full_name?.split(' ')[0] || '',
-                  last_name: lead.last_name || lead.full_name?.split(' ').slice(1).join(' ') || '',
+                  first_name: lead.first_name || lead.full_name.split(' ')[0] || '',
+                  last_name: lead.last_name || lead.full_name.split(' ').slice(1).join(' ') || '',
                   full_name: lead.full_name,
                   title: lead.title || 'Executive',
-                  company_name: lead.company_name || lead.company_domain?.split('.')[0] || '',
-                  company_domain: cleanDomain(lead.company_domain),
+                  company_name: lead.company_name || lead.company_domain.split('.')[0] || '',
+                  company_domain: lead.company_domain || '',
                   company_size: lead.company_size || null,
                   company_revenue: lead.company_revenue || null,
                   linkedin_url: lead.linkedin_url || null,
@@ -1736,26 +2114,29 @@ Deno.serve(async (req: Request) => {
                 });
               }
             } else {
-              failedKeys.push(`${(lead.company_domain || '').toLowerCase().trim()}::${(lead.full_name || '').toLowerCase().trim()}`);
+              failedKeys.push(lead.client_key);
             }
           } catch (err: any) {
-            failedKeys.push(`${(lead.company_domain || '').toLowerCase().trim()}::${(lead.full_name || '').toLowerCase().trim()}`);
+            failedKeys.push(lead.client_key);
             console.warn('[leads] bulk email item failed:', err?.name || err?.message);
           }
         })
       );
     }
-
-    // Settle credits: ONLY charge for successful reveals!
-    const creditsCharged = verifiedReveals * emailPrice;
-    await settleCredits(
-      admin,
-      hold.id,
-      creditsCharged,
-      totalProviderCostUsd,
-      runKey,
-      `Bulk revealed ${successfulReveals} emails, ${verifiedReveals} verified and charged (${batch.length - verifiedReveals} not charged)`
-    );
+    } finally {
+      // Settled from `finally` so an exception mid-batch cannot leave the hold
+      // open. Only verified reveals are charged; the provider cost is Treg's
+      // actual charge for every lookup in the batch, hits and misses.
+      await settleCredits(
+        admin,
+        hold.id,
+        creditsCharged(),
+        usage.costSince(bulkUsageStart, 'treg.people.email.find', 'bulk-email'),
+        runKey,
+        `Bulk revealed ${successfulReveals} emails, ${verifiedReveals} verified and charged (${batch.length - verifiedReveals} not charged)`,
+        openHolds,
+      );
+    }
 
     // Save all successful records to user_leads
     if (updatedRecords.length > 0) {
@@ -1786,13 +2167,13 @@ Deno.serve(async (req: Request) => {
       capped_count: Math.max(0, neededLeads.length - batch.length),
       revealed_count: successfulReveals,
       verified_count: verifiedReveals,
-      credits_charged: creditsCharged,
+      credits_charged: creditsCharged(),
       skipped_count: neededLeads.length - batch.length,
       updated_records: updatedRecords,
       // Leads in this request whose address was already on file. Returned so
       // the client can show them without a second round trip.
       existing_records: leadsToReveal
-        .map((l: any) => existingMap.get(`${(l.company_domain || '').toLowerCase().trim()}::${(l.full_name || '').toLowerCase().trim()}`))
+        .map((l: any) => existingMap.get(`${l.company_domain}::${l.full_name.toLowerCase()}`))
         .filter(Boolean),
       not_found_keys: notFoundKeys,
       failed_keys: failedKeys,
@@ -1813,14 +2194,11 @@ Deno.serve(async (req: Request) => {
     const keyOf = (l: any) =>
       `${(l.company_domain || '').toLowerCase().trim()}::${(l.full_name || '').toLowerCase().trim()}`;
 
+    // Clamped first; `client_key` carries the client's own key for results.
     const requested: any[] = (Array.isArray(body.leads) ? body.leads : [])
       .slice(0, 2000)
-      .filter(
-        (l: any) =>
-          typeof l?.full_name === 'string' &&
-          l.full_name.trim() &&
-          (cleanDomain(l.company_domain) || l.linkedin_url || isEmailAddress(l.work_email)),
-      );
+      .map(sanitizeLead)
+      .filter((l: any) => l.full_name && (l.company_domain || l.linkedin_url || l.work_email));
     if (requested.length === 0) return fail('No leads provided for phone lookup');
 
     const domains = [...new Set(requested.map((l: any) => cleanDomain(l.company_domain)).filter(Boolean))];
@@ -1856,11 +2234,19 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    const runKey = `bulk_phone_${userId}_${Date.now()}`;
+    const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.bulkRevealBurst, RATE_LIMITS.bulkReveal]);
+    if (limited) return limited;
+
+    // Deterministic per (user, set of leads, action, minute) so a
+    // double-submitted batch reuses the hold and is refused, not charged twice.
+    const batchRefs = await Promise.all(batch.map((l: any) => shortHash(leadIdentity(l))));
+    const batchRef = await shortHash([...batchRefs].sort().join(','));
+    const runKey = `bulk_reveal_phone:${userId}:${batchRef}:${revealWindow()}`;
     const hold = await reserveCredits(admin, userId, batch.length * PHONE_CREDITS, runKey, {
       feature: 'bulk_lead_phone_reveal',
       count: batch.length,
-    });
+      batch_ref: batchRef,
+    }, openHolds);
     if ('shortfall' in hold) {
       return fail(`Insufficient credits. Needed: ${hold.required}, Available: ${hold.available}`, 402, {
         insufficient_credits: true,
@@ -1868,21 +2254,24 @@ Deno.serve(async (req: Request) => {
         available: hold.available,
       });
     }
+    if (hold.duplicate) {
+      return fail('This batch is already being looked up. Please wait a moment.', 409, { duplicate_request: true });
+    }
 
     const updatedRecords: any[] = [];
     const notFoundKeys: string[] = [];
     const failedKeys: string[] = [];
-    let providerCostUsd = 0;
+    const phoneUsageStart = usage.rows.length;
 
     try {
       for (let i = 0; i < batch.length; i += 5) {
         await Promise.all(
           batch.slice(i, i + 5).map(async (lead: any) => {
-            const key = keyOf(lead);
+            const key = lead.client_key;
             try {
-              const domain = cleanDomain(lead.company_domain);
-              const email = isEmailAddress(lead.work_email) ? lead.work_email.trim() : '';
-              const payload: Record<string, string> = { full_name: lead.full_name.trim() };
+              const domain = lead.company_domain;
+              const email = lead.work_email || '';
+              const payload: Record<string, string> = { full_name: lead.full_name };
               if (lead.linkedin_url) payload.linkedin_url = lead.linkedin_url;
               if (email) payload.email = email;
               if (domain) payload.domain = domain;
@@ -1899,8 +2288,6 @@ Deno.serve(async (req: Request) => {
                 body: JSON.stringify(payload),
                 signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
               });
-              const costMicro = Number(res.headers.get('x-treg-cost-micro') || 0);
-              if (costMicro > 0) providerCostUsd += costMicro / 1e6;
               const phoneRow = usage.track('treg.people.phone.find', res, { feature: 'bulk-phone' });
               if (!res.ok) {
                 failedKeys.push(key);
@@ -1915,19 +2302,19 @@ Deno.serve(async (req: Request) => {
               phoneRow.credits_charged = PHONE_CREDITS;
               updatedRecords.push({
                 user_id: userId,
-                full_name: lead.full_name.trim(),
-                first_name: lead.first_name || lead.full_name.trim().split(' ')[0] || '',
-                last_name: lead.last_name || lead.full_name.trim().split(' ').slice(1).join(' ') || '',
+                full_name: lead.full_name,
+                first_name: lead.first_name || lead.full_name.split(' ')[0] || '',
+                last_name: lead.last_name || lead.full_name.split(' ').slice(1).join(' ') || '',
                 title: lead.title || 'Executive',
                 company_name: lead.company_name || (domain ? domain.split('.')[0] : ''),
-                company_domain: domain,
+                company_domain: domain || '',
                 linkedin_url: lead.linkedin_url || null,
                 location: lead.location || null,
                 // Omitted when unknown: on a conflict an explicit null would
                 // erase the address this row already had.
                 ...(email ? { work_email: email } : {}),
-                phone_number: phone.trim(),
-                phone_type: data?.output?.line_type || 'mobile',
+                phone_number: clampText(phone, 50),
+                phone_type: clampText(data?.output?.line_type, 32) || 'mobile',
                 updated_at: new Date().toISOString(),
               });
             } catch (err: any) {
@@ -1939,14 +2326,16 @@ Deno.serve(async (req: Request) => {
       }
     } finally {
       // Settled from `finally` so an exception mid-batch cannot leave the
-      // hold open. Only numbers actually found are charged.
+      // hold open. Only numbers actually found are charged; the provider cost
+      // is Treg's actual charge for every lookup, hits and misses.
       await settleCredits(
         admin,
         hold.id,
         updatedRecords.length * PHONE_CREDITS,
-        providerCostUsd,
+        usage.costSince(phoneUsageStart, 'treg.people.phone.find', 'bulk-phone'),
         runKey,
         `Bulk revealed ${updatedRecords.length} phones (${batch.length - updatedRecords.length} not charged)`,
+        openHolds,
       );
     }
 
@@ -1980,22 +2369,23 @@ Deno.serve(async (req: Request) => {
   // ACTION 4: REVEAL PHONE (2 Credits)
   // =========================================================================
   if (action === 'reveal-phone') {
-    const { full_name, first_name, last_name, company_domain, linkedin_url } = body;
+    // Every field clamped; a non-linkedin.com profile URL is dropped.
+    const input = sanitizeLead(body);
+    const { full_name, first_name, last_name, company_domain, linkedin_url } = input;
     // Only a real address is used to match or persist; a preview placeholder
     // like "N/A" would otherwise be written into the saved row.
-    const work_email = isEmailAddress(body.work_email) ? body.work_email.trim() : '';
+    const work_email = safeEmail(body.work_email) || '';
 
     if (!linkedin_url && !company_domain && !work_email) {
       return fail('LinkedIn URL, email, or company domain is required.');
     }
 
-    const resolvedDomain = cleanDomain(company_domain);
-    let finalDomain = resolvedDomain;
+    let finalDomain = company_domain;
     if (!finalDomain && work_email && work_email.includes('@')) {
       finalDomain = cleanDomain(work_email.split('@')[1]);
     }
     const derived = !full_name && linkedin_url ? nameFromLinkedinSlug(linkedin_url) : null;
-    const resolvedName = (full_name || derived?.full_name || '').trim();
+    const resolvedName = clampText(full_name || derived?.full_name || '');
 
     const existing = await findExistingLead(admin, userId, { companyDomain: finalDomain, fullName: resolvedName, linkedinUrl: linkedin_url, workEmail: work_email });
 
@@ -2008,12 +2398,21 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.revealBurst, RATE_LIMITS.reveal]);
+    if (limited) return limited;
+
+    // Deterministic per (user, lead, action, minute): a double-click reuses
+    // this hold and is refused below rather than charged twice. The ledger and
+    // reservation carry a hash, not the name or LinkedIn URL.
     const CREDITS_REQUIRED = (await loadPrices(admin)).phone;
-    const runKey = `reveal_phone_${userId}_${Date.now()}`;
+    const leadRef = await shortHash(
+      leadIdentity({ company_domain: finalDomain, full_name: resolvedName, linkedin_url, work_email }),
+    );
+    const runKey = `reveal_phone:${userId}:${leadRef}:${revealWindow()}`;
     const hold = await reserveCredits(admin, userId, CREDITS_REQUIRED, runKey, {
       feature: 'lead_phone_reveal',
-      target: resolvedName || linkedin_url,
-    });
+      lead_ref: leadRef,
+    }, openHolds);
 
     if ('shortfall' in hold) {
       return fail(`Insufficient credits. Required: ${hold.required}, Available: ${hold.available}`, 402, {
@@ -2022,10 +2421,13 @@ Deno.serve(async (req: Request) => {
         available: hold.available,
       });
     }
+    if (hold.duplicate) {
+      return fail('This contact is already being looked up. Please wait a moment.', 409, { duplicate_request: true });
+    }
 
     let phoneFound: string | null = null;
     let phoneType = 'mobile';
-    let providerCostUsd = 0.02;
+    const phoneUsageStart = usage.rows.length;
 
     try {
       const phonePayload: Record<string, string> = {};
@@ -2047,24 +2449,24 @@ Deno.serve(async (req: Request) => {
         signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
       });
 
-      const costMicro = Number(tregRes.headers.get('x-treg-cost-micro') || 0);
-      if (costMicro > 0) providerCostUsd = costMicro / 1e6;
       const singlePhoneRow = usage.track('treg.people.phone.find', tregRes, { feature: 'lead-phone' });
 
       if (tregRes.ok) {
         const resJson = await tregRes.json();
-        phoneFound = resJson?.output?.phone || resJson?.raw?.data?.employee_phone || null;
-        phoneType = resJson?.output?.line_type || 'mobile';
+        phoneFound = clampText(resJson?.output?.phone || resJson?.raw?.data?.employee_phone, 50) || null;
+        phoneType = clampText(resJson?.output?.line_type, 32) || 'mobile';
         if (phoneFound) singlePhoneRow.credits_charged = CREDITS_REQUIRED;
       }
     } catch (err: any) {
-      console.warn('[leads] phone find error:', err.message);
+      console.warn('[leads] phone find error:', err?.name || String(err?.message || '').slice(0, 200));
     }
 
+    // Settled with Treg's actual charge for the lookup, hit or miss.
+    const providerCostUsd = usage.costSince(phoneUsageStart, 'treg.people.phone.find');
     if (phoneFound) {
-      await settleCredits(admin, hold.id, CREDITS_REQUIRED, providerCostUsd, runKey, `Revealed phone for ${resolvedName}`);
+      await settleCredits(admin, hold.id, CREDITS_REQUIRED, providerCostUsd, runKey, `Revealed phone (lead ${leadRef})`, openHolds);
     } else {
-      await settleCredits(admin, hold.id, 0, 0, runKey, `No phone found - refund`);
+      await settleCredits(admin, hold.id, 0, providerCostUsd, runKey, `No phone found (lead ${leadRef}) - refund`, openHolds);
       return fail('No direct mobile number found for this lead. Zero credits charged.', 404, { no_hit: true });
     }
 
@@ -2099,11 +2501,11 @@ Deno.serve(async (req: Request) => {
             first_name: first_name || derived?.first_name || resolvedName.split(' ')[0] || '',
             last_name: last_name || derived?.last_name || resolvedName.split(' ').slice(1).join(' ') || '',
             full_name: resolvedName,
-            title: body.title || 'Executive',
-            company_name: body.company_name || (finalDomain ? finalDomain.split('.')[0].toUpperCase() : ''),
-            company_domain: finalDomain,
+            title: input.title || 'Executive',
+            company_name: input.company_name || (finalDomain ? finalDomain.split('.')[0].toUpperCase() : ''),
+            company_domain: finalDomain || '',
             linkedin_url: linkedin_url || null,
-            location: body.location || null,
+            location: input.location || null,
             // Omitted when unknown: on a conflict an explicit null would erase
             // the address this row already had.
             ...(work_email ? { work_email } : {}),
@@ -2122,7 +2524,7 @@ Deno.serve(async (req: Request) => {
 
     return json({
       ok: true,
-      lead: updatedLead || { ...body, full_name: resolvedName, ...updatePayload },
+      lead: updatedLead || { ...input, client_key: undefined, full_name: resolvedName, ...updatePayload },
       credits_charged: CREDITS_REQUIRED,
     });
   }
@@ -2131,8 +2533,20 @@ Deno.serve(async (req: Request) => {
   // ACTION 5: BULK SAVE LEADS (Bookmarks)
   // =========================================================================
   if (action === 'bulk-save') {
-    const leadsToSave: any[] = Array.isArray(body.leads) ? body.leads : [];
-    if (leadsToSave.length === 0) return fail('No leads provided');
+    const rawLeads: any[] = Array.isArray(body.leads) ? body.leads : [];
+    if (rawLeads.length === 0) return fail('No leads provided');
+    // user_leads is written only by this function now, so this is the one
+    // place a client's payload size and field contents are bounded.
+    if (rawLeads.length > MAX_BULK_SAVE) {
+      return fail(`At most ${MAX_BULK_SAVE} leads can be saved at once. Please save them in smaller batches.`, 400, {
+        max_leads: MAX_BULK_SAVE,
+      });
+    }
+    const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.bulkSave]);
+    if (limited) return limited;
+    // Clamped; invalid statuses become null (so the saved or default stage is
+    // kept) and non-linkedin.com profile URLs are dropped.
+    const leadsToSave = rawLeads.map(sanitizeLead);
   // Fetch existing rows so a re-save cannot wipe a paid-for email, phone, or
   // the pipeline stage the user already set on this prospect.
   //
@@ -2187,37 +2601,33 @@ Deno.serve(async (req: Request) => {
 
 
     const existingFor = (l: any) =>
-      existingMap.get(cleanDomain(l.company_domain) + '::' + (l.full_name || '').toLowerCase().trim());
+      existingMap.get(l.company_domain + '::' + l.full_name.toLowerCase());
     // Only a resolved address may be written as work_email. A search result's
     // unverified preview address (or a placeholder such as "N/A") saved here
     // later came back from the reveal endpoints as "already revealed", so the
-    // verified address could never be bought for that lead.
-    const clientEmail = (l: any): string | null => {
-      if (l?.email_status === 'preview') return null;
-      const candidate = l?.revealed_email || l?.work_email;
-      return isEmailAddress(candidate) ? candidate.trim() : null;
-    };
+    // verified address could never be bought for that lead. sanitizeLead
+    // already applies that rule: its work_email is null for a preview.
 
     const records = leadsToSave
       // full_name is NOT NULL and is half the conflict target, so a record
       // without one cannot be saved at all.
-      .filter((l: any) => typeof l?.full_name === 'string' && l.full_name.trim())
-      .map((l: any) => ({
+      .filter((l) => l.full_name)
+      .map((l) => ({
         user_id: userId,
-        first_name: l.first_name || l.full_name?.split(' ')[0] || '',
-        last_name: l.last_name || l.full_name?.split(' ').slice(1).join(' ') || '',
+        first_name: l.first_name || l.full_name.split(' ')[0] || '',
+        last_name: l.last_name || l.full_name.split(' ').slice(1).join(' ') || '',
         full_name: l.full_name,
         title: l.title || 'Executive',
-        company_name: l.company_name || l.company_domain?.split('.')[0] || '',
-        company_domain: cleanDomain(l.company_domain),
-        company_size: l.company_size || null,
-        company_revenue: l.company_revenue || null,
-        company_phone: l.company_phone || null,
-        linkedin_url: l.linkedin_url || null,
-        location: l.location || null,
-        work_email: clientEmail(l) || existingFor(l)?.work_email || null,
-        phone_number: l.revealed_phone || l.phone_number || existingFor(l)?.phone_number || null,
-        email_status: (clientEmail(l) ? l.email_status : null) || existingFor(l)?.email_status || null,
+        company_name: l.company_name || l.company_domain.split('.')[0] || '',
+        company_domain: l.company_domain || '',
+        company_size: l.company_size,
+        company_revenue: l.company_revenue,
+        company_phone: l.company_phone,
+        linkedin_url: l.linkedin_url,
+        location: l.location,
+        work_email: l.work_email || existingFor(l)?.work_email || null,
+        phone_number: l.phone_number || existingFor(l)?.phone_number || null,
+        email_status: l.email_status || existingFor(l)?.email_status || null,
         status: l.status || existingFor(l)?.status || 'new',
         updated_at: new Date().toISOString(),
       }));
@@ -2328,14 +2738,21 @@ Deno.serve(async (req: Request) => {
   // ACTION 7: UPDATE STATUS / NOTES
   // =========================================================================
   if (action === 'update-status') {
-    const { lead_id, company_domain, full_name, status, notes } = body;
+    const { lead_id, status, notes } = body;
+    const input = sanitizeLead(body);
+    const company_domain = input.company_domain;
+    const full_name = input.full_name;
 
-    const ALLOWED_STATUS = ['new', 'contacted', 'replied', 'dismissed'];
     if (!lead_id && !(company_domain && full_name)) {
       return fail('lead_id or company_domain + full_name is required', 400);
     }
-    if (status && !ALLOWED_STATUS.includes(status)) {
+    if (status && !isAllowedStatus(status)) {
       return fail(`Invalid status. Expected one of: ${ALLOWED_STATUS.join(', ')}`, 400);
+    }
+    // Matches the table's CHECK, so a bad value is a clear 400 rather than a
+    // generic 500 from the constraint. null clears the notes.
+    if (notes !== undefined && notes !== null && (typeof notes !== 'string' || notes.length > MAX_NOTES)) {
+      return fail(`Notes must be text of at most ${MAX_NOTES} characters.`, 400);
     }
 
     const updateData: Record<string, any> = { updated_at: new Date().toISOString() };
@@ -2346,7 +2763,7 @@ Deno.serve(async (req: Request) => {
     if (isUuid(lead_id)) {
       query = query.eq('id', lead_id);
     } else {
-      query = query.eq('company_domain', cleanDomain(company_domain)).ilike('full_name', escapeLike(full_name));
+      query = query.eq('company_domain', company_domain).ilike('full_name', escapeLike(full_name));
     }
 
     const { data: matched, error: lookupError } = await query.limit(1);
@@ -2354,12 +2771,14 @@ Deno.serve(async (req: Request) => {
 
     // If lead is not yet saved in user_leads, auto-save it with the requested status!
     if (!matched || matched.length === 0) {
-      const resolvedName = (full_name || '').trim();
+      const resolvedName = full_name;
       if (!resolvedName) {
         return fail('Lead not found in your pipeline. Save it first.', 404);
       }
-      const first = body.first_name || resolvedName.split(' ')[0] || '';
-      const last = body.last_name || resolvedName.split(' ').slice(1).join(' ') || '';
+      const first = input.first_name || resolvedName.split(' ')[0] || '';
+      const last = input.last_name || resolvedName.split(' ').slice(1).join(' ') || '';
+      const auto_email = safeEmail(body.work_email);
+      const auto_phone = clampText(body.phone_number, 50);
       const { data: inserted, error: insertError } = await admin
         .from('user_leads')
         .upsert(
@@ -2368,15 +2787,15 @@ Deno.serve(async (req: Request) => {
             first_name: first,
             last_name: last,
             full_name: resolvedName,
-            title: body.title || 'Executive',
-            company_name: body.company_name || (company_domain || '').split('.')[0] || '',
-            company_domain: cleanDomain(company_domain),
-            linkedin_url: body.linkedin_url || null,
+            title: input.title || 'Executive',
+            company_name: input.company_name || company_domain.split('.')[0] || '',
+            company_domain: company_domain || '',
+            linkedin_url: input.linkedin_url,
             // Omitted when unknown: on a conflict an explicit null would erase
             // the paid-for contact details the row already carried.
-            ...(isEmailAddress(body.work_email) ? { work_email: body.work_email.trim() } : {}),
-            ...(body.phone_number ? { phone_number: body.phone_number } : {}),
-            location: body.location || null,
+            ...(auto_email ? { work_email: auto_email } : {}),
+            ...(auto_phone ? { phone_number: auto_phone } : {}),
+            location: input.location,
             status: status || 'new',
             notes: notes || null,
             updated_at: new Date().toISOString(),
@@ -2409,12 +2828,15 @@ Deno.serve(async (req: Request) => {
   // ACTION 8: DELETE SAVED LEAD(S)
   // =========================================================================
   if (action === 'delete-saved') {
-    const { lead_id, lead_ids, company_domain, full_name } = body;
+    const { lead_id, lead_ids } = body;
+    const company_domain = cleanDomain(typeof body.company_domain === 'string' ? body.company_domain : '');
+    const full_name = clampText(body.full_name);
     const idsToDelete: string[] = [];
     if (isUuid(lead_id)) idsToDelete.push(lead_id);
     if (Array.isArray(lead_ids)) {
-      lead_ids.forEach((id: string) => {
-        if (isUuid(id)) idsToDelete.push(id);
+      // Bounded so one request cannot send an unbounded IN list.
+      lead_ids.slice(0, 2000).forEach((id: unknown) => {
+        if (typeof id === 'string' && isUuid(id)) idsToDelete.push(id);
       });
     }
 
@@ -2432,19 +2854,25 @@ Deno.serve(async (req: Request) => {
       return json({ ok: true, deleted_count: deleted?.length ?? 0 });
     }
 
-    if (company_domain || full_name) {
-      let delQuery = admin.from('user_leads').delete().eq('user_id', userId);
-      if (company_domain) delQuery = delQuery.eq('company_domain', cleanDomain(company_domain));
-      if (full_name) delQuery = delQuery.ilike('full_name', escapeLike(full_name));
-
-      const { data: deleted, error } = await delQuery.select('id');
+    // Both halves are required. Either one alone was a wildcard: a name-only
+    // delete removed every "John Smith" across companies, and a domain-only
+    // (or empty-domain) delete removed a whole company's contacts or every
+    // LinkedIn-only lead. Those rows must be deleted by id.
+    if (company_domain && full_name) {
+      const { data: deleted, error } = await admin
+        .from('user_leads')
+        .delete()
+        .eq('user_id', userId)
+        .eq('company_domain', company_domain)
+        .ilike('full_name', escapeLike(full_name))
+        .select('id');
       if (error) return fail('Failed to delete lead', 500);
       return json({ ok: true, deleted_count: deleted?.length ?? 0 });
     }
 
-    return fail('lead_id, lead_ids, or company_domain + full_name required for deletion', 400);
+    return fail('lead_id, lead_ids, or both company_domain and full_name are required for deletion', 400);
   }
 
-  return fail(`Unknown action: ${action}`);
+  return fail(`Unknown action: ${String(action).slice(0, 50)}`);
   }
-});
+}

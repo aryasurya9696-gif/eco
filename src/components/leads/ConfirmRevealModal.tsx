@@ -1,7 +1,8 @@
 import React, { useEffect, useId, useRef, useState } from 'react';
 import { ShieldCheck, AlertCircle, X, Loader2, Search } from 'lucide-react';
 import type { B2BLead } from '../../types';
-import { needsEmailReveal, revealedPhone, EMAIL_REVEAL_CREDITS, PHONE_REVEAL_CREDITS } from './lead-utils';
+import { needsEmailReveal, revealedPhone } from './lead-utils';
+import { useLeadPricing } from './leads-store';
 
 interface ConfirmRevealModalProps {
   isOpen: boolean;
@@ -34,6 +35,7 @@ export const ConfirmRevealModal: React.FC<ConfirmRevealModalProps> = ({
   onNavigateBilling,
 }) => {
   const titleId = useId();
+  const pricing = useLeadPricing();
   const dialogRef = useRef<HTMLDivElement>(null);
   const confirmRef = useRef<HTMLButtonElement>(null);
   const [wantEmail, setWantEmail] = useState(defaultEmail);
@@ -85,8 +87,8 @@ export const ConfirmRevealModal: React.FC<ConfirmRevealModalProps> = ({
 
   const emailNeeded = leads.filter(needsEmailReveal).length;
   const phoneNeeded = leads.filter((l) => !revealedPhone(l)).length;
-  const emailCost = wantEmail ? emailNeeded * EMAIL_REVEAL_CREDITS : 0;
-  const phoneCost = wantPhone ? phoneNeeded * PHONE_REVEAL_CREDITS : 0;
+  const emailCost = wantEmail ? emailNeeded * pricing.email : 0;
+  const phoneCost = wantPhone ? phoneNeeded * pricing.phone : 0;
   const maxCharge = emailCost + phoneCost;
   const lookups = (wantEmail ? emailNeeded : 0) + (wantPhone ? phoneNeeded : 0);
   const balanceKnown = availableCredits !== null;
@@ -151,8 +153,8 @@ export const ConfirmRevealModal: React.FC<ConfirmRevealModalProps> = ({
 
         <div className="px-5 py-4 space-y-4 text-sm">
           <div className="space-y-2">
-            {option(wantEmail, setWantEmail, 'Work emails', emailNeeded, EMAIL_REVEAL_CREDITS)}
-            {option(wantPhone, setWantPhone, 'Direct phone numbers', phoneNeeded, PHONE_REVEAL_CREDITS)}
+            {option(wantEmail, setWantEmail, 'Work emails', emailNeeded, pricing.email)}
+            {option(wantPhone, setWantPhone, 'Direct phone numbers', phoneNeeded, pricing.phone)}
           </div>
 
           <div className="divide-y divide-line-soft">

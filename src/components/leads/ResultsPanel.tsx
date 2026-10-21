@@ -3,7 +3,7 @@ import type { B2BLead, B2BPipelineStatus } from '../../types';
 import { LeadCard } from './LeadCard';
 import { ConfirmRevealModal } from './ConfirmRevealModal';
 import { EmailCell, PhoneCell, StageSelect, LinkedinIcon, ContactStatusBadge } from './LeadCells';
-import type { EnrichmentRun } from './leads-store';
+import { useLeadPricing, type EnrichmentRun } from './leads-store';
 import { criteriaChips, type LastSearch, type SearchStatus } from './prospector-types';
 import {
   initialsOf,
@@ -766,13 +766,17 @@ function pageNumbers(current: number, total: number): (number | null)[] {
  * were asked for, what enrichment did and cost, and anything that was skipped.
  */
 const ResultNotes: React.FC<{ lastSearch: LastSearch }> = ({ lastSearch: s }) => {
+  const pricing = useLeadPricing();
   const notes: { tone: 'muted' | 'warn'; text: string }[] = [];
 
-  // What the search itself cost, counted on the server from leads returned.
-  if (typeof s.creditsCharged === 'number' && s.creditsCharged > 0 && s.count > 0) {
+  // What the search itself cost, as charged by the server (a flat
+  // pricing.searchCredits per search, plus any per-lead block fee).
+  if (typeof s.creditsCharged === 'number' && s.creditsCharged > 0) {
     notes.push({
       tone: 'muted',
-      text: `The search itself used ${s.creditsCharged} credit${s.creditsCharged === 1 ? '' : 's'}.`,
+      text: `The search itself used ${s.creditsCharged} credit${s.creditsCharged === 1 ? '' : 's'}${
+        pricing.searchCredits > 0 && s.creditsCharged === pricing.searchCredits ? ' (the per-search fee)' : ''
+      }.`,
     });
   }
 
@@ -820,6 +824,7 @@ const EnrichmentPanel: React.FC<{
   onFindAll: () => void;
   onNavigateBilling?: () => void;
 }> = ({ run, needsContacts, availableCredits, onStop, onResume, onFindAll, onNavigateBilling }) => {
+  const pricing = useLeadPricing();
   const btn = 'h-8 px-3 text-[13px] font-medium border cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed';
   const topUp = onNavigateBilling && (
     <button type="button" onClick={onNavigateBilling} className={`${btn} bg-ink text-white border-ink hover:bg-black`}>
@@ -841,7 +846,8 @@ const EnrichmentPanel: React.FC<{
           {empty ? (
             <>
               <span className="font-semibold">You have 0 credits, so emails and phones are hidden.</span> Top up and they are
-              found automatically — 1 credit per verified email, nothing for misses or unconfirmed ones.
+              found automatically — {pricing.email} credit{pricing.email === 1 ? '' : 's'} per verified email, {pricing.phone} per
+              phone, nothing for misses or unconfirmed ones.
             </>
           ) : (
             'Contact details have not been looked up for these leads yet.'

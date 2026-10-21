@@ -6,10 +6,6 @@ import type { B2BLead } from '../../types';
 // verified email or about which row a server response belongs to.
 // ============================================================================
 
-/** Credits per action. Mirrors pricing_config and the leads edge function. */
-export const EMAIL_REVEAL_CREDITS = 1;
-export const PHONE_REVEAL_CREDITS = 2;
-
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function isEmailAddress(value: unknown): value is string {

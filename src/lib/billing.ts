@@ -33,8 +33,6 @@ export interface Wallet {
    * which is exactly backwards: the heaviest users are the ones checking.
    */
   search_count: number;
-  recognised_revenue_usd: number;
-  service_cost_usd: number;
 }
 
 export interface SweepQuote {
@@ -63,8 +61,6 @@ export interface LedgerEntry {
   delta: number;
   balance_after: number;
   kind: string;
-  revenue_usd: number;
-  service_cost_usd: number;
   note: string | null;
   created_at: string;
 }
@@ -72,9 +68,7 @@ export interface LedgerEntry {
 export interface UsageEntry {
   id: number;
   operation: string;
-  provider_cost_usd: number;
   credits_charged: number;
-  revenue_usd: number;
   outcome: UsageOutcome;
   calls: number;
   created_at: string;
@@ -86,7 +80,15 @@ export interface PaymentEntry {
   gross_usd: number;
   currency: string;
   credits_granted: number;
-  status: 'created' | 'pending' | 'succeeded' | 'failed' | 'refunded';
+  status:
+    | 'created'
+    | 'pending'
+    | 'succeeded'
+    | 'failed'
+    | 'refunded'
+    | 'partially_refunded'
+    | 'disputed'
+    | 'review';
   created_at: string;
   settled_at: string | null;
 }
@@ -262,12 +264,25 @@ export function creditsToUsd(credits: number, packages: Package[]): number {
   return Number.isFinite(value) ? value * Number(cheapest.per_credit_usd) : 0;
 }
 
-export function ledgerLabel(kind: string): string {
+/**
+ * What a usage debit paid for. The ledger row carries no operation column, so
+ * this reads the settlement note each edge function writes ("Lead search: …",
+ * "Revealed verified email for …", "3 keywords across 2 channels").
+ */
+function usageLabel(note: string | null | undefined): string {
+  const n = (note ?? '').toLowerCase();
+  if (n.startsWith('lead search')) return 'People search';
+  if (/reveal|enrich|email|phone/.test(n)) return 'Lead reveal';
+  if (/keywords? across/.test(n)) return 'Sweep';
+  return 'Usage';
+}
+
+export function ledgerLabel(kind: string, note?: string | null): string {
   switch (kind) {
     case 'topup': return 'Top-up';
     case 'grant': return 'Credits added';
     case 'bonus': return 'Bonus';
-    case 'usage': return 'Search';
+    case 'usage': return usageLabel(note);
     case 'refund': return 'Refund';
     case 'reversal': return 'Reversed';
     case 'expiry': return 'Expired';

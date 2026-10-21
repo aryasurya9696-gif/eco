@@ -23,6 +23,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
   const [aiSuggestions, setAiSuggestions] = useState<string[]>([]);
   const [isFinishing, setIsFinishing] = useState<boolean>(false);
   const [isSuccess, setIsSuccess] = useState<boolean>(false);
+  const [finishError, setFinishError] = useState<string | null>(null);
 
   // Sync step from profile if available
   useEffect(() => {
@@ -61,24 +62,36 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
   const handleFinish = async () => {
     if (keywords.length === 0 || isFinishing) return;
     setIsFinishing(true);
+    setFinishError(null);
 
     try {
-      // 1. Batch insert keyword rows
-      await saveInitialKeywords(keywords);
+      // 1. Batch insert keyword rows. A failure stops here: celebrating and
+      // closing the modal would leave an empty workspace with no explanation.
+      const saved = await saveInitialKeywords(keywords);
+      if (!saved) {
+        setFinishError('Could not save your keywords. Check your connection and try again.');
+        setIsFinishing(false);
+        return;
+      }
 
-      // 2. Fire canvas-confetti from the center of modal
+      // 2. Mark completed in profile.
+      const { error } = await completeOnboarding({
+        full_name: fullName,
+        website: website,
+        core_offer: coreOffer,
+      });
+      if (error) {
+        setFinishError(`Could not finish setup: ${error}`);
+        setIsFinishing(false);
+        return;
+      }
+
+      // 3. Only now, celebrate.
       confetti({
         particleCount: 80,
         spread: 70,
         origin: { y: 0.5, x: 0.5 },
         colors: ['#141414', '#8a8a86', '#0a66c2', '#ffffff'],
-      });
-
-      // 3. Mark completed in profile
-      await completeOnboarding({
-        full_name: fullName,
-        website: website,
-        core_offer: coreOffer,
       });
 
       // 4. Show success state for ~900ms
@@ -89,6 +102,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
       }, 950);
     } catch (err) {
       console.error('Error completing onboarding:', err);
+      setFinishError((err as Error)?.message || 'Could not finish setup. Please try again.');
       setIsFinishing(false);
     }
   };
@@ -325,6 +339,12 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
                 </motion.div>
               )}
             </AnimatePresence>
+
+            {finishError && (
+              <p role="alert" className="mt-4 p-3 text-xs bg-[#fdf2f2] border border-[#f0c4c4] text-[#8a2a2a]">
+                {finishError}
+              </p>
+            )}
 
             {/* Bottom Actions */}
             <div className="flex items-center justify-between pt-8 border-t border-[#eeeeea] mt-6">

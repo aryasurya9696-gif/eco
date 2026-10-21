@@ -19,6 +19,7 @@ const TABS: Record<string, string> = {
   keywords: 'keywords',
   billing: 'billing',
   settings: 'settings',
+  mail: 'mail',
 };
 
 /** The tab named in the hash, or null when the hash is not a dashboard URL. */

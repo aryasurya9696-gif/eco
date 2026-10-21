@@ -1,15 +1,12 @@
 // ============================================================================
 // BillingTab
 // ----------------------------------------------------------------------------
-// The customer's wallet: what they have, what it costs, what they have bought,
-// and what their searches have actually cost us.
+// The customer's wallet: what they have, what it costs, and what they have
+// bought and spent. Internal provider costs are never shown or fetched here.
 //
 // No admin controls here and none reachable from this tab. Prices are shown, not
 // editable — changing one is a deliberate act done outside the app, so there is
 // no way to accidentally reprice a live customer by clicking something.
-//
-// The provider cost shown against a search is the figure treg reported for that
-// call, not an estimate. That is what makes the margin on this screen real.
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   fetchBalance,
@@ -135,11 +132,36 @@ export const BillingTab: React.FC = () => {
     void load();
   }, [load]);
 
-  // Returning from checkout. The webhook may not have landed yet, so this polls
-  // rather than reading the wallet once and giving up.
+  // Returning from checkout (`/?billing=returned#dashboard/billing`). The
+  // webhook may not have landed yet, so this polls rather than reading the
+  // wallet once and giving up. Older links carried the flag inside the hash
+  // (`#dashboard/billing?billing=returned`), so that form is accepted too.
+  const [returnedFromCheckout] = useState<boolean>(() => {
+    const fromSearch = new URLSearchParams(window.location.search).get('billing');
+    const hashQuery = window.location.hash.split('?')[1] ?? '';
+    const fromHash = new URLSearchParams(hashQuery).get('billing');
+    return fromSearch === 'returned' || fromHash === 'returned';
+  });
+
   useEffect(() => {
-    const returning = new URLSearchParams(window.location.search).get('billing');
-    if (returning !== 'returned') return;
+    if (!returnedFromCheckout) return;
+    // Strip the flag so a refresh or a bookmark does not replay the notice.
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('billing');
+      const [hashPath, hashQuery = ''] = url.hash.split('?');
+      const hashParams = new URLSearchParams(hashQuery);
+      hashParams.delete('billing');
+      const rest = hashParams.toString();
+      url.hash = rest ? `${hashPath}?${rest}` : hashPath;
+      window.history.replaceState(window.history.state, '', url.toString());
+    } catch {
+      // Cosmetic only.
+    }
+  }, [returnedFromCheckout]);
+
+  useEffect(() => {
+    if (!returnedFromCheckout) return;
     const tries = [2000, 4000, 7000];
     const timers = tries.map((delay, i) =>
       setTimeout(() => {
@@ -150,7 +172,7 @@ export const BillingTab: React.FC = () => {
       }, delay),
     );
     return () => timers.forEach(clearTimeout);
-  }, [load]);
+  }, [load, returnedFromCheckout]);
 
   const buy = async (code: string) => {
     setBusyCode(code);
@@ -465,7 +487,7 @@ export const BillingTab: React.FC = () => {
                     <td className="px-3 py-2.5 text-[#8a8a86] truncate">
                       {formatDateTime(l.created_at)}
                     </td>
-                    <td className="px-3 py-2.5 text-[#141414] truncate">{ledgerLabel(l.kind)}</td>
+                    <td className="px-3 py-2.5 text-[#141414] truncate">{ledgerLabel(l.kind, l.note)}</td>
                     <td
                       className={`px-3 py-2.5 text-right ${
                         l.delta >= 0 ? 'text-emerald-700' : 'text-[#141414]'
@@ -495,6 +517,9 @@ const StatusBadge: React.FC<{ status: string }> = ({ status }) => {
     created: { label: 'Started', cls: 'text-[#8a8a86]' },
     failed: { label: 'Failed', cls: 'text-[#8a2a2a]' },
     refunded: { label: 'Refunded', cls: 'text-[#8a2a2a]' },
+    partially_refunded: { label: 'Partly refunded', cls: 'text-[#8a2a2a]' },
+    disputed: { label: 'Disputed', cls: 'text-[#8a2a2a]' },
+    review: { label: 'Under review', cls: 'text-amber-700' },
   };
   const m = map[status] ?? { label: status, cls: 'text-[#8a8a86]' };
   return <span className={`text-[10px] ${m.cls}`}>{m.label}</span>;

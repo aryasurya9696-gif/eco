@@ -12,13 +12,31 @@ export const AuthPage: React.FC<AuthPageProps> = ({
   onNavigateHome,
   onNavigateDashboard,
 }) => {
-  const { signIn, signUp } = useAuth();
+  const { signIn, signUp, requestPasswordReset } = useAuth();
   const [mode, setMode] = useState<'signin' | 'signup'>('signup');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isSendingReset, setIsSendingReset] = useState(false);
+
+  const handleForgotPassword = async () => {
+    setError(null);
+    setInfoMessage(null);
+    if (!email.trim()) {
+      setError('Enter your email address above, then choose "Forgot password?" again.');
+      return;
+    }
+    setIsSendingReset(true);
+    try {
+      const res = await requestPasswordReset(email);
+      if (res.error) setError(res.error);
+      else setInfoMessage(res.message ?? 'Check your inbox for a reset link.');
+    } finally {
+      setIsSendingReset(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -85,7 +103,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({
             </h1>
             <p className="text-xs text-[#8a8a86] font-mono">
               {mode === 'signup'
-                ? 'Instant setup. No email verification required.'
+                ? "We'll email you a confirmation link to activate your account."
                 : 'Access your live multi-channel buyer intent feed.'}
             </p>
           </div>
@@ -154,9 +172,21 @@ export const AuthPage: React.FC<AuthPageProps> = ({
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-xs font-mono uppercase tracking-wider text-[#4a4a47] block">
-                Password
-              </label>
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-mono uppercase tracking-wider text-[#4a4a47] block">
+                  Password
+                </label>
+                {mode === 'signin' && (
+                  <button
+                    type="button"
+                    onClick={() => void handleForgotPassword()}
+                    disabled={isSendingReset}
+                    className="text-[11px] font-mono text-[#4a4a47] hover:text-[#141414] underline-offset-2 hover:underline cursor-pointer disabled:opacity-50"
+                  >
+                    {isSendingReset ? 'Sending...' : 'Forgot password?'}
+                  </button>
+                )}
+              </div>
               <input
                 type="password"
                 required
@@ -188,6 +218,102 @@ export const AuthPage: React.FC<AuthPageProps> = ({
       {/* Footer */}
       <div className="py-6 text-center text-xs font-mono text-[#8a8a86]">
         Echo • Automated Social Lead Sweep
+      </div>
+    </div>
+  );
+};
+
+/**
+ * Shown after arriving from a password-reset email (Supabase signs the user in
+ * with a recovery session and emits PASSWORD_RECOVERY). Sets the new password
+ * with updateUser, then continues to the dashboard.
+ */
+export const SetNewPasswordPage: React.FC<{ onDone: () => void }> = ({ onDone }) => {
+  const { updatePassword } = useAuth();
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters.');
+      return;
+    }
+    if (password !== confirm) {
+      setError('The two passwords do not match.');
+      return;
+    }
+    setError(null);
+    setIsSubmitting(true);
+    try {
+      const res = await updatePassword(password);
+      if (res.error) setError(res.error);
+      else onDone();
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const inputCls =
+    'w-full px-3.5 py-2.5 bg-white border border-[#e3e3de] rounded-none text-sm text-[#141414] placeholder:text-[#9b9b96] focus:outline-none focus:border-[#141414] transition-colors';
+
+  return (
+    <div className="min-h-screen bg-[#f6f6f4] flex flex-col justify-center font-sans">
+      <div className="w-full max-w-md mx-auto px-6 py-12">
+        <div className="bg-[#ffffff] border border-[#e3e3de] p-8 sm:p-10 shadow-xl rounded-none">
+          <div className="mb-6 space-y-1">
+            <BrandLogo size="sm" />
+            <h1 className="text-2xl font-bold tracking-tight text-[#141414] pt-4">Choose a new password</h1>
+            <p className="text-xs text-[#8a8a86] font-mono">You followed a password reset link. Set a new password to continue.</p>
+          </div>
+
+          {error && (
+            <div role="alert" className="mb-5 p-3 bg-red-50 border border-red-200 text-xs font-mono text-red-700">
+              {error}
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div className="space-y-1.5">
+              <label htmlFor="new-password" className="text-xs font-mono uppercase tracking-wider text-[#4a4a47] block">
+                New password
+              </label>
+              <input
+                id="new-password"
+                type="password"
+                autoComplete="new-password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className={inputCls}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor="confirm-password" className="text-xs font-mono uppercase tracking-wider text-[#4a4a47] block">
+                Confirm password
+              </label>
+              <input
+                id="confirm-password"
+                type="password"
+                autoComplete="new-password"
+                required
+                value={confirm}
+                onChange={(e) => setConfirm(e.target.value)}
+                className={inputCls}
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={isSubmitting}
+              className="w-full mt-2 inline-flex items-center justify-center gap-2 px-5 py-3 bg-[#121212] hover:bg-black text-white text-xs font-medium rounded-none transition-colors cursor-pointer disabled:opacity-50 shadow-xs"
+            >
+              <span>{isSubmitting ? 'Saving...' : 'Save new password'}</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </form>
+        </div>
       </div>
     </div>
   );
