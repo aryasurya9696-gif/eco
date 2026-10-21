@@ -2850,12 +2850,12 @@ DROP VIEW IF EXISTS public.lead_companies_summary;
 -- -----------------------------------------------------------------------------
 -- Named explicitly. DROP TABLE would take them with it, but the automation guard
 -- fires on lead_runs during the delete itself and is worth removing first.
-DROP TRIGGER IF EXISTS lead_icps_set_updated_at ON public.lead_icps;
-DROP TRIGGER IF EXISTS lead_runs_set_updated_at ON public.lead_runs;
-DROP TRIGGER IF EXISTS lead_rows_set_updated_at ON public.lead_rows;
-DROP TRIGGER IF EXISTS lead_waterfall_orders_set_updated_at ON public.lead_waterfall_orders;
-DROP TRIGGER IF EXISTS lead_automations_set_updated_at ON public.lead_automations;
-DROP TRIGGER IF EXISTS lead_runs_automation_guard ON public.lead_runs;
+DO $g$ BEGIN IF to_regclass('public.lead_icps') IS NOT NULL THEN EXECUTE 'DROP TRIGGER IF EXISTS lead_icps_set_updated_at ON public.lead_icps'; END IF; END $g$;
+DO $g$ BEGIN IF to_regclass('public.lead_runs') IS NOT NULL THEN EXECUTE 'DROP TRIGGER IF EXISTS lead_runs_set_updated_at ON public.lead_runs'; END IF; END $g$;
+DO $g$ BEGIN IF to_regclass('public.lead_rows') IS NOT NULL THEN EXECUTE 'DROP TRIGGER IF EXISTS lead_rows_set_updated_at ON public.lead_rows'; END IF; END $g$;
+DO $g$ BEGIN IF to_regclass('public.lead_waterfall_orders') IS NOT NULL THEN EXECUTE 'DROP TRIGGER IF EXISTS lead_waterfall_orders_set_updated_at ON public.lead_waterfall_orders'; END IF; END $g$;
+DO $g$ BEGIN IF to_regclass('public.lead_automations') IS NOT NULL THEN EXECUTE 'DROP TRIGGER IF EXISTS lead_automations_set_updated_at ON public.lead_automations'; END IF; END $g$;
+DO $g$ BEGIN IF to_regclass('public.lead_runs') IS NOT NULL THEN EXECUTE 'DROP TRIGGER IF EXISTS lead_runs_automation_guard ON public.lead_runs'; END IF; END $g$;
 
 -- -----------------------------------------------------------------------------
 -- 4. Functions
