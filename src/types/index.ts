@@ -59,7 +59,99 @@ export interface MonitoredPost {
   created_at: string;
 }
 
-export type DashboardTab = 'feed' | 'leads' | 'keywords' | 'settings' | 'billing';
+export type DashboardTab = 'feed' | 'leads' | 'keywords' | 'settings' | 'billing' | 'mail';
+
+export type MailFolder = 'inbox' | 'sent' | 'drafts' | 'archive' | 'trash' | 'spam';
+
+export interface Mailbox {
+  id: string;
+  user_id: string;
+  kind: 'hosted' | 'app_password' | 'oauth_send';
+  provider: 'google' | 'microsoft' | 'zoho' | 'resend' | 'ses' | 'brevo' | 'custom';
+  address: string;
+  display_name: string;
+  domain_id?: string | null;
+  status: 'active' | 'paused' | 'needs_reauth' | 'disabled';
+  pause_reason?: string | null;
+  daily_send_limit: number;
+  sent_today: number;
+  is_default: boolean;
+}
+
+export interface MailThread {
+  id: string;
+  user_id: string;
+  mailbox_id: string;
+  lead_id?: string | null;
+  lead_name?: string | null;
+  lead_company?: string | null;
+  subject: string;
+  snippet: string;
+  participants: { name?: string; address: string }[];
+  folder: MailFolder;
+  unread_count: number;
+  starred: boolean;
+  has_attachments: boolean;
+  last_message_at: string;
+  created_at: string;
+  lead_pipeline_status?: B2BPipelineStatus;
+}
+
+export interface MailAttachment {
+  id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  storage_path: string;
+}
+
+export interface MailMessage {
+  id: string;
+  thread_id: string;
+  user_id: string;
+  mailbox_id: string;
+  lead_id?: string | null;
+  direction: 'in' | 'out';
+  status: 'draft' | 'queued' | 'sending' | 'sent' | 'delivered' | 'bounced' | 'complained' | 'failed' | 'received';
+  is_auto_reply?: boolean;
+  from_addr: string;
+  to_addrs: { name?: string; address: string }[];
+  cc_addrs?: { name?: string; address: string }[];
+  bcc_addrs?: { name?: string; address: string }[];
+  subject: string;
+  snippet: string;
+  text_body: string;
+  html_body: string;
+  message_id_header?: string;
+  in_reply_to?: string;
+  references_hdr?: string;
+  credits_charged?: number;
+  sent_at?: string;
+  received_at?: string;
+  read_at?: string;
+  created_at: string;
+  attachments?: MailAttachment[];
+}
+
+export interface MailDnsRecord {
+  type: string;
+  host: string;
+  value: string;
+  status: 'verified' | 'pending' | 'missing';
+}
+
+export interface MailDomain {
+  id: string;
+  domain: string;
+  status: 'pending' | 'verifying' | 'verified' | 'failed' | 'suspended';
+  provider: 'resend' | 'ses' | 'brevo' | 'custom';
+  dkim_tokens: string[];
+  dns_records: MailDnsRecord[];
+  inbound_provider: 'cloudflare' | 'ses' | 'none';
+  verified_at?: string | null;
+  last_checked_at?: string | null;
+}
+
 
 export type B2BLookupState = 'queued' | 'processing' | 'not_found' | 'failed' | 'no_credits';
 

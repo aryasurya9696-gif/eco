@@ -42,6 +42,7 @@ const FUNCTIONS = {
   ai: true,
   billing: true,
   leads: true,
+  mail: true,
   'daily-sweep': false,
   'billing-webhook': false,
 };
