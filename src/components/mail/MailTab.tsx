@@ -1,22 +1,17 @@
-import React, { useEffect } from 'react';
-import { MailSidebar } from './MailSidebar';
+import React from 'react';
+import { MailSidebar, MailMobileNav } from './MailSidebar';
 import { ThreadList } from './ThreadList';
 import { ThreadView } from './ThreadView';
 import { DomainsPanel } from './DomainsPanel';
 import { AccountsPanel } from './AccountsPanel';
 import { mailStore, useMailStore } from './mail-store';
-import { useAuth } from '../../context/AuthContext';
 
 export const MailTab: React.FC = () => {
-  const { user } = useAuth();
   const { activeSubView, activeThreadId, loadError } = useMailStore();
-
-  useEffect(() => {
-    mailStore.init(user?.id ?? null);
-  }, [user?.id]);
+  // mailStore is initialised and reset by AuthContext.
 
   return (
-    <div className="flex-1 flex h-full overflow-hidden bg-white relative">
+    <div className="flex-1 flex flex-col h-full min-w-0 overflow-hidden bg-white relative">
       {loadError && (
         <div
           role="alert"
@@ -28,6 +23,10 @@ export const MailTab: React.FC = () => {
           </button>
         </div>
       )}
+      {/* Below md the sidebar is hidden; this bar reaches folders, Mailboxes and Domains. */}
+      <MailMobileNav />
+
+      <div className="flex-1 flex min-h-0 overflow-hidden">
       {/* Pane 1: Left Mail Sidebar */}
       <MailSidebar />
 
@@ -45,6 +44,7 @@ export const MailTab: React.FC = () => {
       {activeSubView === 'domains' && <DomainsPanel />}
 
       {activeSubView === 'accounts' && <AccountsPanel />}
+      </div>
     </div>
   );
 };

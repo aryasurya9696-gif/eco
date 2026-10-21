@@ -47,23 +47,77 @@ export interface LeadPricing {
   freeLeads: number;
   blockLeads: number;
   blockCredits: number;
-  /** Flat credits charged for each people search, whatever it returns. */
+  /** Credits per billed provider call a people search makes. */
   searchCredits: number;
+  /** Most provider calls a single-target search may make (server: 11). */
+  searchMaxCallsSingle: number;
+  /** Most provider calls a multi-company search may make (server: 12). */
+  searchMaxCallsMulti: number;
+  /** Leads holds draw on purchased credits only (welcome credits excluded). */
+  paidCreditsOnly: boolean;
 }
 
-// Each search costs a flat `searchCredits`; the per-lead block fee is off
-// (blockCredits 0), and contacts are charged only when verified.
-export const DEFAULT_PRICING: LeadPricing = { email: 1, phone: 2, freeLeads: 25, blockLeads: 50, blockCredits: 0, searchCredits: 1 };
+// Owner pricing (October 2026): 1 credit per verified email, 2 per phone,
+// and 1 credit per billed provider call a search makes. Only the fallback —
+// the server's pricing action wins.
+export const DEFAULT_PRICING: LeadPricing = {
+  email: 1,
+  phone: 2,
+  freeLeads: 0,
+  blockLeads: 100,
+  blockCredits: 0,
+  searchCredits: 1,
+  searchMaxCallsSingle: 11,
+  searchMaxCallsMulti: 12,
+  paidCreditsOnly: true,
+};
+
+/** The provider returns at most this many people per call. */
+const PEOPLE_PER_CALL = 100;
+const MAX_PROVIDER_CALLS = 12;
+const MAX_SEARCH_DOMAINS = 10;
+
+/** Company domains in the filter (comma-separated; names without a dot are not domains). */
+export function domainCountOf(companyDomain: string | undefined): number {
+  return (companyDomain || '').split(',').map((d) => d.trim()).filter((d) => d.includes('.')).length;
+}
 
 /**
- * The most a search for `leads` people can cost: the flat per-search fee plus
- * any per-lead block fee past the first `freeLeads`.
+ * Most billed provider calls a search can make — mirrors the leads function's
+ * maxSearchProviderCalls (lib.ts), capped by the limits its pricing action
+ * reports.
  */
-export function searchCost(leads: number, pricing: LeadPricing): number {
+export function maxSearchCalls(leads: number, pricing: LeadPricing, domains = 1): number {
+  let calls: number;
+  if (domains > 1) {
+    const d = Math.min(domains, MAX_SEARCH_DOMAINS);
+    const perDomain = Math.max(10, Math.ceil(leads / d));
+    const rounds = Math.max(1, Math.min(Math.ceil(perDomain / PEOPLE_PER_CALL), Math.floor(MAX_PROVIDER_CALLS / d)));
+    calls = Math.min(d * rounds, Math.max(1, pricing.searchMaxCallsMulti));
+  } else {
+    calls = leads <= PEOPLE_PER_CALL ? 1 : 1 + Math.min(MAX_PROVIDER_CALLS, Math.ceil(leads / PEOPLE_PER_CALL));
+    calls = Math.min(calls, Math.max(1, pricing.searchMaxCallsSingle));
+  }
+  return calls;
+}
+
+/**
+ * The most a search for `leads` people can cost (what is held up front): every
+ * possible provider call billed, plus any per-lead block fee past `freeLeads`.
+ */
+export function searchCost(leads: number, pricing: LeadPricing, domains = 1): number {
   return (
-    pricing.searchCredits +
-    Math.ceil(Math.max(0, leads - pricing.freeLeads) / pricing.blockLeads) * pricing.blockCredits
+    pricing.searchCredits * maxSearchCalls(leads, pricing, domains) +
+    Math.ceil(Math.max(0, leads - pricing.freeLeads) / Math.max(1, pricing.blockLeads)) * pricing.blockCredits
   );
+}
+
+/** "1 credit per provider call (up to 12 per search)". */
+export function searchFeeText(pricing: LeadPricing): string {
+  const per = `${pricing.searchCredits} credit${pricing.searchCredits === 1 ? '' : 's'} per provider call`;
+  const maxCalls = Math.max(pricing.searchMaxCallsSingle, pricing.searchMaxCallsMulti);
+  const max = Math.round(pricing.searchCredits * maxCalls * 100) / 100;
+  return maxCalls > 1 ? `${per} (up to ${max} per search)` : per;
 }
 
 /**

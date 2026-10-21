@@ -12,9 +12,17 @@
 // your own cron). A ?secret= query parameter is no longer accepted: URLs end up
 // in access logs, proxies and pg_net's request table.
 //
-// NOTE: this file is intentionally SELF-CONTAINED. Do not split shared helpers
-// into an underscore-prefixed folder — Supabase's bundler skips `_`-prefixed
-// directories and the relative import fails to resolve on deploy.
+// NOTE: helpers are copied from social-search rather than imported across
+// functions. Pure rules (schedule, run claims, time budget, billing, Reddit
+// fallback) live in ./sweep-rules.ts inside this function's own folder, so they
+// bundle with it and are unit tested by sweep-rules_test.ts.
+//
+// Runs are chunked (M3). The hourly cron tick is chunk 0 of that hour's "slot".
+// Each chunk atomically claims a sweep_runs row keyed by (slot, chunk), sweeps
+// due users in id order until its time budget is spent, then hands the rest to
+// chunk n+1 by calling itself with { slot, chunk, after }. A duplicate tick or
+// hop finds the row already claimed and does nothing, and per-user reservation
+// keys are per slot, so a workspace is charged at most once per due hour.
 //
 // Deploy:  supabase functions deploy daily-sweep --no-verify-jwt
 // Secrets: supabase secrets set SWEEP_CRON_SECRET=<long random string>
@@ -22,6 +30,23 @@
 // ============================================================================
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import {
+  CALL_TIMEOUT_MS,
+  canStartBatch,
+  claimIdFor,
+  creditsFor,
+  filterDue,
+  FREE_OPERATIONS,
+  groupKeywords,
+  isOperationAvailable,
+  KEYWORD_CONCURRENCY,
+  MAX_CHUNKS_PER_SLOT,
+  parseChunkRequest,
+  roundCredits,
+  shouldTryRedditFallback,
+  slotHour,
+  USER_CONCURRENCY,
+} from './sweep-rules.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -93,61 +118,26 @@ const TREG_BASE = 'https://treg.to';
 /** Per-call cost ceiling sent as X-Treg-Route-Max-Cost; matches social-search. */
 const ROUTE_MAX_COST_USD = '0.01';
 
-/** Hard caps so one busy day can never run away. */
-const MAX_USERS_PER_RUN = 500;
-const MAX_KEYWORDS_PER_USER = 8;
+/**
+ * Due users one chunk considers. The time budget normally stops a chunk well
+ * before this; anything left goes to the next chunk, not to the next day.
+ */
+const MAX_USERS_PER_CHUNK = 500;
+/** Page size for the profile and keyword reads. */
+const PAGE_SIZE = 1000;
+/** User ids per keyword lookup (keeps the `in.(...)` filter short). */
+const KEYWORD_LOOKUP_BATCH = 100;
 
 type Platform = 'twitter' | 'reddit' | 'google' | 'news';
 
-type SweepSettings = {
-  enabled_channels: Platform[] | null;
-  lookback_hours: number | null;
-  min_intent_threshold: number | null;
-  /** "HH:MM" in UTC. Null means the workspace never opted in. */
-  sweep_time_utc: string | null;
-  /** '6h' | '12h' | '24h'. Anything else is treated as '24h'. */
-  sweep_frequency: string | null;
-};
-
 /**
- * Echo is free, so these are the product's limits rather than anything a
- * workspace can buy past. They mirror public.keyword_limit() and
+ * The product's channel limit. It mirrors public.keyword_limit() and
  * public.channel_limit().
  */
 const MAX_CHANNELS = 3;
 
-/** Interval length in hours for a stored cadence string. */
-function cadenceHoursOf(frequency: string | null | undefined): number {
-  if (frequency === '6h') return 6;
-  if (frequency === '12h') return 12;
-  return 24;
-}
-
-/**
- * Parses the workspace's "HH:MM" sweep time into an hour of day.
- * Returns null when unset or malformed, which the caller treats as "any hour".
- */
-function sweepHourOf(sweepTime: string | null | undefined): number | null {
-  if (!sweepTime) return null;
-
-  const m = /^(\d{1,2}):(\d{2})$/.exec(sweepTime.trim());
-  if (!m) return null;
-  const hour = Number(m[1]);
-  return hour >= 0 && hour <= 23 ? hour : null;
-}
-
-/**
- * The cron fires every hour, so a cadence is just a predicate over the hour of
- * day. A 6h cadence is due whenever the hour is congruent to the chosen hour
- * modulo 6 (four times a day); 12h gives two, 24h gives exactly one.
- *
- * `cadenceHours` must already be clamped to the plan's fastest allowed
- * interval, otherwise a downgraded workspace keeps its old aggressive cadence.
- */
-function isSweepDue(currentHourUtc: number, sweepHour: number, cadenceHours: number): boolean {
-  if (cadenceHours >= 24) return currentHourUtc === sweepHour;
-  return currentHourUtc % cadenceHours === sweepHour % cadenceHours;
-}
+// cadenceHoursOf / sweepHourOf / isSweepDue / DEFAULT_SWEEP_HOUR_UTC live in
+// ./sweep-rules.ts.
 
 type PostRow = {
   user_id: string;
@@ -364,6 +354,8 @@ async function tregCall(
     idempotencyKey?: string;
     /** Tagged onto the call in treg's own ledger for per-customer attribution. */
     customerId?: string;
+    /** This request's counters; never shared with a concurrent run. */
+    stats: RunStats;
   },
 ): Promise<TregResult> {
   if (!tregToken) return emptyResult();
@@ -378,8 +370,10 @@ async function tregCall(
   // treg queues before dispatch and reported a ~2s wait in practice, so the
   // default sits comfortably above that. Cutting it close turns a slow provider
   // into an uncertain charge, which is the expensive kind of wrong.
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 45000);
-  callsMade++;
+  // Shorter than social-search's 45 s so a chunk's worst case fits the edge
+  // function's wall clock (see CALL_TIMEOUT_MS / canStartBatch).
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? CALL_TIMEOUT_MS);
+  opts.stats.callsMade++;
 
   try {
     const res = await fetch(url.toString(), {
@@ -410,7 +404,7 @@ async function tregCall(
     // The charge is whatever treg says it is. Zero means free, whatever the
     // status was.
     const billable: Billable = costMicro > 0 ? 'billed' : 'free';
-    usdSpent += costMicro / 1e6;
+    opts.stats.usdSpent += costMicro / 1e6;
 
     if (!res.ok) {
       // 409 and 410 mean treg still holds the call: 409 is it running, 410 is
@@ -482,9 +476,15 @@ async function tregBalanceUsd(): Promise<number | null> {
   }
 }
 
-let usdSpent = 0;
-/** Provider calls actually issued, for the spend ledger. */
-let callsMade = 0;
+/**
+ * Per-request counters. These used to be module-level `let`s, so two runs in
+ * the same isolate reset and added to each other's figures.
+ */
+interface RunStats {
+  usdSpent: number;
+  /** Provider calls actually issued, for the spend ledger. */
+  callsMade: number;
+}
 
 // ---------------------------------------------------------------------------
 // Mappers
@@ -683,8 +683,15 @@ async function loadPricing(
 }
 
 interface Reservation {
-  id: string;
+  /** Null when nothing needed holding (a 0-credit sweep, e.g. News only). */
+  id: string | null;
   reserved: number;
+  /**
+   * The key already had a hold, held or finalised. It belongs to another (or an
+   * earlier) run, so this run must neither use it nor settle it: running the
+   * sweep against it delivered the work free while the run reported a charge.
+   */
+  duplicate: boolean;
 }
 
 /**
@@ -713,7 +720,7 @@ async function reserveSweep(
   }
   const r = data as any;
   if (r?.ok) {
-    return { id: r.reservation_id, reserved: Number(r.reserved ?? credits) };
+    return { id: typeof r.reservation_id === 'string' ? r.reservation_id : null, reserved: Number(r.reserved ?? credits), duplicate: r.duplicate === true };
   }
   return {
     shortfall: Number(r?.shortfall ?? credits),
@@ -740,6 +747,13 @@ async function settleSweep(
   });
   if (error) {
     console.error('[billing] settle failed:', error.message);
+    return null;
+  }
+  // wallet_settle reports an already-finalised or missing hold as ok:false,
+  // not as an RPC error. Reading balance_after off that counted a charge that
+  // never happened.
+  if ((data as any)?.ok === false) {
+    console.error('[billing] settle refused:', (data as any)?.error);
     return null;
   }
   return Number((data as any)?.balance_after ?? 0);
@@ -819,7 +833,7 @@ async function recordUsage(
 async function searchChannel(
   platform: Platform, kwRow: { id: string; keyword: string },
   userId: string, lookbackHours: number,
-  tally: OperationTally, runNonce: string,
+  tally: OperationTally, runNonce: string, stats: RunStats,
 ): Promise<PostRow[]> {
   const kwId = kwRow.id;
   const kw = kwRow.keyword;
@@ -827,7 +841,7 @@ async function searchChannel(
   // Stable within a run so an internal retry is free, and different between runs
   // so a scheduled sweep is charged normally rather than looking like a replay.
   const idem = `ds:${runNonce}:${kwId}:${platform}`;
-  const common = { customerId: userId, idempotencyKey: idem };
+  const common = { customerId: userId, idempotencyKey: idem, stats };
 
   if (platform === 'twitter') {
     const t = await tregCall('anyapi.x.search.posts', {
@@ -855,10 +869,16 @@ async function searchChannel(
       },
     });
     record(tally, tk, kwId);
-    const tkItems = tk.data?.data?.posts ?? tk.data?.posts ?? [];
-    if (Array.isArray(tkItems) && tkItems.length) {
+    const tkRaw = tk.data?.data?.posts ?? tk.data?.posts ?? [];
+    const tkItems = Array.isArray(tkRaw) ? tkRaw : [];
+    if (tkItems.length) {
       return tkItems.map((x: any) => mapRedditTikhub(x, userId, kwId, kw)).filter((r: any): r is PostRow => !!r);
     }
+
+    // Only an unbilled miss falls back. When tikhub billed (or may have) for an
+    // empty answer the search is already paid for; a second provider would pay
+    // twice for one keyword (N9).
+    if (!shouldTryRedditFallback(tk, tkItems.length)) return [];
 
     // Distinct key: a different provider answering the same search. Reusing the
     // primary's key would make treg reject it as a mismatched replay.
@@ -901,11 +921,54 @@ async function searchChannel(
   return [];
 }
 
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
+type ProfileRow = {
+  id: string;
+  enabled_channels: Platform[] | null;
+  lookback_hours: number | null;
+  min_intent_threshold: number | null;
+  sweep_time_utc: string | null;
+  sweep_frequency: string | null;
+};
+
+/** Everything one chunk accumulates. Per request, never module-level. */
+interface RunAcc {
+  stats: RunStats;
+  errors: Array<Record<string, string>>;
+  usersProcessed: number;
+  usersSkipped: number;
+  postsInserted: number;
+  pruned: number;
+  totalStale: number;
+  // Out-of-credit workspaces are collected rather than logged and forgotten,
+  // because "why did nothing arrive" belongs in the run result.
+  skippedNoCredits: Array<{ user: string; required: number; available: number; shortfall: number }>;
+  totalCreditsCharged: number;
+  totalProviderCostUsd: number;
+  // tregCall never throws, so a run where every call failed used to report
+  // ok: true. Provider failures are collected here (codes only, no bodies).
+  providerFailures: Array<{ user: string; operation: string; code: string }>;
+}
+
+interface ChunkCtx {
+  supabase: ReturnType<typeof createClient>;
+  slot: string;
+  runId: string;
+  pricing: Map<string, number>;
+  pricePerCredit: number;
+  /** Retention never deletes what this chunk wrote. */
+  sweepStartedAt: string;
+  acc: RunAcc;
+}
+
 Deno.serve(async (req) => {
+  const startedMs = Date.now();
+  if (req.method !== 'POST') return json({ ok: false, error: 'method not allowed' }, 405);
+
   // Header only (see the file header for why the query parameter was dropped).
   const provided = req.headers.get('x-sweep-secret') ?? '';
 
@@ -931,6 +994,20 @@ Deno.serve(async (req) => {
     return json({ ok: false, error: 'unauthorized' }, 401);
   }
 
+  // The cron sends {}; a chain hop sends { slot, chunk, after }.
+  let body: unknown = {};
+  try {
+    body = await req.json();
+  } catch {
+    /* empty body: the cron tick */
+  }
+  const parsed = parseChunkRequest(body, new Date());
+  if ('error' in parsed) {
+    console.warn('[sweep] refused request:', parsed.error);
+    return json({ ok: false, error: 'bad request' }, 400);
+  }
+  const { slot, chunk, after } = parsed;
+
   if (!await resolveTregToken(supabase)) {
     return json({ ok: false, error: 'search provider not configured' }, 503);
   }
@@ -942,67 +1019,105 @@ Deno.serve(async (req) => {
     console.error(
       `[sweep] treg balance $${balanceUsd.toFixed(4)} is below the $${MIN_TREG_BALANCE_USD} floor — skipping this run.`,
     );
-    return json(
-      {
-        ok: false,
-        error: 'insufficient_provider_credit',
-        balanceUsd,
-        requiredUsd: MIN_TREG_BALANCE_USD,
-      },
-      503,
-    );
+    return json({ ok: false, error: 'insufficient_provider_credit' }, 503);
   }
 
-  // Captured before any network work so the retention pass at the end of each
-  // user's sweep cannot delete the results that sweep just produced.
-  const sweepStartedAt = new Date().toISOString();
-  usdSpent = 0;
-  callsMade = 0;
-
-  const { data: runRow } = await supabase.from('sweep_runs').insert({}).select().single();
-  const runId = runRow?.id;
-
-  const errors: Array<Record<string, string>> = [];
-
-  // Close out holds whose sweep died between reserving and settling. Without
-  // this, an isolate eviction or a wall-clock kill in that window locked those
-  // credits out of the workspace's balance permanently — invisible until
-  // someone read an ops view by hand.
-  let reaped: { settled: number; released: number } | null = null;
-  try {
-    const { data, error } = await supabase.rpc('reap_stale_reservations', {
-      p_older_than: '1 hour',
-    });
-    if (error) {
-      errors.push({ user: '*', kw: '*', platform: '*', message: `reaper: ${error.message}` });
-    } else if (data && (data.settled > 0 || data.released > 0)) {
-      reaped = { settled: data.settled, released: data.released };
-      console.warn(`[sweep] reaped ${data.settled} settled, ${data.released} released stale holds`);
+  // ---- Claim (slot, chunk) atomically: the run lock -------------------------
+  //
+  // The primary key is derived from (slot, chunk), so of two invocations for the
+  // same chunk exactly one insert succeeds. The loser stops here, before any
+  // hold or provider call; overlapping runs used to double-charge.
+  const runId = await claimIdFor(slot, chunk);
+  const { error: claimError } = await supabase.from('sweep_runs').insert({ id: runId });
+  if (claimError) {
+    if ((claimError as { code?: string }).code === '23505') {
+      console.warn(`[sweep] ${slot} chunk ${chunk} is already claimed; not running it twice`);
+      return json({ ok: true, skipped: 'already_claimed', slot, chunk });
     }
-  } catch (reaperErr) {
-    errors.push({ user: '*', kw: '*', platform: '*', message: `reaper: ${String(reaperErr)}` });
+    // Without a claim there is no lock, so fail closed rather than risk overlap.
+    console.error('[sweep] run claim failed:', claimError.message);
+    return json({ ok: false, error: 'sweep unavailable' }, 503);
   }
-  let usersProcessed = 0;
-  let usersSkipped = 0;
-  let postsInserted = 0;
-  let pruned = 0;
-  let totalStale = 0;
-  // Credit accounting for the whole run. Out-of-credit workspaces are collected
-  // rather than logged and forgotten, because "why did nothing arrive" is a
-  // question the answer to which belongs in the run result.
-  const skippedNoCredits: Array<{ user: string; required: number; available: number; shortfall: number }> = [];
-  let totalCreditsCharged = 0;
-  let totalProviderCostUsd = 0;
-  // Provider failures across the run. tregCall never throws — deliberately, so a
-  // dead provider falls through the chain instead of killing the request — which
-  // means a run where every call failed used to report ok: true and
-  // errorCount: 0. The errors array only ever held database failures.
-  const providerFailures: Array<{ user: string; operation: string; code: string }> = [];
+
+  const work = runChunk(supabase, { slot, chunk, after, runId, startedMs, balanceUsd });
+
+  // A chain hop answers at once and works in the background, so the previous
+  // chunk is not held open waiting for it. The cron tick (chunk 0) stays
+  // synchronous so pg_net records the result.
+  const edgeRuntime = (globalThis as { EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void } }).EdgeRuntime;
+  if (chunk > 0 && typeof edgeRuntime?.waitUntil === 'function') {
+    edgeRuntime.waitUntil(work.catch((err) => {
+      console.error(`[sweep] ${slot} chunk ${chunk} failed:`, (err as Error)?.name ?? 'Error');
+    }));
+    return json({ ok: true, accepted: true, slot, chunk }, 202);
+  }
+
+  try {
+    const result = await work;
+    return json(result.body, result.status);
+  } catch (err) {
+    console.error(`[sweep] ${slot} chunk ${chunk} failed:`, (err as Error)?.name ?? 'Error');
+    return json({ ok: false, error: 'sweep failed' }, 500);
+  }
+});
+
+async function runChunk(
+  supabase: ReturnType<typeof createClient>,
+  req: { slot: string; chunk: number; after: string | null; runId: string; startedMs: number; balanceUsd: number | null },
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const { slot, chunk, after, runId, startedMs } = req;
+  const hourUtc = slotHour(slot);
+
+  const acc: RunAcc = {
+    stats: { usdSpent: 0, callsMade: 0 },
+    errors: [],
+    usersProcessed: 0,
+    usersSkipped: 0,
+    postsInserted: 0,
+    pruned: 0,
+    totalStale: 0,
+    skippedNoCredits: [],
+    totalCreditsCharged: 0,
+    totalProviderCostUsd: 0,
+    providerFailures: [],
+  };
+
+  const finishRun = async () => {
+    const { error } = await supabase
+      .from('sweep_runs')
+      .update({
+        finished_at: new Date().toISOString(),
+        users_processed: acc.usersProcessed,
+        posts_inserted: acc.postsInserted,
+        errors: acc.errors,
+      })
+      .eq('id', runId);
+    if (error) console.error('[sweep] run row update failed:', error.message);
+  };
+
+  // Close out holds whose sweep died between reserving and settling. Once per
+  // slot (chunk 0) is enough.
+  let reaped: { settled: number; released: number } | null = null;
+  if (chunk === 0) {
+    try {
+      const { data, error } = await supabase.rpc('reap_stale_reservations', {
+        p_older_than: '1 hour',
+      });
+      if (error) {
+        acc.errors.push({ user: '*', kw: '*', platform: '*', message: `reaper: ${error.message}` });
+      } else if (data && ((data as any).settled > 0 || (data as any).released > 0)) {
+        reaped = { settled: (data as any).settled, released: (data as any).released };
+        console.warn(`[sweep] reaped ${reaped.settled} settled, ${reaped.released} released stale holds`);
+      }
+    } catch (reaperErr) {
+      acc.errors.push({ user: '*', kw: '*', platform: '*', message: `reaper: ${String(reaperErr)}` });
+    }
+  }
+
   const pricing = await loadPricing(supabase);
 
   // What one credit is realised at, for the usage ledger. Taken from the live
-  // packages rather than assumed, so a price change moves the reported revenue
-  // with it instead of leaving a stale figure in the profit report.
+  // packages rather than assumed.
   const { data: pkgsForPrice } = await supabase
     .from('topup_packages')
     .select('gross_usd, credits')
@@ -1015,313 +1130,412 @@ Deno.serve(async (req) => {
       0,
     );
 
-  const { data: keywords, error: keywordsError } = await supabase
-    .from('keywords')
-    .select('id, user_id, keyword')
-    .eq('is_active', true);
+  const ctx: ChunkCtx = {
+    supabase, slot, runId, pricing, pricePerCredit,
+    sweepStartedAt: new Date().toISOString(),
+    acc,
+  };
 
-  if (keywordsError) {
-    if (runId) {
-      await supabase
-        .from('sweep_runs')
-        .update({
-          finished_at: new Date().toISOString(),
-          errors: [{ stage: 'keywords', message: keywordsError.message }],
-        })
-        .eq('id', runId);
+  // ---- Due users, filtered BEFORE the cap -----------------------------------
+  // Without settings every workspace would look due every hour and be charged
+  // 24x a day, so a failed read stops the run before anything is held.
+  const due = await loadDueProfiles(supabase, hourUtc, after, MAX_USERS_PER_CHUNK + 1);
+  if ('error' in due) {
+    acc.errors.push({ stage: 'profiles', message: due.error });
+    await finishRun();
+    return { status: 500, body: { ok: false, error: 'could not load workspace settings' } };
+  }
+  const candidates = due.profiles.slice(0, MAX_USERS_PER_CHUNK);
+  let more = due.profiles.length > MAX_USERS_PER_CHUNK;
+
+  // ---- Sweep in id order until the time budget is spent ---------------------
+  let cursor: string | null = after;
+  let stoppedForTime = false;
+
+  groups:
+  for (let g = 0; g < candidates.length; g += KEYWORD_LOOKUP_BATCH) {
+    const group = candidates.slice(g, g + KEYWORD_LOOKUP_BATCH);
+    const keywordsByUser = await loadKeywords(supabase, group.map((p) => p.id));
+    if ('error' in keywordsByUser) {
+      acc.errors.push({ stage: 'keywords', message: String(keywordsByUser.error) });
+      await finishRun();
+      return { status: 500, body: { ok: false, error: 'could not load keywords' } };
     }
-    return json({ ok: false, error: keywordsError.message }, 500);
+
+    let i = 0;
+    while (i < group.length) {
+      const batch: Array<{ profile: ProfileRow; keywords: Array<{ id: string; keyword: string }> }> = [];
+      let lastIdx = i - 1;
+      while (i < group.length && batch.length < USER_CONCURRENCY) {
+        const list = keywordsByUser.get(group[i].id) ?? [];
+        if (list.length > 0) batch.push({ profile: group[i], keywords: list });
+        lastIdx = i;
+        i++;
+      }
+      if (batch.length === 0) {
+        // Due but no active keywords: nothing to do, and handled.
+        cursor = group[lastIdx].id;
+        continue;
+      }
+      const maxKeywords = Math.max(...batch.map((b) => b.keywords.length));
+      if (!canStartBatch(Date.now() - startedMs, maxKeywords)) {
+        stoppedForTime = true;
+        break groups;
+      }
+      await Promise.all(batch.map((b) => sweepUser(ctx, b.profile, b.keywords)));
+      cursor = group[lastIdx].id;
+    }
+  }
+  more = more || stoppedForTime;
+
+  // ---- Hand the rest of the slot to the next chunk --------------------------
+  let next: { chunk: number; after: string | null; dispatched: boolean } | null = null;
+  if (more) {
+    if (cursor === after) {
+      acc.errors.push({ stage: 'chain', message: 'no progress in this chunk; remaining due users deferred' });
+    } else if (chunk + 1 >= MAX_CHUNKS_PER_SLOT) {
+      acc.errors.push({ stage: 'chain', message: `chunk limit ${MAX_CHUNKS_PER_SLOT} reached; remaining due users deferred` });
+    } else {
+      const dispatched = await dispatchNextChunk(slot, chunk + 1, cursor);
+      next = { chunk: chunk + 1, after: cursor, dispatched };
+      if (!dispatched) {
+        acc.errors.push({ stage: 'chain', message: `could not confirm dispatch of chunk ${chunk + 1}` });
+      }
+    }
   }
 
-  const byUser = new Map<string, Array<{ id: string; keyword: string }>>();
-  for (const kw of keywords ?? []) {
-    const list = byUser.get(kw.user_id) ?? [];
-    if (list.length < MAX_KEYWORDS_PER_USER) list.push(kw);
-    byUser.set(kw.user_id, list);
-  }
+  await finishRun();
 
-  const userIds = [...byUser.keys()].slice(0, MAX_USERS_PER_RUN);
-  if (userIds.length < byUser.size) {
-    errors.push({
-      stage: 'cap',
-      message: `Run capped at ${MAX_USERS_PER_RUN} users; ${byUser.size - MAX_USERS_PER_RUN} deferred.`,
-    });
-  }
-
-  const { data: profiles } = await supabase
-    .from('profiles')
-    .select('id, enabled_channels, lookback_hours, min_intent_threshold, sweep_time_utc, sweep_frequency, subscription_plan')
-    .in('id', userIds);
-
-  const settingsByUser = new Map<string, SweepSettings>();
-  for (const p of profiles ?? []) {
-    settingsByUser.set(p.id, {
-      enabled_channels: p.enabled_channels,
-      lookback_hours: p.lookback_hours,
-      min_intent_threshold: p.min_intent_threshold,
-      sweep_time_utc: p.sweep_time_utc,
-      sweep_frequency: p.sweep_frequency,
-    });
-  }
-
-  // The cron fires every hour and each workspace is swept only in the hours its
-  // own hour + cadence make due, so "every day at 06:00 UTC" in Settings is
-  // actually true.
-  const currentHourUtc = new Date().getUTCHours();
-
-  for (const userId of userIds) {
-    const userKeywords = byUser.get(userId) ?? [];
-    if (userKeywords.length === 0) continue;
-
-    const settings = settingsByUser.get(userId);
-    const cadenceHours = cadenceHoursOf(settings?.sweep_frequency);
-
-    // Respect the workspace's own sweep hour. Checked before the processed
-    // counter so the two numbers mean what they say.
-    const dueHour = sweepHourOf(settings?.sweep_time_utc);
-    if (dueHour !== null && !isSweepDue(currentHourUtc, dueHour, cadenceHours)) {
-      usersSkipped++;
-      continue;
-    }
-
-    usersProcessed++;
-
-    const ALL: Platform[] = ['twitter', 'reddit', 'google', 'news'];
-    const requested: Platform[] = Array.isArray(settings?.enabled_channels) && settings.enabled_channels.length > 0
-      ? settings.enabled_channels.filter((c): c is Platform => ALL.includes(c as Platform))
-      : ['twitter', 'reddit', 'google'];
-    // A flat cap on how many channels may be scanned. The Settings UI stops the
-    // over-limit selection from being made; this is the backstop.
-    const channels: Platform[] = requested.slice(0, MAX_CHANNELS);
-    const lookbackHours = Number(settings?.lookback_hours) || 24;
-    const minIntent = Number(settings?.min_intent_threshold) || 0;
-    const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
-
-    let droppedStale = 0;
-
-    const rowsToUpsert: PostRow[] = [];
-    const seenUrls = new Set<string>();
-
-    // ---- Price the workspace's sweep, then hold it before any call ---------
-    //
-    // All or nothing. A sweep that ran for six of eight keywords would charge for
-    // a truncated search and quietly under-report the results, so a workspace
-    // that cannot cover the whole thing gets nothing and is recorded as skipped.
-    const runKey = `ds:${runId ?? 'run'}:${userId}`;
-    const runNonce = `${runId ?? Date.now().toString(36)}:${userId}`;
-
-    const wantedOps = [...new Set(channels.map((c) => OPERATION_OF[c]))]
-      .filter((op) => pricing.has(op));
-    const billableChannels = channels.filter((c) => pricing.has(OPERATION_OF[c]));
-
-    const unpriced = channels.filter((c) => !pricing.has(OPERATION_OF[c]));
-    if (unpriced.length > 0) {
-      console.warn(`[sweep] no configured price for ${userId}: ${unpriced.join(', ')}`);
-    }
-
-    const creditsPerKeyword = wantedOps.reduce((s, op) => s + (pricing.get(op) ?? 0), 0);
-    const creditsRequired = creditsPerKeyword * userKeywords.length;
-
-    const hold = await reserveSweep(supabase, userId, creditsRequired, runKey, {
-      scope: 'daily-sweep',
-      run_id: runId,
-      keywords: userKeywords.length,
-      channels: wantedOps,
-      credits_per_keyword: creditsPerKeyword,
-    });
-
-    if ('shortfall' in hold) {
-      // Nothing has been called. Recorded rather than silently dropped so the
-      // user can be told they are short instead of wondering why nothing
-      // arrived this morning.
-      skippedNoCredits.push({
-        user: userId,
-        required: hold.required,
-        available: hold.available,
-        shortfall: hold.shortfall,
-      });
-      console.warn(
-        `[sweep] ${userId} skipped: needs ${hold.required} credits, has ${hold.available}`,
-      );
-      usersSkipped++;
-      continue;
-    }
-
-    const tallies = new Map<string, OperationTally>();
-    for (const op of wantedOps) tallies.set(op, newTally(op));
-
-    // Set once the hold has been settled or released, so the finally block
-    // below only acts on a sweep that threw before reaching that point.
-    let holdClosed = false;
-
-    /**
-     * Works out what is owed from the tallies, writes the usage rows, then
-     * settles (or releases) the hold. Usage is recorded first so a settle that
-     * fails still leaves the measured cost on the ledger for reconciliation.
-     */
-    const closeHold = async (note: string): Promise<void> => {
-      if (holdClosed) return;
-      holdClosed = true;
-
-      let creditsCharged = 0;
-      let providerCostUsd = 0;
-      const charges = new Map<string, { credits: number; revenueUsd: number }>();
-
-      for (const [op, t] of tallies) {
-        providerCostUsd += t.costMicro / 1e6;
-        // Charged per keyword: price x the keywords that had at least one billed
-        // or uncertain call on this operation. A keyword whose calls were all
-        // free costs nothing, even when another keyword on the channel billed.
-        const opCredits = (pricing.get(op) ?? 0) * t.chargeableKeywords.size;
-        creditsCharged += opCredits;
-        // What the usage ledger records, so it carries the same figures the
-        // wallet was debited. Revenue is reconstructed at the rate these credits
-        // were bought for, which is what wallet_settle works out — the two
-        // records then agree instead of diverging.
-        charges.set(op, { credits: opCredits, revenueUsd: opCredits * pricePerCredit });
-      }
-
-      totalProviderCostUsd += providerCostUsd;
-      for (const [op, t] of tallies) {
-        for (const code of t.errorCodes) {
-          providerFailures.push({ user: userId, operation: op, code });
-        }
-      }
-      await recordUsage(supabase, userId, runKey, tallies, hold.id, charges);
-
-      if (creditsCharged > 0) {
-        // The result is checked. settleSweep returns null when the RPC fails;
-        // ignoring that reported a charge that never happened and left the hold
-        // in place forever, shrinking this workspace's balance on every later
-        // sweep.
-        const balanceAfter = await settleSweep(
-          supabase, hold.id, creditsCharged, providerCostUsd, `${runKey}:settle`, note,
-        );
-        if (balanceAfter !== null) {
-          totalCreditsCharged += creditsCharged;
-        } else {
-          errors.push({
-            user: userId, kw: '*', platform: '*',
-            message: 'credit settlement failed; reservation left held for the reaper',
-          });
-        }
-      } else {
-        await releaseSweep(supabase, hold.id, 'no billable provider calls');
-      }
-    };
-
-    try {
-      for (const kw of userKeywords) {
-        const perChannel = await Promise.all(
-          billableChannels.map((ch) => {
-            const tally = tallies.get(OPERATION_OF[ch])!;
-            return searchChannel(ch, kw, userId, lookbackHours, tally, runNonce);
-          }),
-        );
-
-        for (const r of perChannel.flat()) {
-          // Exact cutoff: the endpoints only accept coarse windows, so drop
-          // anything outside the real lookback. Rows with no date cannot be
-          // judged and are kept.
-          if (r.posted_at && Date.parse(r.posted_at) < cutoffMs) {
-            droppedStale++;
-            continue;
-          }
-          if (r.intent_score < minIntent) continue;
-          const key = r.post_url.trim().toLowerCase();
-          if (seenUrls.has(key)) continue;
-          seenUrls.add(key);
-          rowsToUpsert.push(r);
-        }
-      }
-
-      // ---- Settle for what actually billed --------------------------------
-      await closeHold(`${userKeywords.length} keywords across ${billableChannels.length} channels`);
-    } catch (sweepErr) {
-      // One workspace throwing must not abort the whole run, and must not leave
-      // its hold reserved until the reaper finds it. The finally below charges
-      // for whatever was billed before the throw, or releases the hold.
-      errors.push({ user: userId, kw: '*', platform: '*', message: `sweep: ${String(sweepErr)}` });
-    } finally {
-      if (!holdClosed) {
-        try {
-          await closeHold('sweep aborted by an error; charged for calls already billed');
-        } catch (closeErr) {
-          errors.push({ user: userId, kw: '*', platform: '*', message: `close hold: ${String(closeErr)}` });
-        }
-      }
-    }
-
-    if (rowsToUpsert.length > 0) {
-      const { error: upsertError } = await supabase
-        .from('monitored_posts')
-        .upsert(rowsToUpsert, { onConflict: 'user_id,post_url', ignoreDuplicates: true });
-
-      if (upsertError) {
-        errors.push({ user: userId, kw: '*', platform: '*', message: upsertError.message });
-      } else {
-        postsInserted += rowsToUpsert.length;
-      }
-    }
-
-    // Retention pass for this user. sweepStartedAt keeps this sweep's results.
-    try {
-      const { data: prune, error: pruneError } = await supabase.rpc('prune_feed', {
-        p_user_id: userId,
-        p_keep_after: sweepStartedAt,
-      });
-      if (pruneError) {
-        errors.push({ user: userId, kw: '*', platform: 'prune', message: pruneError.message });
-      } else if (typeof prune?.deleted === 'number' && prune.deleted > 0) {
-        pruned += prune.deleted;
-      }
-    } catch (pruneErr) {
-      errors.push({ user: userId, kw: '*', platform: 'prune', message: String(pruneErr) });
-    }
-
-    totalStale += droppedStale;
-  }
-
-  if (runId) {
-    await supabase
-      .from('sweep_runs')
-      .update({
-        finished_at: new Date().toISOString(),
-        users_processed: usersProcessed,
-        posts_inserted: postsInserted,
-        errors,
-      })
-      .eq('id', runId);
-  }
-
-  return json({
-    // False only when every provider call this run failed. A run that swept some
-    // workspaces and found nothing is a success; one where nothing was reachable
-    // is not, and saying otherwise hides an outage behind a healthy-looking count.
-    ok: providerFailures.length === 0 || providerFailures.length < callsMade,
-    hourUtc: currentHourUtc,
-    usersProcessed,
-    usersSkipped,
-    postsInserted,
-    droppedStale: totalStale,
-    pruned,
-    // Measured from treg's own cost headers, not from a rate card.
-    usdSpent: Number(usdSpent.toFixed(6)),
-    callsMade,
-    balanceUsd,
-    errorCount: errors.length,
-    provider_failure_count: providerFailures.length,
-    provider_failures: providerFailures.slice(0, 12),
-    reaped_reservations: reaped,
-    billing: {
-      creditsCharged: Number(totalCreditsCharged.toFixed(6)),
-      providerCostUsd: Number(totalProviderCostUsd.toFixed(8)),
-      // Workspaces that wanted a sweep and could not pay for one. Each of these
-      // cost zero, because the hold is taken before any provider call.
-      skippedInsufficientCredits: skippedNoCredits,
+  return {
+    status: 200,
+    body: {
+      // False only when every provider call this chunk failed.
+      ok: acc.providerFailures.length === 0 || acc.providerFailures.length < acc.stats.callsMade,
+      slot,
+      chunk,
+      hourUtc,
+      dueUsersConsidered: candidates.length,
+      next,
+      usersProcessed: acc.usersProcessed,
+      usersSkipped: acc.usersSkipped,
+      postsInserted: acc.postsInserted,
+      droppedStale: acc.totalStale,
+      pruned: acc.pruned,
+      // Measured from treg's own cost headers, not from a rate card.
+      usdSpent: Number(acc.stats.usdSpent.toFixed(6)),
+      callsMade: acc.stats.callsMade,
+      balanceUsd: req.balanceUsd,
+      errorCount: acc.errors.length,
+      provider_failure_count: acc.providerFailures.length,
+      provider_failures: acc.providerFailures.slice(0, 12),
+      reaped_reservations: reaped,
+      billing: {
+        creditsCharged: roundCredits(acc.totalCreditsCharged),
+        providerCostUsd: Number(acc.totalProviderCostUsd.toFixed(8)),
+        // News is free to the customer by policy: always 0 credits.
+        freeOperations: [...FREE_OPERATIONS],
+        // Each of these cost zero: the hold is taken before any provider call.
+        skippedInsufficientCredits: acc.skippedNoCredits,
+      },
     },
+  };
+}
+
+/**
+ * Due profiles with id > after, in id order. Keyset paging with an explicit
+ * order, so a PostgREST max-rows cap below PAGE_SIZE cannot silently end the
+ * scan, and the due filter is applied before `limit` is.
+ */
+async function loadDueProfiles(
+  supabase: ReturnType<typeof createClient>,
+  hourUtc: number,
+  after: string | null,
+  limit: number,
+): Promise<{ profiles: ProfileRow[] } | { error: string }> {
+  const out: ProfileRow[] = [];
+  let lastId = after;
+  for (;;) {
+    let q = supabase
+      .from('profiles')
+      .select('id, enabled_channels, lookback_hours, min_intent_threshold, sweep_time_utc, sweep_frequency')
+      .order('id', { ascending: true });
+    if (lastId) q = q.gt('id', lastId);
+    const { data, error } = await q.range(0, PAGE_SIZE - 1);
+    if (error) return { error: error.message };
+    const rows = (data ?? []) as unknown as ProfileRow[];
+    if (rows.length === 0) break;
+    out.push(...filterDue(rows, hourUtc));
+    if (out.length >= limit) break;
+    lastId = rows[rows.length - 1].id;
+  }
+  return { profiles: out.slice(0, limit) };
+}
+
+/**
+ * Active keywords for a set of users, ordered (user, created_at, id) and paged
+ * until an empty page, then capped per user to the oldest MAX_KEYWORDS_PER_USER.
+ */
+async function loadKeywords(
+  supabase: ReturnType<typeof createClient>,
+  userIds: string[],
+): Promise<Map<string, Array<{ id: string; keyword: string }>> | { error: string }> {
+  if (userIds.length === 0) return new Map();
+  const rows: Array<{ id: string; user_id: string; keyword: string }> = [];
+  for (let from = 0; ;) {
+    const { data, error } = await supabase
+      .from('keywords')
+      .select('id, user_id, keyword')
+      .eq('is_active', true)
+      .in('user_id', userIds)
+      .order('user_id', { ascending: true })
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) return { error: error.message };
+    const page = (data ?? []) as unknown as Array<{ id: string; user_id: string; keyword: string }>;
+    if (page.length === 0) break;
+    rows.push(...page);
+    from += page.length;
+  }
+  return groupKeywords(rows);
+}
+
+/**
+ * Starts chunk n+1 of this slot. The callee claims its own row, answers 202 and
+ * works in the background, so this normally returns in well under a second.
+ */
+async function dispatchNextChunk(slot: string, chunk: number, after: string | null): Promise<boolean> {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/daily-sweep`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-sweep-secret': SWEEP_CRON_SECRET },
+      body: JSON.stringify({ slot, chunk, after }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    await res.body?.cancel();
+    return res.status === 202 || res.ok;
+  } catch (err) {
+    console.error(`[sweep] dispatch of ${slot} chunk ${chunk} failed:`, (err as Error)?.name ?? 'Error');
+    return false;
+  }
+}
+
+/** Sweeps one due workspace: reserve, search, settle, store, prune. */
+async function sweepUser(
+  ctx: ChunkCtx,
+  settings: ProfileRow,
+  userKeywords: Array<{ id: string; keyword: string }>,
+): Promise<void> {
+  const { supabase, pricing, pricePerCredit, acc } = ctx;
+  const userId = settings.id;
+
+  const ALL: Platform[] = ['twitter', 'reddit', 'google', 'news'];
+  const requested: Platform[] = Array.isArray(settings.enabled_channels) && settings.enabled_channels.length > 0
+    ? settings.enabled_channels.filter((c): c is Platform => ALL.includes(c as Platform))
+    : ['twitter', 'reddit', 'google'];
+  // A flat cap on how many channels may be scanned. The Settings UI stops the
+  // over-limit selection from being made; this is the backstop.
+  const channels: Platform[] = [...new Set(requested)].slice(0, MAX_CHANNELS);
+  const lookbackHours = Number(settings.lookback_hours) || 24;
+  const minIntent = Number(settings.min_intent_threshold) || 0;
+  const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
+
+  let droppedStale = 0;
+  const rowsToUpsert: PostRow[] = [];
+  const seenUrls = new Set<string>();
+
+  // ---- Price the workspace's sweep, then hold it before any call -----------
+  //
+  // All or nothing. The key is per slot, not per invocation: a second run in the
+  // same due hour finds the key taken (duplicate) and skips the workspace, so it
+  // is never charged twice for one scheduled sweep.
+  const runKey = `ds:${ctx.slot}:${userId}`;
+  const runNonce = `${ctx.slot}:${userId}`;
+
+  const wantedOps = [...new Set(channels.map((c) => OPERATION_OF[c]))]
+    .filter((op) => isOperationAvailable(op, pricing));
+  const billableChannels = channels.filter((c) => isOperationAvailable(OPERATION_OF[c], pricing));
+
+  const unpriced = channels.filter((c) => !isOperationAvailable(OPERATION_OF[c], pricing));
+  if (unpriced.length > 0) {
+    console.warn(`[sweep] no configured price for ${userId}: ${unpriced.join(', ')}`);
+  }
+
+  const creditsPerKeyword = wantedOps.reduce((s, op) => s + creditsFor(op, pricing), 0);
+  // Fractional credits (e.g. 0.1 per keyword per channel): never rounded to an
+  // integer, only to 2 decimals to drop float noise.
+  const creditsRequired = roundCredits(creditsPerKeyword * userKeywords.length);
+
+  // No p_paid_only: scheduled sweeps may spend welcome credits.
+  const hold = await reserveSweep(supabase, userId, creditsRequired, runKey, {
+    scope: 'daily-sweep',
+    run_id: ctx.runId,
+    slot: ctx.slot,
+    keywords: userKeywords.length,
+    channels: wantedOps,
+    free_channels: wantedOps.filter((op) => FREE_OPERATIONS.has(op)),
+    credits_per_keyword: roundCredits(creditsPerKeyword),
   });
-});
+
+  if ('shortfall' in hold) {
+    // Nothing has been called. Recorded rather than silently dropped.
+    acc.skippedNoCredits.push({
+      user: userId,
+      required: hold.required,
+      available: hold.available,
+      shortfall: hold.shortfall,
+    });
+    console.warn(`[sweep] ${userId} skipped: needs ${hold.required} credits, has ${hold.available}`);
+    acc.usersSkipped++;
+    return;
+  }
+
+  if (hold.duplicate) {
+    // This slot's key is already taken, so another invocation owns that hold.
+    // Sweeping anyway would deliver the work without charging for it.
+    acc.errors.push({ user: userId, kw: '*', platform: '*', message: 'reservation key already used; user skipped' });
+    console.error(`[sweep] ${userId} skipped: reservation ${runKey} already exists`);
+    acc.usersSkipped++;
+    return;
+  }
+
+  acc.usersProcessed++;
+
+  const tallies = new Map<string, OperationTally>();
+  for (const op of wantedOps) tallies.set(op, newTally(op));
+
+  let holdClosed = false;
+
+  /**
+   * Works out what is owed from the tallies, writes the usage rows, then
+   * settles (or releases) the hold. Usage is recorded first so a settle that
+   * fails still leaves the measured cost on the ledger for reconciliation.
+   */
+  const closeHold = async (note: string): Promise<void> => {
+    if (holdClosed) return;
+    holdClosed = true;
+
+    let creditsCharged = 0;
+    let providerCostUsd = 0;
+    const charges = new Map<string, { credits: number; revenueUsd: number }>();
+
+    for (const [op, t] of tallies) {
+      providerCostUsd += t.costMicro / 1e6;
+      // Charged per keyword: price x the keywords that had at least one billed
+      // or uncertain call on this operation. Free operations (News) are 0.
+      const opCredits = roundCredits(creditsFor(op, pricing) * t.chargeableKeywords.size);
+      creditsCharged += opCredits;
+      charges.set(op, { credits: opCredits, revenueUsd: opCredits * pricePerCredit });
+    }
+
+    // Never settle more than was held (2-decimal rounding per operation must not
+    // push the total past the reservation).
+    creditsCharged = Math.min(roundCredits(creditsCharged), hold.reserved);
+
+    acc.totalProviderCostUsd += providerCostUsd;
+    for (const [op, t] of tallies) {
+      for (const code of t.errorCodes) {
+        acc.providerFailures.push({ user: userId, operation: op, code });
+      }
+    }
+    await recordUsage(supabase, userId, runKey, tallies, hold.id, charges);
+
+    // A 0-credit sweep has no hold (wallet_reserve returns reservation_id null).
+    if (!hold.id) return;
+
+    if (creditsCharged > 0) {
+      const balanceAfter = await settleSweep(
+        supabase, hold.id, creditsCharged, providerCostUsd, `${runKey}:settle`, note,
+      );
+      if (balanceAfter !== null) {
+        acc.totalCreditsCharged = roundCredits(acc.totalCreditsCharged + creditsCharged);
+      } else {
+        acc.errors.push({
+          user: userId, kw: '*', platform: '*',
+          message: 'credit settlement failed; reservation left held for the reaper',
+        });
+      }
+    } else {
+      await releaseSweep(supabase, hold.id, 'no billable provider calls');
+    }
+  };
+
+  try {
+    // Keywords run in waves of KEYWORD_CONCURRENCY, channels in parallel within
+    // each; providers inside a channel stay sequential so a fallback only costs
+    // money once the cheaper one has failed unbilled.
+    for (let k = 0; k < userKeywords.length; k += KEYWORD_CONCURRENCY) {
+      const wave = userKeywords.slice(k, k + KEYWORD_CONCURRENCY);
+      const perKeyword: PostRow[][][] = await Promise.all(
+        wave.map((kw) =>
+          Promise.all(
+            billableChannels.map((ch) => {
+              const tally = tallies.get(OPERATION_OF[ch])!;
+              return searchChannel(ch, kw, userId, lookbackHours, tally, runNonce, acc.stats);
+            }),
+          )
+        ),
+      );
+
+      for (const r of perKeyword.flat(2)) {
+        // Exact cutoff: the endpoints only accept coarse windows. Rows with no
+        // date cannot be judged and are kept.
+        if (r.posted_at && Date.parse(r.posted_at) < cutoffMs) {
+          droppedStale++;
+          continue;
+        }
+        if (r.intent_score < minIntent) continue;
+        const key = r.post_url.trim().toLowerCase();
+        if (seenUrls.has(key)) continue;
+        seenUrls.add(key);
+        rowsToUpsert.push(r);
+      }
+    }
+
+    await closeHold(`${userKeywords.length} keywords across ${billableChannels.length} channels`);
+  } catch (sweepErr) {
+    // One workspace throwing must not abort the whole chunk, and must not leave
+    // its hold reserved until the reaper finds it.
+    acc.errors.push({ user: userId, kw: '*', platform: '*', message: `sweep: ${(sweepErr as Error)?.name ?? 'Error'}` });
+  } finally {
+    if (!holdClosed) {
+      try {
+        await closeHold('sweep aborted by an error; charged for calls already billed');
+      } catch (closeErr) {
+        acc.errors.push({ user: userId, kw: '*', platform: '*', message: `close hold: ${(closeErr as Error)?.name ?? 'Error'}` });
+      }
+    }
+  }
+
+  if (rowsToUpsert.length > 0) {
+    const { error: upsertError } = await supabase
+      .from('monitored_posts')
+      .upsert(rowsToUpsert, { onConflict: 'user_id,post_url', ignoreDuplicates: true });
+
+    if (upsertError) {
+      acc.errors.push({ user: userId, kw: '*', platform: '*', message: upsertError.message });
+    } else {
+      acc.postsInserted += rowsToUpsert.length;
+    }
+  }
+
+  // Retention pass for this user. sweepStartedAt keeps this chunk's results.
+  try {
+    const { data: prune, error: pruneError } = await supabase.rpc('prune_feed', {
+      p_user_id: userId,
+      p_keep_after: ctx.sweepStartedAt,
+    });
+    if (pruneError) {
+      acc.errors.push({ user: userId, kw: '*', platform: 'prune', message: pruneError.message });
+    } else if (typeof (prune as any)?.deleted === 'number' && (prune as any).deleted > 0) {
+      acc.pruned += (prune as any).deleted;
+    }
+  } catch (pruneErr) {
+    acc.errors.push({ user: userId, kw: '*', platform: 'prune', message: (pruneErr as Error)?.name ?? 'Error' });
+  }
+
+  acc.totalStale += droppedStale;
+}
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {

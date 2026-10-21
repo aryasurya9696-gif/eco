@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { supabase, isConfigured } from '../lib/supabase';
 import { leadsStore } from '../components/leads/leads-store';
+import { mailStore } from '../components/mail/mail-store';
 import type { Profile } from '../types';
 
 type AuthUser = { id: string; email: string };
@@ -29,6 +30,9 @@ interface AuthContextType {
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+/** Matches the sign-up and reset forms. */
+const MIN_PASSWORD_LENGTH = 8;
 
 const LOCAL_STORAGE_USER_KEY = 'echo_mock_user';
 const LOCAL_STORAGE_PROFILE_KEY = 'echo_mock_profile';
@@ -170,6 +174,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [fetchSupabaseProfile],
   );
 
+  // Mail is account-scoped and read outside the Mail tab (the Sidebar unread
+  // badge, a composer opened from Leads), so it follows the signed-in user
+  // here rather than being loaded by MailTab. init(null) resets it.
+  useEffect(() => {
+    mailStore.init(user?.id ?? null);
+  }, [user?.id]);
+
   // Initialise auth state once. The subscription is made synchronously so a
   // StrictMode mount/unmount/mount cycle cleans up and resubscribes correctly.
   useEffect(() => {
@@ -252,6 +263,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!email.trim() || !password) {
       return { error: 'Email and password are both required.' };
     }
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      return { error: `Use at least ${MIN_PASSWORD_LENGTH} characters.` };
+    }
 
     if (isConfigured && supabase) {
       const { data, error } = await supabase.auth.signUp({
@@ -292,6 +306,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
     // Lead results, reveals and the run sequence belong to the old account.
     leadsStore.reset();
+    mailStore.init(null);
     currentUserIdRef.current = null;
     profileLoadRef.current = null;
     setUser(null);
@@ -320,7 +335,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!isConfigured || !supabase) {
       return { error: 'Password reset needs a connected Supabase project.' };
     }
-    if (password.length < 6) return { error: 'Use at least 6 characters.' };
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      return { error: `Use at least ${MIN_PASSWORD_LENGTH} characters.` };
+    }
     const { error } = await supabase.auth.updateUser({ password });
     if (error) return { error: error.message };
     setPasswordRecovery(false);

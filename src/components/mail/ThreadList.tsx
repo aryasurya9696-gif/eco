@@ -46,7 +46,7 @@ export const initialsFor = (label: string) =>
 const statusLabel = (status?: string) => (status ? status.charAt(0).toUpperCase() + status.slice(1) : '');
 
 export const ThreadList: React.FC = () => {
-  const { threads, activeFolder, activeThreadId, activeMailboxId, searchQuery, filter } = useMailStore();
+  const { threads, activeFolder, activeThreadId, activeMailboxId, searchQuery, filter, loading } = useMailStore();
 
   const query = searchQuery.trim().toLowerCase();
   const filteredThreads = threads
@@ -91,23 +91,11 @@ export const ThreadList: React.FC = () => {
       {/* Header */}
       <div className="px-4 pt-4 pb-3 border-b border-[#f0f0eb] space-y-3">
         <div className="flex items-center justify-between gap-3">
-          {/* Folder picker for small screens (the sidebar is hidden there) */}
-          <select
-            value={activeFolder}
-            onChange={(e) => mailStore.setActiveFolder(e.target.value as MailFolder)}
-            className="md:hidden text-[15px] font-semibold text-[#18181b] bg-transparent focus:outline-none"
-            aria-label="Folder"
-          >
-            {MAIL_FOLDERS.map((f) => (
-              <option key={f.id} value={f.id}>
-                {f.label}
-              </option>
-            ))}
-          </select>
-          <h2 className="hidden md:block text-[15px] font-semibold text-[#18181b]">{folderLabel}</h2>
+          {/* On small screens the folder (and Mailboxes / Domains) picker is MailMobileNav, above. */}
+          <h2 className="text-[15px] font-semibold text-[#18181b]">{folderLabel}</h2>
 
           <div className="flex items-center gap-2">
-            <span className="text-[12px] text-[#a1a1aa] tabular-nums">
+            <span className="text-[12px] text-[#a1a1aa] tabular-nums" aria-live="polite">
               {filteredThreads.length} {filteredThreads.length === 1 ? 'conversation' : 'conversations'}
             </span>
             <button
@@ -164,7 +152,16 @@ export const ThreadList: React.FC = () => {
 
       {/* Threads */}
       <div className="flex-1 overflow-y-auto">
-        {filteredThreads.length === 0 ? (
+        {loading && threads.length === 0 ? (
+          <ul aria-busy="true" aria-label="Loading conversations" className="divide-y divide-[#f0f0eb]">
+            {[0, 1, 2, 3, 4].map((i) => (
+              <li key={i} className="px-5 py-3.5 animate-pulse">
+                <div className="h-3 w-1/3 rounded bg-[#efefea]" />
+                <div className="mt-2 h-3 w-2/3 rounded bg-[#f4f4f0]" />
+              </li>
+            ))}
+          </ul>
+        ) : filteredThreads.length === 0 ? (
           <div className="px-6 py-16 text-center">
             <div className="text-[14px] font-medium text-[#18181b]">
               {isFiltered ? 'No matching conversations' : `${folderLabel} is empty`}

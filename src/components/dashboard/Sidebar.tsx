@@ -15,12 +15,18 @@ import {
   Mail,
 } from 'lucide-react';
 import { useMailStore } from '../mail/mail-store';
+import { useWallet } from '../../lib/wallet-store';
+import { formatCredits } from '../../lib/billing';
+import { channelLabel } from '../../lib/constants';
+import { formatNextSweep, nextSweepAt } from '../../lib/schedule';
 
 interface NavItem {
   id: DashboardTab;
   label: string;
   icon: React.ReactNode;
   count?: number | string;
+  /** Spoken name when it should say more than the label (e.g. the balance). */
+  ariaLabel?: string;
   isPlaceholder?: boolean;
 }
 
@@ -40,7 +46,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleCollapse,
 }) => {
   const { user, profile, signOut } = useAuth();
-  const { keywords, keywordLimit, posts, sweepTime, sweepCadence, lookbackHours, enabledChannels } = useEcho();
+  // Saved values, not the Settings form's unsaved edits: the schedule card
+  // describes what the cron will actually run.
+  const { keywords, keywordLimit, posts, savedSweepTime, savedSweepCadence, lookbackHours, savedChannels } = useEcho();
+  const nextSweep = formatNextSweep(savedSweepTime, savedSweepCadence);
 
   // Compute user initials for avatar
   const getInitials = () => {
@@ -62,6 +71,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const { threads, activeMailboxId } = useMailStore();
+  // Shared wallet store: "—" while unknown or when the fetch failed, never 0.
+  const { balance, error: balanceError } = useWallet();
+  const balanceText = formatCredits(balance);
+  const balanceTitle = balance === null
+    ? balanceError ? 'Credit balance unavailable' : 'Loading credit balance'
+    : `${balanceText} credit${balance === 1 ? '' : 's'} available`;
   const unreadMailCount = threads.filter(
     (t) => t.mailbox_id === activeMailboxId && t.folder === 'inbox' && t.unread_count > 0
   ).length;
@@ -102,6 +117,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
           id: 'billing',
           label: 'Billing',
           icon: <Wallet className="w-4 h-4" />,
+          count: balanceText,
+          ariaLabel: `Billing, ${balanceTitle}`,
         },
         {
           id: 'settings',
@@ -159,24 +176,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 SWEEP SCHEDULE
               </span>
               <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 bg-white border border-[#deded8] text-emerald-700 font-medium">
-                {sweepCadence === '24h' ? 'Daily' : sweepCadence === '12h' ? '12h Cycle' : '6h Fast'}
+                {savedSweepCadence === '24h' ? 'Daily' : savedSweepCadence === '12h' ? '12h Cycle' : '6h Fast'}
               </span>
             </div>
             <p className="text-[11px] text-[#8a8a86] font-mono">
-              Next: <span className="text-[#141414] font-medium">{sweepTime} UTC</span>
+              Next: <span className="text-[#141414] font-medium">{nextSweep}</span>
             </p>
             <p className="text-[10px] text-[#9b9b96] font-mono mt-0.5 truncate">
-              {enabledChannels.map((c) => (c === 'twitter' ? 'X' : c === 'google' ? 'Web' : c.charAt(0).toUpperCase() + c.slice(1))).join(', ')} ({lookbackHours}h)
+              {savedChannels.map(channelLabel).join(', ')} ({lookbackHours}h)
             </p>
           </div>
         ) : (
           <div
             className="mx-2 mt-3 p-2 bg-[#f6f6f4] border border-[#e3e3de] flex flex-col items-center justify-center cursor-default group"
-            title={`Sweep Schedule: Next at ${sweepTime} UTC (${sweepCadence === '24h' ? 'Daily' : sweepCadence}) • ${lookbackHours}h lookback`}
+            title={`Sweep schedule: next ${nextSweep} (${savedSweepCadence === '24h' ? 'daily' : `every ${savedSweepCadence}`}) • ${lookbackHours}h lookback`}
           >
             <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
             <span className="text-[9px] font-mono text-[#8a8a86] mt-1">
-              {sweepTime.split(':')[0]}h
+              {String(nextSweepAt(savedSweepTime, savedSweepCadence)?.getUTCHours() ?? '—').padStart(2, '0')}h
             </span>
           </div>
         )}
@@ -196,8 +213,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   <button
                     key={item.id}
                     onClick={() => onTabChange(item.id)}
-                    title={`${item.label} ${item.count !== undefined ? `(${item.count})` : ''}`}
-                    aria-label={item.label}
+                    title={item.ariaLabel ?? `${item.label} ${item.count !== undefined ? `(${item.count})` : ''}`}
+                    aria-label={item.ariaLabel ?? item.label}
                     className={`w-full flex items-center transition-colors cursor-pointer relative ${
                       isCollapsed
                         ? `h-10 justify-center rounded-none ${

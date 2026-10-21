@@ -4,21 +4,89 @@ import React, {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import { supabase, isConfigured } from '../lib/supabase';
 import { invokeSearchSweep } from '../lib/sweep';
-import type { KeywordSuggestionResult } from '../lib/ai';
+import type { DraftResult, KeywordSuggestionResult } from '../lib/ai';
 import { generateAiOutreachDraft, generateAiKeywordsFromOffer } from '../lib/ai';
+import { channelLabel, KEYWORD_LIMIT } from '../lib/constants';
+import { walletStore } from '../lib/wallet-store';
 import { useAuth } from './AuthContext';
 import { downloadCsv, downloadTextFile } from '../lib/csv';
-import type { Keyword, MonitoredPost, Platform, LeadStatus } from '../types';
+import type { Keyword, MonitoredPost, Platform, LeadStatus, Profile } from '../types';
 
-interface ToastMessage {
+export interface ToastMessage {
   id: string;
   message: string;
   type: 'info' | 'success' | 'error';
 }
+
+type AddToast = (message: string, type?: 'info' | 'success' | 'error') => void;
+
+// ---------------------------------------------------------------------------
+// Toasts
+// ---------------------------------------------------------------------------
+// A context of their own. They used to live in the Echo context value, so
+// every toast (and every toast expiring) re-rendered every useEcho consumer:
+// the feed, the settings form, the sidebar. The actions context never changes,
+// so callers that only raise toasts never re-render because of one.
+
+interface ToastActions {
+  addToast: AddToast;
+  dismissToast: (id: string) => void;
+}
+
+const ToastListContext = createContext<ToastMessage[]>([]);
+const ToastActionsContext = createContext<ToastActions | undefined>(undefined);
+
+export const ToastProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+
+  const dismissToast = useCallback((id: string) => {
+    const timer = timers.current.get(id);
+    if (timer) clearTimeout(timer);
+    timers.current.delete(id);
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const addToast = useCallback<AddToast>(
+    (message, type = 'info') => {
+      const id = `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      setToasts((prev) => [...prev, { id, message, type }]);
+      timers.current.set(id, setTimeout(() => dismissToast(id), 4000));
+    },
+    [dismissToast],
+  );
+
+  useEffect(() => {
+    const pending = timers.current;
+    return () => {
+      for (const t of pending.values()) clearTimeout(t);
+      pending.clear();
+    };
+  }, []);
+
+  const actions = useMemo(() => ({ addToast, dismissToast }), [addToast, dismissToast]);
+
+  return (
+    <ToastActionsContext.Provider value={actions}>
+      <ToastListContext.Provider value={toasts}>{children}</ToastListContext.Provider>
+    </ToastActionsContext.Provider>
+  );
+};
+
+/** Raise or dismiss toasts without subscribing to the list. */
+export const useToastActions = (): ToastActions => {
+  const ctx = useContext(ToastActionsContext);
+  if (!ctx) throw new Error('useToastActions must be used within a ToastProvider');
+  return ctx;
+};
+
+/** The visible toasts, for the toast container only. */
+export const useToasts = (): ToastMessage[] => useContext(ToastListContext);
 
 
 interface EchoContextType {
@@ -41,15 +109,13 @@ interface EchoContextType {
   updatePostStatus: (postId: string, status: LeadStatus) => void;
   runSweep: () => Promise<void>;
   isSweeping: boolean;
-  toasts: ToastMessage[];
-  dismissToast: (id: string) => void;
-  addToast: (message: string, type?: 'info' | 'success' | 'error') => void;
+  addToast: AddToast;
   // AI features
   generateAiDraft: (
     post: MonitoredPost,
     tone: 'professional' | 'casual' | 'consultative' | 'direct',
     customOffer?: string
-  ) => Promise<string>;
+  ) => Promise<DraftResult>;
   suggestKeywordsFromOffer: (
     offerText: string,
     website?: string,
@@ -73,6 +139,19 @@ interface EchoContextType {
   saveSettings: () => Promise<{ ok: boolean; warning?: string }>;
   enabledChannels: Platform[];
   toggleChannel: (platform: Platform) => void;
+  /**
+   * What the server will actually use: the settings last saved to the profile.
+   * The editable values above may hold unsaved edits, so anything that
+   * describes or filters by the current configuration reads these instead.
+   */
+  savedChannels: Platform[];
+  savedMinIntentThreshold: number;
+  savedSweepTime: string;
+  savedSweepCadence: '24h' | '12h' | '6h';
+  /** True while the Settings form holds edits that have not been saved. */
+  hasUnsavedSettings: boolean;
+  /** Puts the editable settings back to the saved profile values. */
+  discardSettingsChanges: () => void;
   /** Mentions surfaced since this session started (a cheap usage readout). */
   mentionsFound: number;
 }
@@ -83,17 +162,52 @@ const LOCAL_STORAGE_KEYWORDS_KEY = 'echo_mock_keywords';
 const LOCAL_STORAGE_POSTS_KEY = 'echo_mock_posts';
 const LOCAL_STORAGE_SETTINGS_KEY = 'echo_mock_settings';
 
-/**
- * How many keywords a workspace may track. Mirrors public.keyword_limit()
- * in Postgres, which is what actually enforces it.
- */
-const KEYWORD_LIMIT = 8;
+const DEFAULT_CHANNELS: Platform[] = ['twitter', 'reddit', 'google'];
 
-const channelLabel = (platform: Platform): string => {
-  if (platform === 'twitter') return 'X';
-  if (platform === 'google') return 'Web';
-  return platform.charAt(0).toUpperCase() + platform.slice(1);
+type Cadence = '24h' | '12h' | '6h';
+
+interface SettingsSnapshot {
+  lookbackHours: number;
+  sweepTime: string;
+  sweepCadence: Cadence;
+  minIntentThreshold: number;
+  feedRetentionDays: number;
+  enabledChannels: Platform[];
+}
+
+const DEFAULT_SETTINGS: SettingsSnapshot = {
+  lookbackHours: 24,
+  sweepTime: '06:00',
+  sweepCadence: '24h',
+  minIntentThreshold: 0,
+  feedRetentionDays: 30,
+  enabledChannels: DEFAULT_CHANNELS,
 };
+
+/** The settings a profile row describes, with the defaults filled in. */
+function settingsFromProfile(profile: Profile | null): SettingsSnapshot {
+  if (!profile) return DEFAULT_SETTINGS;
+  return {
+    lookbackHours: profile.lookback_hours ?? DEFAULT_SETTINGS.lookbackHours,
+    sweepTime: profile.sweep_time_utc || DEFAULT_SETTINGS.sweepTime,
+    sweepCadence: (profile.sweep_frequency as Cadence) || DEFAULT_SETTINGS.sweepCadence,
+    minIntentThreshold: profile.min_intent_threshold ?? DEFAULT_SETTINGS.minIntentThreshold,
+    feedRetentionDays: profile.feed_retention_days ?? DEFAULT_SETTINGS.feedRetentionDays,
+    enabledChannels:
+      Array.isArray(profile.enabled_channels) && profile.enabled_channels.length > 0
+        ? profile.enabled_channels
+        : DEFAULT_SETTINGS.enabledChannels,
+  };
+}
+
+const sameSettings = (a: SettingsSnapshot, b: SettingsSnapshot): boolean =>
+  a.lookbackHours === b.lookbackHours &&
+  a.sweepTime === b.sweepTime &&
+  a.sweepCadence === b.sweepCadence &&
+  a.minIntentThreshold === b.minIntentThreshold &&
+  a.feedRetentionDays === b.feedRetentionDays &&
+  a.enabledChannels.length === b.enabledChannels.length &&
+  a.enabledChannels.every((c) => b.enabledChannels.includes(c));
 
 export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { user, profile, patchProfile } = useAuth();
@@ -107,7 +221,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [isLoadingKeywords, setIsLoadingKeywords] = useState<boolean>(true);
   const [isLoadingPosts, setIsLoadingPosts] = useState<boolean>(true);
   const [isSweeping, setIsSweeping] = useState<boolean>(false);
-  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const { addToast } = useToastActions();
 
   
   // Filtering
@@ -127,36 +241,28 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const keywordLimit = KEYWORD_LIMIT;
 
-  // --- Toasts ---------------------------------------------------------------
-  const dismissToast = useCallback((id: string) => {
-    setToasts((prev) => prev.filter((t) => t.id !== id));
-  }, []);
-
-  const addToast = useCallback(
-    (message: string, type: 'info' | 'success' | 'error' = 'info') => {
-      const id = `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-      setToasts((prev) => [...prev, { id, message, type }]);
-      setTimeout(() => dismissToast(id), 4000);
-    },
-    [dismissToast],
-  );
-
+  /**
+   * Edits the (unsaved) channel selection. No toast on success: nothing has
+   * been saved yet, so "Activated X" described a change the server did not
+   * know about. The Settings form shows the unsaved state instead. The
+   * last-channel guard is decided outside the state updater, because an
+   * updater runs twice under StrictMode and toasted twice.
+   */
   const toggleChannel = useCallback(
     (platform: Platform) => {
-      setEnabledChannels((prev) => {
-        if (prev.includes(platform)) {
-          if (prev.length <= 1) {
-            addToast('At least one platform must remain active for monitoring.', 'error');
-            return prev;
-          }
-          addToast(`Deactivated ${channelLabel(platform)} channel.`, 'info');
-          return prev.filter((p) => p !== platform);
-        }
-        addToast(`Activated ${channelLabel(platform)} channel.`, 'success');
-        return [...prev, platform];
-      });
+      if (enabledChannels.includes(platform) && enabledChannels.length <= 1) {
+        addToast('At least one channel must stay on.', 'error');
+        return;
+      }
+      setEnabledChannels((prev) =>
+        prev.includes(platform)
+          ? prev.length <= 1
+            ? prev
+            : prev.filter((p) => p !== platform)
+          : [...prev, platform],
+      );
     },
-    [addToast],
+    [enabledChannels, addToast],
   );
 
   // --- Loading --------------------------------------------------------------
@@ -228,64 +334,65 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [userId]);
 
   /**
-   * Copies the saved preferences into the editable settings state, once per
-   * signed-in user as soon as that user's profile is available. It used to run
-   * on every profile change, which overwrote unsaved edits and, right after a
-   * save, reverted them to the stale profile copy.
+   * Copies the saved preferences into the editable settings state.
+   *
+   * Runs when the signed-in user's profile first arrives, and again whenever
+   * the saved values change while the form holds no unsaved edits (a save, a
+   * retry that finally loaded the profile, another tab). It never runs over
+   * unsaved edits. Adjusted during render (React's "storing information from
+   * previous renders" pattern) rather than in an effect, so there is no pass
+   * showing defaults before the saved values.
    */
-  // Adjusted during render (React's "storing information from previous
-  // renders" pattern) rather than in an effect, so there is no extra pass
-  // showing defaults before the saved values.
-  const [hydratedFor, setHydratedFor] = useState<string | null>(null);
   const profileForUser = profile && userId && profile.id === userId ? profile : null;
-
-  if (!userId && hydratedFor !== null) setHydratedFor(null);
-  if (userId && profileForUser && hydratedFor !== userId) {
-    setHydratedFor(userId);
-    const profile = profileForUser;
-
-    // Server-persisted profile fields are authoritative in connected mode.
-    {
-      if (profile.lookback_hours !== undefined && profile.lookback_hours !== null) {
-        setLookbackHours(profile.lookback_hours);
-      }
-      if (profile.sweep_time_utc) setSweepTime(profile.sweep_time_utc);
-      if (profile.sweep_frequency) {
-        setSweepCadence(profile.sweep_frequency as '24h' | '12h' | '6h');
-      }
-      if (profile.min_intent_threshold !== undefined && profile.min_intent_threshold !== null) {
-        setMinIntentThreshold(profile.min_intent_threshold);
-      }
-      if (profile.feed_retention_days !== undefined && profile.feed_retention_days !== null) {
-        setFeedRetentionDays(profile.feed_retention_days);
-      }
-      if (Array.isArray(profile.enabled_channels) && profile.enabled_channels.length > 0) {
-        setEnabledChannels(profile.enabled_channels);
-      }
+  const savedSettings = useMemo(() => {
+    const fromProfile = settingsFromProfile(profileForUser);
+    if (isConfigured || !userId) return fromProfile;
+    // Local sandbox: localStorage is the store.
+    try {
+      const raw = localStorage.getItem(`${LOCAL_STORAGE_SETTINGS_KEY}_${userId}`);
+      return raw ? { ...fromProfile, ...(JSON.parse(raw) as Partial<SettingsSnapshot>) } : fromProfile;
+    } catch {
+      return fromProfile;
     }
+  }, [profileForUser, userId]);
 
-    // Local sandbox preferences overlay (mock mode only).
-    const saved = isConfigured ? null : localStorage.getItem(`${LOCAL_STORAGE_SETTINGS_KEY}_${userId}`);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (parsed.lookbackHours !== undefined) setLookbackHours(parsed.lookbackHours);
-        if (parsed.sweepTime !== undefined) setSweepTime(parsed.sweepTime);
-        if (parsed.sweepCadence !== undefined) setSweepCadence(parsed.sweepCadence);
-        if (parsed.minIntentThreshold !== undefined) {
-          setMinIntentThreshold(parsed.minIntentThreshold);
-        }
-        if (parsed.feedRetentionDays !== undefined) {
-          setFeedRetentionDays(parsed.feedRetentionDays);
-        }
-        if (Array.isArray(parsed.enabledChannels) && parsed.enabledChannels.length > 0) {
-          setEnabledChannels(parsed.enabledChannels);
-        }
-      } catch (err) {
-        console.error('Error loading settings:', err);
-      }
+  const currentSettings: SettingsSnapshot = useMemo(
+    () => ({ lookbackHours, sweepTime, sweepCadence, minIntentThreshold, feedRetentionDays, enabledChannels }),
+    [lookbackHours, sweepTime, sweepCadence, minIntentThreshold, feedRetentionDays, enabledChannels],
+  );
+
+  const applySettings = useCallback((next: SettingsSnapshot) => {
+    setLookbackHours(next.lookbackHours);
+    setSweepTime(next.sweepTime);
+    setSweepCadence(next.sweepCadence);
+    setMinIntentThreshold(next.minIntentThreshold);
+    setFeedRetentionDays(next.feedRetentionDays);
+    setEnabledChannels(next.enabledChannels);
+  }, []);
+
+  // What the form was last synced from: null until a profile has been applied.
+  const [hydratedFrom, setHydratedFrom] = useState<{ user: string; settings: SettingsSnapshot } | null>(null);
+  if (!userId && hydratedFrom !== null) setHydratedFrom(null);
+  if (userId && profileForUser) {
+    const firstForUser = hydratedFrom?.user !== userId;
+    const savedChanged = !firstForUser && !sameSettings(hydratedFrom!.settings, savedSettings);
+    const formClean = !firstForUser && sameSettings(hydratedFrom!.settings, currentSettings);
+    if (firstForUser || (savedChanged && formClean)) {
+      setHydratedFrom({ user: userId, settings: savedSettings });
+      applySettings(savedSettings);
+    } else if (savedChanged && sameSettings(currentSettings, savedSettings)) {
+      // The edits were just saved: the form already shows the new values.
+      setHydratedFrom({ user: userId, settings: savedSettings });
     }
   }
+
+  const hasUnsavedSettings = Boolean(profileForUser) && !sameSettings(currentSettings, savedSettings);
+  const savedChannels = savedSettings.enabledChannels;
+  const savedMinIntentThreshold = savedSettings.minIntentThreshold;
+  const savedSweepTime = savedSettings.sweepTime;
+  const savedSweepCadence = savedSettings.sweepCadence;
+
+  const discardSettingsChanges = useCallback(() => applySettings(savedSettings), [applySettings, savedSettings]);
 
   // --- Bootstrapping --------------------------------------------------------
   useEffect(() => {
@@ -495,23 +602,21 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const runSweep = useCallback(async () => {
     if (!user) return;
+    // The server sweeps the saved channels, so that is what is announced.
+    const activeKeywords = keywords.filter((k) => k.is_active);
+    if (activeKeywords.length === 0) {
+      addToast('No active keywords to track. Add keywords in the Keywords tab.', 'info');
+      return;
+    }
+    if (savedChannels.length === 0) {
+      addToast('Enable at least one channel in Settings.', 'error');
+      return;
+    }
+
     setIsSweeping(true);
-    addToast(`Scanning ${enabledChannels.map(channelLabel).join(', ')}...`, 'info');
+    addToast(`Scanning ${savedChannels.map(channelLabel).join(', ')}...`, 'info');
 
     try {
-      const activeKeywords = keywords.filter((k) => k.is_active);
-
-      if (activeKeywords.length === 0) {
-        setIsSweeping(false);
-        addToast('No active keywords to track. Add keywords in the Keywords tab.', 'info');
-        return;
-      }
-      if (enabledChannels.length === 0) {
-        setIsSweeping(false);
-        addToast('Enable at least one channel in Settings.', 'error');
-        return;
-      }
-
       const result = await invokeSearchSweep();
 
       // The edge function already persisted anything new. Re-read so the feed
@@ -536,7 +641,9 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         );
       } else {
         addToast(
-          `Sweep finished. Nothing new above your ${minIntentThreshold}% intent threshold.`,
+          savedMinIntentThreshold > 0
+            ? `Sweep finished. Nothing new above your ${savedMinIntentThreshold}% intent threshold.`
+            : 'Sweep finished. Nothing new this time.',
           'info',
         );
       }
@@ -546,8 +653,13 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (err) {
       setIsSweeping(false);
       addToast(`Sweep failed: ${(err as Error)?.message || 'Unknown error'}`, 'error');
+    } finally {
+      // A sweep reserves and settles credits whether or not it found anything
+      // (and a failed one may have released a hold), so every balance on screen
+      // is re-read from the one wallet store.
+      void walletStore.refresh().catch(() => {});
     }
-  }, [user, keywords, enabledChannels, minIntentThreshold, addToast, loadPosts]);
+  }, [user, keywords, savedChannels, savedMinIntentThreshold, addToast, loadPosts]);
 
   // --- AI -------------------------------------------------------------------
 
@@ -556,7 +668,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       post: MonitoredPost,
       tone: 'professional' | 'casual' | 'consultative' | 'direct',
       customOffer?: string,
-    ): Promise<string> =>
+    ): Promise<DraftResult> =>
       generateAiOutreachDraft(
         post,
         tone,
@@ -597,6 +709,11 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
    */
   const saveSettings = useCallback(async (): Promise<{ ok: boolean; warning?: string }> => {
     if (!user) return { ok: false, warning: 'Not signed in.' };
+    // Without the profile, the form shows defaults rather than the saved
+    // values; writing them would replace a real configuration with defaults.
+    if (!profileForUser) {
+      return { ok: false, warning: 'Your profile has not loaded yet, so nothing was saved. Try again in a moment.' };
+    }
 
     const fields = {
       lookback_hours: lookbackHours,
@@ -634,6 +751,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return { ok: true };
   }, [
     user,
+    profileForUser,
     lookbackHours,
     sweepTime,
     sweepCadence,
@@ -774,8 +892,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       updatePostStatus,
       runSweep,
       isSweeping,
-      toasts,
-      dismissToast,
       addToast,
       generateAiDraft,
       suggestKeywordsFromOffer,
@@ -796,6 +912,12 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       saveSettings,
       enabledChannels,
       toggleChannel,
+      savedChannels,
+      savedMinIntentThreshold,
+      savedSweepTime,
+      savedSweepCadence,
+      hasUnsavedSettings,
+      discardSettingsChanges,
       mentionsFound,
     }),
     [
@@ -808,8 +930,6 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       filterPlatform,
       filterStatus,
       filterSearch,
-      toasts,
-      dismissToast,
       addToast,
       addKeyword,
       removeKeyword,
@@ -831,6 +951,12 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       saveSettings,
       enabledChannels,
       toggleChannel,
+      savedChannels,
+      savedMinIntentThreshold,
+      savedSweepTime,
+      savedSweepCadence,
+      hasUnsavedSettings,
+      discardSettingsChanges,
       mentionsFound,
     ],
   );

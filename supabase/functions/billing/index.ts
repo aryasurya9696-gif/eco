@@ -18,26 +18,47 @@
 // directories and the relative import fails to resolve on deploy.
 //
 // Deploy:  supabase functions deploy billing
-// Request:  { action: 'balance' | 'packages' | 'history' | 'quote' | 'checkout' | 'status' }
+// Request:  { action: 'balance' | 'packages' | 'pricing' | 'history' | 'quote' | 'checkout' | 'status' }
 // Response: { ok: true, ... }
 // ============================================================================
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-const ALLOWED_ORIGIN = Deno.env.get('ALLOWED_ORIGIN') || '*';
+const stripSlash = (s: string): string => s.replace(/\/+$/, '');
 
-function corsHeaders(): Record<string, string> {
-  return {
-    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
-    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  };
+// CORS: ALLOWED_ORIGIN is a comma-separated allow-list of exact origins, and
+// APP_ORIGIN is always on it. The request's Origin is echoed only when it is on
+// the list. With nothing configured only local dev origins are allowed; "*" is
+// never the default and must be configured explicitly.
+const ALLOWED_ORIGINS = [
+  ...(Deno.env.get('ALLOWED_ORIGIN') || '').split(','),
+  Deno.env.get('APP_ORIGIN') || '',
+].map((o) => stripSlash(o.trim())).filter(Boolean);
+const DEV_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+
+function allowedOrigin(origin: string | null): string | null {
+  if (!origin) return null;
+  const o = stripSlash(origin);
+  if (ALLOWED_ORIGINS.includes('*')) return '*';
+  if (ALLOWED_ORIGINS.includes(o)) return o;
+  if (ALLOWED_ORIGINS.length === 0 && DEV_ORIGIN_RE.test(o)) return o;
+  return null;
+}
+
+/** Adds CORS headers for this request's Origin to any response. */
+function withCors(req: Request, res: Response): Response {
+  const origin = allowedOrigin(req.headers.get('Origin'));
+  if (origin) res.headers.set('Access-Control-Allow-Origin', origin);
+  res.headers.set('Vary', 'Origin');
+  res.headers.set('Access-Control-Allow-Headers', 'authorization, x-client-info, apikey, content-type');
+  res.headers.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  return res;
 }
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+    headers: { 'Content-Type': 'application/json' },
   });
 }
 
@@ -45,8 +66,13 @@ function fail(message: string, status = 400): Response {
   return json({ ok: false, error: message }, status);
 }
 
+interface AuthedUser {
+  id: string;
+  email: string | null;
+}
+
 /** Verifies the caller's JWT server-side. Identity is never taken from the body. */
-async function requireUserId(req: Request): Promise<string | null> {
+async function requireUser(req: Request): Promise<AuthedUser | null> {
   const authHeader = req.headers.get('Authorization');
   if (!authHeader) return null;
 
@@ -55,12 +81,16 @@ async function requireUserId(req: Request): Promise<string | null> {
   if (!supabaseUrl || !anonKey) return null;
 
   try {
+    // Bounded: a hung auth endpoint otherwise holds the request open until the
+    // platform kills it, and the client sees a generic failure.
     const res = await fetch(supabaseUrl + '/auth/v1/user', {
       headers: { Authorization: authHeader, apikey: anonKey },
+      signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) return null;
     const user = await res.json();
-    return typeof user?.id === 'string' ? user.id : null;
+    if (typeof user?.id !== 'string') return null;
+    return { id: user.id, email: typeof user.email === 'string' ? user.email : null };
   } catch {
     return null;
   }
@@ -115,21 +145,20 @@ function dodoBaseUrl(): string {
   return 'https://test.dodopayments.com';
 }
 
-const stripSlash = (s: string): string => s.replace(/\/+$/, '');
-
 /**
  * Where the provider sends the customer back to.
  *
  * APP_ORIGIN is authoritative. Without it, the request's Origin is used only
- * when it is exactly the configured ALLOWED_ORIGIN — echoing an arbitrary
- * Origin would let any page start a checkout that returns somewhere else.
+ * when it is explicitly on the ALLOWED_ORIGIN list (never via "*" or the dev
+ * fallback) — echoing an arbitrary Origin would let any page start a checkout
+ * that returns somewhere else.
  */
 function resolveAppOrigin(req: Request): string | null {
   const configured = Deno.env.get('APP_ORIGIN');
   if (configured && configured.trim()) return stripSlash(configured.trim());
 
   const origin = req.headers.get('Origin');
-  if (origin && ALLOWED_ORIGIN !== '*' && stripSlash(origin) === stripSlash(ALLOWED_ORIGIN)) {
+  if (origin && origin !== '*' && ALLOWED_ORIGINS.includes(stripSlash(origin))) {
     return stripSlash(origin);
   }
   return null;
@@ -158,7 +187,7 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
   // Returning early without it left the UI with nothing to warn about, which is
   // the opposite of what someone on zero credits should see.
   if (!wallet) {
-    const empty = { balance: 0, reserved: 0, available: 0 };
+    const empty = { balance: 0, reserved: 0, available: 0, paid_available: 0 };
     // The keyword count comes from `count` — a head:true query has no `data`,
     // so reading the whole response as a number quoted every empty wallet as
     // free.
@@ -245,7 +274,16 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
     sweepCost += effectiveKeywords * (priceOf.get(OPERATION_OF[ch]) ?? 0);
   }
 
-  const available = Math.max(balance - reserved, 0);
+  // Spendable split as the wallet RPCs see it: only unexpired grants count, and
+  // paid_available leaves out welcome credits, which pay for feed sweeps only
+  // (Leads and Mail reserve paid-only). Falls back to the raw figures on a
+  // database that predates wallet_spendable.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- untyped client
+  const { data: spend, error: spendError } = await (admin as any).rpc('wallet_spendable', { p_user_id: userId });
+  if (spendError) console.error('[billing] wallet_spendable failed:', spendError.message);
+  const spendOk = !spendError && spend && typeof spend === 'object';
+  const available = spendOk ? num((spend as any).available) : Math.max(balance - reserved, 0);
+  const paidAvailable = spendOk ? num((spend as any).available_paid) : 0;
 
   // Two totals the history query cannot supply.
   //
@@ -276,6 +314,9 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
       balance,
       reserved,
       available,
+      // Purchased credits spendable now, net of paid-only holds. 0 while
+      // `available` is not means only welcome credits are left.
+      paid_available: paidAvailable,
       lifetime_granted: lifetimeGranted,
       lifetime_consumed: num(wallet.lifetime_consumed),
       // What actually went through a payment, and what was given. Never merged.
@@ -327,6 +368,29 @@ async function actionPackages(admin: ReturnType<typeof createClient>) {
       // Unit price shown on the card. Derived from the same numbers the grant
       // will use, so what is advertised is what is charged.
       per_credit_usd: num(p.credits) > 0 ? num(p.gross_usd) / num(p.credits) : 0,
+    })),
+  };
+}
+
+/**
+ * The price list the frontend renders (N14): enabled operations only, and only
+ * what the customer pays. Provider cost, cost source and margin stay server-side.
+ */
+async function actionPricing(admin: ReturnType<typeof createClient>) {
+  const { data, error } = await admin
+    .from('pricing_config')
+    .select('operation, display_name, credits')
+    .eq('enabled', true)
+    .order('operation');
+
+  if (error) throw new Error(`pricing lookup failed: ${error.message}`);
+
+  return {
+    ok: true,
+    pricing: (data ?? []).map((p: any) => ({
+      operation: String(p.operation),
+      display_name: String(p.display_name ?? p.operation),
+      credits: num(p.credits),
     })),
   };
 }
@@ -424,6 +488,7 @@ async function actionCheckout(
   admin: ReturnType<typeof createClient>,
   req: Request,
   userId: string,
+  userEmail: string | null,
   packageCode: string,
 ) {
   const { data: pkg, error } = await admin
@@ -493,7 +558,7 @@ async function actionCheckout(
 
   const { data: profile } = await admin
     .from('profiles')
-    .select('email, full_name')
+    .select('full_name')
     .eq('id', userId)
     .maybeSingle();
 
@@ -519,26 +584,36 @@ async function actionCheckout(
     return fail('Could not start checkout', 500);
   }
 
-  const res = await fetch(`${base}/checkout/sessions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      product_cart: [{ product_id: productId, quantity: 1 }],
-      customer: { email: profile?.email, name: profile?.full_name },
-      metadata: { order_id: order.id, package_code: pkg.code },
-      // Returns to the Billing tab. The flag goes in the real query string,
-      // before the hash: BillingTab reads window.location.search, and a
-      // "?billing=" inside the hash is invisible to it.
-      return_url: `${appOrigin}/?billing=returned#dashboard/billing`,
-    }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${base}/checkout/sessions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        product_cart: [{ product_id: productId, quantity: 1 }],
+        // profiles has no email column (selecting one errored and left the
+        // customer blank); the address comes from the verified auth user.
+        customer: { email: userEmail ?? undefined, name: profile?.full_name ?? undefined },
+        metadata: { order_id: order.id, package_code: pkg.code },
+        // Returns to the Billing tab. The flag goes in the real query string,
+        // before the hash: BillingTab reads window.location.search, and a
+        // "?billing=" inside the hash is invisible to it.
+        return_url: `${appOrigin}/?billing=returned#dashboard/billing`,
+      }),
+      signal: AbortSignal.timeout(20_000),
+    });
+  } catch (err) {
+    console.error('[billing] checkout session request failed:', (err as Error)?.name);
+    return fail('The payment provider did not respond. Please try again.', 504);
+  }
 
   if (!res.ok) {
-    const body = await res.text();
-    console.error('[billing] checkout session failed:', res.status, body.slice(0, 300));
+    // Status only: the provider's error body can echo customer details.
+    await res.body?.cancel();
+    console.error('[billing] checkout session failed: HTTP', res.status);
     // Leave the order abandoned rather than deleting it: if the provider did
     // charge and only the response failed, the webhook can still find it.
     return fail('Payment provider rejected the request', 502);
@@ -560,6 +635,10 @@ async function actionCheckout(
 
 /** Polls one order. Lets the page show "processing" while the webhook lands. */
 async function actionStatus(admin: ReturnType<typeof createClient>, userId: string, orderId: string) {
+  // A malformed id is "not found", not a Postgres uuid cast error surfacing as 500.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(orderId)) {
+    return { __status: 404, ok: false, error: 'order_not_found' };
+  }
   const { data, error } = await admin
     .from('payment_orders')
     .select('id, status, credits_granted, gross_usd, currency, created_at, settled_at')
@@ -575,12 +654,15 @@ async function actionStatus(admin: ReturnType<typeof createClient>, userId: stri
 
 // ============================================================================
 
-Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders() });
+Deno.serve(async (req) => withCors(req, await handle(req)));
+
+async function handle(req: Request): Promise<Response> {
+  if (req.method === 'OPTIONS') return new Response('ok');
   if (req.method !== 'POST') return fail('Method not allowed', 405);
 
-  const userId = await requireUserId(req);
-  if (!userId) return fail('Unauthorized', 401);
+  const user = await requireUser(req);
+  if (!user) return fail('Unauthorized', 401);
+  const userId = user.id;
 
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
   const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -608,6 +690,9 @@ Deno.serve(async (req) => {
       case 'packages':
         result = await actionPackages(admin);
         break;
+      case 'pricing':
+        result = await actionPricing(admin);
+        break;
       case 'history':
         result = await actionHistory(admin, userId);
         break;
@@ -615,7 +700,7 @@ Deno.serve(async (req) => {
         result = await actionQuote(admin, userId, Array.isArray(body.channels) ? body.channels : []);
         break;
       case 'checkout':
-        result = await actionCheckout(admin, req, userId, String(body.packageCode ?? ''));
+        result = await actionCheckout(admin, req, userId, user.email, String(body.packageCode ?? ''));
         break;
       case 'status':
         result = await actionStatus(admin, userId, String(body.orderId ?? ''));
@@ -623,6 +708,11 @@ Deno.serve(async (req) => {
       default:
         return fail('Unknown action', 400);
     }
+
+    // Some failure paths build their own Response (with its status). Passing one
+    // through json() serialised it as `{}` at HTTP 200, so a failed checkout
+    // looked like a success with no URL.
+    if (result instanceof Response) return result;
 
     if (typeof result?.__status === 'number') {
       status = result.__status;
@@ -634,4 +724,4 @@ Deno.serve(async (req) => {
     console.error('[billing] action failed:', (err as Error)?.message);
     return fail('Billing request failed', 500);
   }
-});
+}

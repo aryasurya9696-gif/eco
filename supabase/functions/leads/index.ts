@@ -7,15 +7,48 @@
 // ============================================================================
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import {
+  acceptNameOnlyMatch,
+  affordableSearchLimit,
+  allowedOrigins,
+  corsOriginFor,
+  classifyEmail,
+  cleanDomain,
+  dedupeLeads,
+  hasRevealedEmail,
+  hasUsableEmail,
+  isEmailAddress,
+  leadKey,
+  linkedinSlug,
+  MAX_PROVIDER_CALLS,
+  MAX_SEARCH_DOMAINS,
+  maxSearchProviderCalls,
+  mergeLeadRecord,
+  PAID_CREDITS_MESSAGE,
+  UsageLog,
+} from './lib.ts';
 
-const ALLOWED_ORIGIN = Deno.env.get('ALLOWED_ORIGIN') || '*';
+/**
+ * CORS allow-list, never `*` by default: ALLOWED_ORIGIN (comma-separated) and
+ * APP_ORIGIN form the list; with neither set only the local dev server is
+ * allowed. `*` only when ALLOWED_ORIGIN is set to it explicitly.
+ */
+const ALLOWED_ORIGINS = allowedOrigins(Deno.env.get('ALLOWED_ORIGIN'), Deno.env.get('APP_ORIGIN'));
 
+/** Static CORS headers; the origin itself is set per request in Deno.serve (withCors). */
 function corsHeaders(): Record<string, string> {
   return {
-    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
     'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    Vary: 'Origin',
   };
+}
+
+/** Stamps the request-specific Access-Control-Allow-Origin onto a response. */
+function withCors(res: Response, req: Request): Response {
+  res.headers.set('Access-Control-Allow-Origin', corsOriginFor(req.headers.get('Origin'), ALLOWED_ORIGINS));
+  res.headers.set('Vary', 'Origin');
+  return res;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -82,8 +115,8 @@ function sanitizeSearchLimit(raw: unknown): number {
  * is what keeps a large request inside the request timeout: sequentially, ten
  * calls would take ten times as long.
  */
-const MAX_PROVIDER_CALLS = 12;
-const MAX_SEARCH_DOMAINS = 10;
+// MAX_PROVIDER_CALLS (12) and MAX_SEARCH_DOMAINS (10) live in lib.ts with
+// maxSearchProviderCalls, which mirrors how the search spends them.
 
 /**
  * Upper bounds on a single provider call.
@@ -102,54 +135,8 @@ function cleanFilter(value: unknown): string {
   return typeof value === 'string' ? value.trim().slice(0, MAX_FILTER_LENGTH) : '';
 }
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-/**
- * True for a string that is actually an email address.
- *
- * The provider fills the email field with placeholders such as "N/A". Those
- * were treated as revealed addresses: the row showed "N/A" with a copy button,
- * lost its Reveal button, and was skipped by auto-enrich and bulk reveal.
- */
-function isEmailAddress(value: unknown): value is string {
-  return typeof value === 'string' && !value.includes('*') && EMAIL_RE.test(value.trim());
-}
-
-/**
- * True when a saved row holds a resolved work email.
- *
- * A "preview" address is the provider's unverified homepage/company address,
- * not a reveal. Counting it as one made the reveal endpoints return it as
- * "already revealed" for free, so the verified address could never be bought.
- */
-function hasRevealedEmail(row: any): boolean {
-  return isEmailAddress(row?.work_email) && row?.email_status !== 'preview';
-}
-
-/**
- * What an email lookup's verifier said, and whether it may be charged.
- *
- * Treg puts the verifier's answer at _treg.verification.verdict: valid,
- * invalid, catch_all, risky or unknown (or `checked: false` / `pending: true`
- * when no verdict exists yet). Only a `valid` address is charged. Every other
- * found address is still shown — labelled unconfirmed — but costs nothing;
- * an `invalid` one is treated as not found at all. The old code charged every
- * hit and defaulted a missing verdict to "valid".
- */
-interface EmailVerdict {
-  status: string;
-  charge: boolean;
-  usable: boolean;
-}
-function classifyEmail(resJson: any): EmailVerdict {
-  const v = resJson?._treg?.verification;
-  const verdict = typeof v?.verdict === 'string' ? v.verdict.toLowerCase() : '';
-  if (verdict === 'valid') return { status: 'valid', charge: true, usable: true };
-  if (verdict === 'invalid') return { status: 'invalid', charge: false, usable: false };
-  if (verdict === 'catch_all') return { status: 'accept_all', charge: false, usable: true };
-  if (verdict === 'risky') return { status: 'risky', charge: false, usable: true };
-  return { status: v?.pending ? 'pending' : 'unknown', charge: false, usable: true };
-}
+// isEmailAddress, hasRevealedEmail, hasUsableEmail and classifyEmail live in
+// lib.ts (unit tested there).
 
 /**
  * One provider search call.
@@ -159,28 +146,49 @@ function classifyEmail(resJson: any): EmailVerdict {
  * call failed". Treating the two the same is how a provider outage on a
  * multi-company search came back as a successful search with zero results.
  */
+/**
+ * Headers for one Treg call. Every call carries an `Idempotency-Key` (audit
+ * N13): without one, a retry after a timeout paid the provider twice for the
+ * same lookup. Callers derive the key from the request's own reservation key
+ * plus the lead / call index, so a retried request replays rather than re-buys.
+ */
+function tregHeaders(
+  token: string,
+  userId: string,
+  feature: string,
+  maxCost: string,
+  idempotencyKey: string,
+  extra: Record<string, string> = {},
+): Record<string, string> {
+  return {
+    'X-Treg-Token': token,
+    'X-Treg-Meta': `customer=${userId}, feature=${feature}`,
+    'X-Treg-Route-Max-Cost': maxCost,
+    'Idempotency-Key': idempotencyKey.slice(0, 255),
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+    ...extra,
+  };
+}
+
 async function tregPeopleSearch(
   token: string,
   userId: string,
   payload: Record<string, any>,
   feature: string,
-  tagDomain?: string,
-  usage?: UsageLog,
+  tagDomain: string | undefined,
+  usage: UsageLog,
+  reservationId: string | null,
+  idempotencyKey: string,
 ): Promise<any[] | null> {
   try {
     const res = await fetch(`${TREG_BASE}/call/treg.people.search`, {
       method: 'POST',
-      headers: {
-        'X-Treg-Token': token,
-        'X-Treg-Meta': `customer=${userId}, feature=${feature}`,
-        'X-Treg-Route-Max-Cost': MAX_COST.search,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
+      headers: tregHeaders(token, userId, feature, MAX_COST.search, idempotencyKey),
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
     });
-    usage?.track('treg.people.search', res, { feature, batch: true });
+    usage.track('treg.people.search', res, { feature, batch: true }, reservationId);
     if (!res.ok) {
       console.warn('[leads] treg.people.search batch failed:', res.status);
       return null;
@@ -190,7 +198,7 @@ async function tregPeopleSearch(
     if (!Array.isArray(people)) return [];
     return tagDomain ? people.map((p: any) => ({ ...p, _searched_domain: tagDomain })) : people;
   } catch (err: any) {
-    usage?.track('treg.people.search', null, { feature, batch: true, error: err?.name || 'error' });
+    usage.track('treg.people.search', null, { feature, batch: true, error: err?.name || 'error' }, reservationId);
     console.warn('[leads] treg.people.search batch error:', err?.name || err?.message);
     return null;
   }
@@ -264,7 +272,7 @@ function buildSearchVariations(base: Record<string, any>, count: number): Record
   return variants.slice(0, count);
 }
 
-async function resolveToken(admin: ReturnType<typeof createClient>): Promise<string> {
+async function resolveToken(admin: any): Promise<string> {
   if (tregToken) return tregToken;
   const { data, error } = await admin
     .from('service_secrets')
@@ -281,139 +289,92 @@ async function resolveToken(admin: ReturnType<typeof createClient>): Promise<str
 
 
 // ---------------------------------------------------------------------------
-// Pricing, cost caps and usage logging
+// Pricing and cost caps
 // ---------------------------------------------------------------------------
 
 /**
  * Most Treg may spend on one routed call. Treg's default is $1, and the
- * search route used to send no cap at all — a single 100-person call could
- * cost $0.30 while the user paid nothing. Each cap leaves at least ~20%
- * margin on the credit price (1 credit = $0.05): email 1 cr vs $0.04, phone
- * 2 cr vs $0.08, and a 100-lead search call vs the 2 credits it can earn.
+ * search route used to send no cap at all. These are routing caps, not
+ * prices: every credit price is read from pricing_config (1 credit = $0.05).
+ *
+ * Set from treg's catalog prices (cheapest email providers $0.0005–$0.011,
+ * phone $0.0005–$0.026, people search free–$0.0026 per call) so that each
+ * cap keeps at least ~60–70% margin at the configured prices: search $0.015
+ * per call vs 1 credit per billed call, email $0.015 vs 1 credit, phone
+ * $0.03 vs 2 credits. A route that would cost more is not taken.
  */
-const MAX_COST = { search: '0.05', email: '0.04', phone: '0.08' } as const;
-
-/** Leads per search that cost nothing; every further block is charged. */
-const SEARCH_FREE_LEADS = 25;
-const SEARCH_LEADS_PER_BLOCK = 50;
-
-interface Prices {
-  email: number;
-  phone: number;
-  /** Flat credits per search request (pricing_config `treg.people.search`). */
-  search: number;
-  searchBlock: number;
-}
-
-// A search fans out to several billed provider calls, so it carries a flat
-// per-request price on top of the per-contact charges. The fallback matches
-// the seeded pricing_config row.
-const FALLBACK_PRICES: Prices = { email: 1, phone: 2, search: 1, searchBlock: 0 };
-let priceCache: { at: number; prices: Prices } | null = null;
+const MAX_COST = { search: '0.015', email: '0.015', phone: '0.03' } as const;
 
 /**
- * Credit prices come from pricing_config, so changing a price is a data change
- * rather than a deploy. The constants above are only the fallback when the
- * table cannot be read; they match the seeded rows.
+ * Credit prices, all from pricing_config. A price is null when its row is
+ * missing, disabled or unreadable: the action that needs it is then refused
+ * rather than charged at a guessed price. (There used to be hardcoded 1 / 2 /
+ * 1 fallbacks, which silently under-charged whenever the table read failed.)
  */
+interface Prices {
+  /** Credits per verified email (`treg.people.email.find`). */
+  email: number | null;
+  /** Credits per phone number found (`treg.people.phone.find`). */
+  phone: number | null;
+  /**
+   * Credits per BILLED provider search call (`treg.people.search`). A search
+   * makes 1–12 provider calls and is charged for each one the provider billed
+   * (audit H4). `leads.search.extra_50` is no longer read.
+   */
+  search: number | null;
+}
+
+let priceCache: { at: number; prices: Prices } | null = null;
+
 async function loadPrices(admin: any): Promise<Prices> {
   if (priceCache && Date.now() - priceCache.at < 60_000) return priceCache.prices;
-  const prices = { ...FALLBACK_PRICES };
+  const prices: Prices = { email: null, phone: null, search: null };
   try {
     const { data, error } = await admin
       .from('pricing_config')
       .select('operation, credits, enabled')
-      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'treg.people.search', 'leads.search.extra_50']);
-    if (!error && Array.isArray(data)) {
-      for (const row of data) {
-        const credits = Number(row.credits);
-        if (!row.enabled || !Number.isFinite(credits) || credits < 0) continue;
-        if (row.operation === 'treg.people.email.find') prices.email = credits;
-        if (row.operation === 'treg.people.phone.find') prices.phone = credits;
-        if (row.operation === 'treg.people.search') prices.search = credits;
-        if (row.operation === 'leads.search.extra_50') prices.searchBlock = credits;
-      }
+      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'treg.people.search']);
+    if (error || !Array.isArray(data)) {
+      console.warn('[leads] pricing lookup failed:', error?.message);
+      return prices; // not cached: the next request retries the read
+    }
+    for (const row of data) {
+      const credits = Number(row.credits);
+      if (!row.enabled || !Number.isFinite(credits) || credits < 0) continue;
+      if (row.operation === 'treg.people.email.find') prices.email = credits;
+      if (row.operation === 'treg.people.phone.find') prices.phone = credits;
+      if (row.operation === 'treg.people.search') prices.search = credits;
     }
   } catch (err: any) {
-    console.warn('[leads] pricing lookup failed, using defaults:', err?.message);
+    console.warn('[leads] pricing lookup failed:', err?.message);
+    return prices;
   }
   priceCache = { at: Date.now(), prices };
   return prices;
 }
 
-/** Credits a search returning `leads` people costs: the first 25 are free. */
-function searchCreditsFor(leads: number, prices: Prices): number {
-  return Math.ceil(Math.max(0, leads - SEARCH_FREE_LEADS) / SEARCH_LEADS_PER_BLOCK) * prices.searchBlock;
-}
-
-interface UsageRow {
-  user_id: string;
-  idempotency_key: string;
-  operation: string;
-  provider: string;
-  provider_call_id: string | null;
-  provider_cost_usd: number;
-  credits_charged: number;
-  revenue_usd: number;
-  outcome: 'success' | 'free' | 'upstream_failed' | 'not_billed' | 'uncertain';
-  http_status: number | null;
-  metadata: Record<string, unknown>;
+function pricingUnavailable(): Response {
+  return fail('This feature is temporarily unavailable (pricing is not configured). Please try again later.', 503, {
+    pricing_unavailable: true,
+  });
 }
 
 /**
- * One api_usage row per Treg call, carrying what Treg actually charged
- * (x-treg-cost-micro). None of the leads calls were recorded before, so the
- * margin reports could not see a cent of leads spend. Revenue stays in the
- * wallet ledger (wallet_settle); these rows carry the credits for context.
+ * The 402 for a reserve the wallet could not cover. Every leads reserve is
+ * paid-only (welcome credits only cover feed sweeps), so the message says so.
  */
-class UsageLog {
-  rows: UsageRow[] = [];
-  constructor(private userId: string) {}
-
-  track(operation: string, res: Response | null, meta: Record<string, unknown> = {}): UsageRow {
-    const costMicro = res ? Number(res.headers.get('x-treg-cost-micro') || 0) : 0;
-    const cost = Number.isFinite(costMicro) && costMicro > 0 ? costMicro / 1e6 : 0;
-    const row: UsageRow = {
-      user_id: this.userId,
-      idempotency_key: `leads:${operation}:${crypto.randomUUID()}`,
-      operation,
-      provider: 'treg',
-      provider_call_id: res?.headers.get('x-treg-call-id') ?? null,
-      provider_cost_usd: Number(cost.toFixed(8)),
-      credits_charged: 0,
-      revenue_usd: 0,
-      outcome: !res ? 'uncertain' : res.ok ? (cost > 0 ? 'success' : 'free') : cost > 0 ? 'upstream_failed' : 'not_billed',
-      http_status: res?.status ?? null,
-      metadata: meta,
-    };
-    this.rows.push(row);
-    return row;
-  }
-
-  /**
-   * What Treg actually charged (x-treg-cost-micro) for every call tracked since
-   * `start`, hits and misses alike. Settles used to pass literal guesses
-   * (0.0048, 0.02, credits * 0.005), so the ledger's provider cost drifted from
-   * the invoice and misses were recorded as free when they were not.
-   */
-  costSince(start: number, operation?: string, feature?: string): number {
-    let total = 0;
-    for (const row of this.rows.slice(start)) {
-      if (operation && row.operation !== operation) continue;
-      if (feature && row.metadata?.feature !== feature) continue;
-      total += row.provider_cost_usd;
-    }
-    return Number(total.toFixed(8));
-  }
-
-  async flush(admin: any) {
-    if (this.rows.length === 0) return;
-    const rows = this.rows;
-    this.rows = [];
-    const { error } = await admin.from('api_usage').upsert(rows, { onConflict: 'idempotency_key', ignoreDuplicates: true });
-    if (error) console.error('[leads] usage record failed:', error.message);
-  }
+function insufficientCredits(hold: { required: number; available: number }, extra: Record<string, unknown> = {}): Response {
+  return fail(`${PAID_CREDITS_MESSAGE} Needed: ${hold.required}, purchased credits available: ${hold.available}.`, 402, {
+    insufficient_credits: true,
+    paid_credits_required: true,
+    required: hold.required,
+    available: hold.available,
+    ...extra,
+  });
 }
+
+// UsageLog / UsageRow live in lib.ts.
+
 
 /** Credits this user can spend right now (balance minus held credits). */
 async function walletAvailable(admin: any, userId: string): Promise<number> {
@@ -564,6 +525,10 @@ const REVEAL_KEY_WINDOW_MS = 60_000;
 function revealWindow(): number {
   return Math.floor(Date.now() / REVEAL_KEY_WINDOW_MS);
 }
+// A retry inside the same window after the earlier request FINISHED used to
+// get the closed hold back as a duplicate and a 409 (audit M2). reserveOnce
+// below now opens a fresh hold in that case; only a hold still in flight is
+// refused as a duplicate.
 
 const MAX_TEXT_FIELD = 200;
 const MAX_URL_FIELD = 500;
@@ -619,9 +584,14 @@ function clientKeyOf(l: any): string {
  * their input through this before anything reaches the provider or the table.
  * `client_key` keeps the key the client computed so per-lead results
  * (not_found_keys, failed_keys) still match its rows.
+ *
+ * Verification fields are server-owned (audit N13): the client's
+ * work_email / email_status / phone_number are never written to user_leads.
+ * A client-sent address survives only as `email_hint`, a lookup hint for the
+ * phone provider; what gets stored comes from a lookup or the stored row.
  */
 function sanitizeLead(l: any) {
-  const revealed = l?.email_status === 'preview' ? null : safeEmail(l?.revealed_email) || safeEmail(l?.work_email);
+  const hint = l?.email_status === 'preview' ? null : safeEmail(l?.revealed_email) || safeEmail(l?.work_email);
   return {
     client_key: clientKeyOf(l),
     full_name: clampText(l?.full_name),
@@ -635,9 +605,7 @@ function sanitizeLead(l: any) {
     company_phone: clampText(l?.company_phone, 50) || null,
     location: clampText(l?.location) || null,
     linkedin_url: safeLinkedin(l?.linkedin_url),
-    work_email: revealed,
-    email_status: revealed ? clampText(l?.email_status, 32) || null : null,
-    phone_number: clampText(l?.revealed_phone || l?.phone_number, 50) || null,
+    email_hint: hint,
     status: isAllowedStatus(l?.status) ? l.status : null,
   };
 }
@@ -665,19 +633,27 @@ interface Reservation {
  */
 type HoldSet = Set<string>;
 
+type Shortfall = { shortfall: number; required: number; available: number };
+
+/**
+ * Every leads hold is paid-only (`p_paid_only: true`): the owner's decision is
+ * that welcome credits only cover feed sweeps, so only purchased grants count
+ * toward a leads reserve. A shortfall is reported with PAID_CREDITS_MESSAGE.
+ */
 async function reserveCredits(
-  admin: ReturnType<typeof createClient>,
+  admin: any,
   userId: string,
   credits: number,
   key: string,
   context: Record<string, unknown>,
   holds?: HoldSet,
-): Promise<Reservation | { shortfall: number; required: number; available: number }> {
+): Promise<Reservation | Shortfall> {
   const { data, error } = await admin.rpc('wallet_reserve', {
     p_user_id: userId,
     p_credits: credits,
     p_idempotency_key: key,
     p_context: context,
+    p_paid_only: true,
   });
   if (error) {
     console.error('[billing] wallet_reserve failed:', error.message);
@@ -697,9 +673,32 @@ async function reserveCredits(
   };
 }
 
+/**
+ * Reserve under a deterministic key, but only refuse a duplicate whose hold is
+ * still open (a double-click in flight). When the key's hold is already
+ * settled or released, the earlier request finished, so a retry gets its own
+ * hold instead of a 409 (audit M2). Returns the key actually used, which is
+ * the one to settle with.
+ */
+async function reserveOnce(
+  admin: any,
+  userId: string,
+  credits: number,
+  key: string,
+  context: Record<string, unknown>,
+  holds?: HoldSet,
+): Promise<{ hold: Reservation | Shortfall; key: string }> {
+  const hold = await reserveCredits(admin, userId, credits, key, context, holds);
+  if ('shortfall' in hold || !hold.duplicate || !hold.id) return { hold, key };
+  const { data, error } = await admin.from('reservations').select('status').eq('id', hold.id).maybeSingle();
+  if (error || !data || data.status === 'held') return { hold, key };
+  const retryKey = `${key}:retry:${crypto.randomUUID()}`;
+  return { hold: await reserveCredits(admin, userId, credits, retryKey, context, holds), key: retryKey };
+}
+
 /** Gives a hold back untouched: nothing was billed by the provider. */
 async function releaseCredits(
-  admin: ReturnType<typeof createClient>,
+  admin: any,
   reservationId: string | null,
   reason: string,
   holds?: HoldSet,
@@ -713,8 +712,9 @@ async function releaseCredits(
   if (error) console.error('[billing] wallet_release failed:', error.message);
 }
 
+/** Closes a hold. Call through `settleHold` in the handler, which flushes usage first. */
 async function settleCredits(
-  admin: ReturnType<typeof createClient>,
+  admin: any,
   reservationId: string | null,
   creditsCharged: number,
   providerCostUsd: number,
@@ -740,20 +740,72 @@ async function settleCredits(
   return Number((data as any)?.balance_after ?? 0);
 }
 
-// ---------------------------------------------------------------------------
-// Helpers: URL, Domain & Lead Normalization
-// ---------------------------------------------------------------------------
-function cleanDomain(d?: string | null): string {
-  if (!d || typeof d !== 'string') return '';
-  return d
-    .slice(0, 1000)
-    .replace(/^https?:\/\//i, '')
-    .replace(/^www\./i, '')
-    .split('/')[0]
-    .trim()
-    .toLowerCase()
-    .slice(0, 253);
+/**
+ * Every saved row for the domains of `leads`, plus the empty-domain
+ * (LinkedIn-only) rows when any lead has no domain. The bulk phone path used
+ * to fetch only by domain, so an empty-domain lead never matched its saved
+ * row and its number was bought again on every run (audit M2).
+ */
+async function loadExistingRows(admin: any, userId: string, leads: any[]): Promise<any[]> {
+  const domains = [...new Set(leads.map((l: any) => cleanDomain(l?.company_domain)).filter(Boolean))];
+  const rows: any[] = [];
+  const PAGE = 500;
+  for (let i = 0; i < domains.length; i += 100) {
+    // Paged: one PostgREST response is capped, and a short map here means an
+    // upsert writes over (or re-buys) contacts it should have seen.
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await admin
+        .from('user_leads')
+        .select('*')
+        .eq('user_id', userId)
+        .in('company_domain', domains.slice(i, i + 100))
+        .order('id')
+        .range(from, from + PAGE - 1);
+      if (error) throw new Error(`existing-lead lookup failed: ${error.message}`);
+      if (data) rows.push(...data);
+      if (!data || data.length < PAGE) break;
+    }
+  }
+  if (leads.some((l: any) => !cleanDomain(l?.company_domain))) {
+    const { data: emptyRows, error } = await admin
+      .from('user_leads')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('company_domain', '');
+    if (error) throw new Error(`existing-lead lookup failed: ${error.message}`);
+    if (emptyRows) rows.push(...emptyRows);
+  }
+  return rows;
 }
+
+/**
+ * Index of saved rows by (domain, name) key, and by LinkedIn slug, so a lead
+ * can be matched to its stored row. A slug match also requires the same name.
+ */
+function indexExistingRows(rows: any[]) {
+  const byKey = new Map<string, any>();
+  const bySlug = new Map<string, any>();
+  for (const r of rows) {
+    byKey.set(leadKey(r), r);
+    const slug = linkedinSlug(r?.linkedin_url);
+    if (slug && !bySlug.has(slug)) bySlug.set(slug, r);
+  }
+  return {
+    find(l: any): any | null {
+      const hit = byKey.get(leadKey(l));
+      if (hit) return hit;
+      const slug = linkedinSlug(l?.linkedin_url);
+      const bySlugHit = slug ? bySlug.get(slug) : null;
+      const sameName = (a: any, b: any) =>
+        String(a?.full_name || '').toLowerCase().trim() === String(b?.full_name || '').toLowerCase().trim();
+      return bySlugHit && sameName(bySlugHit, l) ? bySlugHit : null;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers: URL, Domain & Lead Normalization (cleanDomain, linkedinSlug in lib.ts)
+// ---------------------------------------------------------------------------
 
 function normalizeLinkedin(url?: string | null): string | null {
   if (!url || typeof url !== 'string' || url === 'N/A' || url === 'null') return null;
@@ -780,13 +832,6 @@ function isUuid(value?: string | null): boolean {
 function escapeLike(value?: string | null): string {
   if (!value || typeof value !== 'string') return '';
   return value.replace(/([\\%_])/g, '\\$1');
-}
-
-/** Slug of a LinkedIn profile URL, lowercased, or null. */
-function linkedinSlug(url?: string | null): string | null {
-  if (!url) return null;
-  const m = String(url).match(/linkedin\.com\/(?:in|pub)\/([^/?#]+)/i);
-  return m ? m[1].toLowerCase() : null;
 }
 
 function slugOfRow(row: any): string | null {
@@ -920,8 +965,12 @@ async function findExistingLead(
 
   // Name-only is the last resort. A domain with no name is deliberately not
   // attempted: it cannot identify a person and would hand back a colleague's
-  // cached contact.
-  if (name) {
+  // cached contact. A name alone cannot either: this stage used to accept any
+  // same-name row, so "John Smith @ a.com" could get another John Smith's
+  // email back as "already revealed" (audit M2). The promised post-filter is
+  // now applied: the LinkedIn slug must be supplied and agree, and the row's
+  // domain must not contradict the requested one.
+  if (name && slug) {
     const hit = await firstMatch(
       () =>
         admin
@@ -929,7 +978,7 @@ async function findExistingLead(
           .select('*')
           .eq('user_id', userId)
           .ilike('full_name', escapeLike(name)),
-      () => true,
+      (row) => acceptNameOnlyMatch(row, slug, domain),
     );
     if (hit) return hit;
   }
@@ -1100,13 +1149,13 @@ function normalizeLead(p: any, idx: number, fallbackDomain = ''): any {
  */
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders() });
+    return withCors(new Response(null, { headers: corsHeaders() }), req);
   }
   try {
-    return await handleRequest(req);
+    return withCors(await handleRequest(req), req);
   } catch (err: any) {
     console.error('[leads] unhandled error:', err?.name || 'error', String(err?.message || '').slice(0, 200));
-    return fail('Internal error', 500);
+    return withCors(fail('Internal error', 500), req);
   }
 });
 
@@ -1149,14 +1198,36 @@ async function handleRequest(req: Request): Promise<Response> {
     console.error('[leads] action failed:', action, err?.name || 'error', String(err?.message || '').slice(0, 200));
     return fail('Internal error', 500);
   } finally {
-    // Any hold still open here was abandoned by an unexpected exception.
-    // Releasing it returns the credits now instead of after the reaper's hour.
-    for (const id of [...openHolds]) {
-      await releaseCredits(admin, id, 'leads: released after unexpected error', openHolds).catch((e: any) =>
-        console.error('[billing] release after error failed:', e?.message),
-      );
-    }
+    // Usage first, so every row is on disk with its reservation_id (audit H6).
     await usage.flush(admin);
+    // Any hold still open here was abandoned by an unexpected exception. It is
+    // closed now the way the reaper would close it: settled for the credits
+    // its usage rows already earned, released when they earned none.
+    for (const id of [...openHolds]) {
+      const rows = usage.rows.filter((r) => r.reservation_id === id);
+      const credits = rows.reduce((s, r) => s + r.credits_charged, 0);
+      const cost = Number(rows.reduce((s, r) => s + r.provider_cost_usd, 0).toFixed(8));
+      const closing = credits > 0
+        ? settleCredits(admin, id, credits, cost, `leads:abort:${id}`, 'leads: settled after unexpected error', openHolds)
+        : releaseCredits(admin, id, 'leads: released after unexpected error', openHolds);
+      await Promise.resolve(closing).catch((e: any) => console.error('[billing] close after error failed:', e?.message));
+    }
+  }
+
+  /**
+   * Every settle goes through here: usage rows (each carrying its hold's
+   * reservation_id) are written BEFORE the hold is closed, so a request killed
+   * between the two leaves a hold the reaper can settle from usage (audit H6).
+   */
+  async function settleHold(
+    reservationId: string | null,
+    creditsCharged: number,
+    providerCostUsd: number,
+    key: string,
+    note: string,
+  ): Promise<number | null> {
+    await usage.flush(admin);
+    return settleCredits(admin, reservationId, creditsCharged, providerCostUsd, key, note, openHolds);
   }
 
   async function handleAction(): Promise<Response> {
@@ -1167,14 +1238,24 @@ async function handleRequest(req: Request): Promise<Response> {
     const prices = await loadPrices(admin);
     return json({
       ok: true,
+      // null when the pricing_config row is missing or disabled; the action is
+      // then refused rather than charged at a guessed price.
       email_credits: prices.email,
       phone_credits: prices.phone,
-      search_free_leads: SEARCH_FREE_LEADS,
-      search_block_leads: SEARCH_LEADS_PER_BLOCK,
-      search_block_credits: prices.searchBlock,
-      // Flat credits per search request, charged when the search returns
-      // results (or the provider billed for it). Additive field.
+      // Search is charged per BILLED provider call (audit H4). A search makes
+      // 1 call up to 100 leads, at most 11 for a single target and 12 for a
+      // multi-company search. The block fields stay for older clients: the
+      // per-block fee is gone.
+      search_credits_per_call: prices.search,
+      search_max_provider_calls_single: maxSearchProviderCalls(1, 1000),
+      search_max_provider_calls_multi: MAX_PROVIDER_CALLS,
+      search_free_leads: 0,
+      search_block_leads: 100,
+      search_block_credits: 0,
+      // Kept for older clients; now the price of ONE billed provider call.
       searchCredits: prices.search,
+      // Leads holds only draw on purchased credits.
+      paid_credits_only: true,
     });
   }
 
@@ -1218,11 +1299,15 @@ async function handleRequest(req: Request): Promise<Response> {
     // result is checked for a verified email/phone and charged per hit. With
     // an empty wallet the provider search would be paid for and shown nothing.
     const prices = await loadPrices(admin);
-    const minimumCredits = Math.max(1, prices.search, Math.min(prices.email, prices.phone));
+    if (prices.search === null || prices.email === null || prices.phone === null) return pricingUnavailable();
+    const creditsPerCall: number = prices.search;
+    const emailPrice: number = prices.email;
+    const minimumCredits = Math.max(1, creditsPerCall, Math.min(emailPrice, prices.phone));
     if ((await walletAvailable(admin, userId)) < minimumCredits) {
-      return fail('Add credits to search. You pay only for verified emails and phone numbers that are found.', 402, {
+      return fail(`Add credits to search. ${PAID_CREDITS_MESSAGE}`, 402, {
         insufficient_credits: true,
         needs_credits_to_search: true,
+        paid_credits_required: true,
       });
     }
 
@@ -1233,49 +1318,54 @@ async function handleRequest(req: Request): Promise<Response> {
     const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.searchBurst, RATE_LIMITS.search]);
     if (limited) return limited;
 
-    // The flat per-search price plus, for large requests, each block of 50
-    // past the free allowance is held up front at the most the search can
-    // cost, then settled on what actually happened: the blocks on what was
-    // returned, the flat price only if the search returned results or the
-    // provider billed us. A search where every call failed is released.
-    const maxSearchCredits = prices.search + searchCreditsFor(requestedLimit, prices);
+    // Charged per BILLED provider call (audit H4). The old price was a flat 1
+    // credit plus a per-block fee of 0, so a 1,000-lead search making 11–12
+    // provider calls was sold for 1 credit. Now the hold is the price per call
+    // times the most calls THIS request can make (1 up to 100 leads, at most
+    // 11 single-target / 12 multi-company), and the settle is the price times
+    // the calls the provider actually billed.
+    const maxCalls = maxSearchProviderCalls(domainList.length, requestedLimit);
+    const maxSearchCredits = creditsPerCall * maxCalls;
     const searchKey = `search_${userId}_${crypto.randomUUID()}`;
     let searchHold: Reservation | null = null;
     let billableLeads = 0;
-    // Where this search's usage rows start, so the settle can sum the
-    // provider's real charges for exactly these calls.
+    // Where this search's usage rows start, so the settle can count and sum
+    // exactly these calls.
     const searchUsageStart = usage.rows.length;
     if (maxSearchCredits > 0) {
       const hold = await reserveCredits(admin, userId, maxSearchCredits, searchKey, {
         feature: 'leads_search',
         requested_limit: requestedLimit,
+        max_provider_calls: maxCalls,
+        credits_per_call: creditsPerCall,
       }, openHolds);
       if ('shortfall' in hold) {
-        const afterFlat = Math.max(0, hold.available - prices.search);
-        const blocks = prices.searchBlock > 0 ? Math.floor(afterFlat / prices.searchBlock) : 0;
-        return fail(
-          `This search needs up to ${maxSearchCredits} credits; you have ${hold.available}.`,
-          402,
-          {
-            insufficient_credits: true,
-            required: maxSearchCredits,
-            available: hold.available,
-            affordable_limit:
-              hold.available < prices.search
-                ? 0
-                : Math.min(requestedLimit, SEARCH_FREE_LEADS + blocks * SEARCH_LEADS_PER_BLOCK),
-          },
-        );
+        return insufficientCredits(hold, {
+          max_provider_calls: maxCalls,
+          credits_per_call: creditsPerCall,
+          affordable_limit: affordableSearchLimit(requestedLimit, domainList.length, hold.available, creditsPerCall),
+        });
       }
       searchHold = hold;
     }
-    const searchRow = usage.track('leads.search', null, { requested_limit: requestedLimit });
-    searchRow.outcome = 'free';
+    const searchHoldId = searchHold?.id ?? null;
+    // Each provider call gets its own Idempotency-Key under this search's key.
+    let searchCallSeq = 0;
+    const nextSearchIdem = () => `echo:${searchKey}:call:${searchCallSeq++}`;
 
-    /** What this search costs given what came back and what was billed. */
-    const searchChargeFor = (returned: number): number => {
-      const billed = returned > 0 || usage.costSince(searchUsageStart, 'treg.people.search') > 0;
-      return (billed ? prices.search : 0) + searchCreditsFor(returned, prices);
+    /**
+     * Prices every billed call since the search started (so the rows the
+     * reaper reads carry the credits) and returns the total. Called once the
+     * provider calls are done, before the rows are flushed.
+     */
+    const priceSearchCalls = (): { charge: number; billedCalls: number } => {
+      const billed = usage.billedCallsSince(searchUsageStart, 'treg.people.search');
+      for (const row of usage.rows.slice(searchUsageStart)) {
+        if (row.operation === 'treg.people.search') row.credits_charged = 0;
+      }
+      for (const row of billed) row.credits_charged = creditsPerCall;
+      const charge = Math.min(billed.length * creditsPerCall, searchHold?.reserved ?? 0);
+      return { charge, billedCalls: billed.length };
     };
 
     try {
@@ -1316,9 +1406,9 @@ async function handleRequest(req: Request): Promise<Response> {
           const variants =
             rounds > 1 ? buildSearchVariations(payload, rounds - 1) : [];
           return [
-            tregPeopleSearch(token, userId, payload, 'leads-multi-domain', domain, usage),
+            tregPeopleSearch(token, userId, payload, 'leads-multi-domain', domain, usage, searchHoldId, nextSearchIdem()),
             ...variants.map((v) =>
-              tregPeopleSearch(token, userId, v, 'leads-multi-domain', domain, usage),
+              tregPeopleSearch(token, userId, v, 'leads-multi-domain', domain, usage, searchHoldId, nextSearchIdem()),
             ),
           ];
         });
@@ -1351,19 +1441,13 @@ async function handleRequest(req: Request): Promise<Response> {
         try {
           tregRes = await fetch(`${TREG_BASE}/call/treg.people.search`, {
             method: 'POST',
-            headers: {
-              'X-Treg-Token': token,
-              'X-Treg-Meta': `customer=${userId}, feature=leads-search`,
-              'X-Treg-Route-Max-Cost': MAX_COST.search,
-              'Content-Type': 'application/json',
-              Accept: 'application/json',
-            },
+            headers: tregHeaders(token, userId, 'leads-search', MAX_COST.search, nextSearchIdem()),
             body: JSON.stringify(payload),
             signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
           });
-          usage.track('treg.people.search', tregRes, { feature: 'leads-search' });
+          usage.track('treg.people.search', tregRes, { feature: 'leads-search' }, searchHoldId);
         } catch (err: any) {
-          usage.track('treg.people.search', null, { feature: 'leads-search', error: err?.name || 'error' });
+          usage.track('treg.people.search', null, { feature: 'leads-search', error: err?.name || 'error' }, searchHoldId);
           console.error('[leads] treg.people.search unreachable:', err?.name || err?.message);
           return fail('The lead search provider did not respond in time. Please try again.', 504);
         }
@@ -1389,7 +1473,9 @@ async function handleRequest(req: Request): Promise<Response> {
             );
             const variations = buildSearchVariations(payload, extraCalls);
             const extraResults = await Promise.all(
-              variations.map((v) => tregPeopleSearch(token, userId, v, 'leads-search-p2', undefined, usage)),
+              variations.map((v) =>
+                tregPeopleSearch(token, userId, v, 'leads-search-p2', undefined, usage, searchHoldId, nextSearchIdem()),
+              ),
             );
             for (const batch of extraResults) {
               if (batch === null) failedBatches++;
@@ -1404,6 +1490,12 @@ async function handleRequest(req: Request): Promise<Response> {
           return fail('Lead search provider error. Please try adjusting your filters.', 502);
         }
       }
+
+      // Provider calls are done: price the billed ones onto their usage rows
+      // and write them now, so a request killed later (enrichment, saving)
+      // leaves a hold the reaper can settle from usage (audit H6).
+      priceSearchCalls();
+      await usage.flush(admin);
 
       // Deduplicate and normalize
       const seen = new Set<string>();
@@ -1458,6 +1550,8 @@ async function handleRequest(req: Request): Promise<Response> {
         if (emptyRows) existingLeads = existingLeads.concat(emptyRows);
       }
 
+      // The saved row behind each result, for merging on a later upsert.
+      const savedRowFor = new Map<any, any>();
       if (existingLeads && existingLeads.length > 0) {
         const existingMap = new Map<string, any>();
         for (const ex of existingLeads) {
@@ -1475,7 +1569,10 @@ async function handleRequest(req: Request): Promise<Response> {
             // address a row that exists. Without it every later update on this
             // lead 500s, because a provider id is not a uuid.
             item.db_id = match.id;
-            if (hasRevealedEmail(match)) {
+            savedRowFor.set(item, match);
+            // Shown when the stored address is verified or a found catch-all /
+            // risky one; an unknown/pending verdict is not shown as revealed.
+            if (hasUsableEmail(match)) {
               item.revealed_email = match.work_email;
               item.email_status = match.email_status;
             }
@@ -1495,29 +1592,24 @@ async function handleRequest(req: Request): Promise<Response> {
       // Of those, the ones the verifier confirmed — the only ones charged.
       let verifiedCount = 0;
       let enrichmentPending = 0;
-      // Why some contacts were left unenriched: the per-search cap, or the
-      // wallet. The client words its notice differently for each.
-      let enrichmentLimitedBy: 'cap' | 'balance' | null = null;
+      // Why some contacts were left unenriched: the per-search cap, the
+      // wallet, or the hourly lookup limit. The client words its notice
+      // differently for each.
+      let enrichmentLimitedBy: 'cap' | 'balance' | 'rate_limit' | null = null;
       const MAX_AUTO_ENRICH = 60;
 
       // Enrichment spends credits, so it has to be an explicit opt-in. A
       // caller that omitted the flag (an older client, a script) used to be
       // charged for up to 60 reveals it never asked for.
       if (body.auto_enrich === true && normalized.length > 0) {
-        // Cap what one search may resolve. A 200-lead search ran 200 upstream
-        // lookups in sequential batches of five, which is minutes of work — the
-        // gateway cut the request off and the credits taken for it were never
-        // settled. The cap keeps a search inside its own time budget; anything
-        // over it still comes back, just with a per-row reveal button.
+        // Cap what one search may resolve, to keep it inside its time budget;
+        // anything over it still comes back with a per-row reveal button.
         const leadsToEnrich = normalized
           .filter((l) => !l.revealed_email && l.company_domain)
           .slice(0, MAX_AUTO_ENRICH);
 
         if (leadsToEnrich.length > 0) {
-          // Held at the configured email price per lead. The old hold assumed a
-          // price of 1 credit, so any other price either under-held (and the
-          // settle was clipped to the hold) or over-held.
-          const emailPrice = prices.email;
+          // Held at the configured email price per lead.
           // Derived from this search's own key, so a retried request reuses
           // the hold rather than stacking a second one.
           let runKey = `${searchKey}:enrich`;
@@ -1526,10 +1618,7 @@ async function handleRequest(req: Request): Promise<Response> {
             requested_count: leadsToEnrich.length,
           }, openHolds);
 
-          // Short on credits: hold what the wallet can cover instead. The old
-          // code fell through to `available` lookups with no hold at all, so
-          // those emails were resolved without ever being charged, while the
-          // response still reported them as credits charged.
+          // Short on credits: hold what the wallet can cover instead.
           if ('shortfall' in hold) {
             const affordableLeads = emailPrice > 0
               ? Math.floor(Math.max(0, Number(hold.available) || 0) / emailPrice)
@@ -1544,20 +1633,19 @@ async function handleRequest(req: Request): Promise<Response> {
             }
           }
 
-          // How many lookups the hold covers. A free price needs no hold.
-          const maxAllowed = 'shortfall' in hold || hold.duplicate
+          // How many lookups the hold covers (audit H3: bounded by the credits
+          // actually held). A zero price is not a licence for unbounded free
+          // lookups: with nothing held, nothing is looked up.
+          const maxAllowed = 'shortfall' in hold || hold.duplicate || emailPrice <= 0
             ? 0
-            : emailPrice > 0
-              ? Math.floor(hold.reserved / emailPrice)
-              : leadsToEnrich.length;
+            : Math.min(leadsToEnrich.length, Math.floor(hold.reserved / emailPrice));
+          const enrichHoldId = 'shortfall' in hold || hold.duplicate ? null : hold.id;
           const enrichUsageStart = usage.rows.length;
           if (maxAllowed < leadsToEnrich.length) enrichmentLimitedBy = 'balance';
 
           const targetBatch = leadsToEnrich.slice(0, maxAllowed);
-          enrichmentPending = normalized.filter(
-            (l) => !l.revealed_email && l.company_domain && !targetBatch.includes(l)
-          ).length;
-          if (enrichmentPending > 0 && !enrichmentLimitedBy) enrichmentLimitedBy = 'cap';
+          // Leads the hourly lookup limit stopped before they were looked up.
+          let rateLimitedLookups = 0;
 
           try {
             // Parallel enrichment batches of 5
@@ -1567,74 +1655,94 @@ async function handleRequest(req: Request): Promise<Response> {
               await Promise.all(
                 chunk.map(async (lead) => {
                   try {
+                    // Each lookup takes a slot from the same hourly
+                    // `leads.reveal` bucket as a manual reveal (audit H3).
+                    // Auto-enrich used to run outside every reveal limit.
+                    const slot = await takeRateLimit(admin, userId, RATE_LIMITS.reveal);
+                    if (slot !== true) {
+                      rateLimitedLookups++;
+                      return;
+                    }
                     const emailPayload: Record<string, string> = { domain: lead.company_domain };
                     if (lead.full_name) emailPayload.full_name = lead.full_name;
                     if (lead.linkedin_url) emailPayload.linkedin_url = lead.linkedin_url;
+                    const leadRef = await shortHash(leadIdentity(lead));
 
                     const res = await fetch(`${TREG_BASE}/call/treg.people.email.find`, {
                       method: 'POST',
-                      headers: {
-                        'X-Treg-Token': token,
-                        'X-Treg-Meta': `customer=${userId}, feature=auto-enrich`,
+                      headers: tregHeaders(token, userId, 'auto-enrich', MAX_COST.email, `echo:${runKey}:${leadRef}`, {
                         'X-Treg-Route-Verify': 'true',
-                        'X-Treg-Route-Max-Cost': MAX_COST.email,
-                        'Content-Type': 'application/json',
-                        Accept: 'application/json',
-                      },
+                      }),
                       body: JSON.stringify(emailPayload),
                       signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
                     });
-                    const autoRow = usage.track('treg.people.email.find', res, { feature: 'auto-enrich' });
+                    const autoRow = usage.track('treg.people.email.find', res, { feature: 'auto-enrich' }, enrichHoldId);
 
                     if (!res.ok) {
                       // Not a miss: the lookup itself failed, so the row keeps
                       // its Reveal button and the user can retry it.
                       return;
                     }
-                    {
-                      const data = await res.json();
-                      const rawEmail = data?.output?.email || data?.raw?.data?.email || null;
-                      const verdict = classifyEmail(data);
-                      const email = isEmailAddress(rawEmail) && verdict.usable ? rawEmail.trim() : null;
-                      if (email) {
-                        enrichedCount++;
-                        if (verdict.charge) {
-                          verifiedCount++;
-                          autoRow.credits_charged = prices.email;
-                        }
-                        lead.revealed_email = email;
-                        lead.work_email = email;
-                        lead.email_status = verdict.status;
-                        lead.is_saved = true;
-
-                        // Upsert into user_leads
-                        const { data: upserted } = await admin
-                          .from('user_leads')
-                          .upsert(
-                            {
-                              user_id: userId,
-                              company_domain: lead.company_domain,
-                              company_name: lead.company_name,
-                              full_name: lead.full_name,
-                              first_name: lead.first_name,
-                              last_name: lead.last_name,
-                              title: lead.title,
-                              location: lead.location,
-                              linkedin_url: lead.linkedin_url,
-                              work_email: email,
-                              email_status: lead.email_status,
-                              status: lead.status || 'new',
-                              updated_at: new Date().toISOString(),
-                            },
-                            { onConflict: 'user_id,company_domain,full_name' }
-                          )
-                          .select('id')
-                          .maybeSingle();
-                        if (upserted?.id) lead.db_id = upserted.id;
-                      } else {
-                        lead.email_status = 'not_found';
-                      }
+                    const data = await res.json();
+                    const rawEmail = data?.output?.email || data?.raw?.data?.email || null;
+                    // An unknown / pending verdict is not usable (audit H3):
+                    // it is neither shown nor saved as revealed.
+                    const verdict = classifyEmail(data);
+                    const email = isEmailAddress(rawEmail) && verdict.usable ? rawEmail.trim() : null;
+                    if (!email) {
+                      lead.email_status = verdict.status === 'unknown' || verdict.status === 'pending'
+                        ? verdict.status
+                        : 'not_found';
+                      return;
                     }
+                    enrichedCount++;
+                    if (verdict.charge) {
+                      verifiedCount++;
+                      autoRow.credits_charged = emailPrice;
+                    }
+                    lead.revealed_email = email;
+                    lead.work_email = email;
+                    lead.email_status = verdict.status;
+                    lead.is_saved = true;
+
+                    // Merged onto the saved row, if any: a blank or placeholder
+                    // provider value no longer overwrites stored data (M2).
+                    const record = mergeLeadRecord(savedRowFor.get(lead) ?? null, {
+                      user_id: userId,
+                      company_domain: lead.company_domain,
+                      company_name: lead.company_name,
+                      full_name: lead.full_name,
+                      first_name: lead.first_name,
+                      last_name: lead.last_name,
+                      title: lead.title,
+                      location: lead.location,
+                      linkedin_url: lead.linkedin_url,
+                      work_email: email,
+                      email_status: verdict.status,
+                      email_confidence: verdict.charge ? 0.95 : 0.5,
+                      status: lead.status || null,
+                      updated_at: new Date().toISOString(),
+                    });
+                    const { data: upserted, error: upsertErr } = await admin
+                      .from('user_leads')
+                      .upsert(record, { onConflict: 'user_id,company_domain,full_name' })
+                      .select('id')
+                      .maybeSingle();
+                    if (upsertErr) {
+                      // Not saved, so not charged: the address is still shown.
+                      console.error('[leads] auto-enrich save failed:', upsertErr.message);
+                      lead.is_saved = Boolean(lead.db_id);
+                      if (verdict.charge) {
+                        verifiedCount--;
+                        autoRow.credits_charged = 0;
+                        lead.revealed_email = null;
+                        lead.work_email = null;
+                        lead.email_status = null;
+                        enrichedCount--;
+                      }
+                      return;
+                    }
+                    if (upserted?.id) lead.db_id = upserted.id;
                   } catch (err: any) {
                     // A timeout or network error is not a "not found" — leave
                     // the status empty so the row can still be revealed.
@@ -1644,39 +1752,50 @@ async function handleRequest(req: Request): Promise<Response> {
               );
             }
           } finally {
-            // Settling from `finally` rather than after the loop: an exception
-            // thrown mid-run used to skip the settle entirely, and a held
-            // reservation is money the user can see as available and cannot
-            // spend. Whatever happened, the hold is closed here.
+            // Settling from `finally`, so whatever happened the hold is closed.
+            // Usage rows are flushed first (settleHold), each carrying this
+            // hold's reservation_id (audit H6).
             creditsCharged = verifiedCount * emailPrice;
             if (!('shortfall' in hold) && !hold.duplicate) {
-              // Provider cost is what Treg reported for every lookup in this
-              // run, hits and misses alike.
-              await settleCredits(
-                admin,
+              await settleHold(
                 hold.id,
                 creditsCharged,
                 usage.costSince(enrichUsageStart, 'treg.people.email.find', 'auto-enrich'),
                 runKey,
                 `Auto-enriched ${verifiedCount} verified emails for search (${normalized.length} leads)`,
-                openHolds,
               );
             }
           }
+
+          if (rateLimitedLookups > 0) enrichmentLimitedBy = 'rate_limit';
+          enrichmentPending = normalized.filter(
+            (l) => !l.revealed_email && l.company_domain && !l.email_status,
+          ).length;
+          if (enrichmentPending > 0 && !enrichmentLimitedBy) enrichmentLimitedBy = 'cap';
         }
       }
 
       billableLeads = normalized.length;
-      const searchCredits = searchChargeFor(billableLeads);
-      searchRow.credits_charged = searchCredits;
-      searchRow.metadata = { ...searchRow.metadata, returned: billableLeads };
+      const { charge: searchCredits, billedCalls } = priceSearchCalls();
+      // A summary row for the search itself. It carries no reservation_id and
+      // no credits (the per-call rows carry those), so the reaper and the
+      // margin reports never count the search twice.
+      usage.track('leads.search', null, {
+        requested_limit: requestedLimit,
+        returned: billableLeads,
+        billed_calls: billedCalls,
+        credits_per_call: creditsPerCall,
+        credits: searchCredits,
+      }).outcome = 'free';
       return json({
         ok: true,
         people: normalized,
         count: normalized.length,
         requested_limit: requestedLimit,
-        free_leads: Math.min(SEARCH_FREE_LEADS, normalized.length),
+        free_leads: 0,
         search_credits_charged: searchCredits,
+        search_billed_calls: billedCalls,
+        search_credits_per_call: creditsPerCall,
         enriched_count: enrichedCount,
         credits_charged: creditsCharged + searchCredits,
         enrichment_pending: enrichmentPending,
@@ -1688,24 +1807,22 @@ async function handleRequest(req: Request): Promise<Response> {
       console.error('[leads] search execution error:', err?.name || 'error', String(err?.message || '').slice(0, 200));
       return fail('Internal lead search error', 500);
     } finally {
-      // Every exit — success, provider error, exception — closes the hold.
-      // Nothing returned and nothing billed by the provider: released in full.
-      // Otherwise settled for the flat price plus any blocks returned, with
-      // the provider's actual charge for every search call.
+      // Every exit — success, provider error, exception — closes the hold:
+      // settled at the price per call times the calls the provider billed,
+      // with its actual charge; released when no call was billed at all.
       if (searchHold && !searchHold.duplicate) {
-        const charge = searchChargeFor(billableLeads);
+        const { charge, billedCalls } = priceSearchCalls();
         const cost = usage.costSince(searchUsageStart, 'treg.people.search');
         if (charge === 0 && cost === 0) {
-          await releaseCredits(admin, searchHold.id, 'Lead search: no results, nothing billed', openHolds);
+          await usage.flush(admin);
+          await releaseCredits(admin, searchHold.id, 'Lead search: no billed provider calls', openHolds);
         } else {
-          await settleCredits(
-            admin,
+          await settleHold(
             searchHold.id,
             charge,
             cost,
             searchKey,
-            `Lead search: ${billableLeads} leads (${Math.min(SEARCH_FREE_LEADS, billableLeads)} free)`,
-            openHolds,
+            `Lead search: ${billableLeads} leads, ${billedCalls} billed provider calls`,
           );
         }
       }
@@ -1713,7 +1830,7 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   // =========================================================================
-  // ACTION 2: REVEAL EMAIL (Single, 1 Credit)
+  // ACTION 2: REVEAL EMAIL (single; pricing_config `treg.people.email.find`)
   // =========================================================================
   if (action === 'reveal-email') {
     // Every field clamped before it reaches the provider or user_leads; a
@@ -1738,10 +1855,11 @@ async function handleRequest(req: Request): Promise<Response> {
     if (!full_name && !first_name && !linkedin_url) {
       return fail('Lead name or LinkedIn URL is required.');
     }
+    const emailPrice = (await loadPrices(admin)).email;
+    if (emailPrice === null) return pricingUnavailable();
 
     // A LinkedIn-only lookup arrives with no name at all. Deriving one from the
-    // profile slug keeps the saved row identifiable; sending a placeholder like
-    // "LinkedIn Prospect" saved a different junk row on every single lookup.
+    // profile slug keeps the saved row identifiable.
     const derived = !full_name && linkedin_url ? nameFromLinkedinSlug(linkedin_url) : null;
     const resolvedName = clampText(full_name || derived?.full_name || '');
     const resolvedFirst = clampText(first_name || derived?.first_name || resolvedName.split(' ')[0] || '');
@@ -1752,7 +1870,8 @@ async function handleRequest(req: Request): Promise<Response> {
     );
     let resolvedDomain = company_domain;
 
-    // 1. Check if already revealed in local database (idempotent / free)
+    // 1. Already bought? Only a VERIFIED stored address counts (audit M2): a
+    // free unknown / risky one used to block buying the verified one forever.
     const existing = await findExistingLead(admin, userId, { companyDomain: resolvedDomain, fullName: resolvedName, linkedinUrl: linkedin_url });
 
     if (hasRevealedEmail(existing)) {
@@ -1764,34 +1883,26 @@ async function handleRequest(req: Request): Promise<Response> {
       });
     }
 
-    // Only lookups that reach the provider count against the limits; an
-    // already-revealed contact above is free and unlimited.
+    // Only lookups that reach the provider count against the limits.
     const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.revealBurst, RATE_LIMITS.reveal]);
     if (limited) return limited;
 
-    // 2. Reserve the email price in user's wallet. The key is deterministic per
-    // (user, lead, action, minute) so a double-click reuses this hold instead
-    // of charging twice; the ledger and reservation carry a hash, not the name.
-    const CREDITS_REQUIRED = (await loadPrices(admin)).email;
+    // 2. Hold the email price. The key is deterministic per (user, lead,
+    // action, minute) so a double-click in flight is refused; a retry after
+    // the first request finished gets a fresh hold (reserveOnce).
     const leadRef = await shortHash(leadIdentity({ company_domain: resolvedDomain, full_name: resolvedName, linkedin_url }));
-    const runKey = `reveal_email:${userId}:${leadRef}:${revealWindow()}`;
-    const hold = await reserveCredits(admin, userId, CREDITS_REQUIRED, runKey, {
+    const baseKey = `reveal_email:${userId}:${leadRef}:${revealWindow()}`;
+    const { hold, key: runKey } = await reserveOnce(admin, userId, emailPrice, baseKey, {
       feature: 'lead_email_reveal',
       lead_ref: leadRef,
     }, openHolds);
 
-    if ('shortfall' in hold) {
-      return fail(`Insufficient credits. Required: ${hold.required}, Available: ${hold.available}`, 402, {
-        insufficient_credits: true,
-        required: hold.required,
-        available: hold.available,
-      });
-    }
+    if ('shortfall' in hold) return insufficientCredits(hold);
     if (hold.duplicate) {
       return fail('This contact is already being looked up. Please wait a moment.', 409, { duplicate_request: true });
     }
 
-    // 3. Call Treg Email Finder with auto verification
+    // 3. Treg email finder with verification.
     let emailFound: string | null = null;
     // Credits this reveal costs: the full price only for a verified address.
     let emailCharge = 0;
@@ -1811,31 +1922,28 @@ async function handleRequest(req: Request): Promise<Response> {
 
       const tregRes = await fetch(`${TREG_BASE}/call/treg.people.email.find`, {
         method: 'POST',
-        headers: {
-          'X-Treg-Token': token,
-          'X-Treg-Meta': `customer=${userId}, feature=lead-email`,
+        // Keyed on the base key, so a retry after a timeout replays the
+        // provider's answer instead of paying for the lookup again.
+        headers: tregHeaders(token, userId, 'lead-email', MAX_COST.email, `echo:${baseKey}`, {
           'X-Treg-Route-Verify': 'true',
-          'X-Treg-Route-Max-Cost': MAX_COST.email,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
+        }),
         body: JSON.stringify(emailPayload),
         signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
       });
 
-      const emailRow = usage.track('treg.people.email.find', tregRes, { feature: 'lead-email' });
+      const emailRow = usage.track('treg.people.email.find', tregRes, { feature: 'lead-email' }, hold.id);
 
       if (tregRes.ok) {
         const resJson = await tregRes.json();
         const rawEmail = resJson?.output?.email || resJson?.raw?.data?.email || null;
+        // unknown / pending / invalid → not usable: a 404, never a free reveal.
         const verdict = classifyEmail(resJson);
         emailFound = isEmailAddress(rawEmail) && verdict.usable ? rawEmail.trim() : null;
-        emailCharge = emailFound && verdict.charge ? CREDITS_REQUIRED : 0;
+        emailCharge = emailFound && verdict.charge ? emailPrice : 0;
         emailRow.credits_charged = emailCharge;
         emailStatus = verdict.status;
-        emailConfidence = resJson?.output?.confidence || 0.95;
+        emailConfidence = resJson?.output?.confidence || (verdict.charge ? 0.95 : 0.5);
 
-        // Auto-extract domain & company info from Treg if empty
         const outputDomain = cleanDomain(
           resJson?.output?.domain ||
           resJson?.raw?.data?.domain ||
@@ -1850,42 +1958,33 @@ async function handleRequest(req: Request): Promise<Response> {
       console.warn('[leads] email find upstream warning:', err?.name || String(err?.message || '').slice(0, 200));
     }
 
-    // 4. Settle credit hold with what Treg actually charged for the lookup —
-    // a miss is free for the user but not for us, and the ledger says so.
+    // 4. Settle with what Treg actually charged (usage flushed first).
     const providerCostUsd = usage.costSince(revealUsageStart, 'treg.people.email.find');
     if (emailFound) {
-      await settleCredits(
-        admin,
+      await settleHold(
         hold.id,
         emailCharge,
         providerCostUsd,
         runKey,
         emailCharge > 0 ? `Revealed verified email (lead ${leadRef})` : `Unconfirmed email (lead ${leadRef}) - not charged`,
-        openHolds,
       );
     } else {
-      await settleCredits(admin, hold.id, 0, providerCostUsd, runKey, `No email found (lead ${leadRef}) - refund`, openHolds);
+      await settleHold(hold.id, 0, providerCostUsd, runKey, `No email found (lead ${leadRef}) - refund`);
       return fail('No verified email found for this lead. Zero credits charged.', 404, { no_hit: true });
     }
 
-    const finalCompanyName =
-      company_name && company_name !== 'Target Company'
-        ? company_name
-        : (resolvedDomain ? resolvedDomain.split('.')[0].toUpperCase() : 'Company');
-
-    const finalTitle =
-      title && title !== 'Target Decision Maker'
-        ? title
-        : title || 'Executive';
-
-    // 5. Upsert into user_leads table
-    const leadRecord = {
+    // 5. Saved merged onto the stored row: a blank or placeholder field no
+    // longer overwrites what the row already had (audit M2).
+    const leadRecord = mergeLeadRecord(existing, {
       user_id: userId,
       first_name: resolvedFirst,
       last_name: resolvedLast,
       full_name: resolvedName || `${resolvedFirst} ${resolvedLast}`.trim(),
-      title: finalTitle,
-      company_name: finalCompanyName,
+      title: title && title !== 'Target Decision Maker' ? title : 'Executive',
+      company_name:
+        company_name && company_name !== 'Target Company'
+          ? company_name
+          : (resolvedDomain ? resolvedDomain.split('.')[0].toUpperCase() : 'Company'),
       company_domain: resolvedDomain,
       company_size: company_size || null,
       company_revenue: company_revenue || null,
@@ -1894,14 +1993,12 @@ async function handleRequest(req: Request): Promise<Response> {
       work_email: emailFound,
       email_status: emailStatus,
       email_confidence: emailConfidence,
-      status: existing?.status || 'new',
+      status: null,
       updated_at: new Date().toISOString(),
-    };
+    });
 
     if (!leadRecord.full_name) {
       // full_name is NOT NULL, so an unidentifiable target cannot be persisted.
-      // The credits are still settled above — the work was done, and the user
-      // got an address back on screen.
       return json({
         ok: true,
         lead: { ...leadRecord, full_name: 'Unknown contact', is_saved: false },
@@ -1934,291 +2031,242 @@ async function handleRequest(req: Request): Promise<Response> {
   // =========================================================================
   if (action === 'bulk-reveal-email') {
     const MAX_BULK = 100;
-    // A lead without a name cannot be looked up or saved (full_name is NOT
-    // NULL), and one bad row used to fail the batch upsert, leaving every
-    // email in it charged but never persisted.
-    // Clamped first: these fields go to the provider and into user_leads.
-    // Keys below use the sanitised values for matching saved rows, and each
-    // lead's `client_key` (what the client computed) for per-lead results.
-    const leadsToReveal: any[] = (Array.isArray(body.leads) ? body.leads : [])
+    const emailPrice = (await loadPrices(admin)).email;
+    if (emailPrice === null) return pricingUnavailable();
+    // Clamped first; a lead without a name cannot be looked up or saved.
+    // Then deduped by (company_domain, full_name) BEFORE any lookup (audit
+    // H5): duplicates used to be looked up and charged once each, and then the
+    // batch upsert failed on them, so nothing was saved at all.
+    const sanitized: any[] = (Array.isArray(body.leads) ? body.leads : [])
       .slice(0, 2000)
       .map(sanitizeLead)
       .filter((l: any) => l.full_name && (l.company_domain || l.linkedin_url));
-    if (leadsToReveal.length === 0) {
+    if (sanitized.length === 0) {
       return fail('No leads provided for bulk reveal');
     }
+    const leadsToReveal = dedupeLeads(sanitized);
 
-    // Filter out already revealed. Fetch only the rows whose domain is among
-    // the requested leads: a full-table select is capped at 1000 rows by
-    // PostgREST, which silently dropped the oldest leads and re-charged them.
-    const revealDomains = [...new Set(leadsToReveal.map((l: any) => (l.company_domain || '').trim().toLowerCase()).filter(Boolean))];
-    let existingLeads: any[] = [];
-    if (revealDomains.length > 0) {
-      const { data } = await admin
-        .from('user_leads')
-        .select('*')
-        .eq('user_id', userId)
-        .in('company_domain', revealDomains);
-      if (data) existingLeads = data;
-    }
-    // LinkedIn-only leads (empty domain) are handled separately so they can
-    // still be matched instead of being missed.
-    if (leadsToReveal.some((l: any) => !(l.company_domain || '').trim())) {
-      const { data: nullRows } = await admin
-        .from('user_leads')
-        .select('*')
-        .eq('user_id', userId)
-        .is('company_domain', null);
-      if (nullRows) existingLeads = existingLeads.concat(nullRows);
-      const { data: emptyRows } = await admin
-        .from('user_leads')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('company_domain', '');
-      if (emptyRows) existingLeads = existingLeads.concat(emptyRows);
-    }
-
-    const existingMap = new Map<string, any>();
-    (existingLeads || []).forEach((e: any) => {
-      const k = `${(e.company_domain || '').toLowerCase().trim()}::${(e.full_name || '').toLowerCase().trim()}`;
-      if (hasRevealedEmail(e)) existingMap.set(k, e);
-    });
-
-    const neededLeads = leadsToReveal.filter((l: any) => {
-      const k = `${(l.company_domain || '').toLowerCase().trim()}::${(l.full_name || '').toLowerCase().trim()}`;
-      return !existingMap.has(k);
-    });
+    const saved = indexExistingRows(await loadExistingRows(admin, userId, leadsToReveal));
+    // Only a VERIFIED stored address is "already revealed" (audit M2).
+    const alreadyRevealed = leadsToReveal.filter((l: any) => hasRevealedEmail(saved.find(l)));
+    const neededLeads = leadsToReveal.filter((l: any) => !hasRevealedEmail(saved.find(l)));
+    const existingRecords = alreadyRevealed.map((l: any) => saved.find(l));
 
     if (neededLeads.length === 0) {
-      // Same key as the success branch. This one returned `updated_leads`, which
-      // the client never reads, so a re-run of the batch looked like it had
-      // revealed nothing at all.
       return json({
         ok: true,
         message: 'All selected leads were already revealed.',
         requested_count: 0,
         revealed_count: 0,
         credits_charged: 0,
-        updated_records: (existingLeads || []).filter((e: any) =>
-          existingMap.has(`${(e.company_domain || '').toLowerCase().trim()}::${(e.full_name || '').toLowerCase().trim()}`)
-        ),
+        updated_records: existingRecords,
+        existing_records: existingRecords,
       });
     }
 
     const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.bulkRevealBurst, RATE_LIMITS.bulkReveal]);
     if (limited) return limited;
 
-    // Reserve credits for the batch. The key is deterministic per (user, set of
-    // leads, action, minute): a double-submitted batch lands on the same hold
-    // and is refused below instead of being looked up and charged twice.
-    const emailPrice = (await loadPrices(admin)).email;
-    const batch = neededLeads.slice(0, Math.min(neededLeads.length, MAX_BULK));
-    const creditsToHold = batch.length * emailPrice;
+    // One charge per UNIQUE lead. Deterministic key per (user, set of leads,
+    // minute): a double-submitted batch in flight is refused, not charged twice.
+    const batch = neededLeads.slice(0, MAX_BULK);
     const batchRefs = await Promise.all(batch.map((l: any) => shortHash(leadIdentity(l))));
     const batchRef = await shortHash([...batchRefs].sort().join(','));
-    const runKey = `bulk_reveal_email:${userId}:${batchRef}:${revealWindow()}`;
-    const hold = await reserveCredits(admin, userId, creditsToHold, runKey, {
+    const baseKey = `bulk_reveal_email:${userId}:${batchRef}:${revealWindow()}`;
+    const { hold, key: runKey } = await reserveOnce(admin, userId, batch.length * emailPrice, baseKey, {
       feature: 'bulk_lead_email_reveal',
       count: batch.length,
       batch_ref: batchRef,
     }, openHolds);
 
-    if ('shortfall' in hold) {
-      return fail(`Insufficient credits. Needed: ${hold.required}, Available: ${hold.available}`, 402, {
-        insufficient_credits: true,
-        required: hold.required,
-        available: hold.available,
-      });
-    }
+    if ('shortfall' in hold) return insufficientCredits(hold);
     if (hold.duplicate) {
       return fail('This batch is already being looked up. Please wait a moment.', 409, { duplicate_request: true });
     }
 
-    // Execute email finds concurrently (batches of 5)
     let successfulReveals = 0;
     // Only verified addresses are charged; unconfirmed ones are returned free.
-    // That is a product rule (users never pay for a miss or an unconfirmed
-    // address), so the provider cost of those lookups is ours; the rate limits
-    // above are what keep it bounded.
     let verifiedReveals = 0;
     const bulkUsageStart = usage.rows.length;
-    const updatedRecords: any[] = [];
-    // Leads the provider answered for but had no address. A failed or timed-out
-    // lookup is deliberately not listed: the client marks these rows "Not
-    // found", and that must not happen to a row that was never really tried.
+    const records: any[] = [];
+    const chargedRows: { credits_charged: number }[] = [];
+    // Leads the provider answered for but had no usable address.
     const notFoundKeys: string[] = [];
-    // Lookups that errored or timed out. Reported separately so the client
-    // can offer a retry instead of claiming the person has no email.
+    // Lookups that errored or timed out, so the client can offer a retry.
     const failedKeys: string[] = [];
+    // Leads not looked up because the hourly `leads.reveal` limit refused.
+    const rateLimitedKeys: string[] = [];
+    const bulkCost = () => usage.costSince(bulkUsageStart, 'treg.people.email.find', 'bulk-email');
+    let closed = false;
 
-    const batchSize = 5;
-    const creditsCharged = () => verifiedReveals * emailPrice;
     try {
-    for (let i = 0; i < batch.length; i += batchSize) {
-      const chunk = batch.slice(i, i + batchSize);
-      await Promise.all(
-        chunk.map(async (lead: any) => {
-          try {
-            const emailPayload: Record<string, string> = {};
-            if (lead.company_domain) emailPayload.domain = lead.company_domain;
-            if (lead.full_name) emailPayload.full_name = lead.full_name;
-            if (lead.linkedin_url) emailPayload.linkedin_url = lead.linkedin_url;
+      for (let i = 0; i < batch.length; i += 5) {
+        await Promise.all(
+          batch.slice(i, i + 5).map(async (lead: any, j: number) => {
+            try {
+              // Each lookup also takes a slot from the hourly `leads.reveal`
+              // bucket, like a single reveal and auto-enrich, so bulk cannot
+              // run thousands of lookups an hour outside the reveal limits.
+              // Refused (or limiter down): not looked up, not charged, and
+              // reported in rate_limited_keys so the client can retry later.
+              if ((await takeRateLimit(admin, userId, RATE_LIMITS.reveal)) !== true) {
+                rateLimitedKeys.push(...lead.client_keys);
+                return;
+              }
+              const emailPayload: Record<string, string> = {};
+              if (lead.company_domain) emailPayload.domain = lead.company_domain;
+              if (lead.full_name) emailPayload.full_name = lead.full_name;
+              if (lead.linkedin_url) emailPayload.linkedin_url = lead.linkedin_url;
 
-            const tregRes = await fetch(`${TREG_BASE}/call/treg.people.email.find`, {
-              method: 'POST',
-              headers: {
-                'X-Treg-Token': token,
-                'X-Treg-Meta': `customer=${userId}, feature=bulk-email`,
-                'X-Treg-Route-Verify': 'true',
-                'X-Treg-Route-Max-Cost': MAX_COST.email,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify(emailPayload),
-              signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
-            });
+              const tregRes = await fetch(`${TREG_BASE}/call/treg.people.email.find`, {
+                method: 'POST',
+                headers: tregHeaders(token, userId, 'bulk-email', MAX_COST.email, `echo:${baseKey}:${batchRefs[i + j]}`, {
+                  'X-Treg-Route-Verify': 'true',
+                }),
+                body: JSON.stringify(emailPayload),
+                signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
+              });
 
-            const bulkRow = usage.track('treg.people.email.find', tregRes, { feature: 'bulk-email' });
-            if (tregRes.ok) {
+              const bulkRow = usage.track('treg.people.email.find', tregRes, { feature: 'bulk-email' }, hold.id);
+              if (!tregRes.ok) {
+                failedKeys.push(...lead.client_keys);
+                return;
+              }
               const resJson = await tregRes.json();
               const rawEmail = resJson?.output?.email || resJson?.raw?.data?.email;
               const verdict = classifyEmail(resJson);
               const email = isEmailAddress(rawEmail) && verdict.usable ? rawEmail.trim() : null;
-              if (email && verdict.charge) {
+              if (!email) {
+                notFoundKeys.push(...lead.client_keys);
+                return;
+              }
+              if (verdict.charge) {
                 verifiedReveals++;
                 bulkRow.credits_charged = emailPrice;
+                chargedRows.push(bulkRow);
               }
-              const key = `${lead.company_domain}::${lead.full_name.toLowerCase()}`;
-              if (!email) notFoundKeys.push(lead.client_key);
-              if (email) {
-                successfulReveals++;
-                updatedRecords.push({
-                  user_id: userId,
-                  first_name: lead.first_name || lead.full_name.split(' ')[0] || '',
-                  last_name: lead.last_name || lead.full_name.split(' ').slice(1).join(' ') || '',
-                  full_name: lead.full_name,
-                  title: lead.title || 'Executive',
-                  company_name: lead.company_name || lead.company_domain.split('.')[0] || '',
-                  company_domain: lead.company_domain || '',
-                  company_size: lead.company_size || null,
-                  company_revenue: lead.company_revenue || null,
-                  linkedin_url: lead.linkedin_url || null,
-                  location: lead.location || null,
-                  work_email: email,
-                  email_status: verdict.status,
-                  email_confidence: verdict.charge ? 0.95 : 0.5,
-                  // Carry the existing stage forward. Hardcoding 'new' moved a
-                  // prospect the user had already marked "Replied" back to the
-                  // top of the pipeline every time its email was re-resolved.
-                  status: existingMap.get(key)?.status || lead.status || 'new',
-                  updated_at: new Date().toISOString(),
-                });
-              }
-            } else {
-              failedKeys.push(lead.client_key);
+              successfulReveals++;
+              // Same columns for every record (a bulk upsert nulls missing
+              // ones); merged onto the stored row so blanks keep stored data.
+              records.push(mergeLeadRecord(saved.find(lead), {
+                user_id: userId,
+                first_name: lead.first_name || lead.full_name.split(' ')[0] || '',
+                last_name: lead.last_name || lead.full_name.split(' ').slice(1).join(' ') || '',
+                full_name: lead.full_name,
+                title: lead.title || 'Executive',
+                company_name: lead.company_name || lead.company_domain.split('.')[0] || '',
+                company_domain: lead.company_domain || '',
+                company_size: lead.company_size || null,
+                company_revenue: lead.company_revenue || null,
+                linkedin_url: lead.linkedin_url || null,
+                location: lead.location || null,
+                work_email: email,
+                email_status: verdict.status,
+                email_confidence: verdict.charge ? 0.95 : 0.5,
+                // The stored stage wins; 'new' only for a new row.
+                status: null,
+                updated_at: new Date().toISOString(),
+              }));
+            } catch (err: any) {
+              failedKeys.push(...lead.client_keys);
+              console.warn('[leads] bulk email item failed:', err?.name || err?.message);
             }
-          } catch (err: any) {
-            failedKeys.push(lead.client_key);
-            console.warn('[leads] bulk email item failed:', err?.name || err?.message);
-          }
-        })
-      );
-    }
-    } finally {
-      // Settled from `finally` so an exception mid-batch cannot leave the hold
-      // open. Only verified reveals are charged; the provider cost is Treg's
-      // actual charge for every lookup in the batch, hits and misses.
-      await settleCredits(
-        admin,
+          }),
+        );
+      }
+
+      let savedRows: any[] = [];
+      if (records.length > 0) {
+        const { data, error: saveErr } = await admin
+          .from('user_leads')
+          .upsert(records, { onConflict: 'user_id,company_domain,full_name' })
+          .select();
+        if (saveErr) {
+          // Fail loudly (audit H5). Nothing was saved, so nothing is charged:
+          // the hold is settled at 0 with the provider's real cost, and the
+          // usage rows carry no credits for the reaper to bill.
+          console.error('[leads] bulk reveal upsert failed:', saveErr.message);
+          for (const row of chargedRows) row.credits_charged = 0;
+          closed = true;
+          await settleHold(hold.id, 0, bulkCost(), runKey, `Bulk email reveal not saved (${batch.length} leads) - not charged`);
+          return fail('The contacts could not be saved. Zero credits charged; please try again.', 500, {
+            save_failed: true,
+            credits_charged: 0,
+          });
+        }
+        savedRows = data || [];
+      }
+
+      closed = true;
+      await settleHold(
         hold.id,
-        creditsCharged(),
-        usage.costSince(bulkUsageStart, 'treg.people.email.find', 'bulk-email'),
+        verifiedReveals * emailPrice,
+        bulkCost(),
         runKey,
         `Bulk revealed ${successfulReveals} emails, ${verifiedReveals} verified and charged (${batch.length - verifiedReveals} not charged)`,
-        openHolds,
       );
-    }
 
-    // Save all successful records to user_leads
-    if (updatedRecords.length > 0) {
-      const { data: savedRows, error: saveErr } = await admin
-        .from('user_leads')
-        .upsert(updatedRecords, { onConflict: 'user_id,company_domain,full_name' })
-        .select('id, company_domain, full_name');
-      if (saveErr) console.error('[leads] bulk reveal upsert failed:', saveErr.message);
-      // Hand the row ids back so the client can address those leads directly.
-      const idByKey = new Map<string, string>();
-      (savedRows || []).forEach((r: any) => {
-        idByKey.set(`${(r.company_domain || '').toLowerCase().trim()}::${(r.full_name || '').toLowerCase().trim()}`, r.id);
+      return json({
+        ok: true,
+        requested_count: sanitized.length,
+        unique_count: leadsToReveal.length,
+        duplicate_count: sanitized.length - leadsToReveal.length,
+        already_revealed_count: alreadyRevealed.length,
+        processed_count: batch.length,
+        capped_count: Math.max(0, neededLeads.length - batch.length),
+        revealed_count: successfulReveals,
+        verified_count: verifiedReveals,
+        credits_charged: verifiedReveals * emailPrice,
+        skipped_count: neededLeads.length - batch.length,
+        // The saved rows, ids included, so the client can address them.
+        updated_records: savedRows,
+        existing_records: existingRecords,
+        not_found_keys: notFoundKeys,
+        failed_keys: failedKeys,
+        rate_limited_keys: rateLimitedKeys,
+        rate_limited_count: rateLimitedKeys.length,
+        ...(rateLimitedKeys.length > 0
+          ? { partial: true, message: RATE_LIMITS.reveal.message }
+          : {}),
       });
-      updatedRecords.forEach((r: any) => {
-        r.id = idByKey.get(`${(r.company_domain || '').toLowerCase().trim()}::${(r.full_name || '').toLowerCase().trim()}`) || r.id;
-      });
+    } finally {
+      // An exception before the save: nothing saved, nothing charged.
+      if (!closed) {
+        for (const row of chargedRows) row.credits_charged = 0;
+        await settleHold(hold.id, 0, bulkCost(), runKey, 'Bulk email reveal aborted - not charged');
+      }
     }
-
-    return json({
-      ok: true,
-      // The client needs all three numbers to describe what happened without
-      // inventing a refund: leads it sent, leads that cost nothing because the
-      // address was already known, and leads this run could not reach because
-      // of the per-batch cap.
-      requested_count: leadsToReveal.length,
-      already_revealed_count: leadsToReveal.length - neededLeads.length,
-      processed_count: batch.length,
-      capped_count: Math.max(0, neededLeads.length - batch.length),
-      revealed_count: successfulReveals,
-      verified_count: verifiedReveals,
-      credits_charged: creditsCharged(),
-      skipped_count: neededLeads.length - batch.length,
-      updated_records: updatedRecords,
-      // Leads in this request whose address was already on file. Returned so
-      // the client can show them without a second round trip.
-      existing_records: leadsToReveal
-        .map((l: any) => existingMap.get(`${l.company_domain}::${l.full_name.toLowerCase()}`))
-        .filter(Boolean),
-      not_found_keys: notFoundKeys,
-      failed_keys: failedKeys,
-    });
   }
 
   // =========================================================================
-  // ACTION 3b: BULK REVEAL PHONES (2 credits per number found)
+  // ACTION 3b: BULK REVEAL PHONES (pricing_config `treg.people.phone.find`)
   // -------------------------------------------------------------------------
-  // Same contract as bulk-reveal-email: credits are held for the batch up
-  // front, only numbers actually found are charged, and the response says per
-  // lead whether it was found, not found, or failed. The provider has no batch
-  // endpoint, so the batch is small and the lookups run five at a time.
+  // Same contract as bulk-reveal-email: deduped input, one hold for the
+  // batch, only numbers actually found (and saved) are charged, and the
+  // response says per lead whether it was found, not found, or failed.
   // =========================================================================
   if (action === 'bulk-reveal-phone') {
     const MAX_BULK_PHONE = 25;
-    const PHONE_CREDITS = (await loadPrices(admin)).phone;
-    const keyOf = (l: any) =>
-      `${(l.company_domain || '').toLowerCase().trim()}::${(l.full_name || '').toLowerCase().trim()}`;
+    const phonePrice = (await loadPrices(admin)).phone;
+    if (phonePrice === null) return pricingUnavailable();
 
-    // Clamped first; `client_key` carries the client's own key for results.
-    const requested: any[] = (Array.isArray(body.leads) ? body.leads : [])
+    const sanitized: any[] = (Array.isArray(body.leads) ? body.leads : [])
       .slice(0, 2000)
       .map(sanitizeLead)
-      .filter((l: any) => l.full_name && (l.company_domain || l.linkedin_url || l.work_email));
-    if (requested.length === 0) return fail('No leads provided for phone lookup');
+      .filter((l: any) => l.full_name && (l.company_domain || l.linkedin_url || l.email_hint));
+    if (sanitized.length === 0) return fail('No leads provided for phone lookup');
+    // Deduped before any lookup (audit H5).
+    const requested = dedupeLeads(sanitized);
 
-    const domains = [...new Set(requested.map((l: any) => cleanDomain(l.company_domain)).filter(Boolean))];
-    let existingRows: any[] = [];
-    if (domains.length > 0) {
-      const { data } = await admin
-        .from('user_leads')
-        .select('*')
-        .eq('user_id', userId)
-        .in('company_domain', domains);
-      if (data) existingRows = data;
-    }
-    const existingByKey = new Map<string, any>();
-    existingRows.forEach((r: any) => existingByKey.set(keyOf(r), r));
+    // Includes the empty-domain (LinkedIn-only) rows: those used to be missed,
+    // so their numbers were bought again on every run (audit M2).
+    const saved = indexExistingRows(await loadExistingRows(admin, userId, requested));
 
     // A number already on file is never bought twice.
-    const known = requested.filter((l: any) => existingByKey.get(keyOf(l))?.phone_number);
-    const needed = requested.filter((l: any) => !existingByKey.get(keyOf(l))?.phone_number);
+    const known = requested.filter((l: any) => saved.find(l)?.phone_number);
+    const needed = requested.filter((l: any) => !saved.find(l)?.phone_number);
     const batch = needed.slice(0, MAX_BULK_PHONE);
-    const existingRecords = known.map((l: any) => existingByKey.get(keyOf(l)));
+    const existingRecords = known.map((l: any) => saved.find(l));
 
     if (batch.length === 0) {
       return json({
@@ -2237,40 +2285,47 @@ async function handleRequest(req: Request): Promise<Response> {
     const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.bulkRevealBurst, RATE_LIMITS.bulkReveal]);
     if (limited) return limited;
 
-    // Deterministic per (user, set of leads, action, minute) so a
-    // double-submitted batch reuses the hold and is refused, not charged twice.
     const batchRefs = await Promise.all(batch.map((l: any) => shortHash(leadIdentity(l))));
     const batchRef = await shortHash([...batchRefs].sort().join(','));
-    const runKey = `bulk_reveal_phone:${userId}:${batchRef}:${revealWindow()}`;
-    const hold = await reserveCredits(admin, userId, batch.length * PHONE_CREDITS, runKey, {
+    const baseKey = `bulk_reveal_phone:${userId}:${batchRef}:${revealWindow()}`;
+    const { hold, key: runKey } = await reserveOnce(admin, userId, batch.length * phonePrice, baseKey, {
       feature: 'bulk_lead_phone_reveal',
       count: batch.length,
       batch_ref: batchRef,
     }, openHolds);
-    if ('shortfall' in hold) {
-      return fail(`Insufficient credits. Needed: ${hold.required}, Available: ${hold.available}`, 402, {
-        insufficient_credits: true,
-        required: hold.required,
-        available: hold.available,
-      });
-    }
+    if ('shortfall' in hold) return insufficientCredits(hold);
     if (hold.duplicate) {
       return fail('This batch is already being looked up. Please wait a moment.', 409, { duplicate_request: true });
     }
 
-    const updatedRecords: any[] = [];
+    const records: any[] = [];
+    const chargedRows: { credits_charged: number }[] = [];
     const notFoundKeys: string[] = [];
     const failedKeys: string[] = [];
+    // Leads not looked up because the hourly `leads.reveal` limit refused.
+    const rateLimitedKeys: string[] = [];
     const phoneUsageStart = usage.rows.length;
+    const phoneCost = () => usage.costSince(phoneUsageStart, 'treg.people.phone.find', 'bulk-phone');
+    let closed = false;
 
     try {
       for (let i = 0; i < batch.length; i += 5) {
         await Promise.all(
-          batch.slice(i, i + 5).map(async (lead: any) => {
-            const key = lead.client_key;
+          batch.slice(i, i + 5).map(async (lead: any, j: number) => {
             try {
+              // Each lookup also takes a slot from the hourly `leads.reveal`
+              // bucket, like a single reveal and auto-enrich, so bulk cannot
+              // run thousands of lookups an hour outside the reveal limits.
+              // Refused (or limiter down): not looked up, not charged, and
+              // reported in rate_limited_keys so the client can retry later.
+              if ((await takeRateLimit(admin, userId, RATE_LIMITS.reveal)) !== true) {
+                rateLimitedKeys.push(...lead.client_keys);
+                return;
+              }
+              const stored = saved.find(lead);
               const domain = lead.company_domain;
-              const email = lead.work_email || '';
+              // A lookup hint only; never written to the row (audit N13).
+              const email = (hasUsableEmail(stored) ? stored.work_email : '') || lead.email_hint || '';
               const payload: Record<string, string> = { full_name: lead.full_name };
               if (lead.linkedin_url) payload.linkedin_url = lead.linkedin_url;
               if (email) payload.email = email;
@@ -2278,29 +2333,24 @@ async function handleRequest(req: Request): Promise<Response> {
 
               const res = await fetch(`${TREG_BASE}/call/treg.people.phone.find`, {
                 method: 'POST',
-                headers: {
-                  'X-Treg-Token': token,
-                  'X-Treg-Meta': `customer=${userId}, feature=bulk-phone`,
-                  'X-Treg-Route-Max-Cost': MAX_COST.phone,
-                  'Content-Type': 'application/json',
-                  Accept: 'application/json',
-                },
+                headers: tregHeaders(token, userId, 'bulk-phone', MAX_COST.phone, `echo:${baseKey}:${batchRefs[i + j]}`),
                 body: JSON.stringify(payload),
                 signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
               });
-              const phoneRow = usage.track('treg.people.phone.find', res, { feature: 'bulk-phone' });
+              const phoneRow = usage.track('treg.people.phone.find', res, { feature: 'bulk-phone' }, hold.id);
               if (!res.ok) {
-                failedKeys.push(key);
+                failedKeys.push(...lead.client_keys);
                 return;
               }
               const data = await res.json();
               const phone = data?.output?.phone || data?.raw?.data?.employee_phone || null;
               if (typeof phone !== 'string' || !phone.trim()) {
-                notFoundKeys.push(key);
+                notFoundKeys.push(...lead.client_keys);
                 return;
               }
-              phoneRow.credits_charged = PHONE_CREDITS;
-              updatedRecords.push({
+              phoneRow.credits_charged = phonePrice;
+              chargedRows.push(phoneRow);
+              records.push(mergeLeadRecord(stored, {
                 user_id: userId,
                 full_name: lead.full_name,
                 first_name: lead.first_name || lead.full_name.split(' ')[0] || '',
@@ -2310,75 +2360,89 @@ async function handleRequest(req: Request): Promise<Response> {
                 company_domain: domain || '',
                 linkedin_url: lead.linkedin_url || null,
                 location: lead.location || null,
-                // Omitted when unknown: on a conflict an explicit null would
-                // erase the address this row already had.
-                ...(email ? { work_email: email } : {}),
                 phone_number: clampText(phone, 50),
                 phone_type: clampText(data?.output?.line_type, 32) || 'mobile',
+                status: null,
                 updated_at: new Date().toISOString(),
-              });
+              }));
             } catch (err: any) {
-              failedKeys.push(key);
+              failedKeys.push(...lead.client_keys);
               console.warn('[leads] bulk phone item failed:', err?.name || err?.message);
             }
           }),
         );
       }
-    } finally {
-      // Settled from `finally` so an exception mid-batch cannot leave the
-      // hold open. Only numbers actually found are charged; the provider cost
-      // is Treg's actual charge for every lookup, hits and misses.
-      await settleCredits(
-        admin,
+
+      let savedRows: any[] = [];
+      if (records.length > 0) {
+        const { data, error: saveErr } = await admin
+          .from('user_leads')
+          .upsert(records, { onConflict: 'user_id,company_domain,full_name' })
+          .select();
+        if (saveErr) {
+          // Fail loudly (audit H5): nothing saved, nothing charged.
+          console.error('[leads] bulk phone upsert failed:', saveErr.message);
+          for (const row of chargedRows) row.credits_charged = 0;
+          closed = true;
+          await settleHold(hold.id, 0, phoneCost(), runKey, `Bulk phone reveal not saved (${batch.length} leads) - not charged`);
+          return fail('The numbers could not be saved. Zero credits charged; please try again.', 500, {
+            save_failed: true,
+            credits_charged: 0,
+          });
+        }
+        savedRows = data || [];
+      }
+
+      closed = true;
+      await settleHold(
         hold.id,
-        updatedRecords.length * PHONE_CREDITS,
-        usage.costSince(phoneUsageStart, 'treg.people.phone.find', 'bulk-phone'),
+        records.length * phonePrice,
+        phoneCost(),
         runKey,
-        `Bulk revealed ${updatedRecords.length} phones (${batch.length - updatedRecords.length} not charged)`,
-        openHolds,
+        `Bulk revealed ${records.length} phones (${batch.length - records.length} not charged)`,
       );
-    }
 
-    if (updatedRecords.length > 0) {
-      const { data: savedRows, error: saveErr } = await admin
-        .from('user_leads')
-        .upsert(updatedRecords, { onConflict: 'user_id,company_domain,full_name' })
-        .select('id, company_domain, full_name');
-      if (saveErr) console.error('[leads] bulk phone upsert failed:', saveErr.message);
-      const idByKey = new Map<string, string>();
-      (savedRows || []).forEach((r: any) => idByKey.set(keyOf(r), r.id));
-      updatedRecords.forEach((r: any) => {
-        r.id = idByKey.get(keyOf(r)) || r.id;
+      return json({
+        ok: true,
+        revealed_count: records.length,
+        credits_charged: records.length * phonePrice,
+        processed_count: batch.length,
+        capped_count: Math.max(0, needed.length - batch.length),
+        duplicate_count: sanitized.length - requested.length,
+        updated_records: savedRows,
+        existing_records: existingRecords,
+        not_found_keys: notFoundKeys,
+        failed_keys: failedKeys,
+        rate_limited_keys: rateLimitedKeys,
+        rate_limited_count: rateLimitedKeys.length,
+        ...(rateLimitedKeys.length > 0
+          ? { partial: true, message: RATE_LIMITS.reveal.message }
+          : {}),
       });
+    } finally {
+      if (!closed) {
+        for (const row of chargedRows) row.credits_charged = 0;
+        await settleHold(hold.id, 0, phoneCost(), runKey, 'Bulk phone reveal aborted - not charged');
+      }
     }
-
-    return json({
-      ok: true,
-      revealed_count: updatedRecords.length,
-      credits_charged: updatedRecords.length * PHONE_CREDITS,
-      processed_count: batch.length,
-      capped_count: Math.max(0, needed.length - batch.length),
-      updated_records: updatedRecords,
-      existing_records: existingRecords,
-      not_found_keys: notFoundKeys,
-      failed_keys: failedKeys,
-    });
   }
 
   // =========================================================================
-  // ACTION 4: REVEAL PHONE (2 Credits)
+  // ACTION 4: REVEAL PHONE (single; pricing_config `treg.people.phone.find`)
   // =========================================================================
   if (action === 'reveal-phone') {
     // Every field clamped; a non-linkedin.com profile URL is dropped.
     const input = sanitizeLead(body);
     const { full_name, first_name, last_name, company_domain, linkedin_url } = input;
-    // Only a real address is used to match or persist; a preview placeholder
-    // like "N/A" would otherwise be written into the saved row.
+    // The client's address is a lookup / matching hint only. It is never
+    // written to the row: verification fields are server-owned (audit N13).
     const work_email = safeEmail(body.work_email) || '';
 
     if (!linkedin_url && !company_domain && !work_email) {
       return fail('LinkedIn URL, email, or company domain is required.');
     }
+    const phonePrice = (await loadPrices(admin)).phone;
+    if (phonePrice === null) return pricingUnavailable();
 
     let finalDomain = company_domain;
     if (!finalDomain && work_email && work_email.includes('@')) {
@@ -2401,26 +2465,16 @@ async function handleRequest(req: Request): Promise<Response> {
     const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.revealBurst, RATE_LIMITS.reveal]);
     if (limited) return limited;
 
-    // Deterministic per (user, lead, action, minute): a double-click reuses
-    // this hold and is refused below rather than charged twice. The ledger and
-    // reservation carry a hash, not the name or LinkedIn URL.
-    const CREDITS_REQUIRED = (await loadPrices(admin)).phone;
     const leadRef = await shortHash(
       leadIdentity({ company_domain: finalDomain, full_name: resolvedName, linkedin_url, work_email }),
     );
-    const runKey = `reveal_phone:${userId}:${leadRef}:${revealWindow()}`;
-    const hold = await reserveCredits(admin, userId, CREDITS_REQUIRED, runKey, {
+    const baseKey = `reveal_phone:${userId}:${leadRef}:${revealWindow()}`;
+    const { hold, key: runKey } = await reserveOnce(admin, userId, phonePrice, baseKey, {
       feature: 'lead_phone_reveal',
       lead_ref: leadRef,
     }, openHolds);
 
-    if ('shortfall' in hold) {
-      return fail(`Insufficient credits. Required: ${hold.required}, Available: ${hold.available}`, 402, {
-        insufficient_credits: true,
-        required: hold.required,
-        available: hold.available,
-      });
-    }
+    if ('shortfall' in hold) return insufficientCredits(hold);
     if (hold.duplicate) {
       return fail('This contact is already being looked up. Please wait a moment.', 409, { duplicate_request: true });
     }
@@ -2432,30 +2486,25 @@ async function handleRequest(req: Request): Promise<Response> {
     try {
       const phonePayload: Record<string, string> = {};
       if (linkedin_url) phonePayload.linkedin_url = linkedin_url;
-      if (work_email) phonePayload.email = work_email;
+      const hintEmail = (hasUsableEmail(existing) ? existing.work_email : '') || work_email;
+      if (hintEmail) phonePayload.email = hintEmail;
       if (finalDomain) phonePayload.domain = finalDomain;
       if (resolvedName) phonePayload.full_name = resolvedName;
 
       const tregRes = await fetch(`${TREG_BASE}/call/treg.people.phone.find`, {
         method: 'POST',
-        headers: {
-          'X-Treg-Token': token,
-          'X-Treg-Meta': `customer=${userId}, feature=lead-phone`,
-          'X-Treg-Route-Max-Cost': MAX_COST.phone,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
+        headers: tregHeaders(token, userId, 'lead-phone', MAX_COST.phone, `echo:${baseKey}`),
         body: JSON.stringify(phonePayload),
         signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
       });
 
-      const singlePhoneRow = usage.track('treg.people.phone.find', tregRes, { feature: 'lead-phone' });
+      const singlePhoneRow = usage.track('treg.people.phone.find', tregRes, { feature: 'lead-phone' }, hold.id);
 
       if (tregRes.ok) {
         const resJson = await tregRes.json();
         phoneFound = clampText(resJson?.output?.phone || resJson?.raw?.data?.employee_phone, 50) || null;
         phoneType = clampText(resJson?.output?.line_type, 32) || 'mobile';
-        if (phoneFound) singlePhoneRow.credits_charged = CREDITS_REQUIRED;
+        if (phoneFound) singlePhoneRow.credits_charged = phonePrice;
       }
     } catch (err: any) {
       console.warn('[leads] phone find error:', err?.name || String(err?.message || '').slice(0, 200));
@@ -2464,9 +2513,9 @@ async function handleRequest(req: Request): Promise<Response> {
     // Settled with Treg's actual charge for the lookup, hit or miss.
     const providerCostUsd = usage.costSince(phoneUsageStart, 'treg.people.phone.find');
     if (phoneFound) {
-      await settleCredits(admin, hold.id, CREDITS_REQUIRED, providerCostUsd, runKey, `Revealed phone (lead ${leadRef})`, openHolds);
+      await settleHold(hold.id, phonePrice, providerCostUsd, runKey, `Revealed phone (lead ${leadRef})`);
     } else {
-      await settleCredits(admin, hold.id, 0, providerCostUsd, runKey, `No phone found (lead ${leadRef}) - refund`, openHolds);
+      await settleHold(hold.id, 0, providerCostUsd, runKey, `No phone found (lead ${leadRef}) - refund`);
       return fail('No direct mobile number found for this lead. Zero credits charged.', 404, { no_hit: true });
     }
 
@@ -2490,13 +2539,11 @@ async function handleRequest(req: Request): Promise<Response> {
       updatedLead = data || existing;
     } else if (resolvedName) {
       // The credits are already settled, so the number has to land somewhere
-      // durable. Previously a phone revealed for a lead that was not already in
-      // the pipeline was returned to the screen and then dropped on the next
-      // render — two credits for a contact the user could never find again.
+      // durable.
       const { data, error } = await admin
         .from('user_leads')
         .upsert(
-          {
+          mergeLeadRecord(null, {
             user_id: userId,
             first_name: first_name || derived?.first_name || resolvedName.split(' ')[0] || '',
             last_name: last_name || derived?.last_name || resolvedName.split(' ').slice(1).join(' ') || '',
@@ -2506,11 +2553,9 @@ async function handleRequest(req: Request): Promise<Response> {
             company_domain: finalDomain || '',
             linkedin_url: linkedin_url || null,
             location: input.location || null,
-            // Omitted when unknown: on a conflict an explicit null would erase
-            // the address this row already had.
-            ...(work_email ? { work_email } : {}),
+            status: null,
             ...updatePayload,
-          },
+          }),
           { onConflict: 'user_id,company_domain,full_name' }
         )
         .select()
@@ -2524,8 +2569,8 @@ async function handleRequest(req: Request): Promise<Response> {
 
     return json({
       ok: true,
-      lead: updatedLead || { ...input, client_key: undefined, full_name: resolvedName, ...updatePayload },
-      credits_charged: CREDITS_REQUIRED,
+      lead: updatedLead || { ...input, client_key: undefined, email_hint: undefined, full_name: resolvedName, ...updatePayload },
+      credits_charged: phonePrice,
     });
   }
 
@@ -2535,8 +2580,8 @@ async function handleRequest(req: Request): Promise<Response> {
   if (action === 'bulk-save') {
     const rawLeads: any[] = Array.isArray(body.leads) ? body.leads : [];
     if (rawLeads.length === 0) return fail('No leads provided');
-    // user_leads is written only by this function now, so this is the one
-    // place a client's payload size and field contents are bounded.
+    // user_leads is written only by this function, so this is the one place a
+    // client's payload size and field contents are bounded.
     if (rawLeads.length > MAX_BULK_SAVE) {
       return fail(`At most ${MAX_BULK_SAVE} leads can be saved at once. Please save them in smaller batches.`, 400, {
         max_leads: MAX_BULK_SAVE,
@@ -2545,74 +2590,24 @@ async function handleRequest(req: Request): Promise<Response> {
     const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.bulkSave]);
     if (limited) return limited;
     // Clamped; invalid statuses become null (so the saved or default stage is
-    // kept) and non-linkedin.com profile URLs are dropped.
+    // kept) and non-linkedin.com profile URLs are dropped. full_name is NOT
+    // NULL and half the conflict key, so a lead without one cannot be saved.
+    // Deduped by (domain, name): Postgres rejects an upsert that touches the
+    // same conflict key twice.
     const leadsToSave = rawLeads.map(sanitizeLead);
-  // Fetch existing rows so a re-save cannot wipe a paid-for email, phone, or
-  // the pipeline stage the user already set on this prospect.
-  //
-  // Scoped to the domains in this batch on purpose: a full-table select is
-  // capped by PostgREST, so on a pipeline bigger than that cap the map came
-  // back incomplete and the upsert below wrote null over the very emails and
-  // phones it was supposed to preserve.
-  const saveDomains = [
-    ...new Set(
-      leadsToSave.map((l: any) => cleanDomain(l?.company_domain)).filter(Boolean),
-    ),
-  ];
-  let existingRows: any[] = [];
-  const DOMAIN_CHUNK = 100;
-  const ROW_PAGE = 500;
-  for (let i = 0; i < saveDomains.length; i += DOMAIN_CHUNK) {
-    const chunk = saveDomains.slice(i, i + DOMAIN_CHUNK);
-    let from = 0;
-    while (true) {
-      const { data, error } = await admin
-        .from('user_leads')
-        .select('*')
-        .eq('user_id', userId)
-        .in('company_domain', chunk)
-        .range(from, from + ROW_PAGE - 1);
-      if (error || !data || data.length === 0) break;
-      existingRows.push(...data);
-      if (data.length < ROW_PAGE) break;
-      from += ROW_PAGE;
-    }
-  }
-  // LinkedIn-only leads carry an empty domain, and the upsert can collide with
-  // those rows too.
-  if (leadsToSave.some((l: any) => !cleanDomain(l?.company_domain))) {
-    const { data: emptyRows } = await admin
-      .from('user_leads')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('company_domain', '');
-    if (emptyRows) existingRows = existingRows.concat(emptyRows);
-    const { data: nullRows } = await admin
-      .from('user_leads')
-      .select('*')
-      .eq('user_id', userId)
-      .is('company_domain', null);
-    if (nullRows) existingRows = existingRows.concat(nullRows);
-  }
-  const existingMap = new Map();
-  (existingRows || []).forEach((r) => {
-    existingMap.set((r.company_domain || '').toLowerCase().trim() + '::' + (r.full_name || '').toLowerCase().trim(), r);
-  });
+    const unique = dedupeLeads(leadsToSave.filter((l) => l.full_name));
+    if (unique.length === 0) return fail('No savable leads provided');
 
+    // Stored rows, so a re-save keeps the stored stage and fields.
+    const saved = indexExistingRows(await loadExistingRows(admin, userId, unique));
 
-    const existingFor = (l: any) =>
-      existingMap.get(l.company_domain + '::' + l.full_name.toLowerCase());
-    // Only a resolved address may be written as work_email. A search result's
-    // unverified preview address (or a placeholder such as "N/A") saved here
-    // later came back from the reveal endpoints as "already revealed", so the
-    // verified address could never be bought for that lead. sanitizeLead
-    // already applies that rule: its work_email is null for a preview.
-
-    const records = leadsToSave
-      // full_name is NOT NULL and is half the conflict target, so a record
-      // without one cannot be saved at all.
-      .filter((l) => l.full_name)
-      .map((l) => ({
+    // Verification and contact fields (work_email, email_status,
+    // email_confidence, phone_number, phone_type) are server-owned (audit N13)
+    // and deliberately absent: the client used to be able to save its own
+    // `email_status: 'valid'`. An upsert leaves them as stored; a new row gets
+    // them only from a reveal.
+    const records = unique.map((l: any) =>
+      mergeLeadRecord(saved.find(l), {
         user_id: userId,
         first_name: l.first_name || l.full_name.split(' ')[0] || '',
         last_name: l.last_name || l.full_name.split(' ').slice(1).join(' ') || '',
@@ -2625,26 +2620,13 @@ async function handleRequest(req: Request): Promise<Response> {
         company_phone: l.company_phone,
         linkedin_url: l.linkedin_url,
         location: l.location,
-        work_email: l.work_email || existingFor(l)?.work_email || null,
-        phone_number: l.phone_number || existingFor(l)?.phone_number || null,
-        email_status: l.email_status || existingFor(l)?.email_status || null,
-        status: l.status || existingFor(l)?.status || 'new',
+        // An explicit, valid stage from the client wins; otherwise the stored one.
+        status: l.status || null,
         updated_at: new Date().toISOString(),
-      }));
-
-    if (records.length === 0) return fail('No savable leads provided');
-
-    // Postgres rejects an upsert whose payload touches the same conflict key
-    // twice ("ON CONFLICT DO UPDATE command cannot affect row a second time").
-    // Keep the last copy of each person.
-    const dedupedRecords = new Map<string, any>();
-    for (const record of records) {
-      dedupedRecords.set(
-        `${record.company_domain}::${(record.full_name || '').toLowerCase().trim()}`,
-        record,
-      );
-    }
-    const uniqueRecords = [...dedupedRecords.values()];
+      }),
+    );
+    // Merging onto stored rows can map two inputs to one stored key.
+    const uniqueRecords = [...new Map(records.map((r) => [`${r.company_domain}::${r.full_name}`, r])).values()];
 
     const { data, error } = await admin
       .from('user_leads')
@@ -2657,15 +2639,13 @@ async function handleRequest(req: Request): Promise<Response> {
     }
     // How many were already in the pipeline, so the client can say "3 added,
     // 2 already saved" instead of claiming every row was newly saved.
-    const alreadySaved = uniqueRecords.filter((r) =>
-      existingMap.has(`${r.company_domain}::${(r.full_name || '').toLowerCase().trim()}`),
-    ).length;
+    const alreadySaved = unique.filter((l: any) => saved.find(l)).length;
     return json({
       ok: true,
       saved_count: data?.length || 0,
       new_count: Math.max(0, (data?.length || 0) - alreadySaved),
       already_saved_count: alreadySaved,
-      skipped_count: leadsToSave.length - records.length,
+      skipped_count: leadsToSave.length - unique.length,
       leads: data,
     });
   }
@@ -2721,7 +2701,7 @@ async function handleRequest(req: Request): Promise<Response> {
     // (or a placeholder such as "N/A") in work_email. Hand those back as the
     // unverified preview they are, so no view presents them as revealed.
     const cleaned = savedLeads.map((row) =>
-      row.work_email && !hasRevealedEmail(row)
+      row.work_email && !hasUsableEmail(row)
         ? {
             ...row,
             preview_email: isEmailAddress(row.work_email) ? row.work_email : null,
@@ -2777,8 +2757,8 @@ async function handleRequest(req: Request): Promise<Response> {
       }
       const first = input.first_name || resolvedName.split(' ')[0] || '';
       const last = input.last_name || resolvedName.split(' ').slice(1).join(' ') || '';
-      const auto_email = safeEmail(body.work_email);
-      const auto_phone = clampText(body.phone_number, 50);
+      // Contact and verification fields are server-owned (audit N13): the
+      // client's work_email / phone_number are not written here.
       const { data: inserted, error: insertError } = await admin
         .from('user_leads')
         .upsert(
@@ -2791,10 +2771,6 @@ async function handleRequest(req: Request): Promise<Response> {
             company_name: input.company_name || company_domain.split('.')[0] || '',
             company_domain: company_domain || '',
             linkedin_url: input.linkedin_url,
-            // Omitted when unknown: on a conflict an explicit null would erase
-            // the paid-for contact details the row already carried.
-            ...(auto_email ? { work_email: auto_email } : {}),
-            ...(auto_phone ? { phone_number: auto_phone } : {}),
             location: input.location,
             status: status || 'new',
             notes: notes || null,

@@ -9,11 +9,9 @@ import type { ProspectorSearchParams } from './prospector-types';
 import { QuickLookupView } from './QuickLookupView';
 import { SavedLeadsView } from './SavedLeadsView';
 import { leadsStore, useLeadsStore } from './leads-store';
-import { leadKey, revealedEmail, revealedPhone } from './lead-utils';
+import { walletStore, useWallet, isWelcomeOnlyRefusal, WELCOME_ONLY_MESSAGE } from '../../lib/wallet-store';
+import { foundEmail, leadKey, revealedEmail, revealedPhone } from './lead-utils';
 import { Search, Zap, Bookmark, Wallet as WalletIcon, Plus } from 'lucide-react';
-
-/** Largest batch the leads function's bulk-save accepts (400 max_leads above it). */
-const BULK_SAVE_MAX = 500;
 
 interface LeadsTabProps {
   onNavigateBilling?: () => void;
@@ -25,7 +23,8 @@ type SubTab = 'prospector' | 'quick' | 'saved';
 export type RevealOutcome =
   | { kind: 'found'; lead: B2BLead; cached: boolean; credits: number }
   | { kind: 'not_found' }
-  | { kind: 'no_credits' }
+  /** message is set when the refusal needs explaining (welcome credits only). */
+  | { kind: 'no_credits'; message?: string }
   | { kind: 'error'; message: string };
 
 /** Same person, whichever of the three identities the caller has to hand. */
@@ -47,24 +46,21 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ onNavigateBilling }) => {
   const uid = user?.id ?? null;
   if (leadsStore.getSnapshot().userId !== uid) leadsStore.init(uid, addToast);
   const store = useLeadsStore();
-  const { leads, savedLeads, wallet, enrichment } = store;
+  const { leads, savedLeads, enrichment } = store;
+  // The shared wallet store (also shown in the Sidebar and Billing).
+  const { balance: availableCredits } = useWallet();
 
   useEffect(() => {
     leadsStore.init(uid, addToast);
   }, [uid, addToast]);
 
   useEffect(() => {
-    void leadsStore.loadBalance();
+    // The wallet store also re-reads on window focus (a top-up happens on
+    // the payment provider's site).
+    void walletStore.refresh();
     void leadsStore.loadSaved();
     void leadsStore.loadPricing();
-    // The wallet is topped up outside this tab; refresh it on focus so the
-    // affordability copy is not based on an old balance.
-    const onFocus = () => void leadsStore.loadBalance();
-    window.addEventListener('focus', onFocus);
-    return () => window.removeEventListener('focus', onFocus);
   }, [uid]);
-
-  const availableCredits = wallet ? Number(wallet.available) : null;
 
   // Row spinners come from the queue itself, so a row shows "processing"
   // exactly while the server is working on it.
@@ -140,54 +136,26 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ onNavigateBilling }) => {
       };
       leadsStore.applySavedLead(saved);
       leadsStore.setLeads((prev) => prev.map((l) => (sameLead(l, merged) ? { ...l, ...merged, id: l.id } : l)));
-      void leadsStore.loadBalance();
       return { kind: 'found', lead: merged, cached: Boolean(res.already_revealed), credits: res.credits_charged ?? 0 };
     } catch (err) {
-      if (err instanceof ApiError && err.status === 402) return { kind: 'no_credits' };
+      if (err instanceof ApiError && err.status === 402) {
+        const price = kind === 'email' ? store.pricing.email : store.pricing.phone;
+        return isWelcomeOnlyRefusal(err, price) ? { kind: 'no_credits', message: WELCOME_ONLY_MESSAGE } : { kind: 'no_credits' };
+      }
       if (err instanceof ApiError && err.status === 404) return { kind: 'not_found' };
       return { kind: 'error', message: (err as Error)?.message || 'Lookup failed. Please try again.' };
     } finally {
       inFlight.current.delete(flightKey);
+      // A reveal is a charging action (and a miss may still release a hold).
+      void walletStore.refresh();
     }
   };
 
   // ---- Pipeline -----------------------------------------------------------
   const handleBulkSave = async (selected: B2BLead[]) => {
     if (selected.length === 0) return null;
-    type BulkSaveResponse = {
-      ok: boolean;
-      saved_count: number;
-      new_count?: number;
-      already_saved_count?: number;
-      skipped_count?: number;
-      leads?: B2BLead[];
-    };
     try {
-      // The server accepts at most BULK_SAVE_MAX leads per call, so a large
-      // "save all" goes in batches and the counts are summed.
-      const res: BulkSaveResponse = { ok: true, saved_count: 0, new_count: 0, already_saved_count: 0, skipped_count: 0, leads: [] };
-      for (let i = 0; i < selected.length; i += BULK_SAVE_MAX) {
-        const part = await invokeFunction<BulkSaveResponse>('leads', {
-          action: 'bulk-save',
-          leads: selected.slice(i, i + BULK_SAVE_MAX),
-        });
-        if (!part?.ok) throw new Error('The save was rejected.');
-        res.saved_count += part.saved_count ?? 0;
-        res.new_count = (res.new_count ?? 0) + (part.new_count ?? part.saved_count ?? 0);
-        res.already_saved_count = (res.already_saved_count ?? 0) + (part.already_saved_count ?? 0);
-        res.skipped_count = (res.skipped_count ?? 0) + (part.skipped_count ?? 0);
-        res.leads = [...(res.leads ?? []), ...(part.leads ?? [])];
-      }
-
-      const savedIds = new Set(selected.map((l) => l.id));
-      leadsStore.setLeads((prev) =>
-        prev.map((l) => {
-          if (!savedIds.has(l.id)) return l;
-          const row = res.leads?.find((s) => s.id === l.db_id || leadKey(s) === leadKey(l));
-          return row ? { ...l, is_saved: true, db_id: row.id, status: l.status || row.status || 'new' } : l;
-        }),
-      );
-      res.leads?.forEach((row) => leadsStore.applySavedLead(row));
+      const res = await leadsStore.bulkSave(selected);
 
       const added = res.new_count ?? res.saved_count;
       const existing = res.already_saved_count ?? 0;
@@ -289,7 +257,7 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ onNavigateBilling }) => {
         first_name: lead.first_name,
         last_name: lead.last_name,
         title: lead.title,
-        work_email: revealedEmail(lead) || undefined,
+        work_email: foundEmail(lead) || undefined,
         phone_number: revealedPhone(lead) || undefined,
         linkedin_url: lead.linkedin_url,
         location: lead.location,
@@ -363,14 +331,11 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ onNavigateBilling }) => {
               title="Credits available to spend (balance minus any credits held for a running job)"
             >
               <WalletIcon className="w-4 h-4 text-muted" aria-hidden />
-              {wallet ? (
-                <span>
-                  <span className="font-semibold text-ink tabular-nums">{formatCredits(wallet.available)}</span>
-                  <span className="text-muted"> credits</span>
-                </span>
-              ) : (
-                <span className="text-muted">Balance unavailable</span>
-              )}
+              {/* "—" while unknown or when the balance could not be read, never 0. */}
+              <span>
+                <span className="font-semibold text-ink tabular-nums">{formatCredits(availableCredits)}</span>
+                <span className="text-muted"> credits</span>
+              </span>
             </div>
             {onNavigateBilling && (
               <button
@@ -386,7 +351,8 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ onNavigateBilling }) => {
         </div>
       </div>
 
-      <main className="flex-1 overflow-y-auto" id="leads-scroll">
+      {/* Not <main>: the dashboard shell already provides the page's main landmark. */}
+      <div className="flex-1 overflow-y-auto" id="leads-scroll">
         <div className="w-full max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-6">
           {activeSubTab === 'prospector' ? (
             <ProspectorView
@@ -433,7 +399,7 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ onNavigateBilling }) => {
             />
           )}
         </div>
-      </main>
+      </div>
     </div>
   );
 };

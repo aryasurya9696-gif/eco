@@ -1,22 +1,23 @@
 // Runs a SQL acceptance suite against the linked project and reports the result.
 //
-//   node scripts/run-sql-test.mjs credit_wallet_acceptance
-//   node scripts/run-sql-test.mjs credit_wallet_acceptance --yes
+//   node scripts/run-sql-test.cjs credit_wallet_acceptance --yes
+//   node scripts/run-sql-test.cjs credit_wallet_concurrency --yes --local
 //
 // The suites in supabase/tests/ are not unit tests. They run against the live
 // database, because most of what they assert — that a reserve refuses rather
 // than overdrawing, that a settle draws grants FIFO, that a cross-workspace
 // delete is refused — only means anything against the real schema, the real
-// RLS and the real constraints. They clean up after themselves.
+// RLS and the real constraints. Each suite runs inside a single transaction that
+// ends in ROLLBACK, so nothing it writes survives the run.
 //
 // Requires psql and a connection string in the environment:
 //
 //   PSQL_PATH=C:\Program Files\PostgreSQL\17\bin\psql.exe
 //   PGHOST=... PGPORT=5432 PGDATABASE=postgres PGUSER=postgres PGPASSWORD=...
 //
-// The suites create helper functions in pg_temp and write to a real test user,
-// so they are refused without --yes unless CI is set: it replaces the test user
-// with the one named at the top of the suite and writes real rows.
+// The suites create helper functions in pg_temp and a throwaway test user, all
+// inside a transaction that is rolled back. They are still refused without --yes
+// unless CI is set, because they run against whatever database PG* points at.
 
 const { execFileSync } = require('child_process');
 const fs = require('fs');
@@ -26,7 +27,7 @@ const ROOT = path.resolve(__dirname, '..');
 const name = process.argv[2];
 
 if (!name) {
-  console.error('usage: node scripts/run-sql-test.mjs <suite-name> [--yes]');
+  console.error('usage: node scripts/run-sql-test.cjs <suite-name> [--yes]');
   console.error('');
   const dir = path.join(ROOT, 'supabase', 'tests');
   for (const f of fs.readdirSync(dir)) {
@@ -48,10 +49,24 @@ if (!psql) {
   process.exit(1);
 }
 
+// credit_wallet_concurrency COMMITS a synthetic fixture (parallel dblink
+// connections cannot see uncommitted rows) and deletes it afterwards, so it is
+// refused unless --local is passed and PGHOST is a local address.
+const COMMITS_FIXTURES = new Set(['credit_wallet_concurrency']);
+if (COMMITS_FIXTURES.has(name)) {
+  const host = String(process.env.PGHOST || 'localhost').toLowerCase();
+  const local = ['localhost', '127.0.0.1', '::1'].includes(host) || host.endsWith('.localhost');
+  if (!process.argv.includes('--local') || !local) {
+    console.error(`${name} commits fixture rows and needs dblink: local or CI databases only.`);
+    console.error('Point PGHOST at a local database and pass --local.');
+    process.exit(1);
+  }
+}
+
 if (!process.argv.includes('--yes') && !process.env.CI) {
-  console.error('This writes to the live database (it reserves, settles and');
-  console.error('releases real credits on a test user) and it truncates nothing');
-  console.error('outside that user. Re-run with --yes to proceed.');
+  console.error('This runs against the live database. The suite works on a');
+  console.error('throwaway test user inside one transaction and rolls it back,');
+  console.error('but it still takes row locks while it runs. Re-run with --yes.');
   process.exit(1);
 }
 
@@ -74,15 +89,20 @@ try {
   process.exit(1);
 }
 
-// The suites end with `select * from _results order by ord`. Each row is
-// (ord, test, ok, detail-as-json).
-const start = sql.lastIndexOf('\n{');
-const tail = start >= 0 ? sql.slice(start) : sql.trim();
+// Each suite prints one JSON object per check, from
+//   select row_to_json(r)::text from (select ord, test, ok, detail ...) r
+// With -A -t each is one line starting with {"ord". Everything else psql prints
+// (function results, counts) is ignored. The old parser expected JSON while the
+// suites printed pipe-separated rows, so it could never read a result (N11).
 let rows;
 try {
-  rows = tail.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  rows = sql.split(/\r?\n/).filter((l) => l.startsWith('{"ord"')).map((l) => JSON.parse(l));
 } catch (e) {
-  console.error('could not parse the result rows. Raw tail:\n' + tail.slice(0, 2000));
+  console.error('could not parse a result row: ' + e.message);
+  process.exit(1);
+}
+if (rows.length === 0) {
+  console.error('no result rows found. Raw tail:\n' + sql.slice(-2000));
   process.exit(1);
 }
 

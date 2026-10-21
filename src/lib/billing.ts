@@ -13,6 +13,7 @@
 // ============================================================================
 
 import { invokeFunction } from './api';
+import { formatCreditAmount } from './constants';
 
 export interface Wallet {
   balance: number;
@@ -33,6 +34,11 @@ export interface Wallet {
    * which is exactly backwards: the heaviest users are the ones checking.
    */
   search_count: number;
+  /**
+   * Of `available`, the credits leads and mail may spend: welcome credits pay
+   * for sweeps only. Optional — an older billing function does not send it.
+   */
+  paid_available?: number | null;
 }
 
 export interface SweepQuote {
@@ -174,7 +180,17 @@ export function formatCredits(n: number | null | undefined | string): string {
   if (n === null || n === undefined || n === '') return '—';
   const v = Number(n);
   if (!Number.isFinite(v)) return '—';
-  return Number.isInteger(v) ? String(v) : v.toFixed(2);
+  // Credits can be fractional (a sweep is 0.1 per keyword per channel): up to
+  // two decimals, never rounded to a whole number, no trailing zeros
+  // ("2.4", "0.05", "12"). Same rule as formatCreditAmount in constants.ts;
+  // rounding to 2 places also hides float noise (0.1 * 3).
+  return formatCreditAmount(v);
+}
+
+/** "1 credit", "2.4 credits", "— credits": the amount with its unit. */
+export function creditsLabel(n: number | null | undefined | string): string {
+  const text = formatCredits(n);
+  return `${text} credit${text === '1' ? '' : 's'}`;
 }
 
 /**
@@ -247,8 +263,10 @@ export function formatDateTime(iso: string): string {
  * to charge anything — the price that matters is the one in pricing_config, and
  * mixing the two is how a display figure starts contradicting an invoice.
  */
-export function creditsToUsd(credits: number, packages: Package[]): number {
-  if (!Array.isArray(packages) || packages.length === 0) return 0;
+export function creditsToUsd(credits: number | null | undefined, packages: Package[]): number | null {
+  // Unknown credits are an unknown value, not $0.00.
+  if (credits === null || credits === undefined) return null;
+  if (!Array.isArray(packages) || packages.length === 0) return null;
   // per_credit_usd is null-checked as well as finite-checked. Number(null) is 0,
   // so a package with a missing price passed a bare isFinite test and then won
   // the "cheapest" comparison as though it were free — making every balance read
@@ -256,12 +274,12 @@ export function creditsToUsd(credits: number, packages: Package[]): number {
   const priced = packages.filter(
     (p) => p?.per_credit_usd !== null && p?.per_credit_usd !== undefined && Number.isFinite(Number(p.per_credit_usd)),
   );
-  if (priced.length === 0) return 0;
+  if (priced.length === 0) return null;
   const cheapest = priced.reduce((min, p) =>
     Number(p.per_credit_usd) < Number(min.per_credit_usd) ? p : min,
   );
   const value = Number(credits);
-  return Number.isFinite(value) ? value * Number(cheapest.per_credit_usd) : 0;
+  return Number.isFinite(value) ? value * Number(cheapest.per_credit_usd) : null;
 }
 
 /**

@@ -11,6 +11,8 @@ import {
   hasCriteria,
   sameCriteria,
   searchCost,
+  searchFeeText,
+  domainCountOf,
   maxContactCost,
   type SearchForm,
   type LeadPricing,
@@ -19,6 +21,8 @@ import {
   type SearchStatus,
 } from './prospector-types';
 import { AlertCircle, RefreshCw, Search, Sparkles, Bookmark, ArrowRight } from 'lucide-react';
+import { WELCOME_ONLY_MESSAGE } from '../../lib/wallet-store';
+import { creditsLabel, formatCredits } from '../../lib/billing';
 
 export type { ProspectorSearchParams, LastSearch, SearchStatus } from './prospector-types';
 
@@ -63,7 +67,7 @@ export const ProspectorView: React.FC<ProspectorViewProps> = (props) => {
   const isSearching = searchStatus.kind === 'searching';
   const params = formToParams(form);
   const changed = Boolean(lastSearch && hasCriteria(form) && !sameCriteria(params, lastSearch.params));
-  const cost = searchCost(params.limit, pricing) + maxContactCost(params, pricing);
+  const cost = searchCost(params.limit, pricing, domainCountOf(params.companyDomain)) + maxContactCost(params, pricing);
   const errorVisible = searchStatus.kind === 'error' && dismissedError !== searchStatus;
   const showResults = leads.length > 0 || Boolean(lastSearch) || isSearching;
 
@@ -75,18 +79,18 @@ export const ProspectorView: React.FC<ProspectorViewProps> = (props) => {
   };
 
   const walletEmpty = availableCredits !== null && availableCredits < Math.max(1, pricing.searchCredits);
-  const searchFee = `${pricing.searchCredits} credit${pricing.searchCredits === 1 ? '' : 's'} per search`;
+  const searchFee = searchFeeText(pricing);
   const notice: React.ComponentProps<typeof SearchBar>['notice'] = walletEmpty
     ? {
         tone: 'warn',
-        text: `You need credits to search: ${searchFee}, then ${pricing.email} credit per verified email and ${pricing.phone} per phone found.`,
+        text: `You need bought credits to search: ${searchFee}, then ${creditsLabel(pricing.email)} per verified email and ${formatCredits(pricing.phone)} per phone found. Free welcome credits don't cover leads.`,
       }
     : !hasCriteria(form)
       ? { tone: 'info', text: 'Type a job title to start — keywords, company and country are optional.' }
       : availableCredits !== null && cost > availableCredits
         ? {
             tone: 'info',
-            text: `Up to ${cost} credits (${searchFee} plus every lead verified); you have ${availableCredits}. Lookups stop when your balance runs out.`,
+            text: `Up to ${creditsLabel(cost)} (search: ${searchFee}, plus every lead verified); you have ${formatCredits(availableCredits)}. Lookups stop when your balance runs out.`,
           }
         : changed && !isSearching
         ? { tone: 'info', text: 'Filters changed — press Search to update the results below.' }
@@ -124,6 +128,15 @@ export const ProspectorView: React.FC<ProspectorViewProps> = (props) => {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            {searchStatus.message === WELCOME_ONLY_MESSAGE && onNavigateBilling && (
+              <button
+                type="button"
+                onClick={onNavigateBilling}
+                className="h-9 px-3 bg-ink hover:bg-black text-white text-sm font-medium cursor-pointer"
+              >
+                Go to Billing
+              </button>
+            )}
             {typeof searchStatus.affordableLimit === 'number' && searchStatus.affordableLimit >= 5 && (
               <button
                 type="button"
@@ -135,7 +148,7 @@ export const ProspectorView: React.FC<ProspectorViewProps> = (props) => {
                 className="h-9 px-3 bg-ink hover:bg-black text-white text-sm font-medium cursor-pointer"
               >
                 Search {searchStatus.affordableLimit} leads
-                {searchCost(searchStatus.affordableLimit, pricing) === 0 ? ' free' : ''} instead
+                {searchCost(searchStatus.affordableLimit, pricing, domainCountOf(searchStatus.params.companyDomain)) === 0 ? ' free' : ''} instead
               </button>
             )}
             <button
@@ -196,12 +209,12 @@ const EmptyState: React.FC<{ pricing: LeadPricing; onExample: (text: string) => 
         {
           icon: <Search className="w-4 h-4" />,
           title: 'Search',
-          text: `Pick a role and location. Each search costs ${pricing.searchCredits} credit${pricing.searchCredits === 1 ? '' : 's'}.`,
+          text: `Pick a role and location. A search costs ${searchFeeText(pricing)}.`,
         },
         {
           icon: <Sparkles className="w-4 h-4" />,
           title: 'Verified contacts appear',
-          text: `Every lead is checked automatically. ${pricing.email} credit per verified email, ${pricing.phone} per phone — nothing for the rest.`,
+          text: `Every lead is checked automatically. ${pricing.email} credit${pricing.email === 1 ? '' : 's'} per verified email, ${pricing.phone} per phone — nothing for the rest.`,
         },
         {
           icon: <Bookmark className="w-4 h-4" />,

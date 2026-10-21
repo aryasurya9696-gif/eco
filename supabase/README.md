@@ -37,7 +37,17 @@ supabase/
 
 Dashboard → SQL Editor → paste [`deploy-all.sql`](deploy-all.sql) → Run.
 
-Idempotent: safe to run more than once.
+Idempotent: safe to run more than once. Seeds are insert-only and one-off data
+changes are recorded in `public.data_migrations`, so a re-run never reverts a
+price somebody changed since.
+
+Verify locally (no database needed; throwaway in-memory Postgres):
+
+```bash
+npm i --no-save @electric-sql/pglite@0.2.17   # or PGLITE_MODULE=<path to it>
+node scripts/verify-deploy-local.cjs          # fresh + 2 re-runs, M9, cron, acceptance suite
+node scripts/check-deploy-all.cjs             # static drift + structure check
+```
 
 <details>
 <summary>Or run the numbered migrations individually</summary>
@@ -66,6 +76,14 @@ Idempotent: safe to run more than once.
 | 18 | `20261122_user_leads.sql` | `user_leads` + lead reveal prices |
 | 19 | `20261123_leads_search_pricing.sql` | Lead price and cost estimates |
 | 20 | `20261124_audit_fixes.sql` | Margin views private, `take_rate_limit()`, paid-amount check, partial refunds and disputes, reaper fix, `user_leads` write lock-down, retention job |
+| 21 | `20261125_mail.sql` | Mail domains, mailboxes, threads, messages; send slots; mail prices |
+| 22 | `20261126_billing_integrity.sql` | One grant per order (replay after refund/dispute refused), bonus-safe unit price, full revoke fix |
+| 23 | `20261127_audit_round2.sql` | Paid-only reserves, unexpired-only spendable, atomic refunds/disputes, webhook claim, reaper cron, pricing (once), full pricing audit, cost columns hidden from owners, history kept on account deletion, `v_platform_totals` fix, indexes, sweep cron from config, rate-limit validation |
+
+> `20261023_scheduled_sweeps.sql` is **not** in `deploy-all.sql`: its job posted to a literal
+> `REPLACE_WITH_PROJECT_REF` URL. `20261127` builds the job from configuration instead (section 4).
+> Older migrations (`20261017`, `20261023`) are not replayable on an empty database by themselves;
+> use `deploy-all.sql` for a fresh install.
 
 </details>
 
@@ -93,7 +111,9 @@ supabase secrets set SWEEP_CRON_SECRET="$(openssl rand -hex 32)"
 | `APP_ORIGIN` | `billing` | checkout refuses to start (no return URL) |
 | `SWEEP_CRON_SECRET` | `daily-sweep` | sweep refuses to run at all (min. 32 characters) |
 
-Optional: `ALLOWED_ORIGIN` (CORS origin, defaults `*` — set it in production),
+Optional: `ALLOWED_ORIGIN` (comma-separated CORS allow-list; `billing` also
+allows `APP_ORIGIN`; with nothing set only localhost origins are allowed, and
+`*` is never a default; `billing-webhook` sends no CORS headers at all),
 `OPENAI_MODEL` (defaults `gpt-4o-mini`).
 
 **Dodo product ids** are stored per package, not as secrets. Checkout refuses a
@@ -161,6 +181,21 @@ back for both the authenticated and the anonymous case.
 
 ## 4. Schedule the sweep
 
+Built from configuration, not pasted by hand. Store the project URL once, then
+let the database (re)create both jobs:
+
+```sql
+insert into public.service_secrets (name, value)
+values ('project_url', 'https://<project-ref>.supabase.co')
+on conflict (name) do update set value = excluded.value;
+
+select public.configure_echo_cron();   -- echo-daily-sweep (hourly) + echo-reap-stale
+```
+
+`deploy-all.sql` calls it too; without pg_cron it does nothing, and without
+`project_url` it leaves an existing sweep job alone (unless that job still posts
+to `REPLACE_WITH_PROJECT_REF`, which is removed). The job it builds is equivalent to:
+
 ```sql
 select cron.schedule(
   'echo-daily-sweep',
@@ -217,8 +252,27 @@ only through `billing-webhook`, after the backend has verified a payment.
 and recognises revenue at each grant's own `unit_price_usd`, or `wallet_release`
 returns them when nothing billable happened. A crash between the two used to lock
 credits out of a workspace permanently, so `reap_stale_reservations` closes holds
-older than an hour — settling them for whatever `api_usage` recorded, releasing
-the rest.
+older than an hour — settling them for whatever `api_usage` recorded against
+`reservation_id`, releasing the rest. It has its own pg_cron job
+(`echo-reap-stale`, every 15 minutes).
+
+**Welcome credits are for feed sweeps only.** The 20 signup credits are a
+`source = 'grant'` grant. Ordinary holds (sweeps) draw them first; paid-only holds
+(Leads, Mail) cannot draw them at all. `billing` → `balance` reports both
+`available` and `paid_available`.
+
+| Operation | Credits | Unit |
+|---|---|---|
+| `treg.twitter.search`, `treg.reddit.search`, `treg.web.search` | 0.1 | per keyword per sweep |
+| `treg.news.search` | 0 | free |
+| `treg.people.search` | 1 | per **billed provider call** |
+| `treg.people.email.find` | 1 | per verified email |
+| `treg.people.phone.find` | 2 | per number found |
+| `mail.send.hosted` / `mail.send.connected` | 0.1 / 0.05 | per send |
+| `leads.search.extra_50` | — | disabled |
+
+The live list is served by `billing` → `{ action: 'pricing' }` (operation,
+display name, credits; never cost).
 
 Out of credits is a **refusal**, not a loan: no negative balance, no overdraft,
 no partial sweep. Both gates fire with distinct messages — the product caps
@@ -227,13 +281,17 @@ no partial sweep. Both gates fire with distinct messages — the product caps
 | Function | Purpose |
 |---|---|
 | `wallet_apply_grant(uuid, numeric, text, numeric, uuid, text, timestamptz, jsonb)` | Issue credits, record the price they were bought at |
-| `wallet_reserve(uuid, numeric, text, jsonb)` | Hold credits for a job |
+| `wallet_reserve(p_user_id uuid, p_credits numeric, p_idempotency_key text, p_context jsonb = null, p_paid_only boolean = false)` | Hold credits for a job. `p_paid_only => true` (Leads, Mail) counts only purchased grants; a refusal is then `error: 'insufficient_paid_credits'` |
 | `wallet_settle(uuid, numeric, numeric, text, text, jsonb)` | Charge what billed, release the rest, recognise revenue |
 | `wallet_release(uuid, text)` | Return a hold in full |
 | `wallet_topup_from_order(uuid, numeric, numeric, text, text)` | Grant a paid order, priced net of the fee |
-| `wallet_revoke_grant(uuid, text)` | Take back the unspent part of a refunded purchase |
+| `wallet_revoke_grant(uuid, text, numeric = null, text = null)` | Take back unspent credits of one grant; the 4th argument is a unique ledger key, so a replay revokes once |
+| `wallet_refund_order(order uuid, refund_id text, amount, currency, cumulative bool, webhook_id)` | One refund, atomically: recorded once per (order, refund id), share revoked under `refund:<order>:<refund id>`, other-currency refunds parked in `review` |
+| `wallet_dispute_order(order uuid, stage text)` | `opened` freezes, `lost` takes the rest and marks refunded, `won` restores the status |
+| `wallet_spendable(uuid)` | `available` (unexpired, minus holds) and `available_paid` (purchased only) |
+| `webhook_claim(provider, webhook_id, type, payload, lease)` | Claims a delivery under a row lock; a parallel redelivery gets `in_flight` |
 
-All six are `SECURITY DEFINER` with a pinned `search_path`, and all six are
+All of them are `SECURITY DEFINER` with a pinned `search_path`, and all of them are
 revoked from `anon` and `authenticated` — the whole model depends on there being
 no path from the API to them. `quote_sweep`, `reap_stale_reservations`,
 `keyword_limit`, `channel_limit` and `sweep_shape` round out the RPC surface.
@@ -260,7 +318,8 @@ workspace gets served for free.
 | Concern | Protection |
 |---|---|
 | Vendor API keys | Edge Function secrets or `service_secrets` — never `.env`, never the bundle |
-| Credits | Only the six wallet RPCs move them, all service-role only; the browser can read a balance and nothing more |
+| Credits | Only the wallet RPCs move them, all service-role only; the browser can read a balance and nothing more |
+| Margin data | Owners get column-level SELECT on wallet/ledger/grants/usage/orders without cost, revenue, unit-price and fee columns; financial rows keep `user_id = null` on account deletion instead of cascading |
 | Price changes | `audit_pricing_change` trigger records who changed what and when, including from raw SQL |
 | Keyword limits | `enforce_keyword_limit` trigger, server-side, from `keyword_limit()` |
 | Server-owned profile columns | Per-column `GRANT`: `authenticated` gets `UPDATE` on 11 named columns only, so a column with no grant cannot be written from the client even though the RLS policy allows the row |
@@ -311,7 +370,9 @@ edits is the one nobody notices.
 | `reservations` | Holds between reserve and settle |
 | `payment_orders` | Dodo checkout attempts |
 | `api_usage` | One row per Treg call: real `provider_cost_usd`, credits charged, revenue |
-| `pricing_config` | Credit price per operation, change-audited |
+| `pricing_config` | Credit price per operation; INSERT/UPDATE/DELETE audited in `pricing_audit` with `changed_by` |
+| `payment_refunds` | One row per (order, refund id); makes refund handling idempotent |
+| `data_migrations` | One-off data changes already applied |
 | `topup_packages` | Public price list, readable before signup; no client write path |
 | `webhook_events` | Every delivery, with `attempts` and `last_error` |
 | `service_secrets` | Fallback secret store, service-role only |
@@ -328,8 +389,12 @@ grants it on purpose.
 ## 🧪 Tests
 
 ```bash
-# 39 checks against the live database; cleans up after itself, so --yes is required
+# one transaction, rolled back; prefer a local database
 node scripts/run-sql-test.cjs credit_wallet_acceptance --yes
+
+# parallel reserves / refunds / webhook claims via dblink; commits and deletes a
+# synthetic fixture, so it is refused unless PGHOST is local and --local is passed
+node scripts/run-sql-test.cjs credit_wallet_concurrency --yes --local
 
 # HTTP against the deployed webhook — needs the signing key
 node supabase/tests/webhook-signature-tests.cjs <url> <DODO_PAYMENTS_WEBHOOK_KEY>

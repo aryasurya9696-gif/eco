@@ -5,6 +5,7 @@ import { MessageBody } from './MessageBody';
 import { initialsFor } from './ThreadList';
 import { useEcho } from '../../context/EchoContext';
 import type { MailMessage } from '../../types';
+import { SendProblem, type SendProblemState } from './SendProblem';
 
 const formatFullTime = (iso: string) =>
   new Date(iso).toLocaleString([], {
@@ -29,12 +30,14 @@ export const ThreadView: React.FC = () => {
   const { addToast } = useEcho();
   const [replyText, setReplyText] = useState('');
   const [isSendingReply, setIsSendingReply] = useState(false);
+  const [sendProblem, setSendProblem] = useState<SendProblemState | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Reset the reply box when switching conversations so a draft never leaks
   // into the wrong thread.
   useEffect(() => {
     setReplyText('');
+    setSendProblem(null);
   }, [activeThreadId]);
 
   const activeThread = threads.find((t) => t.id === activeThreadId);
@@ -67,16 +70,19 @@ export const ThreadView: React.FC = () => {
   const nameFor = (address: string) =>
     activeThread.participants.find((p) => p.address.toLowerCase() === address.toLowerCase())?.name || address;
 
-  const handleSendReply = async () => {
+  const handleSendReply = async (confirmResend = false) => {
     if (!replyText.trim() || isSendingReply) return;
     setIsSendingReply(true);
-    const res = await mailStore.sendQuickReply(activeThread.id, replyText);
+    setSendProblem(null);
+    const res = await mailStore.sendQuickReply(activeThread.id, replyText, { confirmResend });
     setIsSendingReply(false);
     if (res.success) {
       setReplyText('');
       addToast('Reply sent.', 'success');
-    } else {
+    } else if (res.kind === 'error') {
       addToast(res.error, 'error');
+    } else {
+      setSendProblem({ kind: res.kind, message: res.error });
     }
   };
 
@@ -164,9 +170,12 @@ export const ThreadView: React.FC = () => {
               <span className="font-medium text-[#18181b]">{activeThread.lead_name}</span>
               {activeThread.lead_company && ` · ${activeThread.lead_company}`}
             </span>
-            <span className="shrink-0 px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 capitalize">
-              {activeThread.lead_pipeline_status || 'contacted'}
-            </span>
+            {/* Only the real pipeline status; none is shown when it is unknown. */}
+            {activeThread.lead_pipeline_status && (
+              <span className="shrink-0 px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 capitalize">
+                {activeThread.lead_pipeline_status}
+              </span>
+            )}
           </div>
         )}
       </div>
@@ -253,6 +262,16 @@ export const ThreadView: React.FC = () => {
       {canReply && (
         <div className="shrink-0 border-t border-[#f0f0eb] bg-white">
           <div className="max-w-3xl mx-auto px-4 sm:px-6 py-3">
+            {sendProblem && (
+              <div className="mb-2">
+                <SendProblem
+                  problem={sendProblem}
+                  busy={isSendingReply}
+                  onSendAnyway={() => void handleSendReply(true)}
+                  onDismiss={() => setSendProblem(null)}
+                />
+              </div>
+            )}
             <div className="rounded-xl border border-[#e8e8e3] focus-within:border-[#a1a1aa] transition-colors">
               <textarea
                 value={replyText}
@@ -260,7 +279,7 @@ export const ThreadView: React.FC = () => {
                 onKeyDown={(e) => {
                   if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
                     e.preventDefault();
-                    handleSendReply();
+                    void handleSendReply();
                   }
                 }}
                 placeholder={`Reply to ${activeThread.participants[0]?.name || activeThread.participants[0]?.address || 'this thread'}…`}
@@ -274,7 +293,7 @@ export const ThreadView: React.FC = () => {
                 </span>
                 <button
                   type="button"
-                  onClick={handleSendReply}
+                  onClick={() => void handleSendReply()}
                   disabled={isSendingReply || !replyText.trim() || Boolean(sendBlocker)}
                   className="shrink-0 inline-flex items-center gap-1.5 h-8 px-3 bg-[#18181b] hover:bg-black text-white text-[13px] font-medium rounded-lg transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                 >

@@ -9,9 +9,12 @@ import {
   Heart,
   Repeat2,
   MessageSquare,
+  EyeOff,
+  Undo2,
 } from 'lucide-react';
 import type { MonitoredPost, LeadStatus } from '../../types';
 import { safeHttpUrl } from '../../lib/url';
+import { channelLabel } from '../../lib/constants';
 
 interface FeedCardProps {
   post: MonitoredPost;
@@ -81,12 +84,7 @@ function relativeTime(iso: string | null, now: number): string {
   return `${Math.floor(days / 30)}mo ago`;
 }
 
-const platformName = (p: MonitoredPost['platform']): string => {
-  if (p === 'twitter') return 'X';
-  if (p === 'reddit') return 'Reddit';
-  if (p === 'google') return 'Web';
-  return 'News';
-};
+const platformName = (p: MonitoredPost['platform']): string => channelLabel(p);
 
 /** Small muted action button shared by the card footer. */
 const GhostButton: React.FC<{
@@ -105,13 +103,13 @@ const GhostButton: React.FC<{
 
   if (href) {
     return (
-      <a href={href} target="_blank" rel="noopener noreferrer" title={title} className={cls}>
+      <a href={href} target="_blank" rel="noopener noreferrer" title={title} aria-label={title} className={cls}>
         {children}
       </a>
     );
   }
   return (
-    <button type="button" onClick={onClick} title={title} className={`${cls} cursor-pointer`}>
+    <button type="button" onClick={onClick} title={title} aria-label={title} aria-pressed={active} className={`${cls} cursor-pointer`}>
       {children}
     </button>
   );
@@ -132,12 +130,13 @@ export const FeedCard: React.FC<FeedCardProps> = ({
   const isLong = body.length > 240;
   const isSaved = post.status === 'saved';
   const isContacted = post.status === 'contacted';
+  const isDismissed = post.status === 'dismissed';
 
   return (
     <article
       className={`group relative bg-white border pl-5 pr-5 py-4 sm:py-5 transition-all duration-200 ease-out ${
         isSaved ? 'border-[#c9c9c2]' : 'border-[#e8e8e3]'
-      } hover:border-[#d0d0ca] hover:shadow-[0_1px_2px_rgba(0,0,0,0.04),0_6px_20px_-10px_rgba(0,0,0,0.15)] ${
+      } ${isDismissed ? 'opacity-60' : ''} hover:border-[#d0d0ca] hover:shadow-[0_1px_2px_rgba(0,0,0,0.04),0_6px_20px_-10px_rgba(0,0,0,0.15)] ${
         band === 'high' ? style.glow : ''
       }`}
     >
@@ -288,10 +287,19 @@ export const FeedCard: React.FC<FeedCardProps> = ({
             </span>
           </GhostButton>
 
+          <GhostButton
+            title={isDismissed ? 'Restore to the feed' : 'Dismiss: hide from the active feed'}
+            onClick={() => onStatusChange(post.id, isDismissed ? 'new' : 'dismissed')}
+          >
+            {isDismissed ? <Undo2 className="w-3 h-3" aria-hidden="true" /> : <EyeOff className="w-3 h-3" aria-hidden="true" />}
+            <span className="hidden sm:inline">{isDismissed ? 'Restore' : 'Dismiss'}</span>
+          </GhostButton>
+
           <button
             type="button"
             onClick={() => onOpenAiDraft(post)}
-            title="Generate an AI outreach reply"
+            title="Draft an outreach reply"
+            aria-label="Draft an outreach reply"
             className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-[#141414] hover:bg-black text-white text-[11px] font-mono transition-all duration-150 cursor-pointer active:scale-[0.97]"
           >
             <Sparkles className="w-3 h-3 text-emerald-400" />

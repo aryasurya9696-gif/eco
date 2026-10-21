@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { BrandLogo } from '../components/common/BrandLogo';
 import { useAuth } from '../context/AuthContext';
-import { ArrowLeft, ArrowRight, ShieldCheck, CheckCircle2 } from 'lucide-react';
+import { ArrowLeft, ArrowRight, CheckCircle2 } from 'lucide-react';
 
 interface AuthPageProps {
   onNavigateHome: () => void;
@@ -94,7 +94,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({
       </div>
 
       {/* Main Card */}
-      <div className="w-full max-w-md mx-auto px-6 py-12">
+      <main className="w-full max-w-md mx-auto px-6 py-12">
         <div className="bg-[#ffffff] border border-[#e3e3de] p-8 sm:p-10 shadow-xl rounded-none">
           {/* Header */}
           <div className="mb-6 space-y-1">
@@ -142,15 +142,15 @@ export const AuthPage: React.FC<AuthPageProps> = ({
 
           {/* Error Banner */}
           {error && (
-            <div className="mb-5 p-3 bg-red-50 border border-red-200 text-xs font-mono text-red-700 animate-in fade-in duration-150">
+            <div role="alert" className="mb-5 p-3 bg-red-50 border border-red-200 text-xs font-mono text-red-700 animate-in fade-in duration-150">
               {error}
             </div>
           )}
 
           {/* Info Banner */}
           {infoMessage && (
-            <div className="mb-5 p-3 bg-emerald-50 border border-emerald-200 text-xs font-mono text-emerald-800 flex items-start gap-2 animate-in fade-in duration-150">
-              <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
+            <div role="status" className="mb-5 p-3 bg-emerald-50 border border-emerald-200 text-xs font-mono text-emerald-800 flex items-start gap-2 animate-in fade-in duration-150">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" aria-hidden="true" />
               <span>{infoMessage}</span>
             </div>
           )}
@@ -158,11 +158,13 @@ export const AuthPage: React.FC<AuthPageProps> = ({
           {/* Form */}
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-1.5">
-              <label className="text-xs font-mono uppercase tracking-wider text-[#4a4a47] block">
+              <label htmlFor="auth-email" className="text-xs font-mono uppercase tracking-wider text-[#4a4a47] block">
                 Email Address
               </label>
               <input
+                id="auth-email"
                 type="email"
+                autoComplete="email"
                 required
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -173,7 +175,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({
 
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">
-                <label className="text-xs font-mono uppercase tracking-wider text-[#4a4a47] block">
+                <label htmlFor="auth-password" className="text-xs font-mono uppercase tracking-wider text-[#4a4a47] block">
                   Password
                 </label>
                 {mode === 'signin' && (
@@ -188,13 +190,22 @@ export const AuthPage: React.FC<AuthPageProps> = ({
                 )}
               </div>
               <input
+                id="auth-password"
                 type="password"
+                autoComplete={mode === 'signup' ? 'new-password' : 'current-password'}
+                minLength={mode === 'signup' ? 8 : undefined}
+                aria-describedby={mode === 'signup' ? 'auth-password-hint' : undefined}
                 required
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••••••"
                 className="w-full px-3.5 py-2.5 bg-white border border-[#e3e3de] rounded-none text-sm text-[#141414] placeholder:text-[#9b9b96] focus:outline-none focus:border-[#141414] transition-colors"
               />
+              {mode === 'signup' && (
+                <p id="auth-password-hint" className="text-[11px] font-mono text-[#8a8a86]">
+                  At least 8 characters.
+                </p>
+              )}
             </div>
 
             <button
@@ -207,13 +218,8 @@ export const AuthPage: React.FC<AuthPageProps> = ({
             </button>
           </form>
 
-          {/* Security Notice */}
-          <div className="mt-4 flex items-center justify-center gap-1.5 text-[10px] font-mono text-[#8a8a86]">
-            <ShieldCheck className="w-3 h-3 text-emerald-600" />
-            <span>Secure 256-bit encrypted authentication</span>
-          </div>
         </div>
-      </div>
+      </main>
 
       {/* Footer */}
       <div className="py-6 text-center text-xs font-mono text-[#8a8a86]">
@@ -261,7 +267,7 @@ export const SetNewPasswordPage: React.FC<{ onDone: () => void }> = ({ onDone })
 
   return (
     <div className="min-h-screen bg-[#f6f6f4] flex flex-col justify-center font-sans">
-      <div className="w-full max-w-md mx-auto px-6 py-12">
+      <main className="w-full max-w-md mx-auto px-6 py-12">
         <div className="bg-[#ffffff] border border-[#e3e3de] p-8 sm:p-10 shadow-xl rounded-none">
           <div className="mb-6 space-y-1">
             <BrandLogo size="sm" />
@@ -314,7 +320,7 @@ export const SetNewPasswordPage: React.FC<{ onDone: () => void }> = ({ onDone })
             </button>
           </form>
         </div>
-      </div>
+      </main>
     </div>
   );
 };

@@ -1,7 +1,15 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useEcho } from '../../context/EchoContext';
-import { INTENT_THRESHOLD_OPTIONS, RETENTION_OPTIONS } from '../../lib/constants';
+import {
+  CHANNEL_LIMIT,
+  creditsText,
+  formatCreditAmount,
+  INTENT_THRESHOLD_OPTIONS,
+  RETENTION_OPTIONS,
+} from '../../lib/constants';
+import { usePricing } from '../../lib/pricing';
+import { CADENCE_LABELS, formatNextSweep } from '../../lib/schedule';
 import {
   Save,
   Building2,
@@ -16,18 +24,16 @@ import type { Platform } from '../../types';
 
 const CORE_OFFER_MAX = 280;
 
-/** Sweep intervals, slowest first. Index order is the upgrade order. */
-const CADENCES = [
-  { id: '24h', label: 'Daily', hours: 24 },
-  { id: '12h', label: 'Twice a day', hours: 12 },
-  { id: '6h', label: 'Every 6 hours', hours: 6 },
-] as const;
+/** Sweep intervals, slowest first. */
+const CADENCES = (['24h', '12h', '6h'] as const).map((id) => ({ id, label: CADENCE_LABELS[id] }));
+
+/** The cron runs hourly, so the start time is an hour (minutes were ignored). */
+const HOURS = Array.from({ length: 24 }, (_, h) => `${String(h).padStart(2, '0')}:00`);
 
 const CHANNELS: {
   id: Platform;
   name: string;
   desc: string;
-  tag?: string;
 }[] = [
   {
     id: 'twitter',
@@ -48,7 +54,6 @@ const CHANNELS: {
     id: 'news',
     name: 'Press & news',
     desc: 'Launches, funding rounds and hiring signals.',
-    tag: 'Free',
   },
 ];
 
@@ -56,23 +61,6 @@ const LOOKBACKS = [
   { hours: 24, label: 'Last 24 hours' },
   { hours: 48, label: 'Last 48 hours' },
 ] as const;
-
-/**
- * Mirrors isSweepDue() in supabase/functions/daily-sweep. The cron wakes up
- * every hour, so "when is my next sweep" is just the next hour-of-day that
- * satisfies the same modulo rule the sweep itself uses.
- */
-function isSweepDue(hour: number, sweepHour: number, cadenceHours: number): boolean {
-  if (cadenceHours >= 24) return hour === sweepHour;
-  return hour % cadenceHours === sweepHour % cadenceHours;
-}
-
-const relative = (target: Date, now: Date): string => {
-  const mins = Math.max(1, Math.round((target.getTime() - now.getTime()) / 60000));
-  if (mins < 60) return `in ${mins}m`;
-  const hrs = Math.round(mins / 60);
-  return hrs < 48 ? `in ${hrs}h` : `in ${Math.round(hrs / 24)}d`;
-};
 
 // ---------------------------------------------------------------------------
 // Primitives
@@ -104,25 +92,48 @@ const Section: React.FC<{
   </section>
 );
 
+/**
+ * A labelled field. With `htmlFor` the label is a real <label> for that
+ * control; without it (button groups) the children are a group named by it.
+ */
 const Field: React.FC<{
   label: string;
+  htmlFor?: string;
   hint?: React.ReactNode;
   aside?: React.ReactNode;
   children: React.ReactNode;
-}> = ({ label, hint, aside, children }) => (
-  <div className="space-y-2">
-    <div className="flex items-baseline justify-between gap-3">
-      <span className="text-xs font-mono font-medium text-[#141414]">{label}</span>
-      {aside}
+}> = ({ label, htmlFor, hint, aside, children }) => {
+  const labelId = useId();
+  const hintId = useId();
+  return (
+    <div className="space-y-2">
+      <div className="flex items-baseline justify-between gap-3">
+        {htmlFor ? (
+          <label htmlFor={htmlFor} id={labelId} className="text-xs font-mono font-medium text-[#141414]">
+            {label}
+          </label>
+        ) : (
+          <span id={labelId} className="text-xs font-mono font-medium text-[#141414]">
+            {label}
+          </span>
+        )}
+        {aside}
+      </div>
+      {htmlFor ? (
+        children
+      ) : (
+        <div role="group" aria-labelledby={labelId} aria-describedby={hint ? hintId : undefined}>
+          {children}
+        </div>
+      )}
+      {hint && (
+        <p id={hintId} className="text-[11px] font-mono text-[#8a8a86] leading-relaxed">{hint}</p>
+      )}
     </div>
-    {children}
-    {hint && (
-      <p className="text-[11px] font-mono text-[#8a8a86] leading-relaxed">{hint}</p>
-    )}
-  </div>
-);
+  );
+};
 
-//** Segmented control. Every option gets an equal column. */
+/** Segmented control. Every option gets an equal column. */
 function Segmented<T extends string | number>({
   options,
   value,
@@ -190,13 +201,29 @@ export const SettingsTab: React.FC = () => {
     enabledChannels,
     toggleChannel,
     saveSettings,
+    hasUnsavedSettings,
+    discardSettingsChanges,
     addToast,
   } = useEcho();
+  const pricing = usePricing(Boolean(profile));
 
   const [fullName, setFullName] = useState<string>(profile?.full_name || '');
   const [website, setWebsite] = useState<string>(profile?.website || '');
   const [coreOffer, setCoreOffer] = useState<string>(profile?.core_offer || '');
   const [isSaving, setIsSaving] = useState<boolean>(false);
+
+  // The profile often arrives after first render (or changes after a save or
+  // onboarding). Re-sync the form when it does, but never over unsaved edits:
+  // a field is only replaced while it still shows the previous profile value.
+  const syncedProfile = useRef({ full_name: profile?.full_name || '', website: profile?.website || '', core_offer: profile?.core_offer || '' });
+  useEffect(() => {
+    const next = { full_name: profile?.full_name || '', website: profile?.website || '', core_offer: profile?.core_offer || '' };
+    const prev = syncedProfile.current;
+    setFullName((v) => (v === prev.full_name ? next.full_name : v));
+    setWebsite((v) => (v === prev.website ? next.website : v));
+    setCoreOffer((v) => (v === prev.core_offer ? next.core_offer : v));
+    syncedProfile.current = next;
+  }, [profile?.full_name, profile?.website, profile?.core_offer]);
 
   // One ticking clock drives every relative timestamp on the page, so the
   // "next sweep" countdown stays honest instead of freezing at first render.
@@ -207,37 +234,29 @@ export const SettingsTab: React.FC = () => {
   }, []);
   const now = useMemo(() => new Date(nowMs), [nowMs]);
 
-  // Echo is free, so these are the product's limits rather than anything a
-  // workspace can buy past. They mirror public.keyword_limit() and
-  // public.channel_limit() on the server.
-  const channelLimit = 3;
+  // Mirrors public.channel_limit() on the server.
+  const channelLimit = CHANNEL_LIMIT;
 
-  const cadenceHours =
-    CADENCES.find((c) => c.id === sweepCadence)?.hours ?? 24;
-  const sweepHour = useMemo(() => {
-    const parsed = /^(\d{1,2}):/.exec(sweepTime);
-    const hour = parsed ? Number(parsed[1]) : 6;
-    return hour >= 0 && hour <= 23 ? hour : 6;
-  }, [sweepTime]);
+  const profileDirty =
+    fullName !== (profile?.full_name || '') ||
+    website !== (profile?.website || '') ||
+    coreOffer !== (profile?.core_offer || '');
+  const isDirty = hasUnsavedSettings || profileDirty;
 
-  const nextSweep = useMemo(() => {
-    const midnight = Date.UTC(
-      now.getUTCFullYear(),
-      now.getUTCMonth(),
-      now.getUTCDate(),
-    );
-    for (let offset = 0; offset <= 24; offset += 1) {
-      const candidate = new Date(midnight + (offset * 24 + sweepHour) * 3600_000);
-      if (candidate <= now) continue;
-      if (isSweepDue(candidate.getUTCHours(), sweepHour, cadenceHours)) {
-        return candidate;
-      }
-    }
-    return null;
-  }, [now, sweepHour, cadenceHours]);
+  // What one sweep costs with the settings on screen (fractional credits).
+  const activeKeywordCount = keywords.filter((k) => k.is_active).length;
+  const perKeyword = enabledChannels.reduce((sum, c) => sum + pricing.channelCredits(c), 0);
+  const sweepCost = activeKeywordCount * perKeyword;
+  const sweepsPerDay = sweepCadence === '6h' ? 4 : sweepCadence === '12h' ? 2 : 1;
 
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
+    // Without the loaded profile the form shows blanks and defaults; saving
+    // them would overwrite the real values.
+    if (!profile) {
+      addToast('Your profile has not loaded yet, so nothing was saved.', 'error');
+      return;
+    }
     setIsSaving(true);
 
     // Both writes, one message. The profile save is what the user asked for; the
@@ -281,6 +300,7 @@ export const SettingsTab: React.FC = () => {
     // land before pruning. Its failure is surfaced rather than swallowed — the
     // prune would otherwise run against the old value and report a success that
     // used the wrong number.
+    const hadUnsaved = hasUnsavedSettings;
     const saved = await saveSettings();
     if (!saved.ok) {
       addToast(saved.warning || 'Could not save your retention setting.', 'error');
@@ -289,26 +309,18 @@ export const SettingsTab: React.FC = () => {
 
     const result = await pruneFeed();
     if (result.success) {
-      addToast(
-        result.deleted
-          ? `Removed ${result.deleted} expired mention${result.deleted === 1 ? '' : 's'}.`
-          : 'Nothing has expired yet.',
-        'success',
-      );
+      // Saving the retention window saves the other pending settings with it,
+      // so the message says so instead of implying only a prune happened.
+      const outcome = result.deleted
+        ? `Removed ${result.deleted} expired mention${result.deleted === 1 ? '' : 's'}.`
+        : 'Nothing has expired yet.';
+      addToast(hadUnsaved ? `Settings saved. ${outcome}` : outcome, 'success');
     } else {
       addToast(result.error || 'Could not apply retention.', 'error');
     }
   };
 
-  const nextSweepLabel = nextSweep
-    ? `${nextSweep.toLocaleString('en-US', {
-        weekday: 'short',
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false,
-        timeZone: 'UTC',
-      })} UTC · ${relative(nextSweep, now)}`
-    : 'Not scheduled';
+  const nextSweepLabel = formatNextSweep(sweepTime, sweepCadence, now);
 
   return (
     <form
@@ -321,19 +333,35 @@ export const SettingsTab: React.FC = () => {
           <h2 className="text-xl font-bold tracking-tight text-[#141414]">
             Workspace Settings
           </h2>
-          <p className="text-[11px] text-[#8a8a86] font-mono mt-1">
-            Saved to your account and applied to the next sweep.
+          <p className="text-[11px] text-[#8a8a86] font-mono mt-1" aria-live="polite">
+            {!profile
+              ? 'Loading your saved settings…'
+              : isDirty
+              ? 'You have unsaved changes. Sweeps and the feed use your saved settings until you save.'
+              : 'Saved to your account and applied to the next sweep.'}
           </p>
         </div>
 
+        <div className="flex items-center gap-2 shrink-0">
+        {hasUnsavedSettings && (
+          <button
+            type="button"
+            onClick={discardSettingsChanges}
+            disabled={isSaving}
+            className="px-3 py-2.5 text-xs font-mono border border-[#deded8] bg-white text-[#4a4a47] hover:bg-[#f6f6f4] cursor-pointer disabled:opacity-50"
+          >
+            Discard changes
+          </button>
+        )}
         <button
           type="submit"
-          disabled={isSaving}
+          disabled={isSaving || !profile}
           className="inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-[#121212] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer disabled:opacity-50 shrink-0"
         >
           <Save className="w-3.5 h-3.5" />
           <span>{isSaving ? 'Saving…' : 'Save changes'}</span>
         </button>
+        </div>
       </div>
 
       {/* At a glance ---------------------------------------------------- */}
@@ -375,9 +403,11 @@ export const SettingsTab: React.FC = () => {
         description="Your offer is the context every keyword score and AI draft is built from."
       >
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <Field label="Name">
+          <Field label="Name" htmlFor="settings-name">
             <input
+              id="settings-name"
               type="text"
+              autoComplete="name"
               value={fullName}
               onChange={(e) => setFullName(e.target.value)}
               placeholder="e.g. Alex Rivera"
@@ -385,11 +415,13 @@ export const SettingsTab: React.FC = () => {
             />
           </Field>
 
-          <Field label="Website">
+          <Field label="Website" htmlFor="settings-website">
             <div className="relative">
-              <Globe className="w-3.5 h-3.5 text-[#8a8a86] absolute left-3 top-3 pointer-events-none" />
+              <Globe className="w-3.5 h-3.5 text-[#8a8a86] absolute left-3 top-3 pointer-events-none" aria-hidden="true" />
               <input
+                id="settings-website"
                 type="text"
+                autoComplete="url"
                 value={website}
                 onChange={(e) => setWebsite(e.target.value)}
                 placeholder="acme.ai"
@@ -401,6 +433,7 @@ export const SettingsTab: React.FC = () => {
 
         <Field
           label="What you sell"
+          htmlFor="settings-offer"
           hint="One or two sentences. This is what tells a buying mention apart from noise."
           aside={
             <span className="text-[11px] font-mono text-[#8a8a86]">
@@ -409,6 +442,7 @@ export const SettingsTab: React.FC = () => {
           }
         >
           <textarea
+            id="settings-offer"
             rows={3}
             maxLength={CORE_OFFER_MAX}
             value={coreOffer}
@@ -432,7 +466,7 @@ export const SettingsTab: React.FC = () => {
       <Section
         icon={<Radio className="w-4 h-4 text-[#141414]" />}
         title="Channels"
-        description="Every sweep searches exactly these sources. Fewer channels means faster sweeps and lower cost."
+        description="Every sweep searches exactly these sources. Credits are charged per keyword on each channel; News is free."
         aside={
           <span
             className={`${pillClass} ${
@@ -462,13 +496,14 @@ export const SettingsTab: React.FC = () => {
                       <span className="text-xs font-bold text-[#141414]">
                         {channel.name}
                       </span>
-                      {channel.tag && (
-                        <span
-                          className={`${pillClass} border-emerald-200 bg-emerald-50 text-emerald-700`}
-                        >
-                          {channel.tag}
-                        </span>
-                      )}
+                      <span
+                        className={`${pillClass} border-[#deded8] text-[#8a8a86]`}
+                        title="Credits per keyword, each sweep"
+                      >
+                        {pricing.channelCredits(channel.id) === 0
+                          ? 'Free'
+                          : `${formatCreditAmount(pricing.channelCredits(channel.id))} cr / keyword`}
+                      </span>
                     </div>
                     <p className="text-[11px] text-[#8a8a86] font-mono mt-0.5">
                       {channel.desc}
@@ -504,6 +539,13 @@ export const SettingsTab: React.FC = () => {
             );
           })}
         </ul>
+        <p className="text-[11px] font-mono text-[#4a4a47]" aria-live="polite">
+          {activeKeywordCount} keyword{activeKeywordCount === 1 ? '' : 's'} × {enabledChannels.length} channel
+          {enabledChannels.length === 1 ? '' : 's'} ={' '}
+          <span className="text-[#141414] font-medium">{creditsText(sweepCost)} per sweep</span>
+          {sweepsPerDay > 1 ? ` · ${creditsText(sweepCost * sweepsPerDay)} a day` : ''}
+          {hasUnsavedSettings ? ' (with these unsaved settings)' : ''}
+        </p>
       </Section>
 
       {/* Schedule ------------------------------------------------------- */}
@@ -513,13 +555,19 @@ export const SettingsTab: React.FC = () => {
         description="When Echo runs on its own. All times are UTC."
       >
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
-          <Field label="Start time">
-            <input
-              type="time"
-              value={sweepTime}
+          <Field label="Start time (UTC)" htmlFor="settings-sweep-time" hint="Sweeps start on the hour.">
+            <select
+              id="settings-sweep-time"
+              value={HOURS.includes(sweepTime) ? sweepTime : `${sweepTime.slice(0, 2)}:00`}
               onChange={(e) => setSweepTime(e.target.value || '06:00')}
               className={`${inputClass} cursor-pointer`}
-            />
+            >
+              {HOURS.map((h) => (
+                <option key={h} value={h}>
+                  {h}
+                </option>
+              ))}
+            </select>
           </Field>
 
           <Field label="How often">
@@ -534,7 +582,7 @@ export const SettingsTab: React.FC = () => {
 
         <Field
           label="Search window"
-          hint="How far back each sweep looks. A wider window costs more but catches slower-moving conversations."
+          hint="How far back each sweep looks. A wider window catches slower-moving conversations; the price per keyword is the same."
         >
           <Segmented
             options={LOOKBACKS.map((l) => l.hours)}

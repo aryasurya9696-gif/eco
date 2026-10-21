@@ -3,14 +3,17 @@ import { Check, Copy, Loader2, Mail, Phone, CheckCircle2, AlertTriangle, RotateC
 import type { B2BLead, B2BPipelineStatus } from '../../types';
 import {
   emailState,
+  leadKey,
   previewEmail,
   revealedPhone,
   contactStatus,
   CONTACT_STATUS_LABEL,
   type ContactStatus,
 } from './lead-utils';
-import { useLeadPricing } from './leads-store';
+import { leadsStore, useLeadPricing } from './leads-store';
+import { creditsLabel } from '../../lib/billing';
 import { mailStore } from '../mail/mail-store';
+import { useEcho } from '../../context/EchoContext';
 
 // ============================================================================
 // Contact cells shared by the results table, the cards view and Quick Lookup.
@@ -129,8 +132,38 @@ interface EmailCellProps {
 
 export const EmailCell: React.FC<EmailCellProps> = ({ lead, onReveal, isRevealing, locked, onTopUp }) => {
   const pricing = useLeadPricing();
+  const { addToast } = useEcho();
+  const [isOpeningComposer, setIsOpeningComposer] = useState(false);
   const state = emailState(lead);
   const preview = previewEmail(lead);
+
+  // The mail function links the thread to the lead (and marks it contacted)
+  // by its user_leads id, not the provider id a search row carries. A lead
+  // that isn't in the pipeline yet is saved first to get one.
+  const openComposerFor = async (email: string) => {
+    if (isOpeningComposer) return;
+    let leadId = lead.db_id || null;
+    if (!leadId) {
+      setIsOpeningComposer(true);
+      try {
+        const res = await leadsStore.bulkSave([lead]);
+        leadId = res.leads?.find((row) => leadKey(row) === leadKey(lead))?.id ?? res.leads?.[0]?.id ?? null;
+      } catch (err) {
+        addToast('Could not save this lead before emailing: ' + ((err as Error)?.message || 'unknown error'), 'error');
+        return;
+      } finally {
+        setIsOpeningComposer(false);
+      }
+    }
+    mailStore.openComposer({
+      leadId,
+      to: email,
+      name: lead.first_name,
+      company: lead.company_name,
+      title: lead.title,
+      subject: lead.company_name ? `Quick intro // ${lead.company_name}` : '',
+    });
+  };
 
   if (state.kind === 'verified' || state.kind === 'unconfirmed') {
     const verified = state.kind === 'verified';
@@ -149,18 +182,13 @@ export const EmailCell: React.FC<EmailCellProps> = ({ lead, onReveal, isRevealin
             onClick={(e) => {
               e.preventDefault();
               e.stopPropagation();
-              mailStore.openComposer({
-                leadId: lead.id,
-                to: state.email,
-                name: lead.first_name,
-                company: lead.company_name,
-                subject: lead.company_name ? `Quick intro // ${lead.company_name}` : '',
-              });
+              void openComposerFor(state.email);
             }}
+            disabled={isOpeningComposer}
             className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-mono font-medium bg-[#1b7f3b] text-white hover:bg-[#15662f] transition-colors cursor-pointer shrink-0 rounded-xs"
             title="Send 1-Click Outreach via Echo Mail"
           >
-            <Mail className="w-3 h-3" />
+            {isOpeningComposer ? <Loader2 className="w-3 h-3 animate-spin" /> : <Mail className="w-3 h-3" />}
             <span>Email</span>
           </button>
           <CopyButton value={state.email} label="email" />
@@ -176,6 +204,23 @@ export const EmailCell: React.FC<EmailCellProps> = ({ lead, onReveal, isRevealin
           {verified ? <CheckCircle2 className="w-3.5 h-3.5" aria-hidden /> : <AlertTriangle className="w-3.5 h-3.5" aria-hidden />}
           {state.label}
         </span>
+        {/* Risky / catch-all / unknown is not revealed: offer the verified one. */}
+        {!verified && onReveal && !locked && (
+          lead.email_lookup === 'queued' || lead.email_lookup === 'processing' || isRevealing ? (
+            <LookupLine state="processing" what="verified email" retryTitle="" />
+          ) : (
+            <button
+              type="button"
+              onClick={() => onReveal(lead)}
+              className={`${findLink} mt-1`}
+              title={`Find a verified email — ${creditsLabel(pricing.email)} only if it is verified`}
+              aria-label={`Find a verified email for ${lead.full_name || 'this lead'} (${creditsLabel(pricing.email)} if verified)`}
+            >
+              <Mail className="w-3.5 h-3.5" aria-hidden />
+              <span>Reveal verified</span>
+            </button>
+          )
+        )}
       </div>
     );
   }

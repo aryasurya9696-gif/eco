@@ -3,16 +3,11 @@ import { useEcho } from '../../context/EchoContext';
 import { useAuth } from '../../context/AuthContext';
 import { PillInput } from '../common/PillInput';
 import type { KeywordSuggestion, KeywordSuggestionResult } from '../../lib/ai';
+import { channelLabel } from '../../lib/constants';
+import { CADENCE_LABELS, formatNextSweep, type SweepCadence } from '../../lib/schedule';
 import {
   ShieldCheck, Zap, Sparkles, Plus, AlertTriangle, Users, Check,
 } from 'lucide-react';
-
-const CHANNEL_LABEL: Record<string, string> = {
-  x: 'X',
-  reddit: 'Reddit',
-  web: 'Web',
-  news: 'News',
-};
 
 const INTENT_STYLE: Record<KeywordSuggestion['intent'], string> = {
   high: 'bg-emerald-50 text-emerald-700 border-emerald-200',
@@ -21,7 +16,19 @@ const INTENT_STYLE: Record<KeywordSuggestion['intent'], string> = {
 };
 
 export const KeywordsTab: React.FC = () => {
-  const { keywords, keywordLimit, addKeyword, removeKeyword, suggestKeywordsFromOffer, addToast, sweepTime, lookbackHours, enabledChannels } = useEcho();
+  const {
+    keywords,
+    keywordLimit,
+    addKeyword,
+    removeKeyword,
+    suggestKeywordsFromOffer,
+    addToast,
+    savedSweepTime,
+    savedSweepCadence,
+    lookbackHours,
+    savedChannels,
+  } = useEcho();
+  const cadenceText = CADENCE_LABELS[savedSweepCadence as SweepCadence]?.toLowerCase() ?? 'daily';
   const { profile } = useAuth();
   const [aiResult, setAiResult] = useState<KeywordSuggestionResult | null>(null);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
@@ -51,7 +58,7 @@ export const KeywordsTab: React.FC = () => {
       setAiResult(result);
       setAddedPhrases(new Set());
       if (result.source === 'fallback') {
-        addToast('AI key not configured — showing heuristic suggestions.', 'info');
+        addToast('AI suggestions are unavailable right now. Showing rule-based suggestions instead.', 'info');
       } else {
         addToast(`AI generated ${result.suggestions.length} keyword suggestions.`, 'success');
       }
@@ -68,9 +75,6 @@ export const KeywordsTab: React.FC = () => {
     setAddedPhrases((prev) => new Set(prev).add(s.phrase));
   };
 
-  const channelLabel = (c: string) =>
-    c === 'twitter' ? 'X' : c === 'google' ? 'Web' : c.charAt(0).toUpperCase() + c.slice(1);
-
   return (
     <div className="space-y-6 max-w-4xl">
       {/* Header card */}
@@ -81,7 +85,7 @@ export const KeywordsTab: React.FC = () => {
               Tracked Keywords
             </h2>
             <p className="text-xs text-[#8a8a86] font-mono mt-1">
-              Scanned daily across {enabledChannels.length} active channels ({enabledChannels.map(channelLabel).join(', ')}) for buyer-intent mentions.
+              Scanned {cadenceText} across {savedChannels.length} channel{savedChannels.length === 1 ? '' : 's'} ({savedChannels.map(channelLabel).join(', ')}) for buyer-intent mentions.
             </p>
           </div>
 
@@ -93,7 +97,7 @@ export const KeywordsTab: React.FC = () => {
               className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#f6f6f4] hover:bg-[#ecece7] border border-[#e3e3de] text-xs font-mono text-[#141414] transition-colors cursor-pointer disabled:opacity-40"
             >
               <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
-              <span>{isGenerating ? 'Analyzing...' : 'AI Auto-Suggest'}</span>
+              <span>{isGenerating ? 'Analyzing...' : 'Suggest keywords'}</span>
             </button>
 
             <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-[#f6f6f4] border border-[#e3e3de] text-xs font-mono text-[#141414]">
@@ -109,7 +113,7 @@ export const KeywordsTab: React.FC = () => {
             <div className="px-4 py-3 border-b border-[#eeeeea] space-y-1.5">
               <span className="text-[11px] font-mono text-[#141414] font-semibold flex items-center gap-1.5">
                 <Sparkles className="w-3 h-3 text-emerald-600" />
-                Ranked by expected lead value
+                {aiResult.source === 'openai' ? 'AI suggestions, ranked by expected lead value' : 'Rule-based suggestions (AI unavailable)'}
               </span>
               {aiResult.icp && (
                 <p className="text-[11px] font-mono text-[#4a4a47] flex items-start gap-1.5 leading-relaxed">
@@ -156,7 +160,7 @@ export const KeywordsTab: React.FC = () => {
                         )}
                         {s.channels.map((c) => (
                           <span key={c} className="text-[10px] font-mono text-[#8a8a86]">
-                            {CHANNEL_LABEL[c] ?? c}
+                            {channelLabel(c)}
                           </span>
                         ))}
                       </div>
@@ -193,9 +197,9 @@ export const KeywordsTab: React.FC = () => {
 
         {/* Pill Input Management */}
         <div className="pt-6">
-          <label className="text-xs font-mono uppercase tracking-wider text-[#4a4a47] block mb-2">
+          <p id="keywords-label" className="text-xs font-mono uppercase tracking-wider text-[#4a4a47] block mb-2">
             Keywords & phrases
-          </label>
+          </p>
           <PillInput
             keywords={keywords.map((k) => k.keyword)}
             onAdd={handleAdd}
@@ -215,7 +219,7 @@ export const KeywordsTab: React.FC = () => {
             <span>Automated Sweep Policy</span>
           </div>
           <p className="text-xs text-[#8a8a86] font-mono leading-relaxed">
-            Every day at <span className="text-[#141414] font-medium">{sweepTime} UTC</span>, Echo scans connected social platforms for conversations from the last <span className="text-[#141414] font-medium">{lookbackHours} hours</span> matching each active keyword. Results are automatically deduplicated and verified.
+            Echo sweeps <span className="text-[#141414] font-medium">{cadenceText}</span> from <span className="text-[#141414] font-medium">{savedSweepTime} UTC</span> (next: {formatNextSweep(savedSweepTime, savedSweepCadence)}), looking at conversations from the last <span className="text-[#141414] font-medium">{lookbackHours} hours</span> that match each active keyword. Results are deduplicated.
           </p>
         </div>
 

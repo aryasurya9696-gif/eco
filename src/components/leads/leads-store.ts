@@ -1,7 +1,8 @@
 import { useSyncExternalStore } from 'react';
 import type { B2BLead } from '../../types';
 import { invokeFunction, ApiError } from '../../lib/api';
-import { fetchBalance, type Wallet } from '../../lib/billing';
+import { walletStore, isWelcomeOnlyRefusal, WELCOME_ONLY_MESSAGE } from '../../lib/wallet-store';
+import { creditsLabel } from '../../lib/billing';
 import { leadKey, revealedEmail, revealedPhone, emailState } from './lead-utils';
 import {
   DEFAULT_PRICING,
@@ -9,6 +10,9 @@ import {
   type ProspectorSearchParams,
   type LastSearch,
   type SearchStatus,
+  searchCost,
+  searchFeeText,
+  domainCountOf,
 } from './prospector-types';
 
 // ============================================================================
@@ -56,7 +60,6 @@ interface LeadsState {
   savedLimitReached: boolean;
   isLoadingSaved: boolean;
   savedLoaded: boolean;
-  wallet: Wallet | null;
   pricing: LeadPricing;
 }
 
@@ -77,7 +80,6 @@ const initialState = (): LeadsState => ({
   savedLimitReached: false,
   isLoadingSaved: false,
   savedLoaded: false,
-  wallet: null,
   pricing: DEFAULT_PRICING,
 });
 
@@ -142,6 +144,18 @@ function restore(userId: string) {
 // Public API
 // ---------------------------------------------------------------------------
 
+/** Largest batch the leads function's bulk-save accepts (400 max_leads above it). */
+const BULK_SAVE_MAX = 500;
+
+export type BulkSaveResponse = {
+  ok: boolean;
+  saved_count: number;
+  new_count?: number;
+  already_saved_count?: number;
+  skipped_count?: number;
+  leads?: B2BLead[];
+};
+
 export const leadsStore = {
   subscribe(listener: () => void) {
     listeners.add(listener);
@@ -172,19 +186,21 @@ export const leadsStore = {
     emit({ savedLeads: updater(state.savedLeads) });
   },
 
-  async loadBalance() {
-    try {
-      const before = state.wallet ? Number(state.wallet.available) : null;
-      const res = await fetchBalance();
-      if (res?.wallet) {
-        emit({ wallet: res.wallet });
-        // Topped up after a search that could not afford its contacts: the
-        // user already chose automatic enrichment for it, so carry on.
-        if (before !== null && before <= 0 && Number(res.wallet.available) > 0) resumeAfterTopUp();
-      }
-    } catch (err) {
-      console.warn('Failed to load wallet balance', err);
-    }
+  /** Re-reads the shared wallet (kept for callers; the store is walletStore). */
+  loadBalance(): Promise<void> {
+    return walletStore.refresh();
+  },
+
+  /**
+   * Mirrors an email sent to a saved lead (by its user_leads id) into both the
+   * pipeline and the Prospector rows, so both show "contacted" at once.
+   */
+  markContacted(dbId: string) {
+    if (!dbId) return;
+    const hit = (l: B2BLead) => l.db_id === dbId || l.id === dbId;
+    // Only advance from "new" (or unset): a later stage is not rolled back.
+    const bump = (l: B2BLead): B2BLead => (hit(l) && (!l.status || l.status === 'new') ? { ...l, status: 'contacted' } : l);
+    emit({ leads: state.leads.map(bump), savedLeads: state.savedLeads.map(bump) });
   },
 
   /**
@@ -200,7 +216,12 @@ export const leadsStore = {
         search_free_leads: number;
         search_block_leads: number;
         search_block_credits: number;
+        /** Credits per billed provider call (older deployments: per search). */
         searchCredits?: number;
+        search_credits_per_call?: number;
+        search_max_provider_calls_single?: number;
+        search_max_provider_calls_multi?: number;
+        paid_credits_only?: boolean;
       }>('leads', { action: 'pricing' });
       if (res?.ok) {
         const n = (v: unknown, d: number) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d);
@@ -211,7 +232,10 @@ export const leadsStore = {
             freeLeads: n(res.search_free_leads, DEFAULT_PRICING.freeLeads),
             blockLeads: Math.max(1, n(res.search_block_leads, DEFAULT_PRICING.blockLeads)),
             blockCredits: n(res.search_block_credits, DEFAULT_PRICING.blockCredits),
-            searchCredits: n(res.searchCredits, DEFAULT_PRICING.searchCredits),
+            searchCredits: n(res.search_credits_per_call ?? res.searchCredits, DEFAULT_PRICING.searchCredits),
+            searchMaxCallsSingle: Math.max(1, n(res.search_max_provider_calls_single, DEFAULT_PRICING.searchMaxCallsSingle)),
+            searchMaxCallsMulti: Math.max(1, n(res.search_max_provider_calls_multi, DEFAULT_PRICING.searchMaxCallsMulti)),
+            paidCreditsOnly: res.paid_credits_only ?? DEFAULT_PRICING.paidCreditsOnly,
           },
         });
       }
@@ -241,6 +265,40 @@ export const leadsStore = {
     }
   },
 
+  /**
+   * Saves leads to the pipeline (the leads function's bulk-save) and stamps the
+   * saved user_leads id onto the matching result rows as db_id. Throws on a
+   * failed or rejected save; the caller reports it.
+   */
+  async bulkSave(selected: B2BLead[]): Promise<BulkSaveResponse> {
+    // The server accepts at most BULK_SAVE_MAX leads per call, so a large
+    // "save all" goes in batches and the counts are summed.
+    const res: BulkSaveResponse = { ok: true, saved_count: 0, new_count: 0, already_saved_count: 0, skipped_count: 0, leads: [] };
+    for (let i = 0; i < selected.length; i += BULK_SAVE_MAX) {
+      const part = await invokeFunction<BulkSaveResponse>('leads', {
+        action: 'bulk-save',
+        leads: selected.slice(i, i + BULK_SAVE_MAX),
+      });
+      if (!part?.ok) throw new Error('The save was rejected.');
+      res.saved_count += part.saved_count ?? 0;
+      res.new_count = (res.new_count ?? 0) + (part.new_count ?? part.saved_count ?? 0);
+      res.already_saved_count = (res.already_saved_count ?? 0) + (part.already_saved_count ?? 0);
+      res.skipped_count = (res.skipped_count ?? 0) + (part.skipped_count ?? 0);
+      res.leads = [...(res.leads ?? []), ...(part.leads ?? [])];
+    }
+
+    const savedIds = new Set(selected.map((l) => l.id));
+    emit({
+      leads: state.leads.map((l) => {
+        if (!savedIds.has(l.id)) return l;
+        const row = res.leads?.find((s) => s.id === l.db_id || leadKey(s) === leadKey(l));
+        return row ? { ...l, is_saved: true, db_id: row.id, status: l.status || row.status || 'new' } : l;
+      }),
+    });
+    if (res.leads?.length) applySavedRows(res.leads);
+    return res;
+  },
+
   /** Inserts or merges a row the server just persisted into the pipeline list. */
   applySavedLead(saved: Partial<B2BLead> | null | undefined) {
     if (!saved) return;
@@ -268,6 +326,7 @@ export const leadsStore = {
     }
     state = initialState();
     listeners.forEach((l) => l());
+    walletStore.reset();
   },
 
   search,
@@ -284,6 +343,22 @@ export function useLeadsStore(): LeadsState {
 }
 
 const getPricing = () => state.pricing;
+
+/** Spendable credits from the shared wallet, or null when unknown. */
+function walletAvailable(): number | null {
+  const w = walletStore.getSnapshot().wallet;
+  return w ? Number(w.available) : null;
+}
+
+// Topped up after a search that could not afford its contacts: the user
+// already chose automatic enrichment for it, so carry on.
+let lastAvailable: number | null = null;
+walletStore.watch(() => {
+  const now = walletAvailable();
+  const before = lastAvailable;
+  if (now !== null) lastAvailable = now;
+  if (before !== null && before <= 0 && now !== null && now > 0) resumeAfterTopUp();
+});
 
 /**
  * Just the server prices. The reference only changes when pricing is reloaded,
@@ -319,11 +394,12 @@ async function search(params: ProspectorSearchParams, opts: { email: boolean; ph
   // Searching needs credits to reveal what it finds (the server enforces the
   // same rule); refuse here too so no request is made on an empty wallet.
   const minimum = Math.max(1, state.pricing.searchCredits);
-  if (state.wallet && Number(state.wallet.available) < minimum) {
+  const available = walletAvailable();
+  if (available !== null && available < minimum) {
     emit({
       searchStatus: {
         kind: 'error',
-        message: `Add credits to search. Each search costs ${state.pricing.searchCredits} credit${state.pricing.searchCredits === 1 ? '' : 's'}, plus verified emails and phones found.`,
+        message: `Add credits to search. A search costs ${searchFeeText(state.pricing)}, plus ${state.pricing.email} per verified email and ${state.pricing.phone} per phone found.`,
         params,
       },
     });
@@ -347,6 +423,7 @@ async function search(params: ProspectorSearchParams, opts: { email: boolean; ph
       skipped_domains?: number;
       failed_batches?: number;
       search_credits_charged?: number;
+      enrichment_limited_by?: 'cap' | 'balance' | 'rate_limit' | null;
     }>('leads', {
       action: 'search',
       company_domain: params.companyDomain,
@@ -379,9 +456,10 @@ async function search(params: ProspectorSearchParams, opts: { email: boolean; ph
       searchStatus: { kind: 'done' },
       enrichment: null,
     });
-    // Every search spends its flat fee (and any per-lead block fee).
-    if (res.search_credits_charged) void leadsStore.loadBalance();
 
+    if (res.enrichment_limited_by === 'rate_limit') {
+      notify('Hourly contact-lookup limit reached: some contacts were not looked up or charged. Use Find contacts later.', 'info');
+    }
     if (leads.length === 0) {
       notify('No leads matched these filters. Try a broader role, keyword or location.', 'info');
       return;
@@ -395,20 +473,29 @@ async function search(params: ProspectorSearchParams, opts: { email: boolean; ph
     if (seq !== searchSeq) return;
     let message = (err as Error)?.message || 'Search failed. Please try again.';
     let affordableLimit: number | undefined;
-    if (err instanceof ApiError && err.status === 402) {
-      message = message || 'Add credits to search. You pay only for verified emails and phones found.';
+    if (err instanceof ApiError && err.status === 402 && isWelcomeOnlyRefusal(err, searchCost(params.limit, state.pricing, domainCountOf(params.companyDomain)))) {
+      message = WELCOME_ONLY_MESSAGE;
+    } else if (err instanceof ApiError && err.status === 402) {
+      message = message || `Add credits to search. A search holds up to ${searchCost(params.limit, state.pricing, domainCountOf(params.companyDomain))} credits.`;
       // A per-lead search fee (off by default) can make a large search
       // unaffordable; offer the size the balance covers when it is on.
       const p = state.pricing;
       if (p.blockCredits > 0) {
-        const credits = state.wallet ? Math.max(0, Number(state.wallet.available) - p.searchCredits) : 0;
+        const credits = Math.max(0, (walletAvailable() ?? 0) - searchCost(0, p));
         affordableLimit = Math.min(params.limit - 1, p.freeLeads + Math.floor(credits / p.blockCredits) * p.blockLeads);
       }
     } else if (err instanceof ApiError && err.status === 429) {
       message = message || 'Too many searches in the last hour. Please wait a few minutes.';
+    } else if (err instanceof ApiError && err.status === 503) {
+      message = message || 'Search is temporarily unavailable (pricing is not configured). Nothing was charged.';
     }
     // Previous results stay; only the status reports the failure.
     emit({ searchStatus: { kind: 'error', message, params, affordableLimit } });
+  } finally {
+    // A search is a charging action whether or not it returned anything (a
+    // provider-billed empty search is still charged; a failed one releases
+    // its hold).
+    if (seq === searchSeq) void walletStore.refresh();
   }
 }
 
@@ -505,18 +592,18 @@ function finishRun(runId: number, final: EnrichmentRun['state'], message?: strin
     `${r.emailsFound} email${r.emailsFound === 1 ? '' : 's'}${r.emailsFound > (r.emailsVerified ?? 0) ? ` (${r.emailsVerified ?? 0} verified)` : ''}`,
     r.phonesFound ? `${r.phonesFound} phone${r.phonesFound === 1 ? '' : 's'}` : '',
   ].filter(Boolean).join(' and ');
-  const charged = `${r.creditsCharged} credit${r.creditsCharged === 1 ? '' : 's'} used`;
+  const charged = `${creditsLabel(r.creditsCharged)} used`;
   if (final === 'done') notify(`Enrichment finished: ${found} found · ${charged}.`, r.emailsFound + r.phonesFound > 0 ? 'success' : 'info');
-  else if (final === 'no_credits') notify(`Enrichment paused — out of credits. ${found} found · ${charged}.`, 'error');
+  else if (final === 'no_credits') notify(`${message || 'Enrichment paused — out of credits.'} ${found} found · ${charged}.`, 'error');
   else if (final === 'error') notify(message || 'Enrichment stopped after repeated errors.', 'error');
-  else if (final === 'stopped') notify(`Enrichment stopped. ${found} found · ${charged}.`, 'info');
+  else if (final === 'stopped') notify(`${message || 'Enrichment stopped.'} ${found} found · ${charged}.`, 'info');
 
   void leadsStore.loadBalance();
 }
 
 async function availableCredits(): Promise<number | null> {
-  await leadsStore.loadBalance();
-  return state.wallet ? Number(state.wallet.available) : null;
+  await walletStore.refresh();
+  return walletAvailable();
 }
 
 interface BulkResult {
@@ -528,11 +615,17 @@ interface BulkResult {
   existing_records?: Array<Partial<B2BLead>>;
   not_found_keys?: string[];
   failed_keys?: string[];
+  /** Hourly limit hit part-way: these keys were skipped and not charged. */
+  partial?: boolean;
+  message?: string;
+  rate_limited_keys?: string[];
+  rate_limited_count?: number;
 }
 
 async function runQueue(runId: number) {
   runActive = true;
   let consecutiveFailures = 0;
+  let lastError: string | null = null;
 
   while (true) {
     const run = state.enrichment;
@@ -556,10 +649,16 @@ async function runQueue(runId: number) {
       if (state.enrichment?.id !== runId || runSeq !== runId) return;
       if (outcome.kind === 'no_credits') {
         patchRows((l) => emailIds.has(l.id), () => ({ email_lookup: 'queued' }));
-        return finishRun(runId, 'no_credits');
+        return finishRun(runId, 'no_credits', outcome.welcomeOnly ? WELCOME_ONLY_MESSAGE : undefined);
+      }
+      if (outcome.kind === 'halt') {
+        // Not attempted (rate limit / pricing unavailable): retryable later.
+        patchRows((l) => emailIds.has(l.id), () => ({ email_lookup: null }));
+        return finishRun(runId, outcome.state, outcome.message);
       }
       if (outcome.kind === 'error') {
         consecutiveFailures++;
+        lastError = outcome.message;
         patchRows((l) => emailIds.has(l.id), () => ({ email_lookup: 'failed' }));
       } else {
         consecutiveFailures = 0;
@@ -569,6 +668,7 @@ async function runQueue(runId: number) {
           emailsVerified: outcome.data.verified_count ?? found,
           creditsCharged: outcome.data.credits_charged || 0,
         });
+        if (isPartial(outcome.data)) return finishRun(runId, 'stopped', partialMessage(outcome.data));
       }
     }
 
@@ -588,15 +688,21 @@ async function runQueue(runId: number) {
       if (state.enrichment?.id !== runId || runSeq !== runId) return;
       if (outcome.kind === 'no_credits') {
         patchRows((l) => phoneIds.has(l.id), () => ({ phone_lookup: 'queued' }));
-        return finishRun(runId, 'no_credits');
+        return finishRun(runId, 'no_credits', outcome.welcomeOnly ? WELCOME_ONLY_MESSAGE : undefined);
+      }
+      if (outcome.kind === 'halt') {
+        patchRows((l) => phoneIds.has(l.id), () => ({ phone_lookup: null }));
+        return finishRun(runId, outcome.state, outcome.message);
       }
       if (outcome.kind === 'error') {
         consecutiveFailures++;
+        lastError = outcome.message;
         patchRows((l) => phoneIds.has(l.id), () => ({ phone_lookup: 'failed' }));
       } else {
         consecutiveFailures = 0;
         const found = applyBulk(outcome.data, phoneIds, 'phone');
         bumpRun(runId, { phonesFound: found, creditsCharged: outcome.data.credits_charged || 0 });
+        if (isPartial(outcome.data)) return finishRun(runId, 'stopped', partialMessage(outcome.data));
       }
     }
 
@@ -605,12 +711,38 @@ async function runQueue(runId: number) {
     });
 
     if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      return finishRun(runId, 'error', 'Enrichment stopped: the contact lookup service failed twice in a row. Try Resume in a moment.');
+      return finishRun(
+        runId,
+        'error',
+        lastError && lastError !== 'Lookup failed'
+          ? `Enrichment stopped: ${lastError}`
+          : 'Enrichment stopped: the contact lookup service failed twice in a row. Try Resume in a moment.',
+      );
     }
   }
 }
 
-type BulkOutcome = { kind: 'ok'; data: BulkResult } | { kind: 'no_credits' } | { kind: 'error'; message: string };
+type BulkOutcome =
+  | { kind: 'ok'; data: BulkResult }
+  | { kind: 'no_credits'; welcomeOnly: boolean }
+  /** Stop the run without marking rows failed: they stay retryable. */
+  | { kind: 'halt'; state: 'stopped' | 'error'; message: string }
+  | { kind: 'error'; message: string };
+
+const RATE_LIMIT_MESSAGE = 'Hourly contact-lookup limit reached. The rest were not looked up or charged — Resume later.';
+const PRICING_UNAVAILABLE_MESSAGE =
+  'Contact lookups are temporarily unavailable (pricing is not configured). Nothing was charged; try again later.';
+
+/** A batch the server only partly ran (hourly limit): some keys were skipped, uncharged. */
+function isPartial(data: BulkResult): boolean {
+  return Boolean(data.partial || (data.rate_limited_count ?? 0) > 0 || data.rate_limited_keys?.length);
+}
+
+function partialMessage(data: BulkResult): string {
+  const n = data.rate_limited_count ?? data.rate_limited_keys?.length ?? 0;
+  const base = data.message || RATE_LIMIT_MESSAGE;
+  return n > 0 ? `${base} (${n} lead${n === 1 ? '' : 's'} skipped, not charged.)` : base;
+}
 
 async function callBulk(action: 'bulk-reveal-email' | 'bulk-reveal-phone', leads: B2BLead[]): Promise<BulkOutcome> {
   try {
@@ -618,7 +750,21 @@ async function callBulk(action: 'bulk-reveal-email' | 'bulk-reveal-phone', leads
     if (!data?.ok) return { kind: 'error', message: 'Unexpected response' };
     return { kind: 'ok', data };
   } catch (err) {
-    if (err instanceof ApiError && err.status === 402) return { kind: 'no_credits' };
+    if (err instanceof ApiError && err.status === 402) {
+      const price = action === 'bulk-reveal-email' ? state.pricing.email : state.pricing.phone;
+      return { kind: 'no_credits', welcomeOnly: isWelcomeOnlyRefusal(err, price) };
+    }
+    if (err instanceof ApiError && err.status === 429) {
+      return { kind: 'halt', state: 'stopped', message: err.message || RATE_LIMIT_MESSAGE };
+    }
+    if (err instanceof ApiError && err.status === 503) {
+      // pricing_unavailable (or the service is paused): retrying now won't help.
+      return { kind: 'halt', state: 'error', message: err.message || PRICING_UNAVAILABLE_MESSAGE };
+    }
+    if (err instanceof ApiError && err.status === 500 && /saved/i.test(err.message || '')) {
+      // save_failed: nothing saved, zero credits charged; the server says so.
+      return { kind: 'error', message: err.message };
+    }
     // An older deployment of the function has no bulk phone action and
     // answers 400 "Unknown action"; report that plainly.
     return { kind: 'error', message: (err as Error)?.message || 'Lookup failed' };
@@ -635,6 +781,9 @@ function applyBulk(data: BulkResult, targetIds: Set<string>, kind: 'email' | 'ph
   records.forEach((r) => byKey.set(leadKey({ company_domain: r.company_domain ?? '', full_name: r.full_name ?? '' }), r));
   const notFound = new Set(data.not_found_keys ?? []);
   const failed = new Set(data.failed_keys ?? []);
+  // Skipped by the hourly limit: never looked up, so left retryable (no state),
+  // not "not found" — Resume / Find contacts picks them up later.
+  const skipped = new Set(data.rate_limited_keys ?? []);
   let found = 0;
 
   emit({
@@ -656,6 +805,7 @@ function applyBulk(data: BulkResult, targetIds: Set<string>, kind: 'email' | 'ph
             status: l.status || r.status || 'new',
           };
         }
+        if (skipped.has(key) || skipped.has(l.id)) return { ...l, email_lookup: null };
         return { ...l, email_lookup: failed.has(key) ? 'failed' : 'not_found' };
       }
       if (r?.phone_number) {
@@ -671,6 +821,7 @@ function applyBulk(data: BulkResult, targetIds: Set<string>, kind: 'email' | 'ph
           status: l.status || r.status || 'new',
         };
       }
+      if (skipped.has(key) || skipped.has(l.id)) return { ...l, phone_lookup: null };
       return { ...l, phone_lookup: failed.has(key) ? 'failed' : notFound.has(key) ? 'not_found' : 'not_found' };
     }),
   });

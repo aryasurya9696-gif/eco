@@ -11,8 +11,17 @@ import { MailTab } from '../components/mail/MailTab';
 import { Composer } from '../components/mail/Composer';
 import { OnboardingModal } from '../components/onboarding/OnboardingModal';
 import type { DashboardTab } from '../types';
-import { hashForTab, tabFromHash } from '../lib/tab-routing';
-import { RefreshCw, Radio } from 'lucide-react';
+import {
+  clearIntendedPackage,
+  clearIntendedTab,
+  explicitTabFromHash,
+  hashForTab,
+  peekIntendedPackage,
+  peekIntendedTab,
+  tabFromHash,
+} from '../lib/tab-routing';
+import { SweepButton } from '../components/dashboard/SweepButton';
+import { Radio } from 'lucide-react';
 
 interface DashboardPageProps {
   onNavigateHome: () => void;
@@ -23,19 +32,20 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   onNavigateHome,
 }) => {
   const { profile, profileError, retryProfile } = useAuth();
-  const { isSweeping, runSweep, keywords } = useEcho();
+  const { keywords } = useEcho();
+  // A package picked on the landing page ("Buy"). The visitor arrives here to
+  // pay, whichever route (sign-in, sign-up, an email confirmation link in a new
+  // tab) brought them. Read once and owned here, not by BillingTab: a new user
+  // first goes through onboarding, and the intent has to survive that (see the
+  // effect below). Stored in localStorage with a TTL by lib/tab-routing.
+  const [intendedPackage] = useState<string | null>(() => peekIntendedPackage());
+
   // Read the tab out of the hash on first paint rather than always starting on
-  // the feed, so a refresh on #dashboard/billing comes up on Billing rather than
-  // the feed. A package picked on the landing page ("Buy") wins: the visitor
-  // arrives here to pay, whichever route (sign-in, sign-up, already signed in)
-  // brought them.
+  // the feed, so a refresh on #dashboard/billing comes up on Billing. An
+  // intended package wins, then the tab a signed-out deep link named.
   const [activeTab, setActiveTab] = useState<DashboardTab>(() => {
-    try {
-      if (sessionStorage.getItem('echo_intended_package')) return 'billing';
-    } catch {
-      // Storage unavailable: fall back to the hash.
-    }
-    return (tabFromHash() as DashboardTab) ?? 'feed';
+    if (intendedPackage) return 'billing';
+    return ((explicitTabFromHash() ?? peekIntendedTab() ?? tabFromHash()) as DashboardTab) ?? 'feed';
   });
   const [isRetryingProfile, setIsRetryingProfile] = useState(false);
 
@@ -129,19 +139,34 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   // Check if onboarding needs to be shown
   const showOnboarding = Boolean(profile && !profile.onboarding_completed);
 
+  // Intents are consumed only once a fully set-up user is looking at them.
+  // Clearing them earlier (while the profile was loading, or under the
+  // onboarding modal) lost them for every new user, and a reload mid-onboarding
+  // lost them too.
+  useEffect(() => {
+    if (!profile?.onboarding_completed) return;
+    clearIntendedTab();
+    if (intendedPackage && activeTab === 'billing') clearIntendedPackage();
+  }, [intendedPackage, activeTab, profile?.onboarding_completed]);
+
   return (
     <div className="flex h-screen bg-[#f6f6f4] text-[#141414] font-sans overflow-hidden">
-      {/* Sidebar */}
-      <Sidebar
-        activeTab={activeTab}
-        onTabChange={handleTabChange}
-        onNavigateHome={onNavigateHome}
-        isCollapsed={isSidebarCollapsed || isNarrow}
-        onToggleCollapse={toggleSidebar}
-      />
+      {/* Sidebar. Inert under the onboarding dialog, like the content. */}
+      <div className="contents" inert={showOnboarding}>
+        <Sidebar
+          activeTab={activeTab}
+          onTabChange={handleTabChange}
+          onNavigateHome={onNavigateHome}
+          isCollapsed={isSidebarCollapsed || isNarrow}
+          onToggleCollapse={toggleSidebar}
+        />
+      </div>
 
       {/* Main Content Area with 58px Grid Pattern */}
-      <div className="flex-1 min-w-0 flex flex-col h-screen overflow-hidden bg-grid-58 relative">
+      <div
+        className="flex-1 min-w-0 flex flex-col h-screen overflow-hidden bg-grid-58 relative"
+        inert={showOnboarding}
+      >
         {/* Top Header Bar */}
         <header className="h-16 bg-[#ffffff]/90 backdrop-blur-md border-b border-[#e3e3de] px-6 sm:px-8 flex items-center justify-between flex-shrink-0 z-20">
           <div className="flex items-center gap-3">
@@ -165,7 +190,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
             {activeTab === 'feed' && (
               <span className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-[#eeeeea] text-[10px] font-mono text-[#4a4a47] rounded-full border border-[#deded8]">
-                <Radio className="w-2.5 h-2.5 text-emerald-600 animate-pulse" />
+                <Radio className="w-2.5 h-2.5 text-emerald-600" aria-hidden="true" />
                 <span>Tracking {keywords.length} keywords</span>
               </span>
             )}
@@ -173,21 +198,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
           <div className="flex items-center gap-3">
             {activeTab === 'feed' && (
-              <span className="hidden md:inline-flex items-center gap-1.5 text-[10px] font-mono text-emerald-800 bg-emerald-50 px-2.5 py-1 border border-emerald-200">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                Live Radar Active
-              </span>
-            )}
-
-            {activeTab === 'feed' && (
-              <button
-                onClick={runSweep}
-                disabled={isSweeping}
-                className="inline-flex items-center gap-2 px-3.5 py-1.5 bg-[#121212] hover:bg-black text-white text-xs font-mono rounded-none transition-colors cursor-pointer disabled:opacity-50 shadow-xs"
-              >
-                <RefreshCw className={`w-3 h-3 ${isSweeping ? 'animate-spin' : ''}`} />
-                <span>{isSweeping ? 'Sweeping...' : 'Trigger Sweep'}</span>
-              </button>
+              <SweepButton variant="header" onNavigateBilling={() => handleTabChange('billing')} />
             )}
           </div>
         </header>
@@ -215,11 +226,11 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               </button>
             </div>
           )}
-          {activeTab === 'feed' && <FeedTab />}
+          {activeTab === 'feed' && <FeedTab onNavigateBilling={() => handleTabChange('billing')} />}
           {activeTab === 'leads' && <LeadsTab onNavigateBilling={() => handleTabChange('billing')} />}
           {activeTab === 'mail' && <MailTab />}
           {activeTab === 'keywords' && <KeywordsTab />}
-          {activeTab === 'billing' && <BillingTab />}
+          {activeTab === 'billing' && <BillingTab intendedCode={intendedPackage} />}
           {activeTab === 'settings' && <SettingsTab />}
         </main>
       </div>
@@ -228,7 +239,8 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       <OnboardingModal
         isOpen={showOnboarding}
         onComplete={() => {
-          setActiveTab('feed');
+          // Keep the tab a deep link named; only a picked package overrides it.
+          if (intendedPackage) handleTabChange('billing');
         }}
       />
 

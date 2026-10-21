@@ -20,11 +20,27 @@ export function leadKey(lead: Pick<B2BLead, 'company_domain' | 'full_name'>): st
   return `${(lead.company_domain || '').toLowerCase().trim()}::${(lead.full_name || '').toLowerCase().trim()}`;
 }
 
-/** The person's resolved work email, or null. Never a preview or placeholder. */
-export function revealedEmail(lead: B2BLead): string | null {
+const VERIFIED_STATUSES = new Set(['valid', 'deliverable', 'verified']);
+
+/**
+ * Any address the lookup returned for the person, verified or not (risky,
+ * catch-all, unknown). Never a preview or an address that bounces.
+ */
+export function foundEmail(lead: B2BLead): string | null {
   if (lead.email_status === 'preview' || lead.email_status === 'invalid') return null;
   const email = lead.revealed_email || lead.work_email;
   return isEmailAddress(email) ? email.trim() : null;
+}
+
+/**
+ * The person's verified work email, or null. Only a `valid` (deliverable)
+ * status counts as revealed: an unknown, missing, risky or catch-all status
+ * is not, so those rows still offer a reveal — the server sells the verified
+ * address.
+ */
+export function revealedEmail(lead: B2BLead): string | null {
+  const email = foundEmail(lead);
+  return email && VERIFIED_STATUSES.has((lead.email_status || '').toLowerCase()) ? email : null;
 }
 
 export function revealedPhone(lead: B2BLead): string | null {
@@ -54,11 +70,11 @@ export type EmailState =
  * A label now only says "Verified" when the verifier said so.
  */
 export function emailState(lead: B2BLead): EmailState {
-  const email = revealedEmail(lead);
+  const email = foundEmail(lead);
   const status = (lead.email_status || '').toLowerCase();
   // The verifier said this address bounces: it is not a usable email.
   if (email && status !== 'invalid') {
-    if (status === 'valid' || status === 'deliverable' || status === 'verified') {
+    if (VERIFIED_STATUSES.has(status)) {
       return { kind: 'verified', email, label: 'Verified' };
     }
     // Found but not confirmed deliverable. Only verified addresses are

@@ -41,19 +41,12 @@ const REPLAY_WINDOW_MS = 5 * 60 * 1000;
 
 const encoder = new TextEncoder();
 
-/** Dodo posts application/json; CORS headers are harmless and help local testing. */
-function corsHeaders(): Record<string, string> {
-  return {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'content-type, webhook-id, webhook-signature, webhook-timestamp',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  };
-}
-
+// No CORS headers: this endpoint is called server-to-server by Dodo, never by
+// a browser, so there is no origin to allow (it used to answer "*").
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+    headers: { 'Content-Type': 'application/json' },
   });
 }
 
@@ -267,52 +260,19 @@ async function findOrder(admin: ReturnType<typeof createClient>, data: any): Pro
 }
 
 /**
- * Revokes credits from every grant an order produced.
- *
- * `fraction` of each grant's ORIGINAL credits (1 = everything left). Each
- * revocation is tagged with `reason`, and a grant that already has a ledger
- * row with that tag is skipped — so a retried webhook that half-finished
- * the first time does not take the same refund twice.
+ * The refund's own id, so a redelivery (or a second event about the same
+ * refund) is recognised by the database. refund.succeeded carries the refund
+ * object itself; anything else only counts when it names a refund explicitly.
  */
-async function revokeOrderGrants(
-  admin: ReturnType<typeof createClient>,
-  orderId: string,
-  reason: string,
-  fraction: number | null,
-): Promise<{ failures: number; revoked: number }> {
-  const { data: grants, error } = await admin
-    .from('credit_grants')
-    .select('id, credits')
-    .eq('payment_order_id', orderId);
-  if (error) throw new Error(`grant lookup failed: ${error.message}`);
-
-  let failures = 0;
-  let revoked = 0;
-  for (const g of grants ?? []) {
-    const { count: already } = await admin
-      .from('credit_ledger')
-      .select('id', { count: 'exact', head: true })
-      .eq('grant_id', g.id)
-      .eq('note', reason);
-    if ((already ?? 0) > 0) continue;
-
-    const { data: out, error: revokeError } = await admin.rpc('wallet_revoke_grant', {
-      p_grant_id: g.id,
-      p_reason: reason,
-      p_credits: fraction === null ? null : num(g.credits) * fraction,
-    });
-    if (revokeError || out?.ok === false) {
-      failures++;
-      console.error('[webhook] revoke failed:', revokeError?.message ?? out?.error);
-    } else {
-      revoked += num(out?.revoked);
-    }
-  }
-  return { failures, revoked };
+function refundIdOf(eventType: string, data: any): string | null {
+  const explicit = data?.refund_id ?? data?.refund?.refund_id ?? data?.refund?.id;
+  if (typeof explicit === 'string' && explicit) return explicit.slice(0, 128);
+  if (eventType === 'refund.succeeded' && typeof data?.id === 'string' && data.id) return data.id.slice(0, 128);
+  return null;
 }
 
 Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders() });
+  if (req.method === 'OPTIONS') return new Response(null, { status: 204 });
   if (req.method !== 'POST') return new Response('method not allowed', { status: 405 });
 
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
@@ -347,50 +307,32 @@ Deno.serve(async (req) => {
 
   const eventType = String(event?.type ?? 'unknown');
 
-  // Record the delivery before acting on it. The unique constraint on
-  // webhook_id is what makes a redelivery recognisable as one.
-  //
-  // A duplicate is not automatically "already handled". The first attempt
-  // inserts the row and only then processes, so a delivery that failed
-  // afterwards is still sitting here in 'received' or 'failed' — and the
-  // payment provider will retry it, which is the only way that customer ever
-  // gets their credits. Short-circuiting on the duplicate used to swallow
-  // every retry, so a transient failure turned into "paid, no credits, and the
-  // provider was told 200".
-  const { error: recordError } = await admin
-    .from('webhook_events')
-    .insert({
-      provider: 'dodo',
-      webhook_id: webhookId,
-      event_type: eventType,
-      payload: event,
-      status: 'received',
-      attempts: 1,
-    });
-
-  if (recordError) {
-    if (recordError.code === '23505') {
-      // Already seen. Reprocess only if the earlier attempt did not finish.
-      const { data: prior } = await admin
-        .from('webhook_events')
-        .select('status, attempts')
-        .eq('webhook_id', webhookId)
-        .maybeSingle();
-
-      if (prior?.status === 'processed' || prior?.status === 'ignored') {
-        console.log(`[webhook] ${webhookId} (${eventType}) already ${prior.status} - ignoring`);
-        return json({ ok: true, duplicate: true, status: prior.status });
-      }
-
-      await admin.from('webhook_events')
-        .update({ status: 'received', attempts: (prior?.attempts ?? 1) + 1 })
-        .eq('webhook_id', webhookId);
-      console.warn(`[webhook] ${webhookId} retrying after prior ${prior?.status ?? 'unknown'}`);
-      // Falls through to processing.
-    } else {
-      console.error('[webhook] could not record event:', recordError.message);
-      return json({ ok: false, error: 'record_failed' }, 500);
+  // Claim the delivery before acting on it (H7). webhook_claim inserts the row
+  // or, for a redelivery, takes it under a row lock: a delivery that already
+  // finished is answered as a duplicate, one that another invocation is
+  // processing right now is refused with 409 (the provider retries later), and
+  // one whose earlier attempt failed or crashed is reprocessed — the provider's
+  // retry is the only way that customer ever gets their credits.
+  const { data: claim, error: claimError } = await admin.rpc('webhook_claim', {
+    p_provider: 'dodo',
+    p_webhook_id: webhookId,
+    p_event_type: eventType,
+    p_payload: event,
+  });
+  if (claimError) {
+    console.error('[webhook] could not record event:', claimError.message);
+    return json({ ok: false, error: 'record_failed' }, 500);
+  }
+  if (claim?.claimed !== true) {
+    if (claim?.in_flight) {
+      console.warn(`[webhook] ${webhookId} (${eventType}) is being processed by another invocation`);
+      return json({ ok: false, error: 'in_flight' }, 409);
     }
+    console.log(`[webhook] ${webhookId} (${eventType}) already ${claim?.status} - ignoring`);
+    return json({ ok: true, duplicate: true, status: claim?.status ?? null });
+  }
+  if (claim?.first === false) {
+    console.warn(`[webhook] ${webhookId} retrying after prior ${claim?.prior_status ?? 'unknown'}`);
   }
 
   // One place that closes out the delivery record, so every branch reports
@@ -400,6 +342,7 @@ Deno.serve(async (req) => {
       .update({
         status,
         last_error: lastError,
+        claimed_at: null,
         processed_at: status === 'processed' ? new Date().toISOString() : null,
       })
       .eq('webhook_id', webhookId);
@@ -449,13 +392,21 @@ Deno.serve(async (req) => {
           );
           return json({ ok: true, settled: false, review: settle.error });
         }
+        if (settle.error === 'order_not_grantable') {
+          // The order was refunded or disputed (possibly before this payment
+          // event arrived). Granting now would hand out credits for money that
+          // went back, and a retry cannot change that, so this is final.
+          await markEvent('processed', `not granted: order ${settle.status}`);
+          console.warn(`[webhook] payment event for ${settle.status} order ${order.id}; no credits granted`);
+          return json({ ok: true, settled: false, not_grantable: settle.status });
+        }
         // Anything else (missing package, zero-credit package) is a config
         // problem a retry can succeed after, once someone fixes it.
         throw new Error(`topup refused: ${settle.error}`);
       }
 
       await markEvent('processed');
-      console.log(`[webhook] payment.settled order=${order.id} ${JSON.stringify(settle)}`);
+      console.log(`[webhook] payment.settled order=${order.id} duplicate=${settle?.duplicate === true} credits=${settle?.credits_granted ?? 0}`);
       return json({ ok: true, settled: true });
     }
 
@@ -471,52 +422,43 @@ Deno.serve(async (req) => {
         return json({ ok: false, error: 'refund_order_not_found' });
       }
 
-      const gross = num(order.gross_usd);
-      const alreadyRefunded = num(order.refunded_usd);
-      // A refund event carries its own amount; a payment.refunded carries the
-      // payment, whose total is the whole order. If neither is present the
-      // remainder is assumed — over-revoking a refunded customer is the
-      // recoverable direction.
-      const refundCurrency = data?.currency ?? order.currency;
-      let refundAmount = eventType === 'refund.succeeded'
-        ? toMajor(data?.amount ?? data?.refund_amount, refundCurrency)
-        : toMajor(data?.refund_amount ?? data?.total_amount, refundCurrency);
-      if (refundAmount === null) {
-        console.warn(`[webhook] ${eventType} for order ${order.id} has no amount; treating as full refund`);
-        refundAmount = Math.max(gross - alreadyRefunded, 0);
+      // A refund event carries its own amount (incremental); a payment.refunded
+      // carries the payment, whose refunded total is cumulative. The database
+      // records each refund once per (order, refund id), takes the larger of
+      // "sum of refunds" and "largest cumulative total", revokes the matching
+      // share of the order's credits under the key refund:<order>:<refund id>,
+      // and updates the order — all in one transaction. A refund in another
+      // currency is parked in 'review' instead of being guessed at.
+      const cumulative = eventType === 'payment.refunded';
+      const refundCurrency = typeof data?.currency === 'string' ? data.currency.toUpperCase() : null;
+      const refundAmount = cumulative
+        ? toMajor(data?.refund_amount ?? data?.total_refunded ?? data?.total_amount, refundCurrency ?? order.currency)
+        : toMajor(data?.amount ?? data?.refund_amount, refundCurrency ?? order.currency);
+      const refundId = refundIdOf(eventType, data) ?? (cumulative ? null : `webhook:${webhookId}`);
+
+      const { data: out, error: refundError } = await admin.rpc('wallet_refund_order', {
+        p_order_id: order.id,
+        p_refund_id: refundId,
+        p_amount: refundAmount,
+        p_currency: refundCurrency,
+        p_cumulative: cumulative,
+        p_webhook_id: webhookId,
+      });
+      if (refundError) throw new Error(`refund failed: ${refundError.message}`);
+
+      if (out?.ok === false) {
+        if (out.error === 'currency_mismatch') {
+          // Final for the webhook: a retry cannot change the currency.
+          await markEvent('processed', 'review: refund currency_mismatch');
+          console.error(`[webhook] refund on order ${order.id} in ${refundCurrency} parked for review (order ${order.currency})`);
+          return json({ ok: true, refunded: false, review: 'currency_mismatch' });
+        }
+        throw new Error(`refund refused: ${out.error}`);
       }
-      if (data?.currency && String(data.currency).toUpperCase() !== String(order.currency).toUpperCase()) {
-        console.warn(`[webhook] refund currency ${data.currency} differs from order currency ${order.currency}`);
-      }
 
-      // Revoke the same share of each grant's original credits as the share of
-      // the order that was refunded. A $5 refund on a $20 pack takes a quarter,
-      // not the whole pack.
-      const fraction = gross > 0 ? Math.min(refundAmount / gross, 1) : 1;
-
-      // Revoke before marking the order refunded, and treat a failure as a
-      // failure. Doing it the other way round meant a revoke that errored left
-      // the order looking refunded with the credits still there.
-      const { failures } = await revokeOrderGrants(admin, order.id, `refund:${webhookId}`, fraction);
-      if (failures > 0) {
-        // 500 so the provider retries, and the order is left untouched so a
-        // human can see it still needs finishing.
-        await markEvent('failed', `${failures} grant revocation(s) failed`);
-        return json({ ok: false, error: 'revoke_failed' }, 500);
-      }
-
-      const refundedTotal = Math.min(alreadyRefunded + refundAmount, gross);
-      const { error: orderError } = await admin.from('payment_orders')
-        .update({
-          refunded_usd: refundedTotal,
-          status: refundedTotal + 0.005 >= gross ? 'refunded' : 'partially_refunded',
-        })
-        .eq('id', order.id);
-      if (orderError) throw new Error(`order update failed: ${orderError.message}`);
-
-      await markEvent('processed');
-      console.log(`[webhook] refund order=${order.id} amount=${refundAmount} total=${refundedTotal}/${gross}`);
-      return json({ ok: true, refunded: true, fraction });
+      await markEvent('processed', out?.duplicate ? 'duplicate refund' : null);
+      console.log(`[webhook] refund order=${order.id} key=${out?.refund_key ?? '-'} duplicate=${out?.duplicate === true} total=${out?.refunded_usd}`);
+      return json({ ok: true, refunded: true, duplicate: out?.duplicate === true, fraction: out?.fraction ?? 0 });
     }
 
     if (eventType === 'payment.failed') {
@@ -543,30 +485,27 @@ Deno.serve(async (req) => {
       }
 
       // Freeze: the money is contested, so the unspent credits it bought stop
-      // being spendable now rather than after the dispute is decided.
-      const { failures, revoked } = await revokeOrderGrants(admin, order.id, `dispute:${order.id}`, null);
-      if (failures > 0) {
-        await markEvent('failed', `${failures} grant revocation(s) failed`);
-        return json({ ok: false, error: 'revoke_failed' }, 500);
-      }
-
-      const { error } = await admin.from('payment_orders')
-        .update({ status: 'disputed' })
-        .eq('id', order.id);
-      if (error) throw new Error(`order update failed: ${error.message}`);
+      // being spendable now rather than after the dispute is decided. One
+      // atomic call; revokes are keyed per order, stage and grant.
+      const { data: out, error } = await admin.rpc('wallet_dispute_order', {
+        p_order_id: order.id,
+        p_stage: 'opened',
+      });
+      if (error || out?.ok === false) throw new Error(`dispute freeze failed: ${error?.message ?? out?.error}`);
 
       await markEvent('processed');
-      console.warn(`[webhook] dispute opened order=${order.id}; froze ${revoked} credits`);
+      console.warn(`[webhook] dispute opened order=${order.id}; froze ${num(out?.revoked)} credits`);
       return json({ ok: true, disputed: true });
     }
 
     if (eventType === 'dispute.won') {
       const order = await findOrder(admin, data);
       if (order && order.status === 'disputed') {
-        const { error } = await admin.from('payment_orders')
-          .update({ status: 'succeeded' })
-          .eq('id', order.id);
-        if (error) throw new Error(`order update failed: ${error.message}`);
+        const { data: out, error } = await admin.rpc('wallet_dispute_order', {
+          p_order_id: order.id,
+          p_stage: 'won',
+        });
+        if (error || out?.ok === false) throw new Error(`dispute update failed: ${error?.message ?? out?.error}`);
         // Deliberately not automatic: a re-grant creates credits, and this
         // webhook only creates credits on payment.succeeded.
         console.warn(`[webhook] dispute won order=${order.id}; frozen credits are NOT re-granted automatically - restore manually`);
@@ -579,17 +518,13 @@ Deno.serve(async (req) => {
       const order = await findOrder(admin, data);
       if (order) {
         // Anything that became spendable since the freeze (a hold released) is
-        // taken too. Credits a grant no longer has are simply not taken.
-        const { failures } = await revokeOrderGrants(admin, order.id, 'dispute_lost', null);
-        if (failures > 0) {
-          await markEvent('failed', `${failures} grant revocation(s) failed`);
-          return json({ ok: false, error: 'revoke_failed' }, 500);
-        }
-        const { error } = await admin.from('payment_orders')
-          .update({ status: 'refunded', refunded_usd: num(order.gross_usd) })
-          .eq('id', order.id);
-        if (error) throw new Error(`order update failed: ${error.message}`);
-        console.warn(`[webhook] dispute lost order=${order.id}`);
+        // taken too, and the order is marked refunded, in one transaction.
+        const { data: out, error } = await admin.rpc('wallet_dispute_order', {
+          p_order_id: order.id,
+          p_stage: 'lost',
+        });
+        if (error || out?.ok === false) throw new Error(`dispute revoke failed: ${error?.message ?? out?.error}`);
+        console.warn(`[webhook] dispute lost order=${order.id}; revoked ${num(out?.revoked)} more credits`);
       }
       await markEvent('processed', order ? null : 'no matching order');
       return json({ ok: true, matched: !!order });
@@ -605,7 +540,7 @@ Deno.serve(async (req) => {
     // Left in 'received' so a provider retry reprocesses it. Marking it failed
     // and returning 200 would silently drop a real payment.
     await admin.from('webhook_events')
-      .update({ status: 'failed', last_error: String((err as Error)?.message ?? err).slice(0, 500) })
+      .update({ status: 'failed', claimed_at: null, last_error: String((err as Error)?.message ?? err).slice(0, 500) })
       .eq('webhook_id', webhookId);
     return json({ ok: false, error: 'processing_failed' }, 500);
   }

@@ -51,11 +51,14 @@ DO $$
 DECLARE
   job record;
 BEGIN
-  FOR job IN
-    SELECT jobid FROM cron.job WHERE jobname IN ('echo-leads-worker', 'echo-leads-automations')
-  LOOP
-    PERFORM cron.unschedule(job.jobid);
-  END LOOP;
+  -- cron.job only exists when pg_cron is installed (off by default).
+  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+    FOR job IN
+      SELECT jobid FROM cron.job WHERE jobname IN ('echo-leads-worker', 'echo-leads-automations')
+    LOOP
+      PERFORM cron.unschedule(job.jobid);
+    END LOOP;
+  END IF;
 END
 $$;
 

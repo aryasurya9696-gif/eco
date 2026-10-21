@@ -2,6 +2,22 @@ import React, { useEffect, useState } from 'react';
 import { BrandLogo } from '../components/common/BrandLogo';
 import { PlatformBadge } from '../components/common/PlatformBadge';
 import { supabase, isConfigured } from '../lib/supabase';
+import {
+  CHANNEL_LIMIT,
+  CHANNEL_SEARCH_CREDITS,
+  CONNECTED_SEND_CREDITS,
+  DIRECT_PHONE_CREDITS,
+  HOSTED_SEND_CREDITS,
+  KEYWORD_LIMIT,
+  MAX_SWEEP_CREDITS,
+  PEOPLE_SEARCH_CREDITS,
+  VERIFIED_EMAIL_CREDITS,
+  WELCOME_CREDITS,
+  channelLabel,
+  creditsText,
+  formatCreditAmount,
+} from '../lib/constants';
+import { rememberIntendedPackage } from '../lib/tab-routing';
 import { LandingPricing, type CostGroup } from '../components/landing/LandingPricing';
 import {
   ArrowRight,
@@ -18,78 +34,42 @@ import {
 } from 'lucide-react';
 
 /**
- * What one search costs, in credits.
+ * Everything a credit can be spent on, grouped by feature.
  *
- * Shown here so the price list is not a mystery. These match pricing_config,
- * which is where the charge actually comes from — this copy exists to explain
- * it, and if the two ever disagree the table wins and this gets corrected.
- *
- * Reddit is two credits because its fallback is a second billed provider call.
- * The customer still pays for one search either way, which is the point of
- * pricing per operation rather than per call.
- */
-const SEARCH_COSTS: Array<{
-  key: 'twitter' | 'reddit' | 'google' | 'news';
-  channel: string;
-  credits: number;
-  note: string;
-}> = [
-  { key: 'twitter', channel: 'X / Twitter', credits: 1, note: 'latest posts, not all-time top' },
-  { key: 'reddit', channel: 'Reddit', credits: 2, note: 'two providers, one search for you' },
-  { key: 'google', channel: 'Web', credits: 1, note: 'rich results with dates' },
-  { key: 'news', channel: 'Press & news', credits: 1, note: 'every result carries a date' },
-];
-
-/**
- * Everything a credit can be spent on, grouped by feature. Same rule as above:
- * pricing_config is the source (treg.people.*, mail.send.*), this explains it.
+ * Every number comes from the one client-side price list in lib/constants
+ * (kept equal to pricing_config). This page is public, and the live pricing
+ * action needs a session, so the constants are the source here; signed-in
+ * views read the live prices through lib/pricing.
  */
 const COST_GROUPS: CostGroup[] = [
   {
     feature: 'Feed',
-    items: SEARCH_COSTS.map((s) => ({ label: `${s.channel} search`, credits: s.credits, note: s.note })),
+    items: [
+      { label: 'X search', credits: CHANNEL_SEARCH_CREDITS.twitter, note: 'per keyword, per sweep' },
+      { label: 'Reddit search', credits: CHANNEL_SEARCH_CREDITS.reddit, note: 'per keyword, per sweep' },
+      { label: 'Web search', credits: CHANNEL_SEARCH_CREDITS.google, note: 'per keyword, per sweep' },
+      { label: 'News search', credits: CHANNEL_SEARCH_CREDITS.news, note: 'always free' },
+    ],
   },
   {
     feature: 'Leads',
     items: [
-      { label: 'People search', credits: 1, note: 'per search, any number of results' },
-      { label: 'Verified work email', credits: 1, note: 'only when the verifier says valid' },
-      { label: 'Direct phone', credits: 2, note: 'only when a number is found' },
+      { label: 'People search', credits: PEOPLE_SEARCH_CREDITS, note: 'per billed provider call; one search can make several' },
+      { label: 'Verified work email', credits: VERIFIED_EMAIL_CREDITS, note: 'per email revealed' },
+      { label: 'Direct phone', credits: DIRECT_PHONE_CREDITS, note: 'per phone revealed' },
     ],
   },
   {
     feature: 'Mail',
     items: [
-      { label: 'Send from your mailbox', credits: 0.05, note: 'Gmail or Zoho, 20 emails per credit' },
-      { label: 'Send from an Echo domain', credits: 0.1, note: 'your domain, DKIM & SPF set up' },
-      { label: 'AI drafts & polish', credits: 0, note: 'free, as many as you like' },
+      { label: 'Send from your mailbox', credits: CONNECTED_SEND_CREDITS, note: 'Gmail, Zoho or any SMTP mailbox' },
+      { label: 'Send from an Echo domain', credits: HOSTED_SEND_CREDITS, note: 'your domain, DKIM & SPF set up' },
     ],
   },
 ];
 
-/** Credits for one verified email and one connected-mailbox send, as above. */
-const EMAIL_REVEAL_CREDITS = 1;
-const CONNECTED_SEND_CREDITS = 0.05;
-
-/**
- * What one full daily sweep costs at the product's own caps: eight keywords
- * across the three most expensive channels, since only three run at once.
- *
- * The maximum rather than an average, on purpose. Quoting an average would
- * flatter every package, and someone who later tracks all eight keywords on the
- * pricier channels would find their credits gone sooner than they were told.
- */
-const MAX_KEYWORDS_PER_SWEEP = 8;
-const MAX_CHANNELS_PER_SWEEP = 3;
-const SWEEP_COST =
-  MAX_KEYWORDS_PER_SWEEP *
-  [...SEARCH_COSTS]
-    .sort((a, b) => b.credits - a.credits)
-    .slice(0, MAX_CHANNELS_PER_SWEEP)
-    .reduce((sum, s) => sum + s.credits, 0);
-
-/** Credits granted to a new account, matching the welcome grant in the database. */
-const WELCOME_CREDITS = 20;
+/** Sweeps the welcome credits cover at the product maximum (8 keywords, 3 paid channels). */
+const WELCOME_SWEEPS = MAX_SWEEP_CREDITS > 0 ? Math.floor(WELCOME_CREDITS / MAX_SWEEP_CREDITS) : 0;
 
 /**
  * Fallback prices, used only when Supabase is not configured — the local sandbox
@@ -183,22 +163,30 @@ const FEATURES = [
     icon: Radar,
     name: 'Feed',
     title: 'Catch buying intent the day it is posted',
-    body: 'Echo sweeps X, Reddit, the open web and the press every morning for the keywords you track — competitor names, pain points, category questions — and drops every match into one deduplicated feed.',
-    points: ['Up to 8 keywords, 4 channels', 'Scheduled daily sweep', 'Each post appears once, ever'],
+    body: 'Echo sweeps X, Reddit, the open web and the press on your schedule for the keywords you track — competitor names, pain points, category questions — and drops every match into one deduplicated feed.',
+    points: [
+      `Up to ${KEYWORD_LIMIT} keywords on ${CHANNEL_LIMIT} of 4 channels`,
+      `${formatCreditAmount(CHANNEL_SEARCH_CREDITS.twitter)} credit per keyword per channel; News free`,
+      'Each post appears once, ever',
+    ],
   },
   {
     icon: UserSearch,
     name: 'Leads',
     title: 'Find the decision maker and their real contact',
     body: 'Search people by company, title, location or industry, or look one person up in seconds. Reveal a verified work email or a direct phone, and keep everyone in a saved pipeline.',
-    points: ['Prospector & quick lookup', 'Pay only for verified emails', 'Saved pipeline with status'],
+    points: [
+      'Prospector & quick lookup',
+      `Email ${creditsText(VERIFIED_EMAIL_CREDITS)}, phone ${creditsText(DIRECT_PHONE_CREDITS)}`,
+      'Saved pipeline with status',
+    ],
   },
   {
     icon: Send,
     name: 'Mail',
     title: 'Send outreach without leaving Echo',
     body: 'Connect Gmail or Zoho with an app password, or send from your own domain with DKIM and SPF set up. Write with AI, fill merge tags per lead, and keep every thread in one inbox.',
-    points: ['Your mailbox or your domain', 'Daily send limits per mailbox', 'Free AI drafts & polish'],
+    points: ['Your mailbox or your domain', 'Daily send limits per mailbox', 'Merge tags per lead'],
   },
 ];
 
@@ -213,31 +201,17 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [packages, setPackages] = useState(FALLBACK_PACKAGES);
 
   /**
-   * What one credit is worth, taken from the live package list rather than a
-   * constant. If a price changes, the per-credit figure follows it instead of
-   * quietly becoming optimistic.
-   */
-  const perCreditPrice =
-    packages.length > 0 && packages[0].credits > 0
-      ? packages[0].gross_usd / packages[0].credits
-      : 0.05;
-
-  /**
    * Buying from the landing page and buying from the billing tab should feel like
    * one continuous action, not two. The package chosen out here is carried across
    * so the billing page opens on the card they picked rather than making them
    * choose it a second time.
    *
-   * sessionStorage rather than a query string, because the destination depends on
-   * whether they are signed in and two URLs would mean reading it on both ends.
+   * Stored (localStorage, with a TTL) rather than put in a query string, because
+   * it has to survive sign-up through an email link that opens a new tab, and
+   * onboarding after that.
    */
   const beginPurchase = (code: string) => {
-    try {
-      sessionStorage.setItem('echo_intended_package', code);
-    } catch {
-      // Private browsing, or storage disabled. Losing the hint is a small
-      // annoyance; failing to render the page over it would be absurd.
-    }
+    rememberIntendedPackage(code);
     if (isLoggedIn) onNavigateDashboard();
     else onNavigateAuth();
   };
@@ -291,11 +265,11 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     },
     {
       q: 'How does the daily sweep work?',
-      a: 'At your scheduled time each day, Echo searches public posts matching your keywords across the channels you enable. Matches are deduplicated — a post that matches several keywords or several sweeps still appears once — and land straight in your feed.',
+      a: `At your scheduled time (daily, twice a day or every 6 hours), Echo searches public posts matching your keywords across the channels you enable. X, Reddit and Web cost ${creditsText(CHANNEL_SEARCH_CREDITS.twitter)} per keyword per sweep; News is free. ${KEYWORD_LIMIT} keywords on ${CHANNEL_LIMIT} paid channels is ${creditsText(MAX_SWEEP_CREDITS)} per sweep. Matches are deduplicated — a post that matches several keywords or several sweeps still appears once.`,
     },
     {
       q: 'When am I charged for a lead?',
-      a: `A people search costs 1 credit. Revealing a work email costs ${EMAIL_REVEAL_CREDITS} credit, and only when the verifier confirms the address is valid; an unconfirmed address is shown for free. A direct phone costs 2 credits, only when a number is found. Nothing found, nothing charged.`,
+      a: `A people search costs ${creditsText(PEOPLE_SEARCH_CREDITS)} per billed provider call, and a single search can make more than one call; you are charged for the calls the provider bills, even when a search returns few or no results. Revealing a verified work email costs ${creditsText(VERIFIED_EMAIL_CREDITS)} and a direct phone ${creditsText(DIRECT_PHONE_CREDITS)}. Leads need purchased credits; the welcome credits do not cover them.`,
     },
     {
       q: 'Which mailboxes can I send from?',
@@ -303,11 +277,11 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     },
     {
       q: 'What happens when my credits run out?',
-      a: 'Nothing is spent. Echo holds the credits a sweep, search or send needs before calling any provider, so if you are short you are told exactly how much and the action does not run. There is no debt and no negative balance, and a failed send is refunded automatically.',
+      a: 'Echo holds the credits a sweep, search or send needs before calling any provider, so if you are short you are told how much and the action does not run. There is no debt and no negative balance, and a failed send is refunded automatically.',
     },
     {
       q: 'Do the credits expire? Is there a subscription?',
-      a: `No subscription and nothing renews. Credits you buy stay in your balance until you spend them. New accounts start with ${WELCOME_CREDITS} free credits, no card required.`,
+      a: `No subscription and nothing renews. Credits you buy stay in your balance until you spend them. New accounts start with ${WELCOME_CREDITS} free credits, no card required. Welcome credits cover feed sweeps only (about ${WELCOME_SWEEPS} full daily sweeps of ${KEYWORD_LIMIT} keywords, roughly a week); Leads and Mail use purchased credits.`,
     },
     {
       q: 'Can I export my data?',
@@ -316,7 +290,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   ];
 
   const previewTabs: Array<{ id: PreviewTab; label: string; url: string }> = [
-    { id: 'feed', label: 'Feed', url: 'echo.app/feed · daily sweep 06:00 UTC' },
+    { id: 'feed', label: 'Feed', url: 'echo.app/feed · sweep 06:00 UTC' },
     { id: 'leads', label: 'Leads', url: 'echo.app/leads · saved pipeline' },
     { id: 'mail', label: 'Mail', url: 'echo.app/mail · sent' },
   ];
@@ -449,12 +423,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 <span>No card, no subscription</span>
               </span>
               <span className="inline-flex items-center gap-1.5">
-                <Check className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Pay only for verified contacts</span>
+                <Check className="w-3.5 h-3.5 text-emerald-600" aria-hidden="true" />
+                <span>News search always free</span>
               </span>
               <span className="inline-flex items-center gap-1.5">
-                <Check className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Free AI-written outreach</span>
+                <Check className="w-3.5 h-3.5 text-emerald-600" aria-hidden="true" />
+                <span>{WELCOME_CREDITS} free credits for feed sweeps</span>
               </span>
             </div>
           </div>
@@ -551,6 +525,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                   {(['all', 'twitter', 'reddit', 'google', 'news'] as const).map((p) => (
                     <button
                       key={p}
+                      type="button"
+                      aria-pressed={selectedPlatform === p}
                       onClick={() => setSelectedPlatform(p)}
                       className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-mono rounded-full border transition-colors cursor-pointer ${
                         selectedPlatform === p
@@ -559,7 +535,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                       }`}
                     >
                       {p !== 'all' && <PlatformBadge platform={p} size={12} />}
-                      {p === 'all' ? 'All' : p === 'twitter' ? 'X' : p === 'reddit' ? 'Reddit' : p === 'news' ? 'News' : 'Web'}
+                      {p === 'all' ? 'All' : channelLabel(p)}
                     </button>
                   ))}
                 </div>
@@ -623,7 +599,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                               {l.phone}
                             </span>
                           ) : (
-                            <span className="text-[11px] font-mono text-[#8a8a86]">Find · 2 cr</span>
+                            <span className="text-[11px] font-mono text-[#8a8a86]">Find · {formatCreditAmount(DIRECT_PHONE_CREDITS)} cr</span>
                           )}
                         </td>
                         <td className="px-5 py-3 text-right">
@@ -644,7 +620,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                   </tbody>
                 </table>
                 <p className="px-5 py-3 text-[11px] font-mono text-[#8a8a86] border-t border-[#e3e3de]">
-                  Emails are charged only when verified valid. Phones only when found.
+                  Verified email {creditsText(VERIFIED_EMAIL_CREDITS)} · direct phone {creditsText(DIRECT_PHONE_CREDITS)}.
                 </p>
               </div>
             )}
@@ -663,7 +639,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="text-sm font-bold text-[#141414]">Quick intro // Northwind Logistics</div>
                     <span className="inline-flex items-center gap-1 text-[10px] font-mono text-emerald-700 bg-emerald-50 px-2 py-0.5 border border-emerald-200 rounded-full">
-                      <Check className="w-3 h-3" /> Sent · 0.05 credits
+                      <Check className="w-3 h-3" aria-hidden="true" /> Sent · {creditsText(CONNECTED_SEND_CREDITS)}
                     </span>
                   </div>
                   <div className="text-[11px] font-mono text-[#8a8a86] space-y-0.5">
@@ -681,7 +657,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     <p>Worth a 15-minute look next week?</p>
                   </div>
                   <div className="inline-flex items-center gap-1.5 text-[10px] font-mono text-[#4a4a47] bg-[#f6f6f4] border border-[#e3e3de] px-2 py-1">
-                    <Sparkles className="w-3 h-3" /> Drafted with AI from the signal · free
+                    <Sparkles className="w-3 h-3" aria-hidden="true" /> Drafted from the signal
                   </div>
                 </div>
               </div>
@@ -702,12 +678,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 {
                   n: '01',
                   t: 'Track your keywords',
-                  b: `Competitors, pain points, category questions — up to ${MAX_KEYWORDS_PER_SWEEP} per workspace, on any package.`,
+                  b: `Competitors, pain points, category questions — up to ${KEYWORD_LIMIT} per workspace.`,
                 },
                 {
                   n: '02',
-                  t: 'Get a daily feed',
-                  b: 'Every morning Echo sweeps X, Reddit, the web and the press and adds every new match to your feed.',
+                  t: 'Get a feed on your schedule',
+                  b: 'Daily, twice a day or every 6 hours, Echo sweeps X, Reddit, the web and the press and adds every new match to your feed.',
                 },
                 {
                   n: '03',
@@ -734,10 +710,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           packages={packages}
           costGroups={COST_GROUPS}
           welcomeCredits={WELCOME_CREDITS}
-          perCreditPrice={perCreditPrice}
-          sweepCost={SWEEP_COST}
-          emailRevealCredits={EMAIL_REVEAL_CREDITS}
+          welcomeSweeps={WELCOME_SWEEPS}
+          sweepCost={MAX_SWEEP_CREDITS}
+          emailRevealCredits={VERIFIED_EMAIL_CREDITS}
           connectedSendCredits={CONNECTED_SEND_CREDITS}
+          keywordLimit={KEYWORD_LIMIT}
+          channelLimit={CHANNEL_LIMIT}
           onBuy={beginPurchase}
           onStart={() => (isLoggedIn ? onNavigateDashboard() : onNavigateAuth())}
         />
@@ -756,8 +734,10 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 return (
                   <div key={idx} className="py-4">
                     <button
+                      type="button"
                       onClick={() => setOpenFaq(isOpen ? null : idx)}
                       aria-expanded={isOpen}
+                      aria-controls={`faq-answer-${idx}`}
                       className="w-full flex items-center justify-between gap-4 text-left text-xs font-mono font-semibold text-[#141414] hover:text-black cursor-pointer"
                     >
                       <span>{faq.q}</span>
@@ -766,7 +746,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                       />
                     </button>
                     {isOpen && (
-                      <p className="mt-2 text-xs font-mono text-[#4a4a47] leading-relaxed pr-6">{faq.a}</p>
+                      <p id={`faq-answer-${idx}`} className="mt-2 text-xs font-mono text-[#4a4a47] leading-relaxed pr-6">{faq.a}</p>
                     )}
                   </div>
                 );
@@ -782,7 +762,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               Your next customer is posting about it today.
             </h2>
             <p className="text-xs text-[#8a8a86] font-mono">
-              {WELCOME_CREDITS} free credits to start. No card, no subscription.
+              {WELCOME_CREDITS} free credits for feed sweeps to start. No card, no subscription.
             </p>
             <div>
               <button

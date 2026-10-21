@@ -119,13 +119,19 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="onboarding-title"
+    >
       {/* Background Dim (dashboard visible but dimmed and pointer-events disabled) */}
       <motion.div
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
         className="fixed inset-0 bg-[#000000]/45 backdrop-blur-[2px] transition-opacity"
+        aria-hidden="true"
       />
 
       {/* Modal Card */}
@@ -159,14 +165,15 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
               />
             ))}
           </div>
-          <span className="text-[11px] font-mono uppercase tracking-wider text-[#8a8a86]">
+          <span id="onboarding-title" className="text-[11px] font-mono uppercase tracking-wider text-[#8a8a86]">
+            <span className="sr-only">Set up your workspace: </span>
             Step {step} of 4
           </span>
         </div>
 
         {/* Success State Overlay */}
         {isSuccess ? (
-          <div className="py-12 flex flex-col items-center justify-center text-center space-y-4 animate-in fade-in zoom-in-95 duration-200">
+          <div role="status" className="py-12 flex flex-col items-center justify-center text-center space-y-4 animate-in fade-in zoom-in-95 duration-200">
             <div className="w-12 h-12 bg-[#141414] text-white flex items-center justify-center rounded-none shadow-md">
               <Check className="w-6 h-6 stroke-[2.5]" />
             </div>
@@ -203,11 +210,13 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
                   </div>
 
                   <div className="space-y-2 pt-2">
-                    <label className="text-xs font-mono uppercase tracking-wider text-[#4a4a47]">
+                    <label htmlFor="onboarding-name" className="text-xs font-mono uppercase tracking-wider text-[#4a4a47]">
                       Full Name
                     </label>
                     <input
+                      id="onboarding-name"
                       type="text"
+                      autoComplete="name"
                       autoFocus
                       value={fullName}
                       onChange={(e) => setFullName(e.target.value)}
@@ -241,11 +250,13 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
                   </div>
 
                   <div className="space-y-2 pt-2">
-                    <label className="text-xs font-mono uppercase tracking-wider text-[#4a4a47]">
+                    <label htmlFor="onboarding-website" className="text-xs font-mono uppercase tracking-wider text-[#4a4a47]">
                       Website URL
                     </label>
                     <input
+                      id="onboarding-website"
                       type="text"
+                      autoComplete="url"
                       autoFocus
                       value={website}
                       onChange={(e) => setWebsite(e.target.value)}
@@ -284,10 +295,11 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
                   </div>
 
                   <div className="space-y-2 pt-2">
-                    <label className="text-xs font-mono uppercase tracking-wider text-[#4a4a47]">
+                    <label htmlFor="onboarding-offer" className="text-xs font-mono uppercase tracking-wider text-[#4a4a47]">
                       Core Offer
                     </label>
                     <textarea
+                      id="onboarding-offer"
                       autoFocus
                       rows={3}
                       value={coreOffer}
@@ -330,10 +342,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({ isOpen, onComp
                       onAdd={(kw) => setKeywords((prev) => [...prev, kw])}
                       onRemove={(kw) => setKeywords((prev) => prev.filter((k) => k !== kw))}
                       max={keywordLimit}
-                      suggestions={[
-                        fullName ? fullName.toLowerCase() : 'your company',
-                        ...aiSuggestions,
-                      ]}
+                      suggestions={aiSuggestions}
                     />
                   </div>
                 </motion.div>

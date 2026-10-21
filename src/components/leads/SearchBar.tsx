@@ -30,6 +30,8 @@ import {
   MIN_LIMIT,
   sanitizeLimit,
   searchCost,
+  searchFeeText,
+  domainCountOf,
   hasCriteria,
   maxContactCost,
   type LeadPricing,
@@ -37,6 +39,7 @@ import {
   type SearchForm,
 } from './prospector-types';
 import { describeSearch } from './recent-searches';
+import { creditsLabel, formatCredits } from '../../lib/billing';
 
 interface SearchBarProps {
   form: SearchForm;
@@ -297,8 +300,9 @@ export const SearchBar: React.FC<SearchBarProps> = ({
 
   // Most this search can cost: every lead verified for each detail switched
   // on. Charged per verified email / phone actually found, never per lead.
-  const maxCost = searchCost(form.limit, pricing) + maxContactCost(form, pricing);
-  const costFor = (n: number) => searchCost(n, pricing) + maxContactCost({ ...form, limit: n }, pricing);
+  const domains = domainCountOf(form.companyDomain);
+  const maxCost = searchCost(form.limit, pricing, domains) + maxContactCost(form, pricing);
+  const costFor = (n: number) => searchCost(n, pricing, domains) + maxContactCost({ ...form, limit: n }, pricing);
   const related = form.title.trim() ? relatedRoles(form.title).filter((r) => r.toLowerCase() !== form.title.trim().toLowerCase()) : [];
   const country = countryByCode(form.country);
   const walletEmpty = availableCredits !== null && availableCredits < Math.max(1, pricing.searchCredits);
@@ -383,12 +387,12 @@ export const SearchBar: React.FC<SearchBarProps> = ({
                 type="submit"
                 disabled={!canSearch}
                 className="h-14 px-6 md:px-7 bg-ink hover:bg-black text-white font-semibold flex items-center justify-center gap-2 cursor-pointer transition-colors disabled:bg-line-strong disabled:cursor-not-allowed focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink whitespace-nowrap"
-                title={`Up to ${maxCost} credits — charged only for verified emails and phones found`}
+                title={`Up to ${creditsLabel(maxCost)}: the search (${searchFeeText(pricing)}) plus verified emails and phones found`}
               >
                 {isSearching ? <Loader2 className="w-5 h-5 animate-spin" aria-hidden /> : <Search className="w-5 h-5" aria-hidden />}
                 <span>{isSearching ? 'Searching…' : 'Find leads'}</span>
                 {!isSearching && (
-                  <span className="text-[11px] font-medium px-1.5 py-0.5 bg-white/15 tabular-nums">≤ {maxCost} cr</span>
+                  <span className="text-[11px] font-medium px-1.5 py-0.5 bg-white/15 tabular-nums">≤ {formatCredits(maxCost)} cr</span>
                 )}
               </button>
             )}
@@ -566,9 +570,8 @@ export const SearchBar: React.FC<SearchBarProps> = ({
                   />
                 </label>
                 <p className="text-xs text-muted">
-                  The most it can cost. Each search costs {pricing.searchCredits} credit
-                  {pricing.searchCredits === 1 ? '' : 's'}, then {pricing.email} per verified email and {pricing.phone} per phone
-                  actually found — nothing for leads without them.
+                  The most it can cost. A search costs {searchFeeText(pricing)}, then {formatCredits(pricing.email)} per verified
+                  email and {formatCredits(pricing.phone)} per phone actually found — nothing for leads without them.
                 </p>
               </div>
             )}
@@ -627,11 +630,11 @@ export const SearchBar: React.FC<SearchBarProps> = ({
                 })}
                 {(form.autoEnrich || form.autoPhone) && (
                   <p className="text-xs text-ink-2">
-                    Up to <span className="font-semibold text-ink">{maxCost}</span> credits for {form.limit} leads, including
-                    the {pricing.searchCredits}-credit search fee.
+                    Up to <span className="font-semibold text-ink">{formatCredits(maxCost)}</span> credits for {form.limit} leads,
+                    including the search itself ({searchFeeText(pricing)}).
                     {walletEmpty && (
                       <span className="block text-warn">
-                        A search costs {pricing.searchCredits} credit{pricing.searchCredits === 1 ? '' : 's'}. Top up to search.
+                        A search costs {searchFeeText(pricing)}. Buy credits to search (welcome credits don't cover leads).
                       </span>
                     )}
                   </p>

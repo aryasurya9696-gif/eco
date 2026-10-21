@@ -10,7 +10,11 @@
 // Every send is charged from the wallet with the same two-phase hold the Leads
 // feature uses (wallet_reserve -> wallet_settle / wallet_release): the credits
 // are held before the provider call and charged only when it accepts the
-// message. Prices come from pricing_config, never from the client.
+// message. Prices come from pricing_config, never from the client; a missing
+// or disabled price blocks the send. Mail draws on purchased credits only
+// (p_paid_only). A provider timeout is "uncertain": it is charged, not
+// refunded, and an identical resend is blocked until the user confirms
+// (confirm_resend: true). Provider error text never reaches the client.
 //
 // Secrets:
 //   supabase secrets set RESEND_API_KEY=re_...
@@ -19,21 +23,40 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import nodemailer from 'npm:nodemailer@6.9.16';
 
-const ALLOWED_ORIGIN = Deno.env.get('ALLOWED_ORIGIN') || '*';
 const RESEND_BASE = 'https://api.resend.com';
 
-function corsHeaders(): Record<string, string> {
-  return {
-    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
-    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  };
+// CORS: ALLOWED_ORIGIN is a comma-separated allow-list of exact origins
+// (e.g. "https://app.example.com,https://www.example.com"). The request's
+// Origin is echoed only when it is on the list. With nothing configured only
+// local dev origins are allowed; "*" must be set explicitly to open it up.
+const ALLOWED_ORIGINS = (Deno.env.get('ALLOWED_ORIGIN') || '')
+  .split(',')
+  .map((o) => o.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+const DEV_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+
+function allowedOrigin(origin: string | null): string | null {
+  if (!origin) return null;
+  const o = origin.replace(/\/+$/, '');
+  if (ALLOWED_ORIGINS.includes('*')) return '*';
+  if (ALLOWED_ORIGINS.includes(o)) return o;
+  if (ALLOWED_ORIGINS.length === 0 && DEV_ORIGIN_RE.test(o)) return o;
+  return null;
+}
+
+function withCors(req: Request, res: Response): Response {
+  const origin = allowedOrigin(req.headers.get('Origin'));
+  if (origin) res.headers.set('Access-Control-Allow-Origin', origin);
+  res.headers.set('Vary', 'Origin');
+  res.headers.set('Access-Control-Allow-Headers', 'authorization, x-client-info, apikey, content-type');
+  res.headers.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  return res;
 }
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+    headers: { 'Content-Type': 'application/json' },
   });
 }
 
@@ -83,7 +106,21 @@ const HOSTED_DAILY_LIMIT = 40;
 const CONNECTED_DAILY_LIMIT = 150;
 
 const PRICE_OPS = { hosted: 'mail.send.hosted', connected: 'mail.send.connected' } as const;
-const PRICE_FALLBACK = { hosted: 0.1, connected: 0.05 } as const;
+
+/** A held send with the same content inside this window is treated as in flight. */
+const IN_FLIGHT_WINDOW_MS = 5 * 60_000;
+/** A send that timed out blocks an identical resend for this long unless confirmed. */
+const UNCERTAIN_WINDOW_MS = 24 * 3600_000;
+const SETTLE_ATTEMPTS = 3;
+
+const UNCERTAIN_MESSAGE =
+  "The mail server didn't confirm delivery in time, so this email may already have been sent. " +
+  "Check the recipient's thread or your provider's Sent folder before sending it again.";
+const UNCERTAIN_RESEND_MESSAGE =
+  'An earlier attempt to send this exact email timed out and may have been delivered. ' +
+  "Check your provider's Sent folder first; if it isn't there, confirm to send it again.";
+const PAID_ONLY_MESSAGE =
+  'Sending mail needs purchased credits — free welcome credits only cover feed sweeps. Top up in Billing.';
 
 const isUuid = (v: unknown): v is string => typeof v === 'string' && UUID_RE.test(v);
 const clampText = (v: unknown, max: number) => (typeof v === 'string' ? v.slice(0, max) : '');
@@ -184,14 +221,120 @@ function shapeThread(row: any) {
 // Credits
 // ---------------------------------------------------------------------------
 
-async function loadPrice(admin: any, kind: 'hosted' | 'connected'): Promise<{ credits: number; costUsd: number }> {
-  const { data } = await admin
+/**
+ * The live price for a send, or null when there is none to charge: the row is
+ * missing, disabled or unreadable. Like the sweeps, a missing price blocks the
+ * operation; there is no hard-coded fallback.
+ */
+async function loadPrice(admin: any, kind: 'hosted' | 'connected'): Promise<{ credits: number; costUsd: number } | null> {
+  const { data, error } = await admin
     .from('pricing_config')
     .select('credits, provider_cost_usd, enabled')
     .eq('operation', PRICE_OPS[kind])
     .maybeSingle();
-  if (!data || data.enabled === false) return { credits: PRICE_FALLBACK[kind], costUsd: 0 };
-  return { credits: Number(data.credits ?? PRICE_FALLBACK[kind]), costUsd: Number(data.provider_cost_usd ?? 0) };
+  if (error) {
+    console.error('[mail] pricing_config read failed:', error.code || 'error');
+    return null;
+  }
+  if (!data || data.enabled !== true) return null;
+  const credits = Number(data.credits);
+  const costUsd = Number(data.provider_cost_usd ?? 0);
+  if (!Number.isFinite(credits) || credits < 0) return null;
+  return { credits, costUsd: Number.isFinite(costUsd) && costUsd > 0 ? costUsd : 0 };
+}
+
+/** Content hash of a send, so a retry with a fresh request id is still recognised. */
+async function sendFingerprint(parts: string[]): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(parts.join('\u0000')));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 40);
+}
+
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+interface ChargeRequest {
+  userId: string;
+  reservationId: string | null;
+  credits: number;
+  costUsd: number;
+  idempotencyKey: string;
+  operation: string;
+  provider: string;
+  providerCallId: string | null;
+  outcome: 'success' | 'uncertain';
+  errorCode?: string | null;
+  note: string;
+  metadata: Record<string, unknown>;
+}
+
+/**
+ * Records the usage row, then settles the hold.
+ *
+ * The usage row is written first with the intended charge. If the settle then
+ * fails (after retries) the hold stays open, and reap_stale_reservations sees
+ * credits_charged > 0 on the linked row and SETTLES it instead of releasing it,
+ * so a failed settle is never a free send. The caller is told the charge is
+ * pending.
+ */
+async function chargeSend(
+  admin: any,
+  r: ChargeRequest,
+): Promise<{ creditsCharged: number; balanceAfter: number | null; pending: boolean }> {
+  const intended = r.reservationId ? r.credits : 0;
+  const usageRow = {
+    user_id: r.userId,
+    idempotency_key: r.idempotencyKey,
+    operation: r.operation,
+    provider: r.provider,
+    provider_call_id: r.providerCallId,
+    provider_cost_usd: r.costUsd,
+    credits_charged: intended,
+    outcome: r.outcome,
+    error_code: r.errorCode ?? null,
+    reservation_id: r.reservationId,
+    metadata: { ...r.metadata, settle: r.reservationId ? 'pending' : 'none' },
+  };
+  const { error: usageError } = await admin.from('api_usage').upsert(usageRow, { onConflict: 'idempotency_key' });
+  if (usageError) console.error('[mail] usage record failed:', usageError.code || 'error');
+
+  if (!r.reservationId) return { creditsCharged: 0, balanceAfter: null, pending: false };
+
+  for (let attempt = 1; attempt <= SETTLE_ATTEMPTS; attempt++) {
+    const { data: settled, error } = await admin.rpc('wallet_settle', {
+      p_reservation_id: r.reservationId,
+      p_credits_charged: r.credits,
+      p_provider_cost: r.costUsd,
+      p_idempotency_key: r.idempotencyKey,
+      p_note: r.note,
+      p_metadata: { ...r.metadata, outcome: r.outcome },
+    });
+    if (!error && settled?.ok) {
+      const charged = Number(settled.credits_charged ?? 0);
+      await admin
+        .from('api_usage')
+        .update({ credits_charged: charged, metadata: { ...usageRow.metadata, settle: 'done' } })
+        .eq('idempotency_key', r.idempotencyKey)
+        .then(({ error: e }: any) => e && console.error('[mail] usage update failed:', e.code || 'error'));
+      return {
+        creditsCharged: charged,
+        balanceAfter: settled.balance_after != null ? Number(settled.balance_after) : null,
+        pending: false,
+      };
+    }
+    if (!error && settled?.error === 'reservation_already_finalised' && settled?.status === 'settled') {
+      // An earlier attempt went through even though its reply was lost.
+      return { creditsCharged: r.credits, balanceAfter: null, pending: false };
+    }
+    if (!error) {
+      // Not found or released: nothing left to retry. This is a lost charge.
+      console.error('[mail] wallet_settle refused:', settled?.error || 'unknown', 'reservation', r.reservationId);
+      break;
+    }
+    console.error(`[mail] wallet_settle failed (attempt ${attempt}/${SETTLE_ATTEMPTS}):`, error.code || 'error');
+    if (attempt < SETTLE_ATTEMPTS) await pause(250 * attempt);
+  }
+  // Left held on purpose: the reaper settles it from the usage row above.
+  console.error('[mail] settle pending, left for the reaper. reservation', r.reservationId);
+  return { creditsCharged: intended, balanceAfter: null, pending: true };
 }
 
 async function walletAvailable(admin: any, userId: string): Promise<number> {
@@ -206,15 +349,23 @@ const fmtCredits = (n: number) => String(Number(n.toFixed(2)));
 // Resend
 // ---------------------------------------------------------------------------
 
+/**
+ * A provider failure. `message` is always one of our own generic, client-safe
+ * strings; the provider's text is never put in it. `code` is a short token for
+ * the logs. `uncertain` means the provider may have accepted the message.
+ */
 class ProviderError extends Error {
-  constructor(message: string, public status = 502) {
+  constructor(message: string, public status = 502, public code = 'provider_error', public uncertain = false) {
     super(message);
   }
 }
 
 async function resend(path: string, init: { method?: string; body?: unknown; idempotencyKey?: string } = {}) {
   const key = Deno.env.get('RESEND_API_KEY');
-  if (!key) throw new ProviderError('Hosted sending is not configured yet (missing RESEND_API_KEY).', 503);
+  if (!key) {
+    console.error('[mail] RESEND_API_KEY is not set');
+    throw new ProviderError('Hosted sending is not available right now.', 503, 'not_configured');
+  }
   const headers: Record<string, string> = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
   if (init.idempotencyKey) headers['Idempotency-Key'] = init.idempotencyKey;
 
@@ -227,12 +378,20 @@ async function resend(path: string, init: { method?: string; body?: unknown; ide
       signal: AbortSignal.timeout(RESEND_TIMEOUT_MS),
     });
   } catch (err: any) {
-    throw new ProviderError(err?.name === 'TimeoutError' ? 'The email provider timed out.' : 'Could not reach the email provider.');
+    if (err?.name === 'TimeoutError') {
+      // The request may have reached Resend and been accepted.
+      throw new ProviderError('The email provider did not respond in time.', 504, 'timeout', true);
+    }
+    throw new ProviderError('Could not reach the email provider. Please try again.', 502, 'network');
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const msg = typeof data?.message === 'string' ? data.message.slice(0, 300) : `Email provider error (${res.status}).`;
-    throw new ProviderError(msg, res.status >= 500 ? 502 : res.status === 429 ? 429 : 400);
+    // Resend's error `name` (e.g. "validation_error") is a code, safe to log; its message is not echoed.
+    const code = typeof data?.name === 'string' ? data.name.replace(/[^a-z0-9_]/gi, '').slice(0, 60) : '';
+    console.warn('[mail] resend error:', res.status, code || 'unknown');
+    if (res.status === 429) throw new ProviderError('The email provider is busy. Please try again in a minute.', 429, code || 'http_429');
+    if (res.status >= 500) throw new ProviderError('The email provider is unavailable right now. Please try again.', 502, code || `http_${res.status}`);
+    throw new ProviderError('The email provider rejected the request.', 400, code || `http_${res.status}`);
   }
   return data;
 }
@@ -283,40 +442,194 @@ const SMTP_HOSTS: Record<string, string[]> = {
   zoho: ['smtp.zoho.com', 'smtppro.zoho.com', 'smtp.zoho.in', 'smtppro.zoho.in', 'smtp.zoho.eu', 'smtppro.zoho.eu'],
 };
 
-function smtpTransport(host: string, user: string, pass: string) {
+/**
+ * Watches the SMTP conversation (client command lines only, never the message
+ * or the credentials, and nothing is logged) so a failure can be classified:
+ * before DATA nothing was handed over; after it the server may have accepted
+ * the message.
+ */
+interface SmtpTrace {
+  sawCommand: boolean;
+  dataSent: boolean;
+}
+
+function traceLogger(trace: SmtpTrace) {
+  const noop = () => {};
+  return {
+    trace: noop,
+    info: noop,
+    warn: noop,
+    error: noop,
+    fatal: noop,
+    debug: (entry: any, message: unknown) => {
+      if (entry?.tnx !== 'client') return;
+      trace.sawCommand = true;
+      if (typeof message === 'string' && /^DATA\b/i.test(message)) trace.dataSent = true;
+    },
+  };
+}
+
+/**
+ * `connectAddress` pins the TCP connection to an address that was already
+ * checked as public, so a rebinding DNS answer cannot swap it for an internal
+ * one between the check and the connect. TLS still verifies the certificate
+ * against the hostname (servername).
+ */
+function smtpTransport(host: string, user: string, pass: string, connectAddress?: string, trace?: SmtpTrace) {
   return nodemailer.createTransport({
-    host,
+    host: connectAddress || host,
     port: 465,
     secure: true,
     auth: { user, pass },
+    tls: { servername: host },
     connectionTimeout: SMTP_TIMEOUT_MS,
     greetingTimeout: SMTP_TIMEOUT_MS,
     socketTimeout: SMTP_TIMEOUT_MS,
-  });
+    ...(trace ? { logger: traceLogger(trace), transactionLog: true } : {}),
+  } as any);
 }
 
-function smtpErrorMessage(err: any): string {
-  const code = String(err?.code || '');
-  const response = String(err?.response || err?.message || '');
-  if (code === 'EAUTH' || /535|534|authentication/i.test(response)) {
-    return 'The email provider rejected that login. Check the address and app password.';
+interface SmtpFailure {
+  message: string;
+  code: string;
+  auth: boolean;
+  uncertain: boolean;
+}
+
+/**
+ * Generic, client-safe description of an SMTP error. The server's banner and
+ * response text never leave the function and are not logged; only nodemailer's
+ * error code and the numeric reply code are.
+ */
+function classifySmtpError(err: any, trace?: SmtpTrace): SmtpFailure {
+  const code = String(err?.code || 'unknown').replace(/[^A-Z0-9_]/gi, '').slice(0, 30);
+  const reply = Number(err?.responseCode);
+  const tag = Number.isFinite(reply) ? `${code}:${reply}` : code;
+  const failure = (message: string, uncertain = false, auth = false): SmtpFailure => ({ message, code: tag, auth, uncertain });
+
+  if (code === 'EAUTH' || reply === 535 || reply === 534) {
+    return failure('The email provider rejected that login. Check the address and app password.', false, true);
   }
-  if (code === 'ETIMEDOUT' || code === 'ECONNECTION' || code === 'ESOCKET' || code === 'ECONNREFUSED') {
-    return 'Could not connect to the mail server on port 465.';
+  // The server answered with a rejection: nothing was accepted.
+  if (Number.isFinite(reply) && reply >= 400) {
+    return failure(
+      reply >= 500 ? 'The mail server refused the message.' : 'The mail server temporarily refused the message. Please try again later.',
+    );
   }
-  return response.replace(/\s+/g, ' ').slice(0, 200) || 'The mail server refused the message.';
+  if (code === 'EENVELOPE' || code === 'EMESSAGE') return failure('The mail server refused the message.');
+  if (code === 'EDNS' || code === 'ECONNREFUSED' || code === 'ETLS') return failure('Could not connect to the mail server on port 465.');
+
+  // A timeout or dropped connection with no reply. After DATA (or when the
+  // conversation could not be observed at all) the message may have been accepted.
+  const dropped = code === 'ETIMEDOUT' || code === 'ESOCKET' || code === 'ECONNECTION' || code === 'ECONNRESET';
+  if (trace && (trace.dataSent || (dropped && !trace.sawCommand))) return failure(UNCERTAIN_MESSAGE, true);
+  if (dropped) return failure('Could not connect to the mail server on port 465.');
+  return failure('The mail server refused the message.');
+}
+
+// A user-supplied SMTP host must not point the function at private, loopback,
+// link-local or cloud-metadata addresses (SSRF). Same range tables as the ai
+// function's isSafeTarget, kept self-contained (one implementation per file).
+
+/** Parses dotted-quad IPv4 into four octets, or null. */
+function parseV4(h: string): number[] | null {
+  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return null;
+  const o = m.slice(1).map(Number);
+  return o.every((n) => n >= 0 && n <= 255) ? o : null;
+}
+
+function isPrivateV4(o: number[]): boolean {
+  const [a, b, c] = o;
+  if (a === 0 || a === 10 || a === 127) return true; // this network, private, loopback
+  if (a === 100 && b >= 64 && b <= 127) return true; // carrier-grade NAT
+  if (a === 169 && b === 254) return true; // link-local, incl. cloud metadata
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
+  if (a === 192 && b === 0 && c === 0) return true; // IETF protocol assignments
+  if (a === 192 && b === 168) return true; // 192.168/16
+  if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking
+  if (a >= 224) return true; // multicast, reserved, broadcast
+  return false;
+}
+
+/** Expands an IPv6 literal into eight 16-bit groups, or null if it is not one. */
+function parseV6(h: string): number[] | null {
+  if (!h.includes(':')) return null;
+  let s = h.split('%')[0];
+  const tail = s.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (tail) {
+    const o = parseV4(tail[1]);
+    if (!o) return null;
+    s = s.slice(0, -tail[1].length) + ((o[0] << 8) | o[1]).toString(16) + ':' + ((o[2] << 8) | o[3]).toString(16);
+  }
+  const halves = s.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const rest = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const fill = halves.length === 2 ? 8 - head.length - rest.length : 0;
+  if (fill < 0 || (halves.length === 1 && head.length !== 8)) return null;
+  const groups = [...head, ...Array(fill).fill('0'), ...rest];
+  if (groups.length !== 8 || !groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return null;
+  return groups.map((g) => parseInt(g, 16));
+}
+
+function isPrivateV6(g: number[]): boolean {
+  if (g.every((x) => x === 0)) return true; // ::
+  if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return true; // ::1
+  if ((g[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique local
+  if ((g[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((g[0] & 0xff00) === 0xff00) return true; // multicast
+  const v4 = [g[6] >> 8, g[6] & 0xff, g[7] >> 8, g[7] & 0xff];
+  if (g.slice(0, 5).every((x) => x === 0) && (g[5] === 0xffff || g[5] === 0)) return isPrivateV4(v4); // mapped / compatible
+  if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((x) => x === 0)) return isPrivateV4(v4); // NAT64
+  return false;
+}
+
+/** True for any name or address literal that must not be connected to. */
+function isPrivateAddress(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (!h) return true;
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.internal') || h.endsWith('.local')) return true;
+  const v4 = parseV4(h);
+  if (v4) return isPrivateV4(v4);
+  const v6 = parseV6(h);
+  if (v6) return isPrivateV6(v6);
+  // Numeric shorthands (2130706433, 0x7f.1) resolve differently per resolver.
+  if (/^[0-9.]+$/.test(h) || /^0x/i.test(h) || h.includes(':')) return true;
+  return false;
+}
+
+/**
+ * Resolves a hostname and returns one address to connect to, or null when it
+ * has no records or ANY record is non-public (fails closed). IPv4 preferred.
+ */
+async function resolvePublicAddress(host: string): Promise<string | null> {
+  if (isPrivateAddress(host)) return null;
+  const [a, aaaa] = await Promise.allSettled([Deno.resolveDns(host, 'A'), Deno.resolveDns(host, 'AAAA')]);
+  const v4 = a.status === 'fulfilled' ? a.value : [];
+  const v6 = aaaa.status === 'fulfilled' ? aaaa.value : [];
+  const all = [...v4, ...v6];
+  if (all.length === 0 || all.some((ip) => isPrivateAddress(ip))) return null;
+  return v4[0] ?? v6[0];
 }
 
 /** Tries each host and returns the first one that accepts the login. */
-async function verifySmtpLogin(hosts: string[], user: string, pass: string): Promise<{ host: string } | { error: string }> {
+async function verifySmtpLogin(
+  hosts: string[],
+  user: string,
+  pass: string,
+  pinned: Record<string, string> = {},
+): Promise<{ host: string } | { error: string }> {
   let lastError = 'Could not connect to the mail server.';
   for (const host of hosts) {
-    const transport = smtpTransport(host, user, pass);
+    const transport = smtpTransport(host, user, pass, pinned[host]);
     try {
       await transport.verify();
       return { host };
     } catch (err: any) {
-      lastError = smtpErrorMessage(err);
+      const failure = classifySmtpError(err);
+      console.warn('[mail] smtp verify failed:', failure.code);
+      lastError = failure.message;
     } finally {
       transport.close();
     }
@@ -329,13 +642,14 @@ async function verifySmtpLogin(hosts: string[], user: string, pass: string): Pro
 // ---------------------------------------------------------------------------
 
 Deno.serve(async (req: Request) => {
-  if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders() });
-  if (req.method !== 'POST') return fail('Method not allowed', 405);
+  if (req.method === 'OPTIONS') return withCors(req, new Response(null, { status: 204 }));
+  if (req.method !== 'POST') return withCors(req, fail('Method not allowed', 405));
   try {
-    return await handleRequest(req);
+    return withCors(req, await handleRequest(req));
   } catch (err: any) {
-    console.error('[mail] unhandled error:', err?.name || 'error', String(err?.message || '').slice(0, 200));
-    return fail('Internal error', 500);
+    // Name and code only: an error message can carry a provider's response text.
+    console.error('[mail] unhandled error:', err?.name || 'error', String(err?.code || ''));
+    return withCors(req, fail('Internal error', 500));
   }
 });
 
@@ -406,9 +720,13 @@ async function connectAppPassword(admin: any, userId: string, body: any): Promis
   }
 
   let hosts: string[];
+  const pinned: Record<string, string> = {};
   if (provider === 'custom') {
     const host = cleanDomainName(body.smtp_host);
     if (!DOMAIN_RE.test(host)) return fail('Enter your SMTP server, e.g. smtp.yourcompany.com.');
+    const smtpIp = await resolvePublicAddress(host);
+    if (!smtpIp) return fail('That SMTP server does not resolve to a public address.');
+    pinned[host] = smtpIp;
     hosts = [host];
   } else {
     hosts = SMTP_HOSTS[provider];
@@ -426,7 +744,7 @@ async function connectAppPassword(admin: any, userId: string, body: any): Promis
   if (existing) return fail(`${address} is already connected.`, 409);
 
   // Prove the login works before keeping the password.
-  const verified = await verifySmtpLogin(hosts, address, password);
+  const verified = await verifySmtpLogin(hosts, address, password, pinned);
   if ('error' in verified) return fail(verified.error, 422);
 
   const { data: secretId, error: vaultError } = await admin.rpc('store_mailbox_secret', {
@@ -660,7 +978,7 @@ async function removeDomain(admin: any, userId: string, body: any): Promise<Resp
 
   if (dom.provider_domain_id) {
     await resend(`/domains/${dom.provider_domain_id}`, { method: 'DELETE' }).catch((e: any) =>
-      console.error('[mail] resend domain delete failed:', e?.message),
+      console.error('[mail] resend domain delete failed:', e?.code || 'error'),
     );
   }
   // Hosted mailboxes on it can no longer send.
@@ -827,12 +1145,59 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
   if (mailbox.status !== 'active') return fail(`${mailbox.address} is ${mailbox.status} and can't send right now.`, 409);
 
   let fromDomain = mailbox.address.split('@')[1];
+  let smtpConnectAddress: string | undefined;
   if (mailbox.kind === 'hosted') {
     const { data: dom } = await admin.from('mail_domains').select('domain, status').eq('id', mailbox.domain_id).maybeSingle();
     if (!dom || dom.status !== 'verified') return fail(`The domain for ${mailbox.address} isn't verified.`, 409);
     fromDomain = dom.domain;
-  } else if (mailbox.kind !== 'app_password') {
+  } else if (mailbox.kind === 'app_password') {
+    // A custom host is re-checked at send time (its DNS may have changed since
+    // it was connected) and the connection is pinned to the checked address.
+    if (mailbox.provider === 'custom' || !Object.values(SMTP_HOSTS).flat().includes(String(mailbox.smtp_host))) {
+      const ip = await resolvePublicAddress(String(mailbox.smtp_host || ''));
+      if (!ip) return fail(`The SMTP server for ${mailbox.address} does not resolve to a public address. Reconnect it in Accounts.`, 409);
+      smtpConnectAddress = ip;
+    }
+  } else {
     return fail('This mailbox type cannot send yet.', 409);
+  }
+
+  const priceKind = mailbox.kind === 'hosted' ? 'hosted' : 'connected';
+  const operation = PRICE_OPS[priceKind];
+  const providerName = mailbox.kind === 'hosted' ? 'resend' : 'smtp';
+
+  // Retries arrive with a fresh request id, so a repeat of the same email is
+  // recognised by its content. An earlier identical send that timed out (and
+  // may have been delivered) blocks a resend until the user confirms.
+  const fingerprint = await sendFingerprint([
+    mailbox.id,
+    replyThreadId || '',
+    to.map((p) => p.address.toLowerCase()).sort().join(','),
+    subject,
+    text,
+  ]);
+  if (body.confirm_resend !== true) {
+    const { data: unsure, error: unsureError } = await admin
+      .from('api_usage')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('outcome', 'uncertain')
+      .in('operation', Object.values(PRICE_OPS))
+      .eq('metadata->>fingerprint', fingerprint)
+      .gte('created_at', new Date(Date.now() - UNCERTAIN_WINDOW_MS).toISOString())
+      .limit(1);
+    if (unsureError) {
+      console.error('[mail] uncertain-send lookup failed:', unsureError.code || 'error');
+      return fail('The service is busy. Please try again in a moment.', 503);
+    }
+    if (unsure?.length) return fail(UNCERTAIN_RESEND_MESSAGE, 409, { uncertain: true, duplicate_request: true });
+  }
+
+  // A missing or disabled price blocks the send, as it does for sweeps.
+  const price = await loadPrice(admin, priceKind);
+  if (!price) {
+    console.error('[mail] no enabled price for', operation);
+    return fail('Sending is paused right now. Please try again later.', 503, { price_unavailable: true });
   }
 
   const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.sendBurst, RATE_LIMITS.send]);
@@ -841,7 +1206,7 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
   // 1. Daily limit slot.
   const { data: slot, error: slotError } = await admin.rpc('mail_take_send_slot', { p_mailbox_id: mailbox.id, p_user_id: userId });
   if (slotError) {
-    console.error('[mail] send slot failed:', slotError.message);
+    console.error('[mail] send slot failed:', slotError.code || 'error');
     return fail('The service is busy. Please try again in a moment.', 503);
   }
   if (!slot?.ok) {
@@ -856,9 +1221,7 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
   }
   const returnSlot = () => admin.rpc('mail_return_send_slot', { p_mailbox_id: mailbox.id, p_user_id: userId });
 
-  // 2. Credit hold.
-  const priceKind = mailbox.kind === 'hosted' ? 'hosted' : 'connected';
-  const price = await loadPrice(admin, priceKind);
+  // 2. Credit hold. Mail is paid-only: welcome credits cover feed sweeps alone.
   const idempotencyKey = `mail:send:${userId}:${requestId}`;
   let reservationId: string | null = null;
   if (price.credits > 0) {
@@ -866,16 +1229,30 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
       p_user_id: userId,
       p_credits: price.credits,
       p_idempotency_key: idempotencyKey,
-      p_context: { feature: 'mail', operation: PRICE_OPS[priceKind], mailbox_id: mailbox.id },
+      p_context: { feature: 'mail', operation, mailbox_id: mailbox.id, fingerprint },
+      p_paid_only: true,
     });
     if (holdError) {
       await returnSlot();
-      console.error('[mail] wallet_reserve failed:', holdError.message);
+      console.error('[mail] wallet_reserve failed:', holdError.code || 'error');
       return fail('Billing is unavailable right now. Please try again.', 503);
     }
     if (!hold?.ok) {
       await returnSlot();
       const available = Number(hold?.available ?? 0);
+      // Short on purchased credits while the wallet as a whole could cover it:
+      // the rest is welcome credit, which mail can't use.
+      const paidShort =
+        /paid|welcome|bonus|free/i.test(String(hold?.error || '')) ||
+        (await walletAvailable(admin, userId)) >= price.credits;
+      if (paidShort) {
+        return fail(PAID_ONLY_MESSAGE, 402, {
+          insufficient_credits: true,
+          paid_credits_required: true,
+          required: price.credits,
+          available,
+        });
+      }
       return fail(
         `Not enough credits: this email costs ${fmtCredits(price.credits)} credit${price.credits === 1 ? '' : 's'} and you have ${fmtCredits(available)}. Top up in Billing.`,
         402,
@@ -887,6 +1264,25 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
       return fail('Already in progress — this email is still being sent.', 409, { duplicate_request: true });
     }
     reservationId = hold.reservation_id;
+
+    // Two identical sends racing (double click, client retry after its own
+    // timeout): only the oldest open hold for this content goes ahead.
+    const { data: twins, error: twinError } = await admin
+      .from('reservations')
+      .select('id, created_at')
+      .eq('user_id', userId)
+      .eq('status', 'held')
+      .eq('context->>fingerprint', fingerprint)
+      .gte('created_at', new Date(Date.now() - IN_FLIGHT_WINDOW_MS).toISOString())
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
+      .limit(1);
+    if (twinError) console.error('[mail] in-flight lookup failed:', twinError.code || 'error');
+    if (!twinError && twins?.[0] && twins[0].id !== reservationId) {
+      await admin.rpc('wallet_release', { p_reservation_id: reservationId, p_reason: 'mail: duplicate of an in-flight send' });
+      await returnSlot();
+      return fail('This email is already being sent. Wait a moment before trying again.', 409, { duplicate_request: true });
+    }
   }
 
   // 3. Deliver.
@@ -894,6 +1290,7 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
   const html = textToHtml(text);
   let messageIdHeader: string | null = `<${crypto.randomUUID()}@${fromDomain}>`;
   let providerMessageId: string | null = null;
+  const usageMeta = { feature: 'mail', fingerprint, mailbox_id: mailbox.id };
   try {
     if (mailbox.kind === 'hosted') {
       const headers: Record<string, string> = {};
@@ -901,6 +1298,7 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
       if (references) headers['References'] = references;
       const sent = await resend('/emails', {
         method: 'POST',
+        // Same key as the hold: a retry of this request id is deduplicated by Resend too.
         idempotencyKey,
         body: {
           from: formatFrom(fromName, mailbox.address),
@@ -916,8 +1314,9 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
       messageIdHeader = null;
     } else {
       const { data: password } = await admin.rpc('get_mailbox_secret', { p_secret_id: mailbox.vault_secret_id });
-      if (!password) throw new ProviderError('The saved password for this mailbox is missing. Reconnect it.', 409);
-      const transport = smtpTransport(mailbox.smtp_host, mailbox.smtp_user || mailbox.address, password);
+      if (!password) throw new ProviderError('The saved password for this mailbox is missing. Reconnect it.', 409, 'no_secret');
+      const trace: SmtpTrace = { sawCommand: false, dataSent: false };
+      const transport = smtpTransport(mailbox.smtp_host, mailbox.smtp_user || mailbox.address, password, smtpConnectAddress, trace);
       try {
         const info = await transport.sendMail({
           from: formatFrom(fromName, mailbox.address),
@@ -931,54 +1330,72 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
         });
         providerMessageId = typeof info?.messageId === 'string' ? info.messageId : null;
       } catch (err: any) {
-        if (String(err?.code) === 'EAUTH') {
+        const failure = classifySmtpError(err, trace);
+        if (failure.auth) {
           await admin.from('mailboxes').update({ status: 'needs_reauth' }).eq('id', mailbox.id);
-          throw new ProviderError(`${mailbox.address} rejected the saved app password. Reconnect it in Accounts.`, 409);
+          throw new ProviderError(`${mailbox.address} rejected the saved app password. Reconnect it in Accounts.`, 409, failure.code);
         }
-        throw new ProviderError(smtpErrorMessage(err));
+        throw new ProviderError(failure.message, failure.uncertain ? 504 : 502, failure.code, failure.uncertain);
       } finally {
         transport.close();
       }
     }
   } catch (err: any) {
+    const pe = err instanceof ProviderError ? err : null;
+    console.error('[mail] send failed:', providerName, pe?.code || err?.name || 'error', pe?.uncertain ? '(uncertain)' : '');
+
+    if (pe?.uncertain) {
+      // The provider may have accepted it. Not refunded: settled as uncertain
+      // (the daily slot stays used) and an identical resend is blocked until
+      // the user confirms it did not arrive.
+      const charge = await chargeSend(admin, {
+        userId,
+        reservationId,
+        credits: price.credits,
+        costUsd: price.costUsd,
+        idempotencyKey,
+        operation,
+        provider: providerName,
+        providerCallId: null,
+        outcome: 'uncertain',
+        errorCode: pe.code,
+        note: `Email send unconfirmed (${priceKind === 'hosted' ? 'hosted' : 'connected mailbox'})`,
+        metadata: usageMeta,
+      });
+      return fail(UNCERTAIN_MESSAGE, 504, {
+        uncertain: true,
+        credits_charged: charge.creditsCharged,
+        balance_after: charge.balanceAfter,
+        ...(charge.pending ? { charge_pending: true } : {}),
+      });
+    }
+
     // Nothing was delivered: give the credits and the slot back.
     if (reservationId) {
       await admin.rpc('wallet_release', { p_reservation_id: reservationId, p_reason: 'mail: send failed' });
     }
     await returnSlot();
-    const message = err instanceof ProviderError ? err.message : 'The email could not be sent.';
-    console.error('[mail] send failed:', String(err?.message || '').slice(0, 200));
-    return fail(message, err instanceof ProviderError ? err.status : 502);
+    return fail(pe ? pe.message : 'The email could not be sent.', pe ? pe.status : 502);
   }
 
-  // 4. Charge.
-  let creditsCharged = 0;
-  let balanceAfter: number | null = null;
-  if (reservationId) {
-    const { data: settled, error: settleError } = await admin.rpc('wallet_settle', {
-      p_reservation_id: reservationId,
-      p_credits_charged: price.credits,
-      p_provider_cost: price.costUsd,
-      p_idempotency_key: idempotencyKey,
-      p_note: `Email sent (${priceKind === 'hosted' ? 'hosted' : 'connected mailbox'})`,
-      p_metadata: { feature: 'mail', operation: PRICE_OPS[priceKind] },
-    });
-    if (settleError) console.error('[mail] wallet_settle failed:', settleError.message);
-    creditsCharged = Number(settled?.credits_charged ?? 0);
-    balanceAfter = settled?.balance_after != null ? Number(settled.balance_after) : null;
-  }
-  await admin.from('api_usage').insert({
-    user_id: userId,
-    idempotency_key: idempotencyKey,
-    operation: PRICE_OPS[priceKind],
-    provider: mailbox.kind === 'hosted' ? 'resend' : 'smtp',
-    provider_call_id: providerMessageId,
-    provider_cost_usd: price.costUsd,
-    credits_charged: creditsCharged,
+  // 4. Charge. A failed settle is retried, then left for the reaper to settle
+  // from the usage row; the send is never free.
+  const charge = await chargeSend(admin, {
+    userId,
+    reservationId,
+    credits: price.credits,
+    costUsd: price.costUsd,
+    idempotencyKey,
+    operation,
+    provider: providerName,
+    providerCallId: providerMessageId,
     outcome: 'success',
-    reservation_id: reservationId,
-    metadata: { feature: 'mail' },
-  }).then(({ error }: any) => error && console.error('[mail] usage record failed:', error.message));
+    note: `Email sent (${priceKind === 'hosted' ? 'hosted' : 'connected mailbox'})`,
+    metadata: usageMeta,
+  });
+  const creditsCharged = charge.creditsCharged;
+  const balanceAfter = charge.balanceAfter;
+  const chargeExtra = charge.pending ? { charge_pending: true } : {};
 
   // 5. Record. The email is already out, so a failure here is logged, not refunded.
   const now = new Date().toISOString();
@@ -1006,7 +1423,7 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
       .single();
     if (error || !newThread) {
       console.error('[mail] sent thread insert failed:', error?.message);
-      return json({ ok: true, recorded: false, credits_charged: creditsCharged, balance_after: balanceAfter });
+      return json({ ok: true, recorded: false, credits_charged: creditsCharged, balance_after: balanceAfter, ...chargeExtra });
     }
     threadId = newThread.id;
   }
@@ -1058,5 +1475,6 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
     mailbox: freshMailbox,
     credits_charged: creditsCharged,
     balance_after: balanceAfter,
+    ...chargeExtra,
   });
 }

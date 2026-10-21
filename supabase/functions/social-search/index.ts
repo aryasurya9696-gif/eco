@@ -16,9 +16,9 @@
 // read from the database with the service role key. Nothing quota-relevant is
 // trusted from the request body.
 //
-// NOTE: this file is intentionally SELF-CONTAINED. Do not split shared helpers
-// into an underscore-prefixed folder — Supabase's bundler skips `_`-prefixed
-// directories and the relative import fails to resolve on deploy.
+// NOTE: shared helpers are copied rather than imported from another function.
+// Pure rules (billing, Reddit fallback, CORS) live in ./search-rules.ts, inside
+// this function's own folder, so they bundle with it and can be unit tested.
 //
 // Deploy:  supabase functions deploy social-search
 // Secret:  supabase secrets set TREG_TOKEN=treg_...
@@ -32,21 +32,36 @@
 // ============================================================================
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import {
+  allowedOrigins,
+  corsOriginFor,
+  creditsFor,
+  FREE_OPERATIONS,
+  isOperationAvailable,
+  roundCredits,
+  shouldTryRedditFallback,
+} from './search-rules.ts';
 
-const ALLOWED_ORIGIN = Deno.env.get('ALLOWED_ORIGIN') || '*';
+/**
+ * Never `*` by default: ALLOWED_ORIGIN (comma-separated) and APP_ORIGIN form the
+ * allowlist, and with neither set only the local dev server is allowed.
+ */
+const ALLOWED_ORIGINS = allowedOrigins(Deno.env.get('ALLOWED_ORIGIN'), Deno.env.get('APP_ORIGIN'));
 
-function corsHeaders(): Record<string, string> {
+function corsHeaders(requestOrigin: string | null): Record<string, string> {
   return {
-    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+    'Access-Control-Allow-Origin': corsOriginFor(requestOrigin, ALLOWED_ORIGINS),
     'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    Vary: 'Origin',
   };
 }
 
+/** CORS headers are added once, per request, by the Deno.serve wrapper. */
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+    headers: { 'Content-Type': 'application/json' },
   });
 }
 
@@ -730,8 +745,15 @@ async function loadPricing(
 }
 
 interface Reservation {
-  id: string;
+  /** Null when nothing needed holding (a 0-credit sweep, e.g. News only). */
+  id: string | null;
   reserved: number;
+  /**
+   * The key already had a hold, held or finalised. It belongs to another (or an
+   * earlier) run, so this run must neither use it nor settle it: running the
+   * sweep against it delivered the work free while the run reported a charge.
+   */
+  duplicate: boolean;
 }
 
 /**
@@ -760,7 +782,7 @@ async function reserveSweep(
   }
   const r = data as any;
   if (r?.ok) {
-    return { id: r.reservation_id, reserved: Number(r.reserved ?? credits) };
+    return { id: typeof r.reservation_id === 'string' ? r.reservation_id : null, reserved: Number(r.reserved ?? credits), duplicate: r.duplicate === true };
   }
   return {
     shortfall: Number(r?.shortfall ?? credits),
@@ -787,6 +809,13 @@ async function settleSweep(
   });
   if (error) {
     console.error('[billing] settle failed:', error.message);
+    return null;
+  }
+  // wallet_settle reports an already-finalised or missing hold as ok:false,
+  // not as an RPC error. Reading balance_after off that counted a charge that
+  // never happened.
+  if ((data as any)?.ok === false) {
+    console.error('[billing] settle refused:', (data as any)?.error);
     return null;
   }
   return Number((data as any)?.balance_after ?? 0);
@@ -918,11 +947,17 @@ async function searchChannel(
       },
     });
     record(tally, tk, kw.id);
-    const tkItems = tk.data?.data?.posts ?? tk.data?.posts ?? [];
-    if (Array.isArray(tkItems) && tkItems.length) {
+    const tkRaw = tk.data?.data?.posts ?? tk.data?.posts ?? [];
+    const tkItems = Array.isArray(tkRaw) ? tkRaw : [];
+    if (tkItems.length) {
       served.reddit = 'tikhub.x.reddit-app-fetch-dynamic-search';
       return tkItems.map((x: any) => mapRedditTikhub(x, kw)).filter((p: any): p is RawPost => !!p);
     }
+
+    // Only an unbilled miss falls back. When tikhub billed (or may have) for an
+    // empty answer, the search has been paid for once already; calling
+    // scrapecreators too would pay twice for one keyword (N9).
+    if (!shouldTryRedditFallback(tk, tkItems.length)) return [];
 
     // Distinct key: this is a different provider answering the same search, and
     // reusing the primary's key would make treg reject it as a mismatched replay.
@@ -987,7 +1022,21 @@ async function searchChannel(
 // ---------------------------------------------------------------------------
 
 Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders() });
+  const cors = corsHeaders(req.headers.get('Origin'));
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
+  let res: Response;
+  try {
+    res = await handle(req);
+  } catch (err) {
+    // Generic to the client; the detail stays in the function log.
+    console.error('[social-search] unhandled error:', (err as Error)?.name ?? 'Error');
+    res = fail('Search failed. Please try again.', 500);
+  }
+  for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
+  return res;
+});
+
+async function handle(req: Request): Promise<Response> {
   if (req.method !== 'POST') return fail('Method not allowed', 405);
 
   const userId = await requireUserId(req);
@@ -1110,7 +1159,9 @@ Deno.serve(async (req) => {
   // All or nothing. A sweep that ran for six of eight keywords would charge for
   // a truncated search and quietly under-report the results, so a workspace that
   // cannot cover the whole thing gets nothing and a clear message instead.
-  const runKey = `ss:${Date.now().toString(36)}:${userId}`;
+  // Random, not a timestamp: two requests in the same millisecond shared a key,
+  // and the second then ran against the first one's hold for free.
+  const runKey = `ss:${crypto.randomUUID()}:${userId}`;
   const runNonce = runKey.slice(3);
 
   // Service-role client: pricing_config is no longer readable by clients.
@@ -1129,23 +1180,27 @@ Deno.serve(async (req) => {
     0,
   );
   const wanted = [...new Set(enabledChannels.map((c) => OPERATION_OF[c]))]
-    .filter((op) => pricing.has(op));
+    .filter((op) => isOperationAvailable(op, pricing));
 
   // A channel with no configured price is not free — it is unavailable. Running
-  // it would serve the customer something we cannot bill for.
-  const unpriced = enabledChannels.filter((c) => !pricing.has(OPERATION_OF[c]));
+  // it would serve the customer something we cannot bill for. The exception is
+  // an operation that is free by policy (News), which runs at 0 credits.
+  const unpriced = enabledChannels.filter((c) => !isOperationAvailable(OPERATION_OF[c], pricing));
   if (unpriced.length > 0) {
     console.warn(`[social-search] no configured price for: ${unpriced.join(', ')}`);
   }
 
-  const creditsPerKeyword = wanted.reduce((sum, op) => sum + (pricing.get(op) ?? 0), 0);
-  const creditsRequired = creditsPerKeyword * keywords.length;
+  const creditsPerKeyword = wanted.reduce((sum, op) => sum + creditsFor(op, pricing), 0);
+  // Fractional credits (e.g. 0.1 per keyword per channel): never rounded to an
+  // integer, only to 2 decimals to drop float noise.
+  const creditsRequired = roundCredits(creditsPerKeyword * keywords.length);
 
   const hold = await reserveSweep(admin, userId, creditsRequired, runKey, {
     scope: 'social-search',
     keywords: keywords.length,
     channels: wanted,
-    credits_per_keyword: creditsPerKeyword,
+    free_channels: wanted.filter((op) => FREE_OPERATIONS.has(op)),
+    credits_per_keyword: roundCredits(creditsPerKeyword),
   });
 
   if ('shortfall' in hold) {
@@ -1162,6 +1217,10 @@ Deno.serve(async (req) => {
     }, 402);
   }
 
+  if (hold.duplicate) {
+    return json({ ok: false, error: 'duplicate_request', duplicate_request: true }, 409);
+  }
+
   // Exact cutoff. The endpoints only accept coarse windows, so anything that
   // slips in outside the real lookback is dropped here.
   const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
@@ -1172,7 +1231,7 @@ Deno.serve(async (req) => {
 
   const tallies = new Map<string, OperationTally>();
   for (const op of wanted) tallies.set(op, newTally(op));
-  const billableChannels = enabledChannels.filter((c) => pricing.has(OPERATION_OF[c]));
+  const billableChannels = enabledChannels.filter((c) => isOperationAvailable(OPERATION_OF[c], pricing));
 
   let creditsCharged = 0;
   let providerCostUsd = 0;
@@ -1201,7 +1260,8 @@ Deno.serve(async (req) => {
       // had at least one billed or uncertain call on this operation. Keywords
       // whose calls were all free cost nothing, even when another keyword on
       // the same channel was billed.
-      const opCredits = (pricing.get(op) ?? 0) * t.chargeableKeywords.size;
+      // Free operations (News) are always 0, whatever treg charged us.
+      const opCredits = roundCredits(creditsFor(op, pricing) * t.chargeableKeywords.size);
       creditsCharged += opCredits;
       perOperation[op] = opCredits;
       // What the usage ledger records, so it carries the same figures the
@@ -1210,7 +1270,15 @@ Deno.serve(async (req) => {
       charges.set(op, { credits: opCredits, revenueUsd: opCredits * pricePerCredit });
     }
 
+    // Never settle more than was held (2-decimal rounding per operation must not
+    // push the total past the reservation).
+    creditsCharged = Math.min(roundCredits(creditsCharged), hold.reserved);
+
     await recordUsage(admin, userId, runKey, tallies, hold.id, charges);
+
+    // A zero-credit sweep (News only) has no hold: wallet_reserve returns
+    // reservation_id null for 0 credits, so there is nothing to settle or release.
+    if (!hold.id) return;
 
     if (creditsCharged > 0) {
       // Checked. settleSweep returns null when the RPC fails, and this used to
@@ -1343,9 +1411,11 @@ Deno.serve(async (req) => {
       credits_required: creditsRequired,
       per_operation: perOperation,
       balance_after: balanceAfter,
+      // News is free to the customer by policy: always 0 credits.
+      free_operations: wanted.filter((op) => FREE_OPERATIONS.has(op)),
     },
   });
-});
+}
 
 /**
  * Plan ceilings from sweep_shape(). Falls back to the smallest plan's numbers

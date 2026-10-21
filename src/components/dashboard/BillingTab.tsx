@@ -9,7 +9,6 @@
 // no way to accidentally reprice a live customer by clicking something.
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  fetchBalance,
   fetchHistory,
   fetchPackages,
   startCheckout,
@@ -21,9 +20,9 @@ import {
   ledgerLabel,
   type History,
   type Package,
-  type SweepQuote,
-  type Wallet,
 } from '../../lib/billing';
+import { walletStore, useWalletState } from '../../lib/wallet-store';
+import { channelLabel } from '../../lib/constants';
 import {
   Wallet as WalletIcon,
   AlertTriangle,
@@ -33,16 +32,20 @@ import {
   X,
 } from 'lucide-react';
 
-const CHANNEL_LABEL: Record<string, string> = {
-  twitter: 'X',
-  reddit: 'Reddit',
-  google: 'Web',
-  news: 'News',
-};
 
-export const BillingTab: React.FC = () => {
-  const [wallet, setWallet] = useState<Wallet | null>(null);
-  const [sweep, setSweep] = useState<SweepQuote | null>(null);
+interface BillingTabProps {
+  /**
+   * The package picked on the landing page, so someone who chose "Buy 500
+   * credits" is not asked to choose again. DashboardPage reads and clears it,
+   * because a new user passes through onboarding before getting here.
+   */
+  intendedCode?: string | null;
+}
+
+export const BillingTab: React.FC<BillingTabProps> = ({ intendedCode = null }) => {
+  // The balance is the shared wallet store (also shown in the Sidebar and
+  // Leads), so a charge anywhere is reflected here too.
+  const { wallet, sweep } = useWalletState();
   const [packages, setPackages] = useState<Package[]>([]);
   const [history, setHistory] = useState<History>({ ledger: [], payments: [], usage: [] });
   const [loading, setLoading] = useState(true);
@@ -50,50 +53,15 @@ export const BillingTab: React.FC = () => {
   const [busyCode, setBusyCode] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  /**
-   * The package picked on the landing page, carried over in sessionStorage.
-   *
-   * Someone who chose "Buy 500 credits" on the pricing section should not arrive
-   * here to be asked to choose again.
-   *
-   * Read in a lazy state initialiser rather than an effect: it is a one-time read
-   * of an external value, which is what initialisation is for, and an effect would
-   * cost an extra render pass to arrive at the same place.
-   *
-   * The clearing is a separate effect that sets no state. Doing both in the
-   * initialiser would be impure, and React re-runs initialisers under StrictMode,
-   * so a second run would find the key already gone and lose the highlight.
-   */
-  const [intendedCode] = useState<string | null>(() => {
-    try {
-      return sessionStorage.getItem('echo_intended_package');
-    } catch {
-      // Storage unavailable. The tab works fine without the hint.
-      return null;
-    }
-  });
-
-  useEffect(() => {
-    // Consumed once. A later visit should not keep flagging a package they have
-    // since ignored or already bought.
-    try {
-      if (sessionStorage.getItem('echo_intended_package')) {
-        sessionStorage.removeItem('echo_intended_package');
-      }
-    } catch {
-      // Nothing to do; the hint simply persists until the tab is closed.
-    }
-  }, []);
-
   const load = useCallback(async () => {
     setError(null);
     // Settled, not all. These are three independent concerns, and one failing
     // query used to blank the page — including the balance, which had already
     // arrived fine. A customer should still see their credits because a payments
     // history query timed out.
-    const [pkgRes, balRes, histRes] = await Promise.allSettled([
+    const [pkgRes, , histRes] = await Promise.allSettled([
       fetchPackages(),
-      fetchBalance(),
+      walletStore.refresh(),
       fetchHistory(),
     ]);
 
@@ -105,12 +73,9 @@ export const BillingTab: React.FC = () => {
       failures.push('packages');
     }
 
-    if (balRes.status === 'fulfilled' && balRes.value?.wallet) {
-      setWallet(balRes.value.wallet);
-      setSweep(balRes.value.sweep);
-    } else {
-      failures.push('balance');
-    }
+    // refresh() never rejects; a failed balance read leaves wallet null and
+    // sets the store's error.
+    if (walletStore.getSnapshot().error) failures.push('balance');
 
     if (histRes.status === 'fulfilled') {
       setHistory(histRes.value);
@@ -198,33 +163,38 @@ export const BillingTab: React.FC = () => {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-20 text-[#8a8a86]">
-        <Loader2 className="w-4 h-4 animate-spin" />
+      <div className="flex items-center justify-center py-20 text-[#8a8a86]" role="status" aria-live="polite">
+        <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+        <span className="sr-only">Loading billing</span>
       </div>
     );
   }
 
-  const worthUsd = wallet ? creditsToUsd(wallet.available, packages) : 0;
+  // null (rendered "$—") when the balance or the packages could not be read.
+  const worthUsd = wallet ? creditsToUsd(wallet.available, packages) : null;
 
   return (
     <div className="max-w-4xl mx-auto px-6 py-8 space-y-8">
       <header>
-        <h1 className="text-lg font-medium text-[#141414]">Billing</h1>
+        <h2 className="text-lg font-medium text-[#141414]">Billing</h2>
         <p className="text-xs text-[#8a8a86] font-mono mt-1">
           Credits are prepaid and spent down as searches run. They do not expire.
+        </p>
+        <p className="text-xs text-[#8a8a86] font-mono mt-1">
+          Free welcome credits pay for Feed sweeps only. Lead searches, contact reveals and mail use bought credits.
         </p>
       </header>
 
       {error && (
-        <div className="flex items-start gap-2 p-3 bg-[#fdf2f2] border border-[#f0c4c4] text-xs text-[#8a2a2a]">
-          <X className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+        <div role="alert" className="flex items-start gap-2 p-3 bg-[#fdf2f2] border border-[#f0c4c4] text-xs text-[#8a2a2a]">
+          <X className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" aria-hidden="true" />
           <span>{error}</span>
         </div>
       )}
 
       {notice && (
-        <div className="flex items-start gap-2 p-3 bg-[#f6f6f4] border border-[#e3e3de] text-xs text-[#4a4a47]">
-          <RefreshCw className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+        <div role="status" aria-live="polite" className="flex items-start gap-2 p-3 bg-[#f6f6f4] border border-[#e3e3de] text-xs text-[#4a4a47]">
+          <RefreshCw className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" aria-hidden="true" />
           <span>{notice}</span>
         </div>
       )}
@@ -239,14 +209,14 @@ export const BillingTab: React.FC = () => {
               </span>
               <div className="flex items-baseline gap-2 mt-2">
                 <span className="text-3xl font-mono font-medium text-[#141414]">
-                  {formatCredits(wallet?.available ?? 0)}
+                  {formatCredits(wallet?.available)}
                 </span>
                 <span className="text-xs text-[#8a8a86] font-mono">credits</span>
               </div>
               <p className="text-[11px] text-[#8a8a86] font-mono mt-1">
-                worth {formatUsd(worthUsd)}
+                {wallet ? <>worth {formatUsd(worthUsd)}</> : 'Balance unavailable — try Refresh'}
                 {wallet && wallet.reserved > 0 && (
-                  <> · {formatCredits(wallet.reserved)} held for a running sweep</>
+                  <> · {formatCredits(wallet.reserved)} on hold for a running job</>
                 )}
               </p>
             </div>
@@ -275,19 +245,19 @@ export const BillingTab: React.FC = () => {
             <div className="bg-white p-3">
               <dt className="text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">Bought</dt>
               <dd className="text-sm font-mono text-[#141414] mt-1">
-                {formatCredits(wallet?.credits_purchased ?? 0)}
+                {formatCredits(wallet?.credits_purchased)}
               </dd>
             </div>
             <div className="bg-white p-3">
               <dt className="text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">Free</dt>
               <dd className="text-sm font-mono text-[#141414] mt-1">
-                {formatCredits(wallet?.credits_free ?? 0)}
+                {formatCredits(wallet?.credits_free)}
               </dd>
             </div>
             <div className="bg-white p-3">
               <dt className="text-[9px] font-mono uppercase tracking-wider text-[#8a8a86]">Spent</dt>
               <dd className="text-sm font-mono text-[#141414] mt-1">
-                {formatCredits(wallet?.lifetime_consumed ?? 0)}
+                {formatCredits(wallet?.lifetime_consumed)}
               </dd>
             </div>
             <div className="bg-white p-3">
@@ -295,7 +265,7 @@ export const BillingTab: React.FC = () => {
                 Searches run
               </dt>
               <dd className="text-sm font-mono text-[#141414] mt-1">
-                {formatCredits(wallet?.search_count ?? 0)}
+                {formatCredits(wallet?.search_count)}
               </dd>
             </div>
           </dl>
@@ -319,7 +289,7 @@ export const BillingTab: React.FC = () => {
                     both produce a sweep object without it, and .map on undefined
                     threw inside render — which took down the whole billing tab,
                     including the balance that had loaded fine. */}
-                {(sweep.channels ?? []).map((c) => CHANNEL_LABEL[c] ?? c).join(', ')} ·{' '}
+                {(sweep.channels ?? []).map(channelLabel).join(', ')} ·{' '}
                 {formatCredits(sweep.shortfall)} short
               </p>
             </div>
@@ -391,9 +361,9 @@ export const BillingTab: React.FC = () => {
                 }`}
               >
                 {busyCode === p.code ? (
-                  <Loader2 className="w-3 h-3 animate-spin" />
+                  <Loader2 className="w-3 h-3 animate-spin" aria-label="Starting checkout" />
                 ) : (
-                  <>Buy {formatCredits(p.total_credits)} credits <ExternalLink className="w-3 h-3" /></>
+                  <>Buy {formatCredits(p.total_credits)} credits <ExternalLink className="w-3 h-3" aria-hidden="true" /></>
                 )}
               </button>
             </div>

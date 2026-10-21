@@ -3,6 +3,7 @@ import type { Mailbox, MailThread, MailMessage, MailFolder, MailDomain } from '.
 import { leadsStore } from '../leads/leads-store';
 import { supabase } from '../../lib/supabase';
 import { invokeFunction } from '../../lib/api';
+import { walletStore } from '../../lib/wallet-store';
 
 // ============================================================================
 // Echo Mail Workspace Store
@@ -22,6 +23,8 @@ export interface ComposerDraft {
   to: string;
   name?: string;
   company?: string;
+  /** The lead's job title, for the AI writer. */
+  title?: string;
   subject: string;
   body: string;
   fromMailboxId?: string;
@@ -29,7 +32,92 @@ export interface ComposerDraft {
   draftThreadId?: string | null;
 }
 
-export type SendResult = { success: true; threadId: string } | { success: false; error: string };
+/**
+ * Why a send did not go through, so the UI can offer the right next step:
+ *  - uncertain_resend: an identical send recently timed out and may have been
+ *    delivered; the user may confirm a resend ("Send anyway").
+ *  - uncertain: this attempt may already have been sent and was charged; no
+ *    automatic retry is offered.
+ *  - paid_credits_required: only welcome credits are left (Billing).
+ *  - price_unavailable: sending is paused server-side.
+ */
+export type SendFailureKind = 'uncertain_resend' | 'uncertain' | 'paid_credits_required' | 'price_unavailable' | 'error';
+
+export type SendResult =
+  | { success: true; threadId: string; chargePending?: boolean }
+  | { success: false; error: string; kind: SendFailureKind };
+
+export interface SendOptions {
+  /** Resend although an identical send recently ended uncertain. */
+  confirmResend?: boolean;
+}
+
+export const PAID_CREDITS_REQUIRED_MESSAGE =
+  'Sending mail needs purchased credits — free welcome credits only cover feed sweeps.';
+const UNCERTAIN_SEND_MESSAGE =
+  'This email may already have been sent (and was charged). Check your Sent folder before sending it again.';
+const UNCERTAIN_RESEND_FALLBACK =
+  "An earlier attempt to send this exact email timed out and may have been delivered. Check your Sent folder first; if it isn't there, choose Send anyway.";
+const PRICE_UNAVAILABLE_MESSAGE = 'Sending is temporarily unavailable. Please try again later.';
+
+type SendResponse =
+  | { ok: true; data: any }
+  | { ok: false; status: number; body: Record<string, any> | null; message: string };
+
+/**
+ * Calls the mail function's send action and keeps the error body. The shared
+ * invokeFunction() reduces errors to a message (and rewrites any
+ * duplicate_request to "Already in progress"), which loses the uncertain /
+ * paid_credits_required / price_unavailable flags this flow depends on.
+ */
+async function invokeSend(payload: Record<string, unknown>): Promise<SendResponse> {
+  if (!supabase) return { ok: false, status: 503, body: null, message: 'Mail requires a connected Supabase project.' };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
+  try {
+    const { data, error } = await supabase.functions.invoke('mail', { body: payload, signal: controller.signal });
+    if (!error) return { ok: true, data };
+    const ctx = (error as { context?: unknown }).context;
+    if (ctx instanceof Response) {
+      let body: Record<string, any> | null = null;
+      try {
+        body = await ctx.clone().json();
+      } catch {
+        body = null;
+      }
+      return { ok: false, status: ctx.status, body, message: String(body?.message || body?.error || '') };
+    }
+    return { ok: false, status: 500, body: null, message: error.message || '' };
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      // No answer within the timeout: the provider may still have sent it.
+      return { ok: false, status: 504, body: { uncertain: true }, message: '' };
+    }
+    return { ok: false, status: 500, body: null, message: (err as Error)?.message || '' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Maps a refused send onto what the user is told and offered. */
+function sendFailure(res: Extract<SendResponse, { ok: false }>, fallback: string): Extract<SendResult, { success: false }> {
+  const b = res.body || {};
+  if (res.status === 409 && b.uncertain) {
+    return { success: false, kind: 'uncertain_resend', error: res.message || UNCERTAIN_RESEND_FALLBACK };
+  }
+  if (res.status === 504 || b.uncertain) return { success: false, kind: 'uncertain', error: UNCERTAIN_SEND_MESSAGE };
+  if (b.paid_credits_required) return { success: false, kind: 'paid_credits_required', error: PAID_CREDITS_REQUIRED_MESSAGE };
+  if (res.status === 503 && b.price_unavailable) return { success: false, kind: 'price_unavailable', error: PRICE_UNAVAILABLE_MESSAGE };
+  if (b.duplicate_request) return { success: false, kind: 'error', error: 'Already in progress — this email is still being sent.' };
+  if (b.rate_limited) return { success: false, kind: 'error', error: res.message || 'Too many requests. Please try again in a minute.' };
+  return { success: false, kind: 'error', error: res.message || fallback };
+}
+
+/** The charge may settle a moment after the send: re-read the wallet now and again shortly. */
+function refreshWalletAfterSend(chargePending: boolean) {
+  void walletStore.refresh();
+  if (chargePending) window.setTimeout(() => void walletStore.refresh(), 5_000);
+}
 
 export type AppPasswordProvider = 'google' | 'microsoft' | 'zoho' | 'custom';
 
@@ -196,7 +284,9 @@ class MailStore {
       domains: (domRes.data || []) as MailDomain[],
       threads: (thRes.data || []).map(toThread),
       activeMailboxId,
-      composerDraft: this.state.composerDraft.fromMailboxId
+      // An open composer picks its own mailbox once they load; replacing the
+      // draft under it would reset what the user has typed.
+      composerDraft: this.state.composerDraft.fromMailboxId || this.state.isComposerOpen
         ? this.state.composerDraft
         : { ...this.state.composerDraft, fromMailboxId: activeMailboxId },
     });
@@ -323,6 +413,7 @@ class MailStore {
         to: initialDraft?.to || '',
         name: initialDraft?.name || '',
         company: initialDraft?.company || '',
+        title: initialDraft?.title || '',
         leadId: initialDraft?.leadId || null,
         subject: initialDraft?.subject || (initialDraft?.company ? `Quick intro // ${initialDraft.company}` : ''),
         body: initialDraft?.body || '',
@@ -477,34 +568,41 @@ class MailStore {
    * mailbox's daily limit, charges the credits and delivers it. On success the
    * thread shows in Sent and the composer closes.
    */
-  public async sendEmail(draft: ComposerDraft): Promise<SendResult> {
+  public async sendEmail(draft: ComposerDraft, opts: SendOptions = {}): Promise<SendResult> {
     const mailbox = this.state.mailboxes.find((m) => m.id === draft.fromMailboxId) || this.state.mailboxes[0];
     const blocker = mailboxSendBlocker(mailbox);
-    if (blocker) return { success: false, error: blocker };
+    if (blocker) return { success: false, kind: 'error', error: blocker };
 
-    let res: any;
-    try {
-      res = await invokeFunction('mail', {
-        action: 'send',
-        request_id: crypto.randomUUID(),
-        mailbox_id: mailbox.id,
-        to: draft.to.trim(),
-        name: draft.name || '',
-        company: draft.company || '',
-        lead_id: draft.leadId || null,
-        subject: draft.subject,
-        body: draft.body,
-        draft_thread_id: draft.draftThreadId || null,
-      }, { timeoutMs: 60_000 });
-    } catch (err) {
-      return { success: false, error: errorMessage(err, 'The email could not be sent.') };
+    // A fresh request id each attempt; "Send anyway" resends the same content
+    // with confirm_resend, which the server matches by fingerprint.
+    const sent = await invokeSend({
+      action: 'send',
+      request_id: crypto.randomUUID(),
+      mailbox_id: mailbox!.id,
+      to: draft.to.trim(),
+      name: draft.name || '',
+      company: draft.company || '',
+      lead_id: draft.leadId || null,
+      subject: draft.subject,
+      body: draft.body,
+      draft_thread_id: draft.draftThreadId || null,
+      ...(opts.confirmResend ? { confirm_resend: true } : {}),
+    });
+    if (!sent.ok) {
+      // A refused send releases its hold; an uncertain one was charged.
+      refreshWalletAfterSend(Boolean(sent.body?.charge_pending));
+      return sendFailure(sent, 'The email could not be sent.');
     }
+    const res = sent.data;
+    const chargePending = Boolean(res?.charge_pending);
+    // A send is a charging action: the balance drops everywhere.
+    refreshWalletAfterSend(chargePending);
 
     // Sent, but the server could not record it: reload what it did store.
     if (!res?.recorded || !res.thread) {
-      this.patch({ isComposerOpen: false, composerDraft: { ...EMPTY_DRAFT, fromMailboxId: mailbox.id } });
+      this.patch({ isComposerOpen: false, composerDraft: { ...EMPTY_DRAFT, fromMailboxId: mailbox!.id } });
       void this.reload();
-      return { success: true, threadId: '' };
+      return { success: true, threadId: '', chargePending };
     }
 
     const applied = this.applySent(res);
@@ -516,59 +614,55 @@ class MailStore {
       isComposerOpen: false,
       // Jump to the sent thread: it must be visible in the list, so switch to
       // the sending mailbox and drop any search/filter that could hide it.
-      activeMailboxId: mailbox.id,
+      activeMailboxId: mailbox!.id,
       activeThreadId: applied.thread.id,
       activeFolder: 'sent',
       activeSubView: 'mailbox',
       searchQuery: '',
       filter: 'all',
-      composerDraft: { ...EMPTY_DRAFT, fromMailboxId: mailbox.id },
+      composerDraft: { ...EMPTY_DRAFT, fromMailboxId: mailbox!.id },
     });
 
-    // Mirror the outreach into the leads pipeline (the server already updated
-    // the saved lead) so the lead row flips to 'contacted' without a refetch.
-    if (draft.leadId) {
-      try {
-        leadsStore.setSavedLeads((prev) =>
-          prev.map((l) => (l.id === draft.leadId || l.db_id === draft.leadId ? { ...l, status: 'contacted' } : l))
-        );
-      } catch {
-        // leads store may not be initialised; ignore
-      }
-    }
+    // Mirror the outreach into the leads pipeline and the Prospector rows
+    // (the server already updated the saved lead) so both flip to
+    // 'contacted' without a refetch.
+    if (draft.leadId) leadsStore.markContacted(draft.leadId);
 
-    return { success: true, threadId: applied.thread.id };
+    return { success: true, threadId: applied.thread.id, chargePending };
   }
 
-  public async sendQuickReply(threadId: string, replyBody: string): Promise<SendResult> {
+  public async sendQuickReply(threadId: string, replyBody: string, opts: SendOptions = {}): Promise<SendResult> {
     const thread = this.state.threads.find((t) => t.id === threadId);
-    if (!thread) return { success: false, error: 'This conversation no longer exists.' };
-    if (!replyBody.trim()) return { success: false, error: 'Write a reply first.' };
+    if (!thread) return { success: false, kind: 'error', error: 'This conversation no longer exists.' };
+    if (!replyBody.trim()) return { success: false, kind: 'error', error: 'Write a reply first.' };
 
     const mailbox = this.state.mailboxes.find((m) => m.id === thread.mailbox_id);
     const blocker = mailboxSendBlocker(mailbox);
-    if (blocker) return { success: false, error: blocker };
+    if (blocker) return { success: false, kind: 'error', error: blocker };
 
-    let res: any;
-    try {
-      res = await invokeFunction('mail', {
-        action: 'send',
-        request_id: crypto.randomUUID(),
-        thread_id: threadId,
-        body: replyBody,
-      }, { timeoutMs: 60_000 });
-    } catch (err) {
-      return { success: false, error: errorMessage(err, 'The reply could not be sent.') };
+    const sent = await invokeSend({
+      action: 'send',
+      request_id: crypto.randomUUID(),
+      thread_id: threadId,
+      body: replyBody,
+      ...(opts.confirmResend ? { confirm_resend: true } : {}),
+    });
+    if (!sent.ok) {
+      refreshWalletAfterSend(Boolean(sent.body?.charge_pending));
+      return sendFailure(sent, 'The reply could not be sent.');
     }
+    const res = sent.data;
+    const chargePending = Boolean(res?.charge_pending);
+    refreshWalletAfterSend(chargePending);
 
     if (!res?.recorded || !res.thread) {
       void this.reload();
-      return { success: true, threadId };
+      return { success: true, threadId, chargePending };
     }
     await this.loadMessages(threadId);
     const applied = this.applySent(res);
     this.patch({ mailboxes: applied.mailboxes, threads: applied.threads, messages: applied.messages });
-    return { success: true, threadId };
+    return { success: true, threadId, chargePending };
   }
 
   public async addDomain(domainName: string): Promise<{ domain: MailDomain } | { error: string }> {

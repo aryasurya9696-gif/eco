@@ -3,6 +3,7 @@ import { ShieldCheck, AlertCircle, X, Loader2, Search } from 'lucide-react';
 import type { B2BLead } from '../../types';
 import { needsEmailReveal, revealedPhone } from './lead-utils';
 import { useLeadPricing } from './leads-store';
+import { formatCredits, creditsLabel } from '../../lib/billing';
 
 interface ConfirmRevealModalProps {
   isOpen: boolean;
@@ -51,16 +52,27 @@ export const ConfirmRevealModal: React.FC<ConfirmRevealModalProps> = ({
     }
   }
 
+  // onClose is usually an inline arrow, so it changes on every store update
+  // while a run is going. Read through a ref so the effect below runs once
+  // per open, not once per update — re-running it used to pull focus back to
+  // the confirm button (and restore it elsewhere) on every enrichment batch.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  });
+
   // Focus moves into the dialog on open and back on close; Escape closes it
-  // and Tab stays inside it.
+  // and Tab stays inside it. Closing is always allowed: queued lookups run in
+  // the background, so a running job never holds the user in this dialog.
   useEffect(() => {
     if (!isOpen) return;
     const previouslyFocused = document.activeElement as HTMLElement | null;
+    const dialog = dialogRef.current;
     confirmRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !isProcessing) {
+      if (e.key === 'Escape') {
         e.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
       if (e.key === 'Tab' && dialogRef.current) {
         const focusable = dialogRef.current.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)');
@@ -79,9 +91,12 @@ export const ConfirmRevealModal: React.FC<ConfirmRevealModalProps> = ({
     document.addEventListener('keydown', onKey);
     return () => {
       document.removeEventListener('keydown', onKey);
-      previouslyFocused?.focus?.();
+      // Only hand focus back if it is still inside the dialog (or lost);
+      // never yank it from wherever the user has since moved it.
+      const active = document.activeElement;
+      if (!active || active === document.body || dialog?.contains(active)) previouslyFocused?.focus?.();
     };
-  }, [isOpen, isProcessing, onClose]);
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -125,7 +140,7 @@ export const ConfirmRevealModal: React.FC<ConfirmRevealModalProps> = ({
     <div
       className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 p-0 sm:p-4"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !isProcessing) onClose();
+        if (e.target === e.currentTarget) onClose();
       }}
     >
       <div
@@ -143,8 +158,7 @@ export const ConfirmRevealModal: React.FC<ConfirmRevealModalProps> = ({
           <button
             type="button"
             onClick={onClose}
-            disabled={isProcessing}
-            className="p-1.5 text-muted hover:text-ink hover:bg-fill cursor-pointer disabled:opacity-40"
+            className="p-1.5 text-muted hover:text-ink hover:bg-fill cursor-pointer"
             aria-label="Close"
           >
             <X className="w-4 h-4" aria-hidden />
@@ -161,13 +175,13 @@ export const ConfirmRevealModal: React.FC<ConfirmRevealModalProps> = ({
             <div className={row}>
               <span className="text-ink-2">Maximum charge</span>
               <span className="font-semibold text-ink tabular-nums">
-                {maxCharge} credit{maxCharge === 1 ? '' : 's'}
+                {creditsLabel(maxCharge)}
               </span>
             </div>
             <div className={row}>
               <span className="text-ink-2">Available balance</span>
               <span className={`font-medium tabular-nums ${shortfall ? 'text-danger' : 'text-ink'}`}>
-                {balanceKnown ? `${availableCredits} credits` : 'Unavailable'}
+                {balanceKnown ? `${formatCredits(availableCredits)} credits` : '—'}
               </span>
             </div>
           </div>
@@ -176,6 +190,7 @@ export const ConfirmRevealModal: React.FC<ConfirmRevealModalProps> = ({
             <ShieldCheck className="w-4 h-4 text-ok shrink-0 mt-0.5" aria-hidden />
             <span>Credits are charged only for details that are found. Lookups that find nothing, or fail, cost nothing.</span>
           </p>
+          <p className="text-xs text-muted">Free welcome credits can't be used here; lookups use bought credits.</p>
 
           {shortfall && (
             <div role="alert" className="flex items-center justify-between gap-3 bg-warn-bg border border-warn-line p-3 text-[13px] text-ink">
@@ -203,8 +218,7 @@ export const ConfirmRevealModal: React.FC<ConfirmRevealModalProps> = ({
           <button
             type="button"
             onClick={onClose}
-            disabled={isProcessing}
-            className="h-10 px-4 border border-line hover:bg-fill text-ink-2 text-sm font-medium cursor-pointer disabled:opacity-50"
+            className="h-10 px-4 border border-line hover:bg-fill text-ink-2 text-sm font-medium cursor-pointer"
           >
             Cancel
           </button>
@@ -221,7 +235,7 @@ export const ConfirmRevealModal: React.FC<ConfirmRevealModalProps> = ({
                 <span>Queuing…</span>
               </>
             ) : (
-              <span>Find {lookups} detail{lookups === 1 ? '' : 's'} · up to {maxCharge} cr</span>
+              <span>Find {lookups} detail{lookups === 1 ? '' : 's'} · up to {formatCredits(maxCharge)} cr</span>
             )}
           </button>
         </div>

@@ -7,6 +7,7 @@ interface FeedSummaryProps {
   filteredCount: number;
   minIntentThreshold: number;
   onToggleFilters: () => void;
+  filtersOpen?: boolean;
   activeFilterCount: number;
   onExportCsv: () => void;
   onExportJson: () => void;
@@ -34,6 +35,7 @@ export const FeedSummary: React.FC<FeedSummaryProps> = ({
   filteredCount,
   minIntentThreshold,
   onToggleFilters,
+  filtersOpen = false,
   activeFilterCount,
   onExportCsv,
   onExportJson,
@@ -57,7 +59,7 @@ export const FeedSummary: React.FC<FeedSummaryProps> = ({
       {/* ── Title row ─────────────────────────────────────────────────── */}
       <div className="flex items-start justify-between gap-4 px-5 pt-4 pb-3">
         <div className="min-w-0">
-          <h1 className="text-sm font-bold tracking-tight text-[#141414]">Mentions</h1>
+          <h2 className="text-sm font-bold tracking-tight text-[#141414]">Mentions</h2>
           <p className="mt-0.5 text-[11px] font-mono text-[#8a8a86]">
             {isFiltered ? (
               <>
@@ -78,6 +80,8 @@ export const FeedSummary: React.FC<FeedSummaryProps> = ({
             type="button"
             onClick={onToggleFilters}
             title="Toggle filters"
+            aria-expanded={filtersOpen}
+            aria-controls="feed-filters"
             className={`relative inline-flex items-center gap-1.5 px-2.5 py-1.5 border text-[11px] font-mono transition-all duration-150 cursor-pointer active:scale-[0.97] ${
               activeFilterCount > 0
                 ? 'border-[#141414] bg-[#141414] text-white'
@@ -93,11 +97,12 @@ export const FeedSummary: React.FC<FeedSummaryProps> = ({
             )}
           </button>
 
-          <div className="hidden sm:flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5">
             <button
               type="button"
               onClick={onExportCsv}
               title={filteredCount === 0 ? 'Nothing to export' : 'Export as CSV'}
+              aria-label="Export shown mentions as CSV"
               disabled={filteredCount === 0}
               className="p-1.5 border border-[#e3e3de] bg-white text-[#4a4a47] hover:border-[#b5b5b0] hover:bg-[#f6f6f4] transition-all duration-150 cursor-pointer active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-white disabled:hover:border-[#e3e3de]"
             >
@@ -107,6 +112,7 @@ export const FeedSummary: React.FC<FeedSummaryProps> = ({
               type="button"
               onClick={onExportJson}
               title={filteredCount === 0 ? 'Nothing to export' : 'Export as JSON'}
+              aria-label="Export shown mentions as JSON"
               disabled={filteredCount === 0}
               className="p-1.5 border border-[#e3e3de] bg-white text-[#4a4a47] hover:border-[#b5b5b0] hover:bg-[#f6f6f4] transition-all duration-150 cursor-pointer active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-white disabled:hover:border-[#e3e3de]"
             >
@@ -119,6 +125,7 @@ export const FeedSummary: React.FC<FeedSummaryProps> = ({
             onClick={onClearFeed}
             disabled={isClearing || total === 0}
             title="Delete every mention in this workspace"
+            aria-label="Clear the whole feed"
             className="p-1.5 border border-[#e3e3de] bg-white text-[#b04a4a] hover:border-[#d98d8d] hover:bg-red-50 transition-all duration-150 cursor-pointer active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-white disabled:hover:border-[#e3e3de] disabled:text-[#b04a4a]"
           >
             <Trash2 className="w-3 h-3" />

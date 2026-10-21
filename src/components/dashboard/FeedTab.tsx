@@ -1,10 +1,26 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useEcho } from '../../context/EchoContext';
 import type { MonitoredPost } from '../../types';
+import type { DraftResult } from '../../lib/ai';
 import { safeHttpUrl } from '../../lib/url';
+import { ALL_CHANNELS, channelLabel } from '../../lib/constants';
+import { formatNextSweep } from '../../lib/schedule';
 import { FeedCard } from './FeedCard';
 import { FeedSummary, FeedSkeleton } from './FeedSummary';
+import { ModalDialog } from './ModalDialog';
+import { SweepButton } from './SweepButton';
 import { Search, X, Sparkles, Clock, Trash2 } from 'lucide-react';
+
+type Tone = 'professional' | 'casual' | 'consultative' | 'direct';
+
+/** Status filter options. 'all' is every mention that has not been dismissed. */
+const STATUS_FILTERS = [
+  { id: 'all', label: 'Active' },
+  { id: 'new', label: 'New' },
+  { id: 'saved', label: 'Saved' },
+  { id: 'contacted', label: 'Contacted' },
+  { id: 'dismissed', label: 'Dismissed' },
+] as const;
 
 /**
  * Buckets posts by calendar day so the feed is scannable over time instead of
@@ -65,7 +81,7 @@ function groupByDay(
     });
 }
 
-export const FeedTab: React.FC = () => {
+export const FeedTab: React.FC<{ onNavigateBilling?: () => void }> = ({ onNavigateBilling }) => {
   const {
     posts,
     keywords,
@@ -79,14 +95,15 @@ export const FeedTab: React.FC = () => {
     setFilterStatus,
     setFilterSearch,
     updatePostStatus,
-    runSweep,
-    isSweeping,
-    sweepTime,
     generateAiDraft,
     exportPostsToCsv,
     exportPostsToJson,
-    enabledChannels,
-    minIntentThreshold,
+    // Saved values, not the Settings form's unsaved edits: the feed reflects
+    // what is actually configured.
+    savedChannels,
+    savedMinIntentThreshold,
+    savedSweepTime,
+    savedSweepCadence,
     clearFeed,
     feedRetentionDays,
     addToast,
@@ -107,12 +124,11 @@ export const FeedTab: React.FC = () => {
     return () => clearInterval(id);
   }, []);
 
-  // AI outreach modal
+  // Outreach reply modal
   const [aiDraftModalPost, setAiDraftModalPost] = useState<MonitoredPost | null>(null);
-  const [draftTone, setDraftTone] = useState<
-    'professional' | 'casual' | 'consultative' | 'direct'
-  >('consultative');
+  const [draftTone, setDraftTone] = useState<Tone>('consultative');
   const [draftText, setDraftText] = useState<string>('');
+  const [draftSource, setDraftSource] = useState<DraftResult['source'] | null>(null);
   const [isGeneratingDraft, setIsGeneratingDraft] = useState<boolean>(false);
   const [copiedDraft, setCopiedDraft] = useState<boolean>(false);
 
@@ -123,46 +139,53 @@ export const FeedTab: React.FC = () => {
   // so a slow reply for an earlier tone (or post) cannot overwrite a newer one.
   const draftSeqRef = useRef(0);
 
-  const handleOpenAiDraft = async (post: MonitoredPost) => {
+  const requestDraft = async (post: MonitoredPost, tone: Tone, keepOnError: boolean) => {
     const seq = ++draftSeqRef.current;
-    setAiDraftModalPost(post);
-    setCopiedDraft(false);
     setIsGeneratingDraft(true);
-    setDraftText('AI is drafting a personalised reply...');
     try {
-      const text = await generateAiDraft(post, draftTone);
-      if (seq === draftSeqRef.current) setDraftText(text);
+      const result = await generateAiDraft(post, tone);
+      if (seq === draftSeqRef.current) {
+        setDraftText(result.draft);
+        setDraftSource(result.source);
+      }
     } catch (err) {
       if (seq !== draftSeqRef.current) return;
-      setDraftText('');
-      addToast(`Could not draft a reply: ${(err as Error)?.message || 'unknown error'}`, 'error');
+      if (!keepOnError) {
+        setDraftText('');
+        setDraftSource(null);
+      }
+      addToast(
+        `${keepOnError ? 'Could not redraft in that tone' : 'Could not draft a reply'}: ${(err as Error)?.message || 'unknown error'}`,
+        'error',
+      );
     } finally {
       if (seq === draftSeqRef.current) setIsGeneratingDraft(false);
     }
   };
 
-  const handleChangeTone = async (
-    tone: 'professional' | 'casual' | 'consultative' | 'direct',
-  ) => {
+  const handleOpenAiDraft = (post: MonitoredPost) => {
+    setAiDraftModalPost(post);
+    setCopiedDraft(false);
+    // The textarea stays empty while drafting (the status is shown beside it),
+    // so a placeholder sentence can never be copied or sent as the reply.
+    setDraftText('');
+    setDraftSource(null);
+    void requestDraft(post, draftTone, false);
+  };
+
+  const handleChangeTone = (tone: Tone) => {
     setDraftTone(tone);
-    if (aiDraftModalPost) {
-      const seq = ++draftSeqRef.current;
-      setIsGeneratingDraft(true);
-      try {
-        const text = await generateAiDraft(aiDraftModalPost, tone);
-        if (seq === draftSeqRef.current) setDraftText(text);
-      } catch (err) {
-        // The previous draft stays; say why it did not change.
-        if (seq === draftSeqRef.current) {
-          addToast(`Could not redraft in that tone: ${(err as Error)?.message || 'unknown error'}`, 'error');
-        }
-      } finally {
-        if (seq === draftSeqRef.current) setIsGeneratingDraft(false);
-      }
-    }
+    if (aiDraftModalPost) void requestDraft(aiDraftModalPost, tone, true);
+  };
+
+  const closeDraftModal = () => {
+    draftSeqRef.current += 1; // drop any reply still in flight
+    setAiDraftModalPost(null);
+    setIsGeneratingDraft(false);
   };
 
   const handleCopyDraft = async () => {
+    if (isGeneratingDraft || !draftText.trim()) return;
     try {
       await navigator.clipboard.writeText(draftText);
       addToast('Draft copied to clipboard.', 'success');
@@ -173,22 +196,20 @@ export const FeedTab: React.FC = () => {
     }
   };
 
-  // Reset the platform filter if that channel was turned off in Settings.
-  useEffect(() => {
-    if (filterPlatform !== 'all' && !enabledChannels.includes(filterPlatform)) {
-      setFilterPlatform('all');
-    }
-  }, [enabledChannels, filterPlatform, setFilterPlatform]);
+  // Channels worth offering as a filter: the saved ones plus any that still
+  // have stored mentions (e.g. News turned off after a few sweeps).
+  const filterChannels = useMemo(
+    () => ALL_CHANNELS.filter((c) => savedChannels.includes(c) || posts.some((p) => p.platform === c)),
+    [savedChannels, posts],
+  );
+
+  const dismissedCount = useMemo(() => posts.filter((p) => p.status === 'dismissed').length, [posts]);
 
   const filteredPosts = useMemo(
     () =>
       posts.filter((post) => {
-        // Hide posts from channels the user turned off.
-        if (enabledChannels.length > 0 && !enabledChannels.includes(post.platform)) {
-          return false;
-        }
         // Workspace intent threshold (also applied server-side).
-        if (minIntentThreshold > 0 && (post.intent_score ?? 0) < minIntentThreshold) {
+        if (savedMinIntentThreshold > 0 && (post.intent_score ?? 0) < savedMinIntentThreshold) {
           return false;
         }
         if (filterKeyword !== 'all' && post.matched_keyword.toLowerCase() !== filterKeyword.toLowerCase()) {
@@ -197,7 +218,8 @@ export const FeedTab: React.FC = () => {
         if (filterPlatform !== 'all' && post.platform !== filterPlatform) {
           return false;
         }
-        if (filterStatus !== 'all' && post.status !== filterStatus) {
+        // "Active" hides dismissed mentions; the Dismissed filter shows them.
+        if (filterStatus === 'all' ? post.status === 'dismissed' : post.status !== filterStatus) {
           return false;
         }
         if (filterSearch.trim()) {
@@ -209,21 +231,16 @@ export const FeedTab: React.FC = () => {
         }
         return true;
       }),
-    [
-      posts,
-      enabledChannels,
-      minIntentThreshold,
-      filterKeyword,
-      filterPlatform,
-      filterStatus,
-      filterSearch,
-    ],
+    [posts, savedMinIntentThreshold, filterKeyword, filterPlatform, filterStatus, filterSearch],
   );
 
-  const totalPages = Math.ceil(filteredPosts.length / itemsPerPage) || 1;
-  const paginatedPosts = filteredPosts.slice(
-    (currentPage - 1) * itemsPerPage,
-    currentPage * itemsPerPage,
+  const totalPages = Math.max(1, Math.ceil(filteredPosts.length / itemsPerPage));
+  // Clamped at render: dismissing, clearing or a sweep can shrink the list
+  // under the current page, which used to render an empty page.
+  const page = Math.min(Math.max(1, currentPage), totalPages);
+  const paginatedPosts = useMemo(
+    () => filteredPosts.slice((page - 1) * itemsPerPage, page * itemsPerPage),
+    [filteredPosts, page],
   );
   const dayGroups = useMemo(() => groupByDay(paginatedPosts, now), [paginatedPosts, now]);
 
@@ -237,6 +254,7 @@ export const FeedTab: React.FC = () => {
     setFilterPlatform('all');
     setFilterStatus('all');
     setFilterSearch('');
+    setCurrentPage(1);
   };
 
   const handleClearFeed = async () => {
@@ -255,14 +273,20 @@ export const FeedTab: React.FC = () => {
     }
   };
 
+  const filterButton = (selected: boolean) =>
+    `px-2.5 py-1 text-[11px] font-mono border-l first:border-l-0 border-[#e3e3de] transition-colors cursor-pointer ${
+      selected ? 'bg-[#141414] text-white' : 'text-[#4a4a47] hover:bg-[#f6f6f4]'
+    }`;
+
   return (
     <div className="max-w-4xl space-y-4">
       {/* ── Summary header ──────────────────────────────────────────────── */}
       <FeedSummary
         posts={posts}
         filteredCount={filteredPosts.length}
-        minIntentThreshold={minIntentThreshold}
+        minIntentThreshold={savedMinIntentThreshold}
         onToggleFilters={() => setShowFilters((v) => !v)}
+        filtersOpen={showFilters}
         activeFilterCount={activeFilterCount}
         onExportCsv={() => exportPostsToCsv(filteredPosts)}
         onExportJson={() => exportPostsToJson(filteredPosts)}
@@ -274,9 +298,10 @@ export const FeedTab: React.FC = () => {
       <div className="bg-white border border-[#e3e3de]">
         <div className="flex items-center gap-2 p-3">
           <div className="relative flex-1 min-w-0">
-            <Search className="w-3.5 h-3.5 text-[#8a8a86] absolute left-3 top-1/2 -translate-y-1/2" />
+            <Search className="w-3.5 h-3.5 text-[#8a8a86] absolute left-3 top-1/2 -translate-y-1/2" aria-hidden="true" />
             <input
-              type="text"
+              type="search"
+              aria-label="Search mentions"
               value={filterSearch}
               onChange={(e) => {
                 setFilterSearch(e.target.value);
@@ -290,71 +315,62 @@ export const FeedTab: React.FC = () => {
 
         {/* Collapsible filter row */}
         {showFilters && (
-          <div className="px-3 pb-3 pt-1 border-t border-[#f4f4f0] flex flex-wrap items-center gap-2">
-            <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] mr-1">
+          <div id="feed-filters" className="px-3 pb-3 pt-1 border-t border-[#f4f4f0] flex flex-wrap items-center gap-2">
+            <span id="feed-filter-channel" className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] mr-1">
               Channel
             </span>
-            <div className="inline-flex border border-[#e3e3de] bg-white">
+            <div role="group" aria-labelledby="feed-filter-channel" className="inline-flex border border-[#e3e3de] bg-white">
               <button
                 type="button"
+                aria-pressed={filterPlatform === 'all'}
                 onClick={() => {
                   setFilterPlatform('all');
                   setCurrentPage(1);
                 }}
-                className={`px-2.5 py-1 text-[11px] font-mono transition-colors cursor-pointer ${
-                  filterPlatform === 'all'
-                    ? 'bg-[#141414] text-white'
-                    : 'text-[#4a4a47] hover:bg-[#f6f6f4]'
-                }`}
+                className={filterButton(filterPlatform === 'all')}
               >
                 All
               </button>
-              {(['twitter', 'reddit', 'google'] as const)
-                .filter((p) => enabledChannels.includes(p))
-                .map((p) => (
-                  <button
-                    key={p}
-                    type="button"
-                    onClick={() => {
-                      setFilterPlatform(p);
-                      setCurrentPage(1);
-                    }}
-                    className={`px-2.5 py-1 text-[11px] font-mono border-l border-[#e3e3de] transition-colors cursor-pointer ${
-                      filterPlatform === p
-                        ? 'bg-[#141414] text-white'
-                        : 'text-[#4a4a47] hover:bg-[#f6f6f4]'
-                    }`}
-                  >
-                    {p === 'twitter' ? 'X' : p === 'reddit' ? 'Reddit' : 'Web'}
-                  </button>
-                ))}
-            </div>
-
-            <span className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] ml-2 mr-1">
-              Status
-            </span>
-            <div className="inline-flex border border-[#e3e3de] bg-white">
-              {(['all', 'new', 'saved', 'contacted'] as const).map((s) => (
+              {filterChannels.map((p) => (
                 <button
-                  key={s}
+                  key={p}
                   type="button"
+                  aria-pressed={filterPlatform === p}
                   onClick={() => {
-                    setFilterStatus(s);
+                    setFilterPlatform(p);
                     setCurrentPage(1);
                   }}
-                  className={`px-2.5 py-1 text-[11px] font-mono border-l first:border-l-0 border-[#e3e3de] uppercase transition-colors cursor-pointer ${
-                    filterStatus === s
-                      ? 'bg-[#141414] text-white'
-                      : 'text-[#4a4a47] hover:bg-[#f6f6f4]'
-                  }`}
+                  className={filterButton(filterPlatform === p)}
                 >
-                  {s}
+                  {channelLabel(p)}
+                </button>
+              ))}
+            </div>
+
+            <span id="feed-filter-status" className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86] ml-2 mr-1">
+              Status
+            </span>
+            <div role="group" aria-labelledby="feed-filter-status" className="inline-flex flex-wrap border border-[#e3e3de] bg-white">
+              {STATUS_FILTERS.map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  aria-pressed={filterStatus === s.id}
+                  onClick={() => {
+                    setFilterStatus(s.id);
+                    setCurrentPage(1);
+                  }}
+                  className={`${filterButton(filterStatus === s.id)} uppercase`}
+                >
+                  {s.label}
+                  {s.id === 'dismissed' && dismissedCount > 0 ? ` (${dismissedCount})` : ''}
                 </button>
               ))}
             </div>
 
             <div className="relative ml-2">
               <select
+                aria-label="Filter by keyword"
                 value={filterKeyword}
                 onChange={(e) => {
                   setFilterKeyword(e.target.value);
@@ -369,7 +385,7 @@ export const FeedTab: React.FC = () => {
                   </option>
                 ))}
               </select>
-              <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[#8a8a86] text-[9px]">
+              <span aria-hidden="true" className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[#8a8a86] text-[9px]">
                 ▼
               </span>
             </div>
@@ -380,7 +396,7 @@ export const FeedTab: React.FC = () => {
                 onClick={resetFilters}
                 className="ml-auto inline-flex items-center gap-1 text-[11px] font-mono text-[#4a4a47] hover:text-[#141414] underline cursor-pointer"
               >
-                <X className="w-3 h-3" />
+                <X className="w-3 h-3" aria-hidden="true" />
                 Clear filters
               </button>
             )}
@@ -394,36 +410,27 @@ export const FeedTab: React.FC = () => {
       ) : posts.length === 0 ? (
         <div className="bg-white border border-[#e3e3de] p-12 text-center space-y-4 max-w-lg mx-auto">
           <div className="w-11 h-11 bg-[#f6f6f4] border border-[#e3e3de] flex items-center justify-center mx-auto text-[#141414]">
-            <Clock className="w-5 h-5 text-[#8a8a86]" />
+            <Clock className="w-5 h-5 text-[#8a8a86]" aria-hidden="true" />
           </div>
           <div className="space-y-2">
-            <h3 className="text-sm font-bold text-[#141414]">No mentions yet</h3>
+            <h2 className="text-sm font-bold text-[#141414]">No mentions yet</h2>
             <p className="text-xs text-[#8a8a86] font-mono leading-relaxed">
-              Your next automated sweep runs at{' '}
-              <span className="text-[#141414] font-semibold">{sweepTime} UTC</span>, or you can
-              run one now. It searches{' '}
-              {enabledChannels
-                .map((c) => (c === 'twitter' ? 'X' : c === 'google' ? 'Web' : c))
-                .join(', ')}{' '}
-              for your {keywords.length} keyword{keywords.length === 1 ? '' : 's'}.
+              Your next automated sweep:{' '}
+              <span className="text-[#141414] font-semibold">
+                {formatNextSweep(savedSweepTime, savedSweepCadence, new Date(now))}
+              </span>
+              , or you can run one now. It searches {savedChannels.map(channelLabel).join(', ')} for your{' '}
+              {keywords.length} keyword{keywords.length === 1 ? '' : 's'}.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={runSweep}
-            disabled={isSweeping}
-            className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer disabled:opacity-60"
-          >
-            <Sparkles className="w-3.5 h-3.5" />
-            <span>{isSweeping ? 'Scanning...' : 'Run sweep now'}</span>
-          </button>
+          <SweepButton variant="empty" onNavigateBilling={onNavigateBilling} />
         </div>
       ) : filteredPosts.length === 0 ? (
         <div className="bg-white border border-[#e3e3de] p-12 text-center space-y-3 max-w-md mx-auto">
           <p className="text-sm font-medium text-[#141414]">Nothing matches these filters</p>
           <p className="text-xs text-[#8a8a86] font-mono leading-relaxed">
-            {minIntentThreshold > 0
-              ? `Your workspace threshold is ${minIntentThreshold}% intent. Lower it in Settings, or clear the filters here.`
+            {savedMinIntentThreshold > 0
+              ? `Your workspace threshold is ${savedMinIntentThreshold}% intent. Lower it in Settings, or clear the filters here.`
               : 'Try widening the channel, status or keyword filters.'}
           </p>
           <button
@@ -437,7 +444,7 @@ export const FeedTab: React.FC = () => {
       ) : (
         <div className="space-y-6">
           {dayGroups.map((group) => (
-            <section key={group.label}>
+            <section key={group.label} aria-label={group.label}>
               <div className="flex items-center gap-3 mb-2.5">
                 <h2 className="text-[11px] font-mono uppercase tracking-wider text-[#8a8a86] flex-shrink-0">
                   {group.label}
@@ -468,51 +475,53 @@ export const FeedTab: React.FC = () => {
 
       {/* Pagination */}
       {filteredPosts.length > itemsPerPage && (
-        <div className="flex items-center justify-between bg-white border border-[#e3e3de] px-4 py-3 text-xs font-mono text-[#8a8a86]">
+        <nav
+          aria-label="Feed pages"
+          className="flex items-center justify-between bg-white border border-[#e3e3de] px-4 py-3 text-xs font-mono text-[#8a8a86]"
+        >
           <span>
-            {(currentPage - 1) * itemsPerPage + 1}–
-            {Math.min(currentPage * itemsPerPage, filteredPosts.length)} of{' '}
+            {(page - 1) * itemsPerPage + 1}–
+            {Math.min(page * itemsPerPage, filteredPosts.length)} of{' '}
             {filteredPosts.length}
           </span>
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-              disabled={currentPage === 1}
+              onClick={() => setCurrentPage(Math.max(1, page - 1))}
+              disabled={page === 1}
               className="px-2 py-1 border border-[#e3e3de] hover:bg-[#f6f6f4] disabled:opacity-30 disabled:cursor-not-allowed text-[#141414] cursor-pointer"
             >
               Prev
             </button>
-            <span className="px-1 text-[#141414]">
-              {currentPage} / {totalPages}
+            <span className="px-1 text-[#141414]" aria-current="page">
+              {page} / {totalPages}
             </span>
             <button
               type="button"
-              onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
-              disabled={currentPage === totalPages}
+              onClick={() => setCurrentPage(Math.min(totalPages, page + 1))}
+              disabled={page === totalPages}
               className="px-2 py-1 border border-[#e3e3de] hover:bg-[#f6f6f4] disabled:opacity-30 disabled:cursor-not-allowed text-[#141414] cursor-pointer"
             >
               Next
             </button>
           </div>
-        </div>
+        </nav>
       )}
 
       {/* ── Clear feed confirmation ──────────────────────────────────────── */}
       {confirmClear && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div
-            className="fixed inset-0 bg-black/40 backdrop-blur-xs"
-            onClick={() => !isClearing && setConfirmClear(false)}
-          />
-          <div className="relative w-full max-w-sm bg-white border border-[#e3e3de] shadow-2xl z-10">
+        <ModalDialog
+          title="Clear the whole feed?"
+          onClose={() => setConfirmClear(false)}
+          busy={isClearing}
+          renderHeader={(titleId) => (
             <div className="px-5 pt-5 pb-4">
               <div className="flex items-start gap-3">
                 <div className="w-8 h-8 rounded-full bg-red-50 border border-red-200 flex items-center justify-center flex-shrink-0">
-                  <Trash2 className="w-4 h-4 text-red-600" />
+                  <Trash2 className="w-4 h-4 text-red-600" aria-hidden="true" />
                 </div>
                 <div className="min-w-0">
-                  <h3 className="text-sm font-bold text-[#141414]">Clear the whole feed?</h3>
+                  <h2 id={titleId} className="text-sm font-bold text-[#141414]">Clear the whole feed?</h2>
                   <p className="mt-1.5 text-xs text-[#4a4a47] leading-relaxed">
                     This permanently deletes all{' '}
                     <span className="font-semibold text-[#141414]">{posts.length}</span> stored
@@ -528,137 +537,139 @@ export const FeedTab: React.FC = () => {
                 </div>
               </div>
             </div>
-
-            <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-[#eeeeea] bg-[#fafaf9]">
-              <button
-                type="button"
-                onClick={() => setConfirmClear(false)}
-                disabled={isClearing}
-                className="px-3.5 py-1.5 text-[11px] font-mono border border-[#e3e3de] bg-white text-[#4a4a47] hover:bg-[#f6f6f4] transition-all duration-150 cursor-pointer disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleClearFeed()}
-                disabled={isClearing}
-                className="px-3.5 py-1.5 text-[11px] font-mono bg-red-600 hover:bg-red-700 text-white transition-all duration-150 cursor-pointer disabled:opacity-50 active:scale-[0.97]"
-              >
-                {isClearing ? 'Clearing...' : `Delete ${posts.length}`}
-              </button>
-            </div>
+          )}
+        >
+          <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-[#eeeeea] bg-[#fafaf9]">
+            <button
+              type="button"
+              onClick={() => setConfirmClear(false)}
+              disabled={isClearing}
+              className="px-3.5 py-1.5 text-[11px] font-mono border border-[#e3e3de] bg-white text-[#4a4a47] hover:bg-[#f6f6f4] transition-all duration-150 cursor-pointer disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleClearFeed()}
+              disabled={isClearing}
+              className="px-3.5 py-1.5 text-[11px] font-mono bg-red-600 hover:bg-red-700 text-white transition-all duration-150 cursor-pointer disabled:opacity-50 active:scale-[0.97]"
+            >
+              {isClearing ? 'Clearing...' : `Delete ${posts.length}`}
+            </button>
           </div>
-        </div>
+        </ModalDialog>
       )}
 
-      {/* ── AI outreach modal ─────────────────────────────────────────────── */}
+      {/* ── Outreach reply modal ──────────────────────────────────────────── */}
       {aiDraftModalPost && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div
-            className="fixed inset-0 bg-black/40 backdrop-blur-xs"
-            onClick={() => setAiDraftModalPost(null)}
-          />
-          <div className="relative w-full max-w-lg bg-white border border-[#e3e3de] shadow-2xl z-10 space-y-4 max-h-[90vh] overflow-y-auto">
+        <ModalDialog
+          title="Outreach reply"
+          onClose={closeDraftModal}
+          className="max-w-lg"
+          renderHeader={(titleId) => (
             <div className="flex items-center justify-between border-b border-[#eeeeea] px-5 py-3">
               <div className="flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-[#141414]" />
-                <h3 className="text-sm font-bold text-[#141414]">Outreach reply</h3>
+                <Sparkles className="w-4 h-4 text-[#141414]" aria-hidden="true" />
+                <h2 id={titleId} className="text-sm font-bold text-[#141414]">Outreach reply</h2>
               </div>
               <button
                 type="button"
-                onClick={() => setAiDraftModalPost(null)}
+                onClick={closeDraftModal}
                 className="text-[#8a8a86] hover:text-[#141414] cursor-pointer"
                 aria-label="Close"
               >
-                <X className="w-4 h-4" />
+                <X className="w-4 h-4" aria-hidden="true" />
               </button>
             </div>
+          )}
+        >
+          <div className="px-5 py-4 space-y-4">
+            <div className="p-3 bg-[#f6f6f4] border border-[#eeeeea] text-xs space-y-1">
+              <span className="text-[10px] font-mono text-[#8a8a86] uppercase block">
+                Replying to
+              </span>
+              <p className="font-semibold text-[#141414]">
+                {aiDraftModalPost.author_name}
+                {aiDraftModalPost.author_handle ? ` (${aiDraftModalPost.author_handle})` : ''}
+              </p>
+              <p className="text-[11px] text-[#4a4a47] line-clamp-3">{aiDraftModalPost.body}</p>
+            </div>
 
-            <div className="px-5 space-y-4">
-              <div className="p-3 bg-[#f6f6f4] border border-[#eeeeea] text-xs space-y-1">
-                <span className="text-[10px] font-mono text-[#8a8a86] uppercase block">
-                  Replying to
-                </span>
-                <p className="font-semibold text-[#141414]">
-                  {aiDraftModalPost.author_name}
-                  {aiDraftModalPost.author_handle
-                    ? ` (${aiDraftModalPost.author_handle})`
-                    : ''}
-                </p>
-                <p className="text-[11px] text-[#4a4a47] line-clamp-3">
-                  {aiDraftModalPost.body}
-                </p>
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-mono uppercase text-[#4a4a47] block">
-                  Tone
-                </label>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-xs font-mono">
-                  {(['consultative', 'direct', 'professional', 'casual'] as const).map((tone) => (
-                    <button
-                      key={tone}
-                      type="button"
-                      onClick={() => void handleChangeTone(tone)}
-                      className={`py-1.5 text-center border capitalize transition-colors cursor-pointer ${
-                        draftTone === tone
-                          ? 'bg-[#141414] text-white border-[#141414]'
-                          : 'bg-white text-[#4a4a47] border-[#e3e3de] hover:bg-[#f6f6f4]'
-                      }`}
-                    >
-                      {tone}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <label className="text-[11px] font-mono uppercase text-[#4a4a47] block">
-                    Draft
-                  </label>
-                  {isGeneratingDraft && (
-                    <span className="text-[10px] font-mono text-[#8a8a86]">
-                      generating...
-                    </span>
-                  )}
-                </div>
-                <textarea
-                  rows={5}
-                  value={draftText}
-                  disabled={isGeneratingDraft}
-                  onChange={(e) => setDraftText(e.target.value)}
-                  className={`w-full p-3 bg-white border border-[#e3e3de] text-xs leading-relaxed text-[#141414] focus:outline-none focus:border-[#141414] ${
-                    isGeneratingDraft ? 'opacity-50' : ''
-                  }`}
-                />
-              </div>
-
-              <div className="flex items-center justify-between">
-                {safeHttpUrl(aiDraftModalPost.post_url) ? (
-                  <a
-                    href={safeHttpUrl(aiDraftModalPost.post_url) ?? undefined}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1.5 text-[11px] font-mono text-[#4a4a47] hover:text-[#141414]"
+            <div className="space-y-1.5">
+              <span id="draft-tone-label" className="text-[11px] font-mono uppercase text-[#4a4a47] block">
+                Tone
+              </span>
+              <div role="group" aria-labelledby="draft-tone-label" className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-xs font-mono">
+                {(['consultative', 'direct', 'professional', 'casual'] as const).map((tone) => (
+                  <button
+                    key={tone}
+                    type="button"
+                    aria-pressed={draftTone === tone}
+                    onClick={() => handleChangeTone(tone)}
+                    className={`py-1.5 text-center border capitalize transition-colors cursor-pointer ${
+                      draftTone === tone
+                        ? 'bg-[#141414] text-white border-[#141414]'
+                        : 'bg-white text-[#4a4a47] border-[#e3e3de] hover:bg-[#f6f6f4]'
+                    }`}
                   >
-                    Open original
-                  </a>
-                ) : (
-                  <span />
-                )}
-                <button
-                  type="button"
-                  onClick={() => void handleCopyDraft()}
-                  disabled={!draftText}
-                  className="inline-flex items-center gap-2 px-4 py-2 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer disabled:opacity-50"
-                >
-                  {copiedDraft ? 'Copied' : 'Copy draft'}
-                </button>
+                    {tone}
+                  </button>
+                ))}
               </div>
             </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <label htmlFor="outreach-draft" className="text-[11px] font-mono uppercase text-[#4a4a47] block">
+                  Draft
+                </label>
+                <span aria-live="polite" className="text-[10px] font-mono text-[#8a8a86]">
+                  {isGeneratingDraft
+                    ? 'Drafting…'
+                    : draftSource === 'openai'
+                    ? 'Written by AI · review before sending'
+                    : draftSource === 'fallback'
+                    ? 'Template: AI drafting is unavailable right now'
+                    : ''}
+                </span>
+              </div>
+              <textarea
+                id="outreach-draft"
+                rows={5}
+                value={draftText}
+                disabled={isGeneratingDraft}
+                placeholder={isGeneratingDraft ? 'Drafting a reply…' : 'Write your reply'}
+                onChange={(e) => setDraftText(e.target.value)}
+                className={`w-full p-3 bg-white border border-[#e3e3de] text-xs leading-relaxed text-[#141414] focus:outline-none focus:border-[#141414] ${
+                  isGeneratingDraft ? 'opacity-50' : ''
+                }`}
+              />
+            </div>
+
+            <div className="flex items-center justify-between">
+              {safeHttpUrl(aiDraftModalPost.post_url) ? (
+                <a
+                  href={safeHttpUrl(aiDraftModalPost.post_url) ?? undefined}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-[11px] font-mono text-[#4a4a47] hover:text-[#141414]"
+                >
+                  Open original
+                </a>
+              ) : (
+                <span />
+              )}
+              <button
+                type="button"
+                onClick={() => void handleCopyDraft()}
+                disabled={isGeneratingDraft || !draftText.trim()}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {copiedDraft ? 'Copied' : 'Copy draft'}
+              </button>
+            </div>
           </div>
-        </div>
+        </ModalDialog>
       )}
     </div>
   );

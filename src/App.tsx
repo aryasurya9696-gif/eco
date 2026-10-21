@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
-import { EchoProvider } from './context/EchoContext';
+import { EchoProvider, ToastProvider } from './context/EchoContext';
 import { LandingPage } from './pages/LandingPage';
 import { AuthPage, SetNewPasswordPage } from './pages/AuthPage';
 import { arrivedFromAuthCallback, configError } from './lib/supabase';
 import { DashboardPage } from './pages/DashboardPage';
 import { ToastContainer } from './components/common/Toast';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
+import { explicitTabFromHash, hashForTab, peekIntendedTab, rememberIntendedTab } from './lib/tab-routing';
 
 type Route = '/' | '/auth' | '/dashboard';
 
@@ -25,7 +26,13 @@ const MainRouter: React.FC = () => {
   });
 
   const navigate = (route: Route) => {
-    window.location.hash = route;
+    if (route === '/dashboard') {
+      // Keep the tab a deep link named (#dashboard/billing) through sign-in.
+      const tab = explicitTabFromHash() ?? peekIntendedTab();
+      window.location.hash = tab ? hashForTab(tab) : route;
+    } else {
+      window.location.hash = route;
+    }
     setCurrentRoute(route);
   };
 
@@ -52,6 +59,12 @@ const MainRouter: React.FC = () => {
       navigate('/dashboard');
     }
   }, [user, currentRoute]);
+
+  // A signed-out deep link into the dashboard shows the sign-in page; remember
+  // which tab it named so signing in (or confirming by email) lands there.
+  useEffect(() => {
+    if (!isLoading && !user && currentRoute === '/dashboard') rememberIntendedTab();
+  }, [isLoading, user, currentRoute]);
 
   if (isLoading) {
     return (
@@ -133,12 +146,14 @@ export default function App() {
   return (
     <ErrorBoundary>
       <AuthProvider>
-        <EchoProvider>
-          <ErrorBoundary>
-            <MainRouter />
-          </ErrorBoundary>
+        <ToastProvider>
+          <EchoProvider>
+            <ErrorBoundary>
+              <MainRouter />
+            </ErrorBoundary>
+          </EchoProvider>
           <ToastContainer />
-        </EchoProvider>
+        </ToastProvider>
       </AuthProvider>
     </ErrorBoundary>
   );

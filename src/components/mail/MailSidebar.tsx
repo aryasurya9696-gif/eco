@@ -218,3 +218,72 @@ export const MailSidebar: React.FC = () => {
     </aside>
   );
 };
+
+/**
+ * The mail sidebar is hidden below md, so small screens get this bar instead:
+ * one picker for the folders and the Setup pages (Mailboxes, Domains & DNS),
+ * and a mailbox switcher when there is more than one.
+ */
+export const MailMobileNav: React.FC = () => {
+  const { mailboxes, activeMailboxId, activeFolder, activeSubView } = useMailStore();
+  const value = activeSubView === 'mailbox' ? `folder:${activeFolder}` : `view:${activeSubView}`;
+
+  const onViewChange = (next: string) => {
+    const [kind, id] = next.split(':');
+    if (kind === 'folder') {
+      mailStore.setActiveSubView('mailbox');
+      mailStore.setActiveFolder(id as MailFolder);
+    } else {
+      mailStore.setActiveSubView(id as 'accounts' | 'domains');
+    }
+  };
+
+  return (
+    <nav aria-label="Mail" className="md:hidden flex items-center gap-2 px-4 py-2 border-b border-[#e8e8e3] bg-[#fafaf8]">
+      <label htmlFor="mail-mobile-view" className="sr-only">
+        Mail section
+      </label>
+      <select
+        id="mail-mobile-view"
+        value={value}
+        onChange={(e) => onViewChange(e.target.value)}
+        className="min-w-0 flex-1 h-9 px-2 rounded-md border border-[#e8e8e3] bg-white text-[13px] text-[#18181b] focus:outline-none focus:border-[#a1a1aa]"
+      >
+        <optgroup label="Folders">
+          {MAIL_FOLDERS.map((f) => (
+            <option key={f.id} value={`folder:${f.id}`}>
+              {f.label}
+            </option>
+          ))}
+        </optgroup>
+        <optgroup label="Setup">
+          <option value="view:accounts">Mailboxes ({mailboxes.length})</option>
+          <option value="view:domains">Domains &amp; DNS</option>
+        </optgroup>
+      </select>
+
+      {mailboxes.length > 1 && (
+        <>
+          <label htmlFor="mail-mobile-mailbox" className="sr-only">
+            Mailbox
+          </label>
+          <select
+            id="mail-mobile-mailbox"
+            value={activeMailboxId}
+            onChange={(e) => {
+              mailStore.setActiveSubView('mailbox');
+              mailStore.setActiveMailbox(e.target.value);
+            }}
+            className="min-w-0 flex-1 h-9 px-2 rounded-md border border-[#e8e8e3] bg-white text-[13px] text-[#18181b] focus:outline-none focus:border-[#a1a1aa]"
+          >
+            {mailboxes.map((mb) => (
+              <option key={mb.id} value={mb.id}>
+                {mb.address}
+              </option>
+            ))}
+          </select>
+        </>
+      )}
+    </nav>
+  );
+};

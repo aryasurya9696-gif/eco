@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useId, useRef } from 'react';
 import {
   X,
   Send,
@@ -16,71 +16,30 @@ import {
   Scissors,
   Target,
   Braces,
+  Inbox,
+  Loader2,
 } from 'lucide-react';
 import { mailStore, useMailStore, mailboxSendBlocker, sendCostFor, type ComposerDraft } from './mail-store';
-import type { Mailbox } from '../../types';
 import { leadsStore } from '../leads/leads-store';
 import { useEcho } from '../../context/EchoContext';
 import { useAuth } from '../../context/AuthContext';
+import { generateColdEmail, type ColdEmailRequest, type DraftTone, type PolishAction } from '../../lib/ai';
+import { hashForTab } from '../../lib/tab-routing';
+import { creditsLabel } from '../../lib/billing';
+import { SendProblem, type SendProblemState } from './SendProblem';
 
 interface ComposerProps {
   mode?: 'drawer' | 'modal';
 }
 
-type ServiceKey = 'echo_signals' | 'outbound_pipeline' | 'custom';
 type PitchFramework = 'value' | 'direct' | 'casual';
-type PolishAction = 'persuasive' | 'shorter' | 'cta';
 
-interface ServiceDefinition {
-  id: ServiceKey;
-  label: string;
-  badge: string;
-  summary: string;
-  painPoint: string;
-  valueProp: string;
-  metric: string;
-  goal: string;
-}
-
-const SERVICE_PRESETS: Record<ServiceKey, ServiceDefinition> = {
-  echo_signals: {
-    id: 'echo_signals',
-    label: 'Echo Social Intent',
-    badge: 'Intent Intelligence',
-    summary: 'Monitor Reddit, X, and Web discussions to catch buyers actively seeking solutions.',
-    painPoint: 'spending hours manually checking feeds or waiting for inbound form fills',
-    valueProp: 'detect real-time buying signals across social channels and deliver verified executive contacts in 1 click',
-    metric: 'a 3x jump in reply rates and 70% cut in manual prospecting time',
-    goal: 'capturing active buyer demand before competitors',
-  },
-  outbound_pipeline: {
-    id: 'outbound_pipeline',
-    label: 'Verified Outbound',
-    badge: 'Deliverability & Data',
-    summary: 'B2B contact enrichment with 98% verified work emails and warm SES mailbox infrastructure.',
-    painPoint: 'outreach landing in spam or bouncing due to unverified contact lists',
-    valueProp: 'enrich verified C-level emails and send through dedicated AWS SES pools with 99.8% inbox placement',
-    metric: 'sub-1% bounce rates and verified direct executive inboxes',
-    goal: 'scaling cold email outreach without domain reputation risk',
-  },
-  custom: {
-    id: 'custom',
-    label: 'Custom Offer',
-    badge: 'Your Offering',
-    summary: 'Pitch your custom product, consulting service, or agency solution.',
-    painPoint: 'manual bottlenecks and inefficiencies in daily operations',
-    valueProp: 'automate core workflows and deliver measurable business outcomes',
-    metric: 'accelerated delivery timelines and measurable ROI within 30 days',
-    goal: 'optimizing core business workflows',
-  },
+/** Composer tone buttons, mapped to the tones the ai function accepts. */
+const FRAMEWORK_TONE: Record<PitchFramework, DraftTone> = {
+  value: 'consultative',
+  direct: 'direct',
+  casual: 'casual',
 };
-
-const GREETING_RE = /^\s*(hi|hey|hello|dear)\b[^\n]*\n+/i;
-// A closing line ("Best,", "Thanks,", "Cheers") plus anything after it (the name).
-const SIGNOFF_RE = /\n+\s*(best|best regards|kind regards|regards|thanks|thank you|cheers|sincerely)[,!.]?\s*(\n[^\n]*){0,3}\s*$/i;
-
-const stripGreeting = (text: string) => text.replace(GREETING_RE, '');
-const stripSignoff = (text: string) => text.replace(SIGNOFF_RE, '');
 
 const initialsOf = (name?: string) =>
   (name || '?')
@@ -97,7 +56,7 @@ const MERGE_TAGS = [
 
 export const Composer: React.FC<ComposerProps> = ({ mode: initialMode = 'drawer' }) => {
   const store = useMailStore();
-  const { isComposerOpen, composerDraft, mailboxes } = store;
+  const { isComposerOpen, composerDraft, mailboxes, loading: mailLoading } = store;
   const { addToast } = useEcho();
   const { profile } = useAuth();
 
@@ -109,29 +68,43 @@ export const Composer: React.FC<ComposerProps> = ({ mode: initialMode = 'drawer'
   const [selectedLeadId, setSelectedLeadId] = useState<string | null>(composerDraft.leadId || null);
   const [selectedLeadName, setSelectedLeadName] = useState<string | undefined>(composerDraft.name);
   const [selectedLeadCompany, setSelectedLeadCompany] = useState<string | undefined>(composerDraft.company);
+  const [selectedLeadTitle, setSelectedLeadTitle] = useState<string | undefined>(composerDraft.title);
   const [draftThreadId, setDraftThreadId] = useState<string | null>(composerDraft.draftThreadId || null);
 
   // AI Pitch Controls
   const [isAiDrawerOpen, setIsAiDrawerOpen] = useState(true);
   const [customPrompt, setCustomPrompt] = useState('');
-  const [selectedService, setSelectedService] = useState<ServiceKey>('echo_signals');
-  const [customOfferText, setCustomOfferText] = useState(
-    profile?.core_offer || 'AI automation and high-intent B2B lead generation'
-  );
+  // The user's own offer from their profile; editable per email, never a
+  // canned pitch of ours.
+  const [offerText, setOfferText] = useState(profile?.core_offer || '');
   const [selectedFramework, setSelectedFramework] = useState<PitchFramework>('value');
   const [isAiGenerating, setIsAiGenerating] = useState(false);
 
   // AI Polish feature for manually written emails
   const [isPolishing, setIsPolishing] = useState(false);
+  const [isSuggestingSubjects, setIsSuggestingSubjects] = useState(false);
   const [polishedPreview, setPolishedPreview] = useState<string | null>(null);
   const [showSubjectSuggestions, setShowSubjectSuggestions] = useState(false);
   const [subjectSuggestions, setSubjectSuggestions] = useState<string[]>([]);
   const [isSending, setIsSending] = useState(false);
+  // A send outcome that needs a decision (Send anyway / Billing / check Sent).
+  const [sendProblem, setSendProblem] = useState<SendProblemState | null>(null);
 
   // Lead auto-complete
   const [showLeadSuggestions, setShowLeadSuggestions] = useState(false);
   const [matchingLeads, setMatchingLeads] = useState<any[]>([]);
 
+  const uid = useId();
+  const ids = {
+    title: `${uid}-title`,
+    from: `${uid}-from`,
+    to: `${uid}-to`,
+    subject: `${uid}-subject`,
+    offer: `${uid}-offer`,
+    focus: `${uid}-focus`,
+    body: `${uid}-body`,
+    leads: `${uid}-leads`,
+  };
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const toInputRef = useRef<HTMLInputElement>(null);
   const closeRef = useRef<() => void>(() => {});
@@ -146,8 +119,10 @@ export const Composer: React.FC<ComposerProps> = ({ mode: initialMode = 'drawer'
     setSelectedLeadId(composerDraft.leadId || null);
     setSelectedLeadName(composerDraft.name);
     setSelectedLeadCompany(composerDraft.company);
+    setSelectedLeadTitle(composerDraft.title);
     setDraftThreadId(composerDraft.draftThreadId || null);
     setPolishedPreview(null);
+    setSendProblem(null);
     setShowSubjectSuggestions(false);
     setShowLeadSuggestions(false);
   }, [composerDraft]);
@@ -163,10 +138,16 @@ export const Composer: React.FC<ComposerProps> = ({ mode: initialMode = 'drawer'
   }, [isComposerOpen, composerDraft]);
 
   useEffect(() => {
-    if (profile?.core_offer && selectedService === 'custom') {
-      setCustomOfferText(profile.core_offer);
-    }
-  }, [profile, selectedService]);
+    if (profile?.core_offer) setOfferText((prev) => prev || profile.core_offer || '');
+  }, [profile?.core_offer]);
+
+  // Mailboxes can arrive after the composer opened (e.g. from Leads while mail
+  // was still loading). Pick one then, without touching what was typed.
+  useEffect(() => {
+    if (selectedMailboxId && mailboxes.some((m) => m.id === selectedMailboxId)) return;
+    const fallbackId = mailStore.getSnapshot().activeMailboxId || mailboxes[0]?.id || '';
+    if (fallbackId !== selectedMailboxId) setSelectedMailboxId(fallbackId);
+  }, [mailboxes, selectedMailboxId]);
 
   // Lead auto-complete as user types in `To:`
   useEffect(() => {
@@ -241,9 +222,11 @@ export const Composer: React.FC<ComposerProps> = ({ mode: initialMode = 'drawer'
 
   const handleSelectLead = (lead: any) => {
     setTo(lead.work_email || lead.revealed_email || '');
-    setSelectedLeadId(lead.id);
+    // db_id is the user_leads row the mail function links the thread to.
+    setSelectedLeadId(lead.db_id || lead.id);
     setSelectedLeadName(lead.first_name);
     setSelectedLeadCompany(lead.company_name);
+    setSelectedLeadTitle(lead.title);
     setShowLeadSuggestions(false);
     if (!subject) {
       setSubject(`Quick question // ${lead.company_name || lead.first_name}`);
@@ -266,153 +249,85 @@ export const Composer: React.FC<ComposerProps> = ({ mode: initialMode = 'drawer'
     }, 0);
   };
 
-  const selectedMailbox = mailboxes.find((m) => m.id === selectedMailboxId) || mailboxes[0] || ({
-    id: '',
-    user_id: '',
-    kind: 'hosted',
-    provider: 'ses',
-    address: 'alex@tryecho.io',
-    display_name: 'Alex Vance (Sales)',
-    status: 'active',
-    daily_send_limit: 100,
-    sent_today: 14,
-    is_default: true,
-  } as Mailbox);
+  const selectedMailbox = mailboxes.find((m) => m.id === selectedMailboxId) || mailboxes[0];
 
-  // Generate Subject Suggestions
-  const handleSuggestSubjects = () => {
-    const firstName = selectedLeadName || 'there';
-    const company = selectedLeadCompany || 'your team';
-    const srvShort = selectedService === 'echo_signals' ? 'social intent signals' : selectedService === 'outbound_pipeline' ? 'outbound pipeline' : 'growth';
-
-    const suggestions = [
-      `Quick question re: ${company} + ${srvShort}`,
-      `Idea for ${firstName} at ${company}`,
-      `Streamlining ${srvShort} at ${company}?`,
-    ];
-    setSubjectSuggestions(suggestions);
-    setShowSubjectSuggestions(true);
+  const goToMailAccounts = () => {
+    mailStore.closeComposer();
+    mailStore.setActiveSubView('accounts');
+    window.location.hash = hashForTab('mail');
   };
 
-  // Generate New Pitch with AI based on user short prompt & service
-  const handleAiDraft = () => {
-    setIsAiGenerating(true);
-    const firstName = selectedLeadName || 'there';
-    const company = selectedLeadCompany || 'your team';
-    const senderName = profile?.full_name || selectedMailbox.display_name.split('<')[0].trim() || 'Alex Vance';
-    const senderCompany = profile?.website ? profile.website.replace(/^https?:\/\//, '').split('/')[0] : 'Echo';
+  const aiRequest = (task: ColdEmailRequest['task']): ColdEmailRequest => ({
+    task,
+    lead: { name: selectedLeadName, company: selectedLeadCompany, title: selectedLeadTitle },
+    tone: FRAMEWORK_TONE[selectedFramework],
+    userOffer: offerText.trim() || undefined,
+    userName: profile?.full_name || selectedMailbox?.display_name || undefined,
+    focus: customPrompt.trim() || undefined,
+    subject: subject.trim() || undefined,
+    body: body.trim() || undefined,
+  });
 
-    const srv = SERVICE_PRESETS[selectedService];
-    const valueOffer = selectedService === 'custom' ? (customOfferText.trim() || srv.valueProp) : srv.valueProp;
-    const userPromptNote = customPrompt.trim();
+  const AI_UNAVAILABLE = 'The AI writer is unavailable right now. Write the email yourself or try again later.';
+  // Rate-limit (429) and other server messages are shown as they come.
+  const aiErrorMessage = (err: unknown) => (err as Error)?.message || AI_UNAVAILABLE;
 
-    setTimeout(() => {
-      let generatedSubject = '';
-      let generatedBody = '';
-
-      if (selectedFramework === 'value') {
-        generatedSubject = `Scaling ${selectedService === 'echo_signals' ? 'in-market lead capture' : 'outbound pipeline'} at ${company}`;
-        generatedBody = `Hi ${firstName},
-
-Saw the impressive momentum at ${company} recently!
-
-${userPromptNote ? `Specifically regarding ${userPromptNote}:\n\n` : ''}Quick question: how is your team currently tackling ${srv.painPoint}?
-
-We help high-growth teams ${valueOffer}. For example, our customers have achieved ${srv.metric}.
-
-Would you be open to a brief 5-minute walk-through this Thursday?
-
-Best regards,
-${senderName}${senderCompany ? `\n${senderCompany}` : ''}`;
-      } else if (selectedFramework === 'direct') {
-        generatedSubject = `Quick question re: ${company}`;
-        generatedBody = `Hi ${firstName},
-
-${userPromptNote ? `Re: ${userPromptNote} — ` : ''}Are you currently exploring ways to streamline ${srv.goal} at ${company}?
-
-We help teams ${valueOffer}.
-
-Do you have 5 minutes for a quick chat next Tuesday?
-
-Thanks,
-${senderName}`;
+  // Subject lines from the ai function (draft action, kind=email).
+  const handleSuggestSubjects = async () => {
+    if (isSuggestingSubjects) return;
+    setIsSuggestingSubjects(true);
+    try {
+      const res = await generateColdEmail(aiRequest('subjects'));
+      if (res.ok && res.subjects?.length) {
+        setSubjectSuggestions(res.subjects);
+        setShowSubjectSuggestions(true);
       } else {
-        // casual
-        generatedSubject = `Quick idea for ${company}`;
-        generatedBody = `Hey ${firstName},
-
-Really love what you folks are building at ${company}!
-
-${userPromptNote ? `I was just thinking about ${userPromptNote} and wanted to reach out. ` : ''}We help founders and growth leads ${valueOffer}.
-
-Let me know if you'd be open to a quick 2-minute video walkthrough or brief chat!
-
-Cheers,
-${senderName}`;
+        addToast(AI_UNAVAILABLE, 'error');
       }
-
-      setSubject(generatedSubject);
-      setBody(generatedBody);
-      setIsAiGenerating(false);
-      addToast(`Personalized cold outreach crafted for ${company}!`, 'success');
-    }, 400);
+    } catch (err) {
+      addToast(aiErrorMessage(err), 'error');
+    } finally {
+      setIsSuggestingSubjects(false);
+    }
   };
 
-  // Polish / Improve manually written email
-  const handlePolishDraft = (action: PolishAction) => {
+  // Writes a cold email for this recipient from the user's own offer.
+  const handleAiDraft = async () => {
+    if (isAiGenerating) return;
+    setIsAiGenerating(true);
+    try {
+      const res = await generateColdEmail(aiRequest('write'));
+      if (res.ok && res.body) {
+        if (res.subject) setSubject(res.subject);
+        setBody(res.body);
+        addToast(`Draft written${selectedLeadCompany ? ` for ${selectedLeadCompany}` : ''}. Review it before sending.`, 'success');
+      } else {
+        addToast(AI_UNAVAILABLE, 'error');
+      }
+    } catch (err) {
+      addToast(aiErrorMessage(err), 'error');
+    } finally {
+      setIsAiGenerating(false);
+    }
+  };
+
+  // Rewrites the user's own draft; shown as a preview they can apply or discard.
+  const handlePolishDraft = async (action: PolishAction) => {
     if (!body.trim()) {
       addToast('Write or paste some text first to polish it with AI.', 'info');
       return;
     }
-
+    if (isPolishing) return;
     setIsPolishing(true);
-    const firstName = selectedLeadName || 'there';
-    const senderName = profile?.full_name || selectedMailbox.display_name.split('<')[0].trim() || 'Alex';
-
-    setTimeout(() => {
-      let improved = body.trim();
-
-      if (action === 'persuasive') {
-        // Make punchy & persuasive
-        improved = `Hi ${firstName},
-
-I noticed your recent work at ${selectedLeadCompany || 'your team'} and wanted to reach out directly.
-
-${stripSignoff(stripGreeting(improved)).trim()}
-
-Would you be open to a quick 5-minute conversation this week to see if this aligns with your goals?
-
-Best,
-${senderName}`;
-      } else if (action === 'shorter') {
-        // Cut fluff, 3-sentence executive style
-        const sentences = stripSignoff(stripGreeting(improved))
-          .split(/(?<=[.?!])\s+/)
-          .filter((s) => s.length > 10)
-          .slice(0, 3);
-
-        improved = `Hi ${firstName},
-
-${sentences.join(' ') || 'Reaching out with a quick question regarding your current outbound setup.'}
-
-Open to a brief 5-minute chat next week?
-
-Best,
-${senderName}`;
-      } else if (action === 'cta') {
-        // Add strong frictionless CTA
-        const cleaned = stripSignoff(improved).trim();
-        improved = `${cleaned}
-
-Would you be opposed to a brief 5-minute walkthrough this Thursday to see how this works?
-
-Best regards,
-${senderName}`;
-      }
-
-      setPolishedPreview(improved);
+    try {
+      const res = await generateColdEmail({ ...aiRequest('polish'), polish: action });
+      if (res.ok && res.body) setPolishedPreview(res.body);
+      else addToast(AI_UNAVAILABLE, 'error');
+    } catch (err) {
+      addToast(aiErrorMessage(err), 'error');
+    } finally {
       setIsPolishing(false);
-    }, 350);
+    }
   };
 
   const applyPolishedDraft = () => {
@@ -440,7 +355,7 @@ ${senderName}`;
     return { out, missing: [...missing] };
   };
 
-  const handleSend = async () => {
+  const handleSend = async (confirmResend = false) => {
     if (isSending) return;
     if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to.trim())) {
       addToast('Please specify a valid recipient email address.', 'error');
@@ -472,12 +387,16 @@ ${senderName}`;
     };
 
     setIsSending(true);
+    setSendProblem(null);
     try {
-      const res = await mailStore.sendEmail(draftToSend);
+      const res = await mailStore.sendEmail(draftToSend, { confirmResend });
       if (res.success) {
         addToast(`Sent to ${to.trim()}.`, 'success');
-      } else {
+      } else if (res.kind === 'error') {
         addToast(res.error, 'error');
+      } else {
+        // Shown in the composer, which stays open with the draft intact.
+        setSendProblem({ kind: res.kind, message: res.error });
       }
     } finally {
       setIsSending(false);
@@ -491,8 +410,12 @@ ${senderName}`;
     }
   };
 
+  // No fake sender: without a connected mailbox the composer says so and
+  // points at Mail > Accounts instead of showing a form that cannot send.
+  const noMailbox = !mailLoading && mailboxes.length === 0;
+
   const wordCount = body.trim() ? body.trim().split(/\s+/).length : 0;
-  const sendBlocker = mailboxSendBlocker(mailboxes.find((m) => m.id === selectedMailboxId) || mailboxes[0]);
+  const sendBlocker = mailboxSendBlocker(selectedMailbox);
   const sendCost = sendCostFor(selectedMailbox);
   const readingTimeSec = Math.max(1, Math.round((wordCount / 200) * 60));
 
@@ -527,10 +450,13 @@ ${senderName}`;
             : 'max-w-xl border-l border-[#e8e8e3] h-full slide-in-from-right'
         }`}
         onKeyDown={handleKeyDown}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={ids.title}
       >
         {/* Header */}
         <div className="flex items-center justify-between px-5 h-14 border-b border-[#f0f0eb] shrink-0">
-          <h2 className="text-[15px] font-semibold text-[#18181b] truncate">
+          <h2 id={ids.title} className="text-[15px] font-semibold text-[#18181b] truncate">
             {draftThreadId ? 'Edit draft' : selectedLeadName ? `Message to ${selectedLeadName}` : 'New message'}
           </h2>
           <div className="flex items-center gap-0.5">
@@ -539,6 +465,7 @@ ${senderName}`;
               onClick={() => setActiveMode(activeMode === 'drawer' ? 'modal' : 'drawer')}
               className="p-2 rounded-md text-[#a1a1aa] hover:text-[#18181b] hover:bg-[#f4f4f0] transition-colors cursor-pointer"
               title={activeMode === 'drawer' ? 'Open as dialog' : 'Open as side panel'}
+              aria-label={activeMode === 'drawer' ? 'Expand composer' : 'Open composer as side panel'}
             >
               {activeMode === 'drawer' ? <Maximize2 className="w-4 h-4" /> : <Minimize2 className="w-4 h-4" />}
             </button>
@@ -554,12 +481,38 @@ ${senderName}`;
           </div>
         </div>
 
+        {noMailbox ? (
+          <div className="flex-1 flex flex-col items-center justify-center px-8 text-center">
+            <span className="w-11 h-11 rounded-full bg-[#f4f4f0] flex items-center justify-center">
+              <Inbox className="w-5 h-5 text-[#71717a]" />
+            </span>
+            <div className="mt-4 text-[15px] font-semibold text-[#18181b]">Connect a mailbox</div>
+            <p className="mt-1.5 max-w-xs text-[13px] text-[#71717a] leading-relaxed">
+              Emails are sent from your own address. Connect a mailbox or create a hosted one, then come back to write
+              {selectedLeadName ? ` to ${selectedLeadName}` : ' this email'}.
+            </p>
+            <button
+              type="button"
+              onClick={goToMailAccounts}
+              className="mt-5 inline-flex items-center gap-2 h-9 bg-[#18181b] hover:bg-black text-white px-4 text-[13px] font-medium rounded-lg transition-colors cursor-pointer"
+            >
+              Go to Mail &gt; Accounts
+            </button>
+          </div>
+        ) : (
+        <>
         <div className="flex-1 min-h-0 flex flex-col overflow-y-auto">
           {/* From */}
           <div className={fieldRow}>
-            <span className={fieldLabel}>From</span>
+            <label htmlFor={ids.from} className={fieldLabel}>From</label>
             <div className="flex-1 min-w-0 relative flex items-center">
+              {mailLoading && mailboxes.length === 0 ? (
+                <span className="flex items-center gap-1.5 text-[13px] text-[#a1a1aa]">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading mailboxes…
+                </span>
+              ) : (
               <select
+                id={ids.from}
                 value={selectedMailboxId}
                 onChange={(e) => setSelectedMailboxId(e.target.value)}
                 className="w-full appearance-none bg-transparent pr-6 text-[13px] text-[#18181b] focus:outline-none cursor-pointer truncate"
@@ -570,14 +523,18 @@ ${senderName}`;
                   </option>
                 ))}
               </select>
+              )}
               <ChevronDown className="w-4 h-4 text-[#a1a1aa] pointer-events-none absolute right-0" />
             </div>
-            <span
-              className="ml-3 shrink-0 text-[11px] text-[#a1a1aa] tabular-nums"
-              title="Sent today / daily limit"
-            >
-              {selectedMailbox.sent_today || 0}/{selectedMailbox.daily_send_limit || 100} today
-            </span>
+            {/* The mailbox's real limit, or nothing — never an invented one. */}
+            {selectedMailbox && Number.isFinite(Number(selectedMailbox.daily_send_limit)) && Number(selectedMailbox.daily_send_limit) > 0 && (
+              <span
+                className="ml-3 shrink-0 text-[11px] text-[#a1a1aa] tabular-nums"
+                title="Sent today / daily limit"
+              >
+                {selectedMailbox.sent_today || 0}/{selectedMailbox.daily_send_limit} today
+              </span>
+            )}
           </div>
           {sendBlocker && (
             <div role="alert" className="px-5 py-2 text-[12px] text-warn bg-warn-bg border-b border-warn-line">
@@ -587,7 +544,7 @@ ${senderName}`;
 
           {/* To */}
           <div className={`${fieldRow} relative`}>
-            <span className={fieldLabel}>To</span>
+            {selectedLeadId ? <span className={fieldLabel}>To</span> : <label htmlFor={ids.to} className={fieldLabel}>To</label>}
             {selectedLeadId ? (
               <div className="flex-1 min-w-0 flex items-center gap-2">
                 <span className="inline-flex items-center gap-1.5 min-w-0 pl-1 pr-2 py-0.5 rounded-full bg-[#f4f4f0] text-[13px] text-[#18181b]">
@@ -607,6 +564,7 @@ ${senderName}`;
                     setSelectedLeadId(null);
                     setSelectedLeadName(undefined);
                     setSelectedLeadCompany(undefined);
+                    setSelectedLeadTitle(undefined);
                     setTo('');
                   }}
                   className="ml-auto p-1 rounded text-[#a1a1aa] hover:text-[#18181b] hover:bg-[#f4f4f0] cursor-pointer"
@@ -618,24 +576,35 @@ ${senderName}`;
             ) : (
               <div className="flex-1 relative">
                 <input
+                  id={ids.to}
                   ref={toInputRef}
                   type="text"
+                  inputMode="email"
+                  autoComplete="off"
                   value={to}
                   onChange={(e) => setTo(e.target.value)}
                   onBlur={() => setShowLeadSuggestions(false)}
                   role="combobox"
                   aria-expanded={showLeadSuggestions}
+                  aria-controls={ids.leads}
                   aria-autocomplete="list"
                   placeholder="Email or search saved leads"
                   className="w-full bg-transparent text-[13px] text-[#18181b] placeholder:text-[#c4c4bf] focus:outline-none"
                 />
 
                 {showLeadSuggestions && (
-                  <div className="absolute top-full left-0 right-0 mt-3 bg-white rounded-lg border border-[#e8e8e3] shadow-lg z-30 max-h-56 overflow-y-auto py-1">
+                  <div
+                    id={ids.leads}
+                    role="listbox"
+                    aria-label="Saved leads"
+                    className="absolute top-full left-0 right-0 mt-3 bg-white rounded-lg border border-[#e8e8e3] shadow-lg z-30 max-h-56 overflow-y-auto py-1"
+                  >
                     {matchingLeads.map((lead) => (
                       <button
                         key={lead.id}
                         type="button"
+                        role="option"
+                        aria-selected={false}
                         // mousedown so the input's blur doesn't close the list first
                         onMouseDown={(e) => {
                           e.preventDefault();
@@ -666,8 +635,9 @@ ${senderName}`;
 
           {/* Subject */}
           <div className={fieldRow}>
-            <span className={fieldLabel}>Subject</span>
+            <label htmlFor={ids.subject} className={fieldLabel}>Subject</label>
             <input
+              id={ids.subject}
               type="text"
               value={subject}
               onChange={(e) => setSubject(e.target.value)}
@@ -677,10 +647,11 @@ ${senderName}`;
             <button
               type="button"
               onClick={handleSuggestSubjects}
+              disabled={isSuggestingSubjects}
               className="ml-2 shrink-0 inline-flex items-center gap-1.5 text-[12px] text-[#71717a] hover:text-[#18181b] hover:bg-[#f4f4f0] px-2 py-1 rounded-md transition-colors cursor-pointer"
               title="Suggest subject lines"
             >
-              <Lightbulb className="w-3.5 h-3.5" />
+              {isSuggestingSubjects ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Lightbulb className="w-3.5 h-3.5" />}
               Suggest
             </button>
           </div>
@@ -716,6 +687,7 @@ ${senderName}`;
             <button
               type="button"
               onClick={() => setIsAiDrawerOpen(!isAiDrawerOpen)}
+              aria-expanded={isAiDrawerOpen}
               className="w-full flex items-center justify-between px-4 h-10 cursor-pointer"
             >
               <span className="flex items-center gap-2 text-[13px] font-medium text-[#18181b]">
@@ -732,24 +704,12 @@ ${senderName}`;
             {isAiDrawerOpen && (
               <div className="px-4 pb-4 space-y-3">
                 <div className="flex items-center justify-between gap-3 flex-wrap">
-                  <select
-                    value={selectedService}
-                    onChange={(e) => setSelectedService(e.target.value as ServiceKey)}
-                    className="h-8 pl-2.5 pr-7 text-[12px] text-[#18181b] bg-white border border-[#e8e8e3] rounded-md focus:outline-none focus:border-[#a1a1aa] cursor-pointer"
-                    title={SERVICE_PRESETS[selectedService].summary}
-                  >
-                    {(['echo_signals', 'outbound_pipeline', 'custom'] as const).map((key) => (
-                      <option key={key} value={key}>
-                        {SERVICE_PRESETS[key].label}
-                      </option>
-                    ))}
-                  </select>
-
-                  <div className="inline-flex p-0.5 rounded-md bg-[#efefea]">
+                  <div className="inline-flex p-0.5 rounded-md bg-[#efefea]" role="group" aria-label="Tone">
                     {tones.map(({ id, label }) => (
                       <button
                         key={id}
                         type="button"
+                        aria-pressed={selectedFramework === id}
                         onClick={() => setSelectedFramework(id)}
                         className={`px-2.5 h-7 rounded text-[12px] transition-colors cursor-pointer ${
                           selectedFramework === id
@@ -763,18 +723,21 @@ ${senderName}`;
                   </div>
                 </div>
 
-                {selectedService === 'custom' && (
-                  <input
-                    type="text"
-                    value={customOfferText}
-                    onChange={(e) => setCustomOfferText(e.target.value)}
-                    placeholder="Describe your offer, e.g. AI workflow automation"
-                    className="w-full h-9 text-[13px] px-3 bg-white border border-[#e8e8e3] rounded-md text-[#18181b] placeholder:text-[#c4c4bf] focus:outline-none focus:border-[#a1a1aa]"
-                  />
-                )}
+                <label htmlFor={ids.offer} className="sr-only">What you offer</label>
+                <input
+                  id={ids.offer}
+                  type="text"
+                  value={offerText}
+                  onChange={(e) => setOfferText(e.target.value)}
+                  placeholder="What you offer, e.g. AI workflow automation for agencies"
+                  title="From your profile's core offer. Edits here apply to this email only."
+                  className="w-full h-9 text-[13px] px-3 bg-white border border-[#e8e8e3] rounded-md text-[#18181b] placeholder:text-[#c4c4bf] focus:outline-none focus:border-[#a1a1aa]"
+                />
 
                 <div className="flex items-center gap-2">
+                  <label htmlFor={ids.focus} className="sr-only">What the email should focus on</label>
                   <input
+                    id={ids.focus}
                     type="text"
                     value={customPrompt}
                     onChange={(e) => setCustomPrompt(e.target.value)}
@@ -836,7 +799,9 @@ ${senderName}`;
 
           {/* Body */}
           <div className="flex-1 flex flex-col min-h-[240px] mx-5 my-4 rounded-xl border border-[#e8e8e3] focus-within:border-[#a1a1aa] transition-colors">
+            <label htmlFor={ids.body} className="sr-only">Message</label>
             <textarea
+              id={ids.body}
               ref={textareaRef}
               value={body}
               onChange={(e) => setBody(e.target.value)}
@@ -878,6 +843,18 @@ ${senderName}`;
           </div>
         </div>
 
+        {sendProblem && (
+          <div className="px-5 pt-3 shrink-0">
+            <SendProblem
+              problem={sendProblem}
+              busy={isSending}
+              onSendAnyway={() => void handleSend(true)}
+              onDismiss={() => setSendProblem(null)}
+              onBeforeBilling={() => mailStore.closeComposer(currentDraft())}
+            />
+          </div>
+        )}
+
         {/* Footer */}
         <div className="flex items-center justify-between gap-3 px-5 h-16 border-t border-[#f0f0eb] shrink-0">
           <div className="flex items-center gap-1 min-w-0">
@@ -891,14 +868,14 @@ ${senderName}`;
               <Trash2 className="w-4 h-4" />
             </button>
             <span className="text-[12px] text-[#a1a1aa] truncate">
-              {wordCount} words · ~{readingTimeSec}s read · {sendCost} credit
+              {wordCount} word{wordCount === 1 ? '' : 's'} · ~{readingTimeSec}s read · {creditsLabel(sendCost)}
             </span>
           </div>
 
           <button
             type="button"
-            onClick={handleSend}
-            disabled={isSending || Boolean(sendBlocker)}
+            onClick={() => void handleSend()}
+            disabled={isSending || !selectedMailbox || Boolean(sendBlocker)}
             className="shrink-0 inline-flex items-center gap-2 h-9 bg-[#18181b] hover:bg-black text-white pl-4 pr-3 text-[13px] font-medium rounded-lg transition-colors cursor-pointer disabled:opacity-50"
             title="Send (Ctrl/⌘ + Enter)"
           >
@@ -906,6 +883,8 @@ ${senderName}`;
             <Send className="w-3.5 h-3.5" />
           </button>
         </div>
+        </>
+        )}
       </div>
     </div>
   );

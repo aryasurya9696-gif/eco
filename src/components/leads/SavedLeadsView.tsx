@@ -2,7 +2,7 @@ import React, { useMemo, useRef, useState, useEffect } from 'react';
 import type { B2BLead, B2BPipelineStatus } from '../../types';
 import { downloadCsv, downloadTextFile } from '../../lib/csv';
 import { EmailCell, PhoneCell, StageSelect, LinkedinIcon } from './LeadCells';
-import { emailState, initialsOf, linkedinHref, previewEmail, revealedEmail, revealedPhone } from './lead-utils';
+import { emailState, initialsOf, linkedinHref, previewEmail, foundEmail, revealedPhone } from './lead-utils';
 import {
   Search,
   Bookmark,
@@ -95,7 +95,7 @@ export const SavedLeadsView: React.FC<SavedLeadsViewProps> = ({
         text(lead.full_name).includes(q) ||
         text(lead.company_name).includes(q) ||
         text(lead.company_domain).includes(q) ||
-        text(revealedEmail(lead)).includes(q) ||
+        text(foundEmail(lead)).includes(q) ||
         text(lead.phone_number).includes(q) ||
         text(lead.title).includes(q)
       );
@@ -154,7 +154,7 @@ export const SavedLeadsView: React.FC<SavedLeadsViewProps> = ({
           l.title || '',
           l.company_name || '',
           l.company_domain || '',
-          revealedEmail(l) || '',
+          foundEmail(l) || '',
           state.kind === 'verified' || state.kind === 'unconfirmed' ? state.label : '',
           previewEmail(l) || '',
           revealedPhone(l) || '',
@@ -175,8 +175,8 @@ export const SavedLeadsView: React.FC<SavedLeadsViewProps> = ({
       title: l.title,
       company_name: l.company_name,
       company_domain: l.company_domain,
-      work_email: revealedEmail(l),
-      email_status: revealedEmail(l) ? l.email_status : null,
+      work_email: foundEmail(l),
+      email_status: foundEmail(l) ? l.email_status : null,
       phone_number: revealedPhone(l),
       linkedin_url: l.linkedin_url,
       location: l.location,
@@ -293,13 +293,12 @@ export const SavedLeadsView: React.FC<SavedLeadsViewProps> = ({
               className="w-full h-10 pl-9 pr-3 bg-white border border-line hover:border-line-strong focus:border-ink focus:ring-2 focus:ring-ink/10 text-sm text-ink placeholder:text-muted outline-none"
             />
           </div>
-          <div className="flex overflow-x-auto border border-line" role="tablist" aria-label="Filter by stage">
+          <div className="flex overflow-x-auto border border-line" role="group" aria-label="Filter by stage">
             {STAGES.map((s) => (
               <button
                 key={s.id}
                 type="button"
-                role="tab"
-                aria-selected={stage === s.id}
+                aria-pressed={stage === s.id}
                 onClick={() => {
                   setStage(s.id);
                   setPage(1);

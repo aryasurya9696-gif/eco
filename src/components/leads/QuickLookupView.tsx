@@ -5,6 +5,7 @@ import { LinkedinIcon } from './LeadCells';
 import type { RevealOutcome } from './LeadsTab';
 import { leadKey, revealedEmail, revealedPhone } from './lead-utils';
 import { useLeadPricing } from './leads-store';
+import { creditsLabel, formatCredits } from '../../lib/billing';
 import { User, Building2, Search, Loader2, AlertCircle, SearchX, RefreshCw, CheckCircle2 } from 'lucide-react';
 
 interface QuickLookupViewProps {
@@ -24,7 +25,7 @@ type Result =
   | { kind: 'loading'; label: string }
   | { kind: 'found'; lead: B2BLead; note: string }
   | { kind: 'not_found'; label: string; phoneTried: boolean }
-  | { kind: 'no_credits' }
+  | { kind: 'no_credits'; message?: string }
   | { kind: 'error'; message: string };
 
 const LINKEDIN_RE = /^(https?:\/\/)?([a-z]{2,3}\.)?linkedin\.com\/(in|pub)\/[^/?#\s]+/i;
@@ -142,7 +143,7 @@ export const QuickLookupView: React.FC<QuickLookupViewProps> = ({
 
     setResult({ kind: 'loading', label });
     const email = await onReveal(saved ? { ...query, ...saved, id: query.id } : query, 'email');
-    if (email.kind === 'no_credits') return setResult({ kind: 'no_credits' });
+    if (email.kind === 'no_credits') return setResult({ kind: 'no_credits', message: email.message });
     if (email.kind === 'error') return setResult({ kind: 'error', message: email.message });
 
     let lead = email.kind === 'found' ? email.lead : null;
@@ -166,7 +167,7 @@ export const QuickLookupView: React.FC<QuickLookupViewProps> = ({
         (email.kind === 'found' && email.cached
           ? 'Already on file — no credits used.'
           : email.kind === 'found'
-            ? `Found and saved to your pipeline · ${credits} credit${credits === 1 ? '' : 's'}.`
+            ? `Found and saved to your pipeline · ${creditsLabel(credits)}.`
             : 'No work email found (not charged).') + phoneNote,
     });
   };
@@ -201,7 +202,7 @@ export const QuickLookupView: React.FC<QuickLookupViewProps> = ({
         </header>
 
         <form onSubmit={handleSubmit} noValidate className="px-4 sm:px-6 py-5 space-y-4">
-          <div className="inline-flex border border-line" role="tablist" aria-label="Look up by">
+          <div className="inline-flex border border-line" role="group" aria-label="Look up by">
             {([
               ['linkedin', 'LinkedIn URL', <LinkedinIcon key="i" className="w-4 h-4" />],
               ['name', 'Name & company', <User key="u" className="w-4 h-4" aria-hidden />],
@@ -209,8 +210,7 @@ export const QuickLookupView: React.FC<QuickLookupViewProps> = ({
               <button
                 key={id}
                 type="button"
-                role="tab"
-                aria-selected={mode === id}
+                aria-pressed={mode === id}
                 onClick={() => {
                   setMode(id);
                   setErrors({});
@@ -298,14 +298,14 @@ export const QuickLookupView: React.FC<QuickLookupViewProps> = ({
               className="w-4 h-4 accent-ink"
             />
             <span className="text-sm text-ink">Also find a direct phone number</span>
-            <span className="text-xs text-muted">{pricing.phone} cr</span>
+            <span className="text-xs text-muted">{formatCredits(pricing.phone)} cr</span>
           </label>
 
           <div className="pt-1 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3">
             <p className="text-xs text-muted">
               {walletEmpty ? (
                 <span className="text-warn">
-                  Your balance is 0 credits.{' '}
+                  Your balance is {creditsLabel(availableCredits)}.{' '}
                   {onNavigateBilling && (
                     <button type="button" onClick={onNavigateBilling} className="underline underline-offset-2 cursor-pointer">
                       Top up
@@ -322,7 +322,7 @@ export const QuickLookupView: React.FC<QuickLookupViewProps> = ({
               className="h-10 px-5 bg-ink hover:bg-black text-white text-sm font-semibold flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
             >
               {busy ? <Loader2 className="w-4 h-4 animate-spin" aria-hidden /> : <Search className="w-4 h-4" aria-hidden />}
-              {busy ? 'Looking up…' : `Find contact · up to ${maxCost} cr`}
+              {busy ? 'Looking up…' : `Find contact · up to ${formatCredits(maxCost)} cr`}
             </button>
           </div>
         </form>
@@ -391,10 +391,10 @@ export const QuickLookupView: React.FC<QuickLookupViewProps> = ({
 
         {result.kind === 'no_credits' && (
           <div className="bg-warn-bg border border-warn-line px-5 py-5 flex flex-wrap items-center justify-between gap-3" role="alert">
-            <p className="text-sm text-ink">Not enough credits for this lookup. Nothing was charged.</p>
+            <p className="text-sm text-ink">{result.message || 'Not enough credits for this lookup.'} Nothing was charged.</p>
             {onNavigateBilling && (
               <button type="button" onClick={onNavigateBilling} className="h-9 px-3 bg-ink hover:bg-black text-white text-sm font-medium cursor-pointer">
-                Top up
+                {result.message ? 'Go to Billing' : 'Top up'}
               </button>
             )}
           </div>

@@ -4,7 +4,8 @@
  * The OpenAI key lives in the Edge Function environment. If the function is not
  * deployed, or the key is not set, `generateAiKeywordsFromOffer` returns
  * heuristic suggestions and `generateAiOutreachDraft` returns a template. Both
- * responses carry a `source` so the UI can say which one it got.
+ * responses carry a `source`, and the UI labels a 'fallback' result as a
+ * template rather than as AI output.
  */
 import type { MonitoredPost } from '../types';
 import { invokeFunction } from './api';
@@ -152,6 +153,16 @@ export async function parseLeadQuery(
 }
 
 /**
+ * A reply draft and where it came from. `fallback` means a fixed template
+ * (no AI key, the function unreachable, or the model failing), and the UI must
+ * say so rather than present it as AI-written.
+ */
+export interface DraftResult {
+  draft: string;
+  source: 'openai' | 'fallback';
+}
+
+/**
  * Personalized outreach reply for a single lead.
  */
 export async function generateAiOutreachDraft(
@@ -159,8 +170,8 @@ export async function generateAiOutreachDraft(
   tone: DraftTone,
   userOffer?: string,
   userName?: string,
-): Promise<string> {
-  const fallback = () => fallbackAiDraft(post, tone);
+): Promise<DraftResult> {
+  const fallback = (): DraftResult => ({ draft: fallbackAiDraft(post, tone), source: 'fallback' });
 
   try {
     const res = await invokeFunction<DraftResponse>(
@@ -178,13 +189,60 @@ export async function generateAiOutreachDraft(
           matched_keyword: post.matched_keyword,
         },
       },
-      { fallback, timeoutMs: 25000 },
+      { fallback: () => ({ ok: true, ...fallback() }), timeoutMs: 25000 },
     );
-    if (res?.draft && res.draft.length > 20) return res.draft;
+    if (res?.draft && res.draft.length > 20) {
+      // The server also falls back to a template when it has no key; only an
+      // explicit 'openai' is AI-written.
+      return { draft: res.draft, source: res.source === 'openai' ? 'openai' : 'fallback' };
+    }
   } catch (err) {
     console.warn('[ai] draft generation unavailable, using template:', err);
   }
   return fallback();
+}
+
+export type ColdEmailTask = 'write' | 'subjects' | 'polish';
+export type PolishAction = 'persuasive' | 'shorter' | 'cta';
+
+export interface ColdEmailRequest {
+  task: ColdEmailTask;
+  lead: { name?: string; company?: string; title?: string };
+  tone?: DraftTone;
+  userOffer?: string;
+  userName?: string;
+  focus?: string;
+  subject?: string;
+  body?: string;
+  polish?: PolishAction;
+}
+
+export interface ColdEmailResult {
+  ok: boolean;
+  subject?: string;
+  body?: string;
+  subjects?: string[];
+  source: 'openai' | 'fallback';
+}
+
+/**
+ * Cold email writing for the Mail composer (the `ai` function's `draft` action
+ * with kind=email). Unlike the Feed reply there is no local template: when the
+ * function or its key is missing this returns ok=false and the composer says so.
+ */
+export async function generateColdEmail(req: ColdEmailRequest): Promise<ColdEmailResult> {
+  const unavailable = (): ColdEmailResult => ({ ok: false, source: 'fallback' });
+  try {
+    const res = await invokeFunction<ColdEmailResult>(
+      'ai',
+      { action: 'draft', kind: 'email', ...req },
+      { fallback: unavailable, timeoutMs: 25000 },
+    );
+    return res?.ok ? res : unavailable();
+  } catch (err) {
+    console.warn('[ai] cold email unavailable:', err);
+    throw err;
+  }
 }
 
 /**
@@ -252,7 +310,8 @@ export function fallbackKeywordSuggestions(
 }
 
 /**
- * Template outreach reply — used when the AI function is unreachable.
+ * Template outreach reply, used when the AI function is unreachable. Returned
+ * with source 'fallback' so it is labelled as a template, never as AI.
  */
 function fallbackAiDraft(post: MonitoredPost, tone: DraftTone): string {
   const author = post.author_name ? post.author_name.split(' ')[0] : 'there';

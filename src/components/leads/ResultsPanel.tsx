@@ -10,12 +10,13 @@ import {
   linkedinHref,
   needsEmailReveal,
   previewEmail,
-  revealedEmail,
+  foundEmail,
   revealedPhone,
   emailState,
   hasVerifiedContact,
 } from './lead-utils';
 import { downloadCsv, safeFilenamePart } from '../../lib/csv';
+import { creditsLabel, formatCredits } from '../../lib/billing';
 import {
   Search,
   Download,
@@ -50,6 +51,7 @@ interface ResultsPanelProps {
   onBulkSave: (leads: B2BLead[]) => Promise<any>;
   onSaveLead: (lead: B2BLead) => Promise<any>;
   onStatusChange: (lead: B2BLead, status: B2BPipelineStatus) => Promise<boolean | void>;
+  /** Whether a lookup run is going; informational (the dialog stays usable). */
   isBulkRevealing?: boolean;
   revealingEmailIds: ReadonlySet<string>;
   revealingPhoneIds: ReadonlySet<string>;
@@ -70,7 +72,6 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
   onBulkSave,
   onSaveLead,
   onStatusChange,
-  isBulkRevealing,
   revealingEmailIds,
   revealingPhoneIds,
   availableCredits,
@@ -188,7 +189,13 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
       onEnrichContacts(allLeads.filter((l) => !revealedPhone(l) && l.phone_lookup !== 'not_found'), { email: false, phone: true });
     }
   };
-  const needsContacts = allLeads.some((l) => needsEmailReveal(l) && emailState(l).kind !== 'not_found');
+  // Resume / Find contacts stay offered while either kind of lookup is still
+  // outstanding — including when only phone lookups remain.
+  const needsContacts = allLeads.some(
+    (l) =>
+      ((lastSearch?.params.autoEnrich ?? true) && needsEmailReveal(l) && emailState(l).kind !== 'not_found') ||
+      (wantPhone && !revealedPhone(l) && l.phone_lookup !== 'not_found'),
+  );
 
   const handleBulkSave = async () => {
     const unsaved = selectedLeads.filter((l) => !l.is_saved);
@@ -240,7 +247,7 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
           l.industry || '',
           l.company_size || '',
           l.location || '',
-          revealedEmail(l) || '',
+          foundEmail(l) || '',
           state.kind === 'verified' || state.kind === 'unconfirmed'
             ? state.label
             : state.kind === 'not_found'
@@ -294,7 +301,7 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
 
               {allLeads.length > 0 && !isSearching && (
                 <div className="flex flex-wrap items-center gap-2">
-                  <div className="flex border border-line" role="tablist" aria-label="Which leads to show">
+                  <div className="flex border border-line" role="group" aria-label="Which leads to show">
                     {(
                       [
                         ['verified', 'Verified contacts', verifiedLeads.length],
@@ -304,8 +311,7 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
                       <button
                         key={id}
                         type="button"
-                        role="tab"
-                        aria-selected={view === id}
+                        aria-pressed={view === id}
                         onClick={() => setView(id)}
                         className={`h-9 px-3 text-sm flex items-center gap-1.5 border-r border-line last:border-r-0 cursor-pointer ${
                           view === id ? 'bg-ink text-white font-medium' : 'bg-white text-ink-2 hover:bg-fill'
@@ -740,7 +746,9 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
         defaultEmail={lastSearch?.params.autoEnrich ?? true}
         defaultPhone={Boolean(lastSearch?.params.autoPhone)}
         availableCredits={availableCredits}
-        isProcessing={Boolean(isBulkRevealing)}
+        // Confirming during a run adds to that run (enrichLeads appends), so
+        // a running job neither disables the dialog nor keeps it open.
+        isProcessing={false}
         onNavigateBilling={onNavigateBilling}
       />
     </>
@@ -774,8 +782,10 @@ const ResultNotes: React.FC<{ lastSearch: LastSearch }> = ({ lastSearch: s }) =>
   if (typeof s.creditsCharged === 'number' && s.creditsCharged > 0) {
     notes.push({
       tone: 'muted',
-      text: `The search itself used ${s.creditsCharged} credit${s.creditsCharged === 1 ? '' : 's'}${
-        pricing.searchCredits > 0 && s.creditsCharged === pricing.searchCredits ? ' (the per-search fee)' : ''
+      text: `The search itself used ${creditsLabel(s.creditsCharged)}${
+        pricing.searchCredits > 0 && s.creditsCharged % pricing.searchCredits === 0
+          ? ` (${s.creditsCharged / pricing.searchCredits} billed provider call${s.creditsCharged / pricing.searchCredits === 1 ? '' : 's'} × ${formatCredits(pricing.searchCredits)})`
+          : ''
       }.`,
     });
   }
@@ -828,7 +838,7 @@ const EnrichmentPanel: React.FC<{
   const btn = 'h-8 px-3 text-[13px] font-medium border cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed';
   const topUp = onNavigateBilling && (
     <button type="button" onClick={onNavigateBilling} className={`${btn} bg-ink text-white border-ink hover:bg-black`}>
-      Top up
+      Buy credits
     </button>
   );
 
@@ -869,7 +879,7 @@ const EnrichmentPanel: React.FC<{
     `${run.emailsFound} email${run.emailsFound === 1 ? '' : 's'}${run.emailsFound > verified ? ` (${verified} verified)` : ''}`,
     run.phonesFound > 0 ? `${run.phonesFound} phone${run.phonesFound === 1 ? '' : 's'}` : '',
   ].filter(Boolean).join(' · ');
-  const used = `${run.creditsCharged} credit${run.creditsCharged === 1 ? '' : 's'} used`;
+  const used = `${creditsLabel(run.creditsCharged)} used`;
   const pct = run.total > 0 ? Math.min(100, Math.round((run.processed / run.total) * 100)) : 0;
 
   if (run.state === 'running' || run.state === 'stopping') {
@@ -904,15 +914,15 @@ const EnrichmentPanel: React.FC<{
     run.state === 'done'
       ? `Contact lookup finished: ${found} found · ${used}.`
       : run.state === 'no_credits'
-        ? `Paused — out of credits. ${found} found · ${used}.`
+        ? `${run.message || 'Paused — out of credits.'} ${found} found · ${used}.`
         : run.state === 'error'
           ? run.message || 'Contact lookup stopped after repeated errors.'
           : run.state === 'interrupted'
             ? `Contact lookup was interrupted (page reloaded). ${found} found so far.`
-            : `Contact lookup stopped. ${found} found · ${used}.`;
+            : `${run.message || 'Contact lookup stopped.'} ${found} found · ${used}.`;
 
   return (
-    <div className={`flex flex-wrap items-center justify-between gap-3 px-3 py-2.5 border text-[13px] ${tone}`} role="status">
+    <div className={`flex flex-wrap items-center justify-between gap-3 px-3 py-2.5 border text-[13px] ${tone}`} role="status" aria-live="polite">
       <span className="text-ink">{headline}</span>
       <div className="flex items-center gap-2">
         {run.state === 'no_credits' && topUp}
