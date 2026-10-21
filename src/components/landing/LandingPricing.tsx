@@ -20,6 +20,11 @@ import { formatCredits, formatUsd } from '../../lib/billing';
  * actually do differently.
  */
 
+export interface CostGroup {
+  feature: string;
+  items: Array<{ label: string; credits: number; note: string }>;
+}
+
 interface LandingPricingProps {
   packages: Array<{
     code: string;
@@ -28,31 +33,31 @@ interface LandingPricingProps {
     credits: number;
     bonus_credits: number;
   }>;
-  searchCosts: Array<{ channel: string; credits: number; note: string }>;
+  /** Everything a credit buys, grouped by feature (Feed, Leads, Mail). */
+  costGroups: CostGroup[];
   welcomeCredits: number;
-  perSearchPrice: number;
+  perCreditPrice: number;
   /** Credits one full daily sweep costs at the workspace maximum. */
   sweepCost: number;
+  /** Credits for one verified work email. */
+  emailRevealCredits: number;
+  /** Credits for one send from a connected mailbox. */
+  connectedSendCredits: number;
   onBuy: (code: string) => void;
   onStart: () => void;
 }
 
 export const LandingPricing: React.FC<LandingPricingProps> = ({
   packages,
-  searchCosts,
+  costGroups,
   welcomeCredits,
-  perSearchPrice,
+  perCreditPrice,
   sweepCost,
+  emailRevealCredits,
+  connectedSendCredits,
   onBuy,
   onStart,
 }) => {
-  // Spreading an empty array into Math.min gives Infinity rather than throwing,
-  // which would render "about 0 searches" instead of explaining itself. Guarded
-  // so an empty cost list cannot quietly produce confident nonsense.
-  const costs = searchCosts.map((s) => Number(s?.credits)).filter((n) => Number.isFinite(n));
-  const cheapestPerSearch = costs.length > 0 ? Math.min(...costs) : 1;
-  const dearestPerSearch = costs.length > 0 ? Math.max(...costs) : 1;
-
   // The middle package is the one most people land on, so it gets the emphasis.
   // Derived rather than flagged, so reordering the database does not silently
   // point the ribbon at the wrong card.
@@ -69,12 +74,12 @@ export const LandingPricing: React.FC<LandingPricingProps> = ({
             No subscription, nothing renews
           </span>
           <h2 className="text-3xl md:text-4xl font-bold tracking-tight text-[#141414]">
-            Buy credits. Spend them on searches.
+            One balance for the feed, leads and mail.
           </h2>
           <p className="text-[#4a4a47] leading-relaxed mt-4">
-            One payment, and the credits are yours until you have used them up.
-            Same price per credit at every size — you are never paying extra to
-            buy more.
+            Buy credits once and spend them on whichever feature you need — searches,
+            verified contacts or sends. Same price per credit at every size, and the
+            credits are yours until you have used them up.
           </p>
         </div>
 
@@ -85,11 +90,11 @@ export const LandingPricing: React.FC<LandingPricingProps> = ({
             const featured = i === featuredIndex;
             const maxCredits = Math.max(...packages.map((x) => x.credits + x.bonus_credits), 1);
 
-            // Both ends of the range, because a workspace's channel mix decides
-            // the real figure. Quoting only the cheap end would oversell.
-            const bestCase = Math.floor(total / cheapestPerSearch);
-            const worstCase = Math.floor(total / dearestPerSearch);
+            // Each row is what the whole package buys if spent on that one thing.
+            // A real workspace mixes them, which the note under the rows says.
             const sweeps = sweepCost > 0 ? Math.floor(total / sweepCost) : 0;
+            const emails = emailRevealCredits > 0 ? Math.floor(total / emailRevealCredits) : 0;
+            const sends = connectedSendCredits > 0 ? Math.floor(total / connectedSendCredits) : 0;
 
             return (
               <div
@@ -142,30 +147,30 @@ export const LandingPricing: React.FC<LandingPricingProps> = ({
                   </div>
 
                   <p className="text-[11px] text-[#8a8a86] font-mono mt-3">
-                    {formatUsd(perSearchPrice)} per credit
+                    {formatUsd(perCreditPrice)} per credit
                   </p>
 
                   {/* What it actually buys, at both ends of the channel mix. */}
                   <div className="mt-4 pt-4 border-t border-[#eeeeea] space-y-1.5">
-                    <p className="text-[11px] font-mono text-[#4a4a47] flex justify-between gap-2">
-                      <span>Web / Twitter searches</span>
-                      <span className="text-[#141414]">{bestCase.toLocaleString()}</span>
-                    </p>
-                    <p className="text-[11px] font-mono text-[#4a4a47] flex justify-between gap-2">
-                      <span>Reddit searches</span>
-                      <span className="text-[#141414]">{worstCase.toLocaleString()}</span>
-                    </p>
                     {sweeps > 0 && (
                       <p className="text-[11px] font-mono text-[#4a4a47] flex justify-between gap-2">
                         <span>Full daily sweeps</span>
                         <span className="text-[#141414]">{sweeps.toLocaleString()}</span>
                       </p>
                     )}
+                    <p className="text-[11px] font-mono text-[#4a4a47] flex justify-between gap-2">
+                      <span>or verified work emails</span>
+                      <span className="text-[#141414]">{emails.toLocaleString()}</span>
+                    </p>
+                    <p className="text-[11px] font-mono text-[#4a4a47] flex justify-between gap-2">
+                      <span>or emails sent</span>
+                      <span className="text-[#141414]">{sends.toLocaleString()}</span>
+                    </p>
                   </div>
 
                   <p className="text-[10px] text-[#b8b8b2] font-mono mt-3 leading-relaxed">
-                    Sweeps assume all 8 keywords across 3 channels. Track fewer and
-                    they last considerably longer.
+                    Each line is the whole package spent on one thing. Sweeps assume
+                    all 8 keywords across 3 channels; sends are from your own mailbox.
                   </p>
                 </div>
 
@@ -190,53 +195,45 @@ export const LandingPricing: React.FC<LandingPricingProps> = ({
         </div>
 
         {/*
-          What one search costs.
-
-          Laid out as tiles across the row rather than a list beside a paragraph.
-          A four-item list in a two-column split leaves half the card empty and
-          makes the reader work down a column to compare four numbers that sit
-          side by side far more naturally. Mobile collapses to two columns, which
-          keeps the credit figure and its channel name adjacent rather than
-          separated by a wrap.
+          What everything costs, grouped by feature so a reader can find the one
+          thing they plan to do without scanning a flat list of ten prices.
         */}
         <div className="mt-14 bg-white border border-[#e3e3de]">
           <div className="flex flex-wrap items-center justify-between gap-3 px-6 md:px-7 py-4 border-b border-[#eeeeea]">
             <p className="text-[10px] font-mono uppercase tracking-wider text-[#141414] font-bold">
-              What one search costs
+              What everything costs
             </p>
-            <span className="text-[11px] text-[#4a4a47]">
-              Charged once per sweep, per channel
-            </span>
+            <span className="text-[11px] text-[#4a4a47]">In credits, charged only when it works</span>
           </div>
 
-          <div className="grid grid-cols-2 lg:grid-cols-4 divide-x divide-y lg:divide-y-0 divide-[#eeeeea]">
-            {searchCosts.map((s) => (
-              <div key={s.channel} className="px-6 py-5">
-                <p className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">
-                  {s.channel}
-                </p>
-                <div className="flex items-baseline gap-1 mt-1.5">
-                  <span className="text-2xl font-bold tracking-tight text-[#141414]">
-                    {s.credits}
-                  </span>
-                  <span className="text-[11px] font-mono text-[#8a8a86]">
-                    {s.credits === 1 ? 'credit' : 'credits'}
-                  </span>
-                </div>
-                <p className="text-[11px] text-[#8a8a86] mt-1.5 leading-snug">
-                  {s.note}
-                </p>
+          <div className="grid grid-cols-1 md:grid-cols-3 divide-y md:divide-y-0 md:divide-x divide-[#eeeeea]">
+            {costGroups.map((g) => (
+              <div key={g.feature} className="px-6 py-5">
+                <p className="text-[10px] font-mono uppercase tracking-wider text-[#8a8a86]">{g.feature}</p>
+                <ul className="mt-3 space-y-3">
+                  {g.items.map((item) => (
+                    <li key={item.label} className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-[12px] font-medium text-[#141414]">{item.label}</p>
+                        <p className="text-[11px] text-[#8a8a86] leading-snug">{item.note}</p>
+                      </div>
+                      <span className="shrink-0 text-[13px] font-bold tracking-tight text-[#141414] tabular-nums">
+                        {item.credits === 0 ? 'Free' : formatCredits(item.credits)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
               </div>
             ))}
           </div>
 
           <div className="px-6 md:px-7 py-4 border-t border-[#eeeeea] bg-[#fbfbfa] flex flex-col sm:flex-row sm:items-center gap-x-6 gap-y-1">
             <p className="text-[12px] text-[#4a4a47]">
-              A fallback never costs extra — if the first provider is busy you are
-              charged the same as if it had worked.
+              A search that finds nothing, an email that is not verified, or a send that
+              fails is not billed.
             </p>
             <p className="text-[12px] text-[#8a8a86] sm:ml-auto sm:text-right">
-              A search that finds nothing is not billed.
+              A provider fallback never costs extra.
             </p>
           </div>
         </div>
@@ -260,8 +257,9 @@ export const LandingPricing: React.FC<LandingPricingProps> = ({
               Start with {welcomeCredits} free credits
             </p>
             <p className="text-xs text-white/60 mt-1.5 max-w-md leading-relaxed">
-              A few days of daily sweeps on a handful of keywords, before you pay
-              anything. No card, nothing to cancel.
+              Enough to run a few daily sweeps, reveal a handful of verified emails
+              and send your first outreach before you pay anything. No card, nothing
+              to cancel.
             </p>
           </div>
           <button
