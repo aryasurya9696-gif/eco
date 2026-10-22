@@ -139,3 +139,10 @@ Deno.test('fractional credits: 0.1 per keyword is kept, totals rounded to 2 deci
   assert.equal(roundCredits(-1), 0);
   assert.equal(roundCredits(Number.NaN), 0);
 });
+
+Deno.test('automatic sweeps turned off are never due, at any hour', () => {
+  const off = { sweep_time_utc: '06:00', sweep_frequency: 'off' };
+  for (let h = 0; h < 24; h++) assert.equal(isProfileDue(off, h), false);
+  const on = { id: 'b', sweep_time_utc: '06:00', sweep_frequency: '24h' };
+  assert.deepEqual(filterDue([{ id: 'a', ...off }, on], 6).map((p) => p.id), ['b']);
+});

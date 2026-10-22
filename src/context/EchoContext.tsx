@@ -134,8 +134,8 @@ interface EchoContextType {
   setLookbackHours: (hours: number) => void;
   sweepTime: string;
   setSweepTime: (time: string) => void;
-  sweepCadence: '24h' | '12h' | '6h';
-  setSweepCadence: (cadence: '24h' | '12h' | '6h') => void;
+  sweepCadence: '24h' | '12h' | '6h' | 'off';
+  setSweepCadence: (cadence: '24h' | '12h' | '6h' | 'off') => void;
   saveSettings: () => Promise<{ ok: boolean; warning?: string }>;
   enabledChannels: Platform[];
   toggleChannel: (platform: Platform) => void;
@@ -147,7 +147,7 @@ interface EchoContextType {
   savedChannels: Platform[];
   savedMinIntentThreshold: number;
   savedSweepTime: string;
-  savedSweepCadence: '24h' | '12h' | '6h';
+  savedSweepCadence: '24h' | '12h' | '6h' | 'off';
   /** True while the Settings form holds edits that have not been saved. */
   hasUnsavedSettings: boolean;
   /** Puts the editable settings back to the saved profile values. */
@@ -164,7 +164,7 @@ const LOCAL_STORAGE_SETTINGS_KEY = 'echo_mock_settings';
 
 const DEFAULT_CHANNELS: Platform[] = ['twitter', 'reddit', 'google'];
 
-type Cadence = '24h' | '12h' | '6h';
+type Cadence = '24h' | '12h' | '6h' | 'off';
 
 interface SettingsSnapshot {
   lookbackHours: number;
@@ -233,7 +233,7 @@ export const EchoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Settings
   const [lookbackHours, setLookbackHours] = useState<number>(24);
   const [sweepTime, setSweepTime] = useState<string>('06:00');
-  const [sweepCadence, setSweepCadence] = useState<'24h' | '12h' | '6h'>('24h');
+  const [sweepCadence, setSweepCadence] = useState<'24h' | '12h' | '6h' | 'off'>('24h');
   const [minIntentThreshold, setMinIntentThreshold] = useState<number>(0);
   const [feedRetentionDays, setFeedRetentionDays] = useState<number>(30);
   const [enabledChannels, setEnabledChannels] = useState<Platform[]>(['twitter', 'reddit', 'google']);

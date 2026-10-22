@@ -9,7 +9,7 @@ import {
   RETENTION_OPTIONS,
 } from '../../lib/constants';
 import { usePricing } from '../../lib/pricing';
-import { CADENCE_LABELS, formatNextSweep } from '../../lib/schedule';
+import { CADENCE_LABELS, formatNextSweep, sweepsPerDay } from '../../lib/schedule';
 import {
   Save,
   Building2,
@@ -25,7 +25,7 @@ import type { Platform } from '../../types';
 const CORE_OFFER_MAX = 280;
 
 /** Sweep intervals, slowest first. */
-const CADENCES = (['24h', '12h', '6h'] as const).map((id) => ({ id, label: CADENCE_LABELS[id] }));
+const CADENCES = (['24h', '12h', '6h', 'off'] as const).map((id) => ({ id, label: CADENCE_LABELS[id] }));
 
 /** The cron runs hourly, so the start time is an hour (minutes were ignored). */
 const HOURS = Array.from({ length: 24 }, (_, h) => `${String(h).padStart(2, '0')}:00`);
@@ -247,7 +247,8 @@ export const SettingsTab: React.FC = () => {
   const activeKeywordCount = keywords.filter((k) => k.is_active).length;
   const perKeyword = enabledChannels.reduce((sum, c) => sum + pricing.channelCredits(c), 0);
   const sweepCost = activeKeywordCount * perKeyword;
-  const sweepsPerDay = sweepCadence === '6h' ? 4 : sweepCadence === '12h' ? 2 : 1;
+  const perDay = sweepsPerDay(sweepCadence);
+  const autoOff = sweepCadence === 'off';
 
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -543,7 +544,11 @@ export const SettingsTab: React.FC = () => {
           {activeKeywordCount} keyword{activeKeywordCount === 1 ? '' : 's'} × {enabledChannels.length} channel
           {enabledChannels.length === 1 ? '' : 's'} ={' '}
           <span className="text-[#141414] font-medium">{creditsText(sweepCost)} per sweep</span>
-          {sweepsPerDay > 1 ? ` · ${creditsText(sweepCost * sweepsPerDay)} a day` : ''}
+          {autoOff
+            ? ' · automatic sweeps off, so only manual sweeps are charged'
+            : perDay > 1
+              ? ` · ${creditsText(sweepCost * perDay)} a day`
+              : ''}
           {hasUnsavedSettings ? ' (with these unsaved settings)' : ''}
         </p>
       </Section>
@@ -552,15 +557,20 @@ export const SettingsTab: React.FC = () => {
       <Section
         icon={<Clock className="w-4 h-4 text-[#141414]" />}
         title="Sweep schedule"
-        description="When Echo runs on its own. All times are UTC."
+        description="When Echo runs on its own. All times are UTC. Choose Off to only sweep when you click Run sweep."
       >
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
-          <Field label="Start time (UTC)" htmlFor="settings-sweep-time" hint="Sweeps start on the hour.">
+          <Field
+            label="Start time (UTC)"
+            htmlFor="settings-sweep-time"
+            hint={autoOff ? 'Not used while automatic sweeps are off.' : 'Sweeps start on the hour.'}
+          >
             <select
               id="settings-sweep-time"
+              disabled={autoOff}
               value={HOURS.includes(sweepTime) ? sweepTime : `${sweepTime.slice(0, 2)}:00`}
               onChange={(e) => setSweepTime(e.target.value || '06:00')}
-              className={`${inputClass} cursor-pointer`}
+              className={`${inputClass} cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed`}
             >
               {HOURS.map((h) => (
                 <option key={h} value={h}>

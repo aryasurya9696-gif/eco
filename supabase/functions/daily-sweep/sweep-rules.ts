@@ -44,14 +44,19 @@ export function isSweepDue(currentHourUtc: number, sweepHour: number, cadenceHou
   return currentHourUtc % cadenceHours === sweepHour % cadenceHours;
 }
 
+/** `profiles.sweep_frequency` value that turns automatic sweeps off. */
+export const SWEEP_OFF = 'off';
+
 /**
  * Whether a profile is due in the given UTC hour. A missing or malformed hour
- * falls back to the column default (06:00), never "any hour".
+ * falls back to the column default (06:00), never "any hour". A workspace with
+ * automatic sweeps turned off is never due; it can still sweep manually.
  */
 export function isProfileDue(
   profile: { sweep_time_utc?: string | null; sweep_frequency?: string | null },
   hourUtc: number,
 ): boolean {
+  if (profile.sweep_frequency === SWEEP_OFF) return false;
   const dueHour = sweepHourOf(profile.sweep_time_utc) ?? DEFAULT_SWEEP_HOUR_UTC;
   return isSweepDue(hourUtc, dueHour, cadenceHoursOf(profile.sweep_frequency));
 }

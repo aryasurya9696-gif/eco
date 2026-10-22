@@ -219,7 +219,18 @@ export const KeywordsTab: React.FC = () => {
             <span>Automated Sweep Policy</span>
           </div>
           <p className="text-xs text-[#8a8a86] font-mono leading-relaxed">
+            {savedSweepCadence === 'off' ? (
+              <>
+                Automatic sweeps are <span className="text-[#141414] font-medium">off</span>. Echo searches only when you click
+                Run sweep, looking at conversations from the last{' '}
+                <span className="text-[#141414] font-medium">{lookbackHours} hours</span> that match each active keyword. Turn
+                them back on in Settings.
+              </>
+            ) : (
+            <>
             Echo sweeps <span className="text-[#141414] font-medium">{cadenceText}</span> from <span className="text-[#141414] font-medium">{savedSweepTime} UTC</span> (next: {formatNextSweep(savedSweepTime, savedSweepCadence)}), looking at conversations from the last <span className="text-[#141414] font-medium">{lookbackHours} hours</span> that match each active keyword. Results are deduplicated.
+            </>
+            )}
           </p>
         </div>
 

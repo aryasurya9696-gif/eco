@@ -426,11 +426,17 @@ export const FeedTab: React.FC<{ onNavigateBilling?: () => void; onNavigateKeywo
             </p>
             ) : (
             <p className="text-xs text-[#8a8a86] font-mono leading-relaxed">
+              {savedSweepCadence === 'off' ? (
+                <>Automatic sweeps are off</>
+              ) : (
+                <>
               Your next automated sweep:{' '}
               <span className="text-[#141414] font-semibold">
                 {formatNextSweep(savedSweepTime, savedSweepCadence, new Date(now))}
               </span>
-              , or you can run one now. It searches {savedChannels.map(channelLabel).join(', ')} for your{' '}
+                </>
+              )}
+              {savedSweepCadence === 'off' ? '. You can run one now.' : ', or you can run one now.'} It searches {savedChannels.map(channelLabel).join(', ')} for your{' '}
               {activeKeywordCount} keyword{activeKeywordCount === 1 ? '' : 's'}.
             </p>
             )}

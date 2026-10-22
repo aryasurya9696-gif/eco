@@ -18,7 +18,7 @@ import { useMailStore } from '../mail/mail-store';
 import { useWallet } from '../../lib/wallet-store';
 import { formatCredits } from '../../lib/billing';
 import { channelLabel } from '../../lib/constants';
-import { formatNextSweep, nextSweepAt } from '../../lib/schedule';
+import { CADENCE_LABELS, formatNextSweep, nextSweepAt, type SweepCadence } from '../../lib/schedule';
 
 interface NavItem {
   id: DashboardTab;
@@ -50,6 +50,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   // describes what the cron will actually run.
   const { keywords, keywordLimit, posts, savedSweepTime, savedSweepCadence, lookbackHours, savedChannels } = useEcho();
   const nextSweep = formatNextSweep(savedSweepTime, savedSweepCadence);
+  const autoOff = savedSweepCadence === 'off';
 
   // Compute user initials for avatar
   const getInitials = () => {
@@ -172,15 +173,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="mx-4 mt-4 p-3 bg-[#f6f6f4] border border-[#e3e3de] text-xs">
             <div className="flex items-center justify-between mb-1">
               <span className="flex items-center gap-1.5 font-mono text-[11px] text-[#4a4a47] font-semibold">
-                <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" />
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${autoOff ? 'bg-[#b5b5ad]' : 'bg-emerald-500 animate-pulse'}`}
+                />
                 SWEEP SCHEDULE
               </span>
-              <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 bg-white border border-[#deded8] text-emerald-700 font-medium">
-                {savedSweepCadence === '24h' ? 'Daily' : savedSweepCadence === '12h' ? '12h Cycle' : '6h Fast'}
+              <span
+                className={`text-[9px] font-mono uppercase px-1.5 py-0.5 bg-white border border-[#deded8] font-medium ${
+                  autoOff ? 'text-[#8a8a86]' : 'text-emerald-700'
+                }`}
+              >
+                {CADENCE_LABELS[savedSweepCadence as SweepCadence] ?? 'Daily'}
               </span>
             </div>
             <p className="text-[11px] text-[#8a8a86] font-mono">
-              Next: <span className="text-[#141414] font-medium">{nextSweep}</span>
+              {autoOff ? (
+                <span className="text-[#141414] font-medium">Manual sweeps only</span>
+              ) : (
+                <>
+                  Next: <span className="text-[#141414] font-medium">{nextSweep}</span>
+                </>
+              )}
             </p>
             <p className="text-[10px] text-[#9b9b96] font-mono mt-0.5 truncate">
               {savedChannels.map(channelLabel).join(', ')} ({lookbackHours}h)
@@ -189,11 +202,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
         ) : (
           <div
             className="mx-2 mt-3 p-2 bg-[#f6f6f4] border border-[#e3e3de] flex flex-col items-center justify-center cursor-default group"
-            title={`Sweep schedule: next ${nextSweep} (${savedSweepCadence === '24h' ? 'daily' : `every ${savedSweepCadence}`}) • ${lookbackHours}h lookback`}
+            title={
+              autoOff
+                ? 'Automatic sweeps are off: manual sweeps only'
+                : `Sweep schedule: next ${nextSweep} (${savedSweepCadence === '24h' ? 'daily' : `every ${savedSweepCadence}`}) • ${lookbackHours}h lookback`
+            }
           >
-            <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
+            <span className={`w-2 h-2 rounded-full ${autoOff ? 'bg-[#b5b5ad]' : 'bg-emerald-500 animate-pulse'}`} />
             <span className="text-[9px] font-mono text-[#8a8a86] mt-1">
-              {String(nextSweepAt(savedSweepTime, savedSweepCadence)?.getUTCHours() ?? '—').padStart(2, '0')}h
+              {autoOff ? 'off' : `${String(nextSweepAt(savedSweepTime, savedSweepCadence)?.getUTCHours() ?? '—').padStart(2, '0')}h`}
             </span>
           </div>
         )}
