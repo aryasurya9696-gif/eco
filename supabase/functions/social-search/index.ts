@@ -124,6 +124,10 @@ async function takeRateLimit(
 
 const TREG_BASE = 'https://treg.to';
 const MAX_KEYWORDS_PER_SWEEP = 25;
+/** Keywords searched at once in a manual sweep (each fans out to its channels). */
+const KEYWORD_CONCURRENCY = 4;
+/** Per provider call in a manual sweep; the user is waiting on the result. */
+const INTERACTIVE_CALL_TIMEOUT_MS = 20000;
 /** Used when sweep_shape() cannot be read; match keyword_limit()/channel_limit(). */
 const FALLBACK_MAX_KEYWORDS = 8;
 const FALLBACK_MAX_CHANNELS = 3;
@@ -910,7 +914,8 @@ async function searchChannel(
   // Stable within a sweep so an internal retry is free, and different between
   // sweeps so a deliberate second search is charged normally.
   const idem = `ss:${runNonce}:${kw.id}:${platform}`;
-  const common = { customerId: userId, idempotencyKey: idem, stats };
+  // Interactive: a slow provider must not hold the user's sweep for 45s.
+  const common = { customerId: userId, idempotencyKey: idem, stats, timeoutMs: INTERACTIVE_CALL_TIMEOUT_MS };
 
   // ── Twitter ────────────────────────────────────────────────────────────
   if (platform === 'twitter') {
@@ -932,10 +937,37 @@ async function searchChannel(
 
   // ── Reddit ─────────────────────────────────────────────────────────────
   if (platform === 'reddit') {
-    // tikhub is cheapest and fastest but its shared capacity runs out often;
-    // scrapecreators is the reliable second and answers in about a second.
+    // scrapecreators first: it answers in about a second and is reliable.
+    // tikhub (cheaper) was primary, but its upstream now fails most requests
+    // with a generic 400 after up to ~18s, which made a manual sweep take two
+    // minutes. It stays as the fallback for an unbilled scrapecreators miss.
+    const sc = await tregCall('scrapecreators.reddit.search.posts', {
+      ...common,
+      query: {
+        query: kw.keyword,
+        timeframe: redditTimeframe(lookbackHours),
+        sort: 'relevance',
+        limit: 25,
+      },
+    });
+    record(tally, sc, kw.id);
+    const scRaw = sc.data?.posts ?? [];
+    const scItems = Array.isArray(scRaw) ? scRaw : [];
+    if (scItems.length) {
+      served.reddit = 'scrapecreators.reddit.search.posts';
+      return scItems.map((x: any) => mapRedditScrapecreators(x, kw)).filter((p: any): p is RawPost => !!p);
+    }
+
+    // Only an unbilled miss falls back. When the primary billed (or may have)
+    // for an empty answer, the search has been paid for once already; a second
+    // provider would pay twice for one keyword (N9).
+    if (!shouldTryRedditFallback(sc, scItems.length)) return [];
+
+    // Distinct key: this is a different provider answering the same search, and
+    // reusing the primary's key would make treg reject it as a mismatched replay.
     const tk = await tregCall('tikhub.x.reddit-app-fetch-dynamic-search', {
       ...common,
+      idempotencyKey: `${idem}:fb`,
       query: {
         query: kw.keyword,
         search_type: 'post',
@@ -952,30 +984,6 @@ async function searchChannel(
     if (tkItems.length) {
       served.reddit = 'tikhub.x.reddit-app-fetch-dynamic-search';
       return tkItems.map((x: any) => mapRedditTikhub(x, kw)).filter((p: any): p is RawPost => !!p);
-    }
-
-    // Only an unbilled miss falls back. When tikhub billed (or may have) for an
-    // empty answer, the search has been paid for once already; calling
-    // scrapecreators too would pay twice for one keyword (N9).
-    if (!shouldTryRedditFallback(tk, tkItems.length)) return [];
-
-    // Distinct key: this is a different provider answering the same search, and
-    // reusing the primary's key would make treg reject it as a mismatched replay.
-    const sc = await tregCall('scrapecreators.reddit.search.posts', {
-      ...common,
-      idempotencyKey: `${idem}:fb`,
-      query: {
-        query: kw.keyword,
-        timeframe: redditTimeframe(lookbackHours),
-        sort: 'relevance',
-        limit: 25,
-      },
-    });
-    record(tally, sc, kw.id);
-    const scItems = sc.data?.posts ?? [];
-    if (Array.isArray(scItems) && scItems.length) {
-      served.reddit = 'scrapecreators.reddit.search.posts';
-      return scItems.map((x: any) => mapRedditScrapecreators(x, kw)).filter((p: any): p is RawPost => !!p);
     }
     return [];
   }
@@ -1296,17 +1304,29 @@ async function handle(req: Request): Promise<Response> {
   };
 
   try {
-    for (const kw of keywords) {
-      // Channels run in parallel; providers inside a channel run in sequence so
-      // a fallback only costs money once the cheaper one has actually failed.
-      const perChannel = await Promise.all(
-        billableChannels.map((ch) => {
-          const tally = tallies.get(OPERATION_OF[ch])!;
-          return searchChannel(ch, kw, lookbackHours, served, tally, userId, runNonce, stats);
+    // Keywords run KEYWORD_CONCURRENCY at a time and channels in parallel;
+    // providers inside a channel run in sequence so a fallback only costs money
+    // once the first one has actually failed. Results are merged in keyword
+    // order so dedupe stays deterministic.
+    const perKeyword: RawPost[][] = [];
+    for (let i = 0; i < keywords.length; i += KEYWORD_CONCURRENCY) {
+      const batch = keywords.slice(i, i + KEYWORD_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (kw) => {
+          const perChannel = await Promise.all(
+            billableChannels.map((ch) => {
+              const tally = tallies.get(OPERATION_OF[ch])!;
+              return searchChannel(ch, kw, lookbackHours, served, tally, userId, runNonce, stats);
+            }),
+          );
+          return perChannel.flat();
         }),
       );
+      perKeyword.push(...results);
+    }
 
-      for (const post of perChannel.flat()) {
+    for (const posts of perKeyword) {
+      for (const post of posts) {
         if (!withinLookback(post.posted_at)) {
           droppedStale++;
           continue;

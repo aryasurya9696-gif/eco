@@ -859,8 +859,30 @@ async function searchChannel(
   }
 
   if (platform === 'reddit') {
+    // scrapecreators first (fast, reliable); tikhub is the fallback for an
+    // unbilled miss. tikhub's upstream now fails most calls with a generic 400
+    // after up to ~18s, which ate the chunk's time budget.
+    const sc = await tregCall('scrapecreators.reddit.search.posts', {
+      ...common,
+      query: { query: kw, timeframe: redditTimeframe(lookbackHours), sort: 'relevance', limit: 25 },
+    });
+    record(tally, sc, kwId);
+    const scRaw = sc.data?.posts ?? [];
+    const scItems = Array.isArray(scRaw) ? scRaw : [];
+    if (scItems.length) {
+      return scItems.map((x: any) => mapRedditScrapecreators(x, userId, kwId, kw)).filter((r: any): r is PostRow => !!r);
+    }
+
+    // Only an unbilled miss falls back. When the primary billed (or may have)
+    // for an empty answer the search is already paid for; a second provider
+    // would pay twice for one keyword (N9).
+    if (!shouldTryRedditFallback(sc, scItems.length)) return [];
+
+    // Distinct key: a different provider answering the same search. Reusing the
+    // primary's key would make treg reject it as a mismatched replay.
     const tk = await tregCall('tikhub.x.reddit-app-fetch-dynamic-search', {
       ...common,
+      idempotencyKey: `${idem}:fb`,
       query: {
         query: kw, search_type: 'post',
         // RELEVANCE, not NEW: sorted by newest, a site-wide search returns
@@ -871,26 +893,8 @@ async function searchChannel(
     record(tally, tk, kwId);
     const tkRaw = tk.data?.data?.posts ?? tk.data?.posts ?? [];
     const tkItems = Array.isArray(tkRaw) ? tkRaw : [];
-    if (tkItems.length) {
-      return tkItems.map((x: any) => mapRedditTikhub(x, userId, kwId, kw)).filter((r: any): r is PostRow => !!r);
-    }
-
-    // Only an unbilled miss falls back. When tikhub billed (or may have) for an
-    // empty answer the search is already paid for; a second provider would pay
-    // twice for one keyword (N9).
-    if (!shouldTryRedditFallback(tk, tkItems.length)) return [];
-
-    // Distinct key: a different provider answering the same search. Reusing the
-    // primary's key would make treg reject it as a mismatched replay.
-    const sc = await tregCall('scrapecreators.reddit.search.posts', {
-      ...common,
-      idempotencyKey: `${idem}:fb`,
-      query: { query: kw, timeframe: redditTimeframe(lookbackHours), sort: 'relevance', limit: 25 },
-    });
-    record(tally, sc, kwId);
-    const scItems = sc.data?.posts ?? [];
-    return Array.isArray(scItems) && scItems.length
-      ? scItems.map((x: any) => mapRedditScrapecreators(x, userId, kwId, kw)).filter((r: any): r is PostRow => !!r)
+    return tkItems.length
+      ? tkItems.map((x: any) => mapRedditTikhub(x, userId, kwId, kw)).filter((r: any): r is PostRow => !!r)
       : [];
   }
 
