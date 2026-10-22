@@ -11,6 +11,8 @@ interface SweepButtonProps {
   variant?: 'header' | 'empty';
   /** Opens Billing; shown when the balance cannot cover the sweep. */
   onNavigateBilling?: () => void;
+  /** Opens Keywords; shown instead of a sweep when there is nothing to search. */
+  onNavigateKeywords?: () => void;
 }
 
 /**
@@ -21,7 +23,7 @@ interface SweepButtonProps {
  * balance come from the billing function's own quote when it answers, because
  * that is the number the reservation will use.
  */
-export const SweepButton: React.FC<SweepButtonProps> = ({ variant = 'header', onNavigateBilling }) => {
+export const SweepButton: React.FC<SweepButtonProps> = ({ variant = 'header', onNavigateBilling, onNavigateKeywords }) => {
   const { user } = useAuth();
   const { runSweep, isSweeping, keywords, savedChannels, hasUnsavedSettings } = useEcho();
   const pricing = usePricing(Boolean(user));
@@ -37,6 +39,10 @@ export const SweepButton: React.FC<SweepButtonProps> = ({ variant = 'header', on
     return { channel: c, each, total: each * keywordCount };
   });
   const estimate = lines.reduce((sum, l) => sum + l.total, 0);
+  const hasKeywords = keywordCount > 0;
+  // "Free" describes a channel's price, not an empty total: 0.1 × 0 keywords is
+  // still a paid channel that just has nothing to search yet.
+  const allChannelsFree = lines.length > 0 && lines.every((l) => l.each === 0);
 
   const openPreview = async () => {
     setOpen(true);
@@ -64,7 +70,16 @@ export const SweepButton: React.FC<SweepButtonProps> = ({ variant = 'header', on
   const affordable = quote ? quote.sweep.affordable : true;
 
   const trigger =
-    variant === 'header' ? (
+    !hasKeywords && variant === 'empty' && onNavigateKeywords ? (
+      <button
+        type="button"
+        onClick={onNavigateKeywords}
+        className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer"
+      >
+        <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+        <span>Add your first keyword</span>
+      </button>
+    ) : variant === 'header' ? (
       <button
         type="button"
         onClick={() => void openPreview()}
@@ -92,6 +107,11 @@ export const SweepButton: React.FC<SweepButtonProps> = ({ variant = 'header', on
       {open && (
         <ModalDialog title="Run a sweep now?" onClose={() => setOpen(false)}>
           <div className="px-5 pt-3 pb-4 space-y-3 text-xs text-[#4a4a47]">
+            {!hasKeywords && (
+              <p role="alert" className="text-[11px] font-mono text-amber-800 bg-amber-50 border border-amber-200 px-2.5 py-1.5">
+                You have no active keywords, so a sweep has nothing to search. Add a keyword first.
+              </p>
+            )}
             <p className="leading-relaxed">
               {keywordCount} keyword{keywordCount === 1 ? '' : 's'} × {channels.length} channel
               {channels.length === 1 ? '' : 's'} ={' '}
@@ -110,8 +130,8 @@ export const SweepButton: React.FC<SweepButtonProps> = ({ variant = 'header', on
                     <td className="py-1.5 text-right text-[#8a8a86]">
                       {l.each === 0 ? 'free' : `${formatCreditAmount(l.each)} × ${keywordCount}`}
                     </td>
-                    <td className="py-1.5 pl-3 text-right text-[#141414] w-16">
-                      {l.total === 0 ? 'Free' : formatCreditAmount(l.total)}
+                    <td className="py-1.5 pl-3 text-right text-[#141414] whitespace-nowrap">
+                      {l.each === 0 ? 'Free' : formatCreditAmount(l.total)}
                     </td>
                   </tr>
                 ))}
@@ -120,7 +140,7 @@ export const SweepButton: React.FC<SweepButtonProps> = ({ variant = 'header', on
                     Total
                   </th>
                   <td />
-                  <td className="pt-2 pl-3 text-right font-semibold text-[#141414]">
+                  <td className="pt-2 pl-3 text-right font-semibold text-[#141414] whitespace-nowrap">
                     {isQuoting ? '…' : creditsText(total)}
                   </td>
                 </tr>
@@ -163,7 +183,18 @@ export const SweepButton: React.FC<SweepButtonProps> = ({ variant = 'header', on
             >
               Cancel
             </button>
-            {!affordable && onNavigateBilling ? (
+            {!hasKeywords && onNavigateKeywords ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setOpen(false);
+                  onNavigateKeywords();
+                }}
+                className="px-3.5 py-1.5 text-[11px] font-mono bg-[#141414] hover:bg-black text-white cursor-pointer"
+              >
+                Add keywords
+              </button>
+            ) : !affordable && onNavigateBilling ? (
               <button
                 type="button"
                 onClick={() => {
@@ -181,7 +212,7 @@ export const SweepButton: React.FC<SweepButtonProps> = ({ variant = 'header', on
                 disabled={isQuoting || !affordable || keywordCount === 0}
                 className="px-3.5 py-1.5 text-[11px] font-mono bg-[#141414] hover:bg-black text-white cursor-pointer disabled:opacity-50"
               >
-                {total === 0 ? 'Run sweep (free)' : `Run sweep · ${creditsText(total)}`}
+                {allChannelsFree ? 'Run sweep (free)' : `Run sweep · ${creditsText(total)}`}
               </button>
             )}
           </div>

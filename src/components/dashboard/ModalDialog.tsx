@@ -1,4 +1,5 @@
 import React, { useEffect, useId, useRef } from 'react';
+import { createPortal } from 'react-dom';
 
 interface ModalDialogProps {
   /** Visible title; also the dialog's accessible name. */
@@ -73,7 +74,10 @@ export const ModalDialog: React.FC<ModalDialogProps> = ({
     };
   }, []);
 
-  return (
+  // Portalled to <body>: an ancestor with a filter/backdrop-filter (the dashboard
+  // header, the blurred main pane) would otherwise become the containing block
+  // for `fixed` and pin the dialog inside it instead of centring it on screen.
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div
         className="fixed inset-0 bg-black/40 backdrop-blur-xs"
@@ -99,6 +103,7 @@ export const ModalDialog: React.FC<ModalDialogProps> = ({
         )}
         {children}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 };

@@ -81,7 +81,10 @@ function groupByDay(
     });
 }
 
-export const FeedTab: React.FC<{ onNavigateBilling?: () => void }> = ({ onNavigateBilling }) => {
+export const FeedTab: React.FC<{ onNavigateBilling?: () => void; onNavigateKeywords?: () => void }> = ({
+  onNavigateBilling,
+  onNavigateKeywords,
+}) => {
   const {
     posts,
     keywords,
@@ -108,6 +111,8 @@ export const FeedTab: React.FC<{ onNavigateBilling?: () => void }> = ({ onNaviga
     feedRetentionDays,
     addToast,
   } = useEcho();
+  // Matches what a sweep searches: only active keywords count.
+  const activeKeywordCount = keywords.filter((k) => k.is_active).length;
 
   const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>({});
   const [currentPage, setCurrentPage] = useState<number>(1);
@@ -414,16 +419,23 @@ export const FeedTab: React.FC<{ onNavigateBilling?: () => void }> = ({ onNaviga
           </div>
           <div className="space-y-2">
             <h2 className="text-sm font-bold text-[#141414]">No mentions yet</h2>
+            {activeKeywordCount === 0 ? (
+            <p className="text-xs text-[#8a8a86] font-mono leading-relaxed">
+              Add a keyword (a product, competitor or pain point) and Echo will search{' '}
+              {savedChannels.map(channelLabel).join(', ')} for people talking about it.
+            </p>
+            ) : (
             <p className="text-xs text-[#8a8a86] font-mono leading-relaxed">
               Your next automated sweep:{' '}
               <span className="text-[#141414] font-semibold">
                 {formatNextSweep(savedSweepTime, savedSweepCadence, new Date(now))}
               </span>
               , or you can run one now. It searches {savedChannels.map(channelLabel).join(', ')} for your{' '}
-              {keywords.length} keyword{keywords.length === 1 ? '' : 's'}.
+              {activeKeywordCount} keyword{activeKeywordCount === 1 ? '' : 's'}.
             </p>
+            )}
           </div>
-          <SweepButton variant="empty" onNavigateBilling={onNavigateBilling} />
+          <SweepButton variant="empty" onNavigateBilling={onNavigateBilling} onNavigateKeywords={onNavigateKeywords} />
         </div>
       ) : filteredPosts.length === 0 ? (
         <div className="bg-white border border-[#e3e3de] p-12 text-center space-y-3 max-w-md mx-auto">

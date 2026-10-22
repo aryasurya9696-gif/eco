@@ -198,7 +198,11 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
           <div className="flex items-center gap-3">
             {activeTab === 'feed' && (
-              <SweepButton variant="header" onNavigateBilling={() => handleTabChange('billing')} />
+              <SweepButton
+                variant="header"
+                onNavigateBilling={() => handleTabChange('billing')}
+                onNavigateKeywords={() => handleTabChange('keywords')}
+              />
             )}
           </div>
         </header>
@@ -226,7 +230,12 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               </button>
             </div>
           )}
-          {activeTab === 'feed' && <FeedTab onNavigateBilling={() => handleTabChange('billing')} />}
+          {activeTab === 'feed' && (
+            <FeedTab
+              onNavigateBilling={() => handleTabChange('billing')}
+              onNavigateKeywords={() => handleTabChange('keywords')}
+            />
+          )}
           {activeTab === 'leads' && <LeadsTab onNavigateBilling={() => handleTabChange('billing')} />}
           {activeTab === 'mail' && <MailTab />}
           {activeTab === 'keywords' && <KeywordsTab />}
