@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, X, Eye, EyeOff, MoreHorizontal } from 'lucide-react';
+import { X, Eye, EyeOff, MoreHorizontal } from 'lucide-react';
 import { mailStore, useMailStore } from './mail-store';
+import { EchoMailboxCard } from './EchoMailboxCard';
 import { useEcho } from '../../context/EchoContext';
 import type { Mailbox } from '../../types';
 
@@ -46,8 +47,10 @@ const inputClass =
   'w-full h-9 px-3 text-[13px] text-[#18181b] bg-white border border-[#e8e8e3] rounded-md placeholder:text-[#c4c4bf] focus:outline-none focus:border-[#a1a1aa]';
 
 export const AccountsPanel: React.FC = () => {
-  const { mailboxes, activeMailboxId } = useMailStore();
+  const { mailboxes, activeMailboxId, mailConfig, connectInboxRequested } = useMailStore();
   const { addToast } = useEcho();
+  const sharedDomain = mailConfig?.shared_domain?.toLowerCase() || null;
+  const isEchoAddress = (mb: Mailbox) => Boolean(sharedDomain && mb.address.toLowerCase().endsWith(`@${sharedDomain}`));
 
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [menuFor, setMenuFor] = useState<string | null>(null);
@@ -69,6 +72,13 @@ export const AccountsPanel: React.FC = () => {
     setShowPassword(false);
     setFormError(null);
   };
+
+  // Another view (first-run card, composer) asked for the "own inbox" dialog.
+  useEffect(() => {
+    if (!connectInboxRequested) return;
+    setIsModalOpen(true);
+    mailStore.clearConnectInboxRequest();
+  }, [connectInboxRequested]);
 
   useEffect(() => {
     if (!isModalOpen && !menuFor) return;
@@ -117,29 +127,14 @@ export const AccountsPanel: React.FC = () => {
   return (
     <div className="flex-1 overflow-y-auto bg-white">
       <div className="max-w-4xl mx-auto px-4 sm:px-8 py-8 space-y-6">
-        <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
-          <div>
-            <h2 className="text-[19px] font-semibold text-[#18181b]">Mailboxes</h2>
-            <p className="mt-1 text-[13px] text-[#71717a] max-w-xl">
-              The addresses you send outreach from. Connect Gmail or Zoho with an app password, or create an address on a verified domain in Domains.
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() => setIsModalOpen(true)}
-            className="shrink-0 inline-flex items-center gap-1.5 h-9 px-3.5 bg-[#18181b] hover:bg-black text-white text-[13px] font-medium rounded-lg transition-colors cursor-pointer"
-          >
-            <Plus className="w-4 h-4" />
-            Connect mailbox
-          </button>
+        <div>
+          <h2 className="text-[19px] font-semibold text-[#18181b]">Mailboxes</h2>
+          <p className="mt-1 text-[13px] text-[#71717a] max-w-xl">
+            The addresses you send outreach from. Get an Echo email in one click, connect your own inbox, or send from your own domain.
+          </p>
         </div>
 
-        {mailboxes.length === 0 && (
-          <div className="rounded-xl border border-dashed border-[#e8e8e3] px-6 py-12 text-center">
-            <div className="text-[14px] font-medium text-[#18181b]">No mailboxes yet</div>
-            <p className="mt-1 text-[13px] text-[#71717a]">Connect a mailbox to start sending outreach.</p>
-          </div>
-        )}
+        <EchoMailboxCard onUseOwnInbox={() => setIsModalOpen(true)} />
 
         {mailboxes.length > 0 && (
         <ul className="rounded-xl border border-[#e8e8e3] divide-y divide-[#f0f0eb]">
@@ -169,7 +164,7 @@ export const AccountsPanel: React.FC = () => {
                         <span className={`w-1.5 h-1.5 rounded-full ${status.dot}`} />
                         {status.label}
                       </span>
-                      <span className="text-[#a1a1aa]">{PROVIDER_LABEL[mb.provider]}</span>
+                      <span className="text-[#a1a1aa]">{isEchoAddress(mb) ? 'Echo email' : PROVIDER_LABEL[mb.provider]}</span>
                     </div>
                   </div>
                 </div>
@@ -269,7 +264,7 @@ export const AccountsPanel: React.FC = () => {
           >
             <div className="flex items-center justify-between px-5 h-14 border-b border-[#f0f0eb]">
               <h3 id="connect-mailbox-title" className="text-[15px] font-semibold text-[#18181b]">
-                Connect mailbox
+                Use your own inbox
               </h3>
               <button
                 type="button"

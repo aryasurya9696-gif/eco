@@ -138,6 +138,9 @@ export interface MailDnsRecord {
   host: string;
   value: string;
   status: 'verified' | 'pending' | 'missing';
+  /** 'receiving' marks the root MX that routes replies into Echo. */
+  purpose?: 'sending' | 'receiving';
+  priority?: number;
 }
 
 export interface MailDomain {

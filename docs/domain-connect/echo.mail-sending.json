@@ -1,0 +1,53 @@
+{
+  "providerId": "echo",
+  "providerName": "Echo",
+  "serviceId": "mail-sending",
+  "serviceName": "Echo Mail sending and replies",
+  "version": 1,
+  "logoUrl": "",
+  "description": "Lets Echo send email from your domain (SPF and DKIM for the sending subdomain, a DMARC policy) and receive replies (MX).",
+  "variableDescription": "dkimHost: DKIM selector host (e.g. resend._domainkey); dkimValue: DKIM public key record (p=...); sendHost: sending subdomain (e.g. send); spfValue: SPF record for the sending subdomain; bounceMx: bounce/feedback MX host for the sending subdomain; inboundMx: MX host that receives replies",
+  "syncBlock": false,
+  "sharedProviderName": false,
+  "hostRequired": false,
+  "warnPhishing": true,
+  "records": [
+    {
+      "type": "TXT",
+      "host": "%dkimHost%",
+      "data": "%dkimValue%",
+      "ttl": 3600,
+      "txtConflictMatchingMode": "All"
+    },
+    {
+      "type": "TXT",
+      "host": "%sendHost%",
+      "data": "%spfValue%",
+      "ttl": 3600,
+      "txtConflictMatchingMode": "Prefix",
+      "txtConflictMatchingPrefix": "v=spf1"
+    },
+    {
+      "type": "MX",
+      "host": "%sendHost%",
+      "pointsTo": "%bounceMx%",
+      "priority": 10,
+      "ttl": 3600
+    },
+    {
+      "type": "TXT",
+      "host": "_dmarc",
+      "data": "v=DMARC1; p=none;",
+      "ttl": 3600,
+      "txtConflictMatchingMode": "Prefix",
+      "txtConflictMatchingPrefix": "v=DMARC1"
+    },
+    {
+      "type": "MX",
+      "host": "@",
+      "pointsTo": "%inboundMx%",
+      "priority": 10,
+      "ttl": 3600
+    }
+  ]
+}

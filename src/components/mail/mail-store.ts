@@ -41,7 +41,16 @@ export interface ComposerDraft {
  *  - paid_credits_required: only welcome credits are left (Billing).
  *  - price_unavailable: sending is paused server-side.
  */
-export type SendFailureKind = 'uncertain_resend' | 'uncertain' | 'paid_credits_required' | 'price_unavailable' | 'error';
+export type SendFailureKind =
+  | 'uncertain_resend'
+  | 'uncertain'
+  | 'paid_credits_required'
+  | 'price_unavailable'
+  /** Echo's platform-wide daily sending cap is used up (429 platform_cap). */
+  | 'platform_cap'
+  /** A new Echo mailbox hit its warm-up daily limit. */
+  | 'warmup'
+  | 'error';
 
 export type SendResult =
   | { success: true; threadId: string; chargePending?: boolean }
@@ -59,21 +68,27 @@ const UNCERTAIN_SEND_MESSAGE =
 const UNCERTAIN_RESEND_FALLBACK =
   "An earlier attempt to send this exact email timed out and may have been delivered. Check your Sent folder first; if it isn't there, choose Send anyway.";
 const PRICE_UNAVAILABLE_MESSAGE = 'Sending is temporarily unavailable. Please try again later.';
+const PLATFORM_CAP_MESSAGE =
+  "Echo has reached today's sending limit across all accounts, so this email was not sent. Please try again tomorrow.";
+const WARMUP_MESSAGE =
+  'New Echo addresses send up to 15 emails a day in their first week while they warm up. This email was not sent; try again tomorrow.';
 
-type SendResponse =
+type MailResponse =
   | { ok: true; data: any }
-  | { ok: false; status: number; body: Record<string, any> | null; message: string };
+  | { ok: false; status: number; body: Record<string, any> | null; message: string; aborted?: boolean };
+type SendResponse = MailResponse;
 
 /**
- * Calls the mail function's send action and keeps the error body. The shared
+ * Calls the mail function and keeps the error body. The shared
  * invokeFunction() reduces errors to a message (and rewrites any
- * duplicate_request to "Already in progress"), which loses the uncertain /
- * paid_credits_required / price_unavailable flags this flow depends on.
+ * duplicate_request to "Already in progress"), which loses flags such as
+ * uncertain / paid_credits_required / platform_cap, or the suggestions a
+ * taken mailbox name comes back with.
  */
-async function invokeSend(payload: Record<string, unknown>): Promise<SendResponse> {
+async function invokeMail(payload: Record<string, unknown>, timeoutMs = 30_000): Promise<MailResponse> {
   if (!supabase) return { ok: false, status: 503, body: null, message: 'Mail requires a connected Supabase project.' };
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 60_000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const { data, error } = await supabase.functions.invoke('mail', { body: payload, signal: controller.signal });
     if (!error) return { ok: true, data };
@@ -90,14 +105,25 @@ async function invokeSend(payload: Record<string, unknown>): Promise<SendRespons
     return { ok: false, status: 500, body: null, message: error.message || '' };
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') {
-      // No answer within the timeout: the provider may still have sent it.
-      return { ok: false, status: 504, body: { uncertain: true }, message: '' };
+      return { ok: false, status: 504, body: null, message: '', aborted: true };
     }
     return { ok: false, status: 500, body: null, message: (err as Error)?.message || '' };
   } finally {
     clearTimeout(timer);
   }
 }
+
+async function invokeSend(payload: Record<string, unknown>): Promise<SendResponse> {
+  const res = await invokeMail(payload, 60_000);
+  // No answer within the timeout: the provider may still have sent it.
+  if (!res.ok && res.aborted) return { ...res, body: { uncertain: true } };
+  return res;
+}
+
+const isWarmupRefusal = (res: Extract<MailResponse, { ok: false }>) => {
+  const b = res.body || {};
+  return Boolean(b.warmup || b.warm_up || b.warmup_limit || (res.status === 429 && /warm/i.test(res.message)));
+};
 
 /** Maps a refused send onto what the user is told and offered. */
 function sendFailure(res: Extract<SendResponse, { ok: false }>, fallback: string): Extract<SendResult, { success: false }> {
@@ -108,6 +134,11 @@ function sendFailure(res: Extract<SendResponse, { ok: false }>, fallback: string
   if (res.status === 504 || b.uncertain) return { success: false, kind: 'uncertain', error: UNCERTAIN_SEND_MESSAGE };
   if (b.paid_credits_required) return { success: false, kind: 'paid_credits_required', error: PAID_CREDITS_REQUIRED_MESSAGE };
   if (res.status === 503 && b.price_unavailable) return { success: false, kind: 'price_unavailable', error: PRICE_UNAVAILABLE_MESSAGE };
+  if (b.platform_cap) return { success: false, kind: 'platform_cap', error: PLATFORM_CAP_MESSAGE };
+  if (isWarmupRefusal(res)) {
+    const serverMsg = /warm/i.test(res.message) && res.message.includes(' ') ? res.message : '';
+    return { success: false, kind: 'warmup', error: serverMsg || WARMUP_MESSAGE };
+  }
   if (b.duplicate_request) return { success: false, kind: 'error', error: 'Already in progress — this email is still being sent.' };
   if (b.rate_limited) return { success: false, kind: 'error', error: res.message || 'Too many requests. Please try again in a minute.' };
   return { success: false, kind: 'error', error: res.message || fallback };
@@ -151,6 +182,86 @@ export function mailboxSendBlocker(mailbox: Mailbox | undefined): string | null 
 /** Mirrors mail.send.hosted / mail.send.connected in pricing_config. */
 export const sendCostFor = (mailbox: Mailbox | undefined) => (mailbox?.kind === 'hosted' ? 0.1 : 0.05);
 
+/** mail_config: whether Echo-hosted addresses are on, and how many the user has. */
+export interface MailConfig {
+  shared_domain: string | null;
+  max_echo_mailboxes: number;
+  echo_mailboxes_used: number;
+}
+
+export type MailboxNameReason = 'invalid' | 'reserved' | 'taken' | 'too_short';
+
+export type MailboxNameCheck =
+  | { ok: true; available: boolean; reason?: MailboxNameReason; address: string; suggestions: string[] }
+  | { ok: false; error: string; rateLimited?: boolean };
+
+export type ClaimEchoResult =
+  | { mailbox: Mailbox | null }
+  | {
+      error: string;
+      code: 'taken' | 'invalid' | 'limit_reached' | 'platform_unavailable' | 'error';
+      reason?: MailboxNameReason;
+      suggestions?: string[];
+    };
+
+/** What add_domain reports about where the domain's DNS is hosted. */
+export interface DomainSetupInfo {
+  dns_provider?: { id: string; name: string; dns_url: string | null } | null;
+  domain_connect?: { supported: boolean; provider_name?: string } | null;
+  /** The address the user asked to have created once the domain verifies. */
+  local_part?: string;
+}
+
+export const MAILBOX_NAME_REASON_COPY: Record<MailboxNameReason, string> = {
+  invalid: 'Use letters, numbers, dots, dashes or underscores.',
+  reserved: "That name is reserved. Try another.",
+  taken: 'That address is taken.',
+  too_short: 'Use at least 3 characters.',
+};
+
+const DOMAIN_SETUP_STORAGE_KEY = 'echo_mail_domain_setup';
+
+function readStoredSetup(): Record<string, DomainSetupInfo> {
+  try {
+    const raw = window.localStorage.getItem(DOMAIN_SETUP_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeStoredSetup(value: Record<string, DomainSetupInfo>) {
+  try {
+    window.localStorage.setItem(DOMAIN_SETUP_STORAGE_KEY, JSON.stringify(value));
+  } catch {
+    /* storage is a convenience only */
+  }
+}
+
+/** Pulls provider details out of a response that may carry them at the top level or on the domain. */
+function extractSetup(res: any): DomainSetupInfo | null {
+  const src = res?.dns_provider || res?.domain_connect ? res : res?.domain;
+  if (!src || (!src.dns_provider && !src.domain_connect)) return null;
+  return {
+    dns_provider: src.dns_provider ?? null,
+    domain_connect: src.domain_connect ?? null,
+  };
+}
+
+function mergeServerSetup(local: Record<string, DomainSetupInfo>, rows: any[]): Record<string, DomainSetupInfo> {
+  const merged = { ...local };
+  for (const row of rows) {
+    if (!row?.id) continue;
+    const server: DomainSetupInfo = {};
+    if (row.dns_provider) server.dns_provider = row.dns_provider;
+    if (row.domain_connect) server.domain_connect = row.domain_connect;
+    if (row.auto_local_part) server.local_part = row.auto_local_part;
+    if (Object.keys(server).length) merged[row.id] = { ...merged[row.id], ...server };
+  }
+  return merged;
+}
+
 export type MailSubView = 'mailbox' | 'domains' | 'accounts';
 export type ThreadFilter = 'all' | 'unread' | 'leads';
 
@@ -171,12 +282,19 @@ interface MailState {
   domains: MailDomain[];
   isComposerOpen: boolean;
   composerDraft: ComposerDraft;
+  /** null until mail_config has answered. */
+  mailConfig: MailConfig | null;
+  mailConfigLoading: boolean;
+  /** Provider / Domain Connect details per domain id, from add_domain. */
+  domainSetup: Record<string, DomainSetupInfo>;
+  /** Set when another view asks Accounts to open the "own inbox" dialog. */
+  connectInboxRequested: boolean;
 }
 
 const MAILBOX_COLUMNS =
   'id, user_id, kind, provider, address, display_name, domain_id, status, pause_reason, daily_send_limit, sent_today, sent_today_date, is_default, created_at';
 const DOMAIN_COLUMNS =
-  'id, domain, status, provider, dkim_tokens, dns_records, inbound_provider, verified_at, last_checked_at';
+  'id, domain, status, provider, dkim_tokens, dns_records, inbound_provider, verified_at, last_checked_at, dns_provider, domain_connect, auto_local_part';
 const THREAD_COLUMNS = '*, user_leads(status)';
 
 /** sent_today only counts for today's (UTC) date; the server resets it lazily. */
@@ -209,6 +327,10 @@ const emptyState = (userId: string | null): MailState => ({
   domains: [],
   isComposerOpen: false,
   composerDraft: { ...EMPTY_DRAFT },
+  mailConfig: null,
+  mailConfigLoading: false,
+  domainSetup: userId ? readStoredSetup() : {},
+  connectInboxRequested: false,
 });
 
 class MailStore {
@@ -261,7 +383,8 @@ class MailStore {
 
     const [mbRes, domRes, thRes] = await Promise.all([
       supabase.from('mailboxes').select(MAILBOX_COLUMNS).order('created_at'),
-      supabase.from('mail_domains').select(DOMAIN_COLUMNS).order('created_at'),
+      // The shared Echo domain is readable by everyone; it is not the user's to manage.
+      supabase.from('mail_domains').select(DOMAIN_COLUMNS).eq('is_platform', false).order('created_at'),
       supabase.from('mail_threads').select(THREAD_COLUMNS).order('last_message_at', { ascending: false }).limit(500),
     ]);
     if (generation !== this.loadGeneration || this.state.userId !== userId) return;
@@ -282,6 +405,8 @@ class MailStore {
       loadError: null,
       mailboxes,
       domains: (domRes.data || []) as MailDomain[],
+      // Provider details are stored server-side; they win over this browser's cache.
+      domainSetup: mergeServerSetup(this.state.domainSetup, domRes.data || []),
       threads: (thRes.data || []).map(toThread),
       activeMailboxId,
       // An open composer picks its own mailbox once they load; replacing the
@@ -290,6 +415,61 @@ class MailStore {
         ? this.state.composerDraft
         : { ...this.state.composerDraft, fromMailboxId: activeMailboxId },
     });
+  }
+
+  private refreshing = false;
+
+  /**
+   * Re-reads the thread list so replies that arrived since the last load show
+   * up. Threads whose latest message changed drop their cached messages; the
+   * open one is reloaded in place.
+   */
+  public async refreshThreads() {
+    const userId = this.state.userId;
+    if (!userId || !supabase || this.state.loading || this.refreshing) return;
+    this.refreshing = true;
+    const generation = this.loadGeneration;
+    try {
+      const { data, error } = await supabase
+        .from('mail_threads')
+        .select(THREAD_COLUMNS)
+        .order('last_message_at', { ascending: false })
+        .limit(500);
+      if (error || generation !== this.loadGeneration || this.state.userId !== userId) return;
+
+      const fresh = (data || []).map(toThread);
+      const freshIds = new Set(fresh.map((t) => t.id));
+      const before = new Map(this.state.threads.map((t) => [t.id, t]));
+      // Keep drafts saved in the last two minutes whose save may not have landed yet.
+      const recentCutoff = Date.now() - 2 * 60_000;
+      const pendingDrafts = this.state.threads.filter(
+        (t) => !freshIds.has(t.id) && t.folder === 'drafts' && Date.parse(t.created_at) > recentCutoff
+      );
+
+      const messages = { ...this.state.messages };
+      let activeChanged = false;
+      for (const t of fresh) {
+        const prev = before.get(t.id);
+        if (prev && prev.last_message_at !== t.last_message_at && messages[t.id]) {
+          delete messages[t.id];
+          if (t.id === this.state.activeThreadId) activeChanged = true;
+        }
+      }
+      const threads = [...pendingDrafts, ...fresh];
+      // The open thread is being read, so new replies in it count as read.
+      const activeId = this.state.activeThreadId;
+      this.patch({
+        threads: activeId ? threads.map((t) => (t.id === activeId ? { ...t, unread_count: 0 } : t)) : threads,
+        messages,
+      });
+      if (activeId && activeChanged) {
+        const active = fresh.find((t) => t.id === activeId);
+        if (active && active.unread_count > 0) void this.writeThread(activeId, { unread_count: 0 }, threads);
+        void this.loadMessages(activeId);
+      }
+    } finally {
+      this.refreshing = false;
+    }
   }
 
   private async loadMessages(threadId: string): Promise<MailMessage[]> {
@@ -665,7 +845,17 @@ class MailStore {
     return { success: true, threadId, chargePending };
   }
 
-  public async addDomain(domainName: string): Promise<{ domain: MailDomain } | { error: string }> {
+  private setDomainSetup(domainId: string, info: DomainSetupInfo) {
+    const domainSetup = { ...this.state.domainSetup, [domainId]: { ...this.state.domainSetup[domainId], ...info } };
+    this.patch({ domainSetup });
+    writeStoredSetup(domainSetup);
+  }
+
+  public async addDomain(domainName: string, localPart?: string): Promise<{ domain: MailDomain } | { error: string }> {
+    const cleanLocal = (localPart || '').trim().toLowerCase();
+    if (cleanLocal && !/^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$/.test(cleanLocal)) {
+      return { error: 'The address can use letters, numbers, dots, dashes and underscores.' };
+    }
     const cleanDomain = domainName
       .trim()
       .toLowerCase()
@@ -679,8 +869,14 @@ class MailStore {
       return { error: `${cleanDomain} is already added.` };
     }
     try {
-      const res = await invokeFunction<{ domain: MailDomain }>('mail', { action: 'add_domain', domain: cleanDomain });
+      const res = await invokeFunction<{ domain: MailDomain }>('mail', {
+        action: 'add_domain',
+        domain: cleanDomain,
+        ...(cleanLocal ? { local_part: cleanLocal } : {}),
+      });
       this.patch({ domains: [...this.state.domains, res.domain] });
+      const setup = extractSetup(res);
+      if (setup || cleanLocal) this.setDomainSetup(res.domain.id, { ...setup, ...(cleanLocal ? { local_part: cleanLocal } : {}) });
       return { domain: res.domain };
     } catch (err) {
       return { error: errorMessage(err, 'Could not add the domain.') };
@@ -689,15 +885,135 @@ class MailStore {
 
   /** Asks the provider to re-check the domain's DNS records. */
   public async verifyDomain(domainId: string): Promise<{ domain: MailDomain } | { error: string }> {
+    const previous = this.state.domains.find((d) => d.id === domainId);
     try {
       const res = await invokeFunction<{ domain: MailDomain }>('mail', { action: 'verify_domain', domain_id: domainId });
       this.patch({ domains: this.state.domains.map((d) => (d.id === domainId ? res.domain : d)) });
-      // Hosted mailboxes are paused or resumed with their domain.
-      void this.reload();
+      const setup = extractSetup(res);
+      if (setup) this.setDomainSetup(domainId, setup);
+      // Hosted mailboxes are paused, resumed or auto-created with their
+      // domain; only a status change can move them, so a background poll that
+      // finds nothing new does not reload the whole workspace.
+      if (!previous || previous.status !== res.domain.status) void this.reload();
       return { domain: res.domain };
     } catch (err) {
       return { error: errorMessage(err, 'Could not check DNS.') };
     }
+  }
+
+  /** The signed Domain Connect URL that applies the DNS records at the user's provider. */
+  public async domainConnectUrl(
+    domainId: string
+  ): Promise<{ url: string } | { error: string; notConfigured?: boolean }> {
+    const res = await invokeMail({ action: 'domain_connect_url', domain_id: domainId });
+    if (res.ok) {
+      const url = res.data?.url;
+      if (typeof url === 'string' && /^https:\/\//i.test(url)) return { url };
+      return { error: 'Automatic setup returned no link. Follow the steps below instead.' };
+    }
+    if (res.status === 501 || res.body?.not_configured) {
+      this.setDomainSetup(domainId, { domain_connect: { supported: false } });
+      return { notConfigured: true, error: "Automatic setup isn't available for this domain yet. Follow the steps below." };
+    }
+    return { error: res.message || 'Could not start automatic setup.' };
+  }
+
+  // --------------------------------------------------------------------------
+  // Echo-hosted mailboxes on the shared domain
+  // --------------------------------------------------------------------------
+
+  /** Loads mail_config once per session (pass force to re-read the counter). */
+  public async loadMailConfig(force = false) {
+    if (!this.state.userId || this.state.mailConfigLoading) return;
+    if (this.state.mailConfig && !force) return;
+    const userId = this.state.userId;
+    this.patch({ mailConfigLoading: true });
+    const res = await invokeMail({ action: 'mail_config' }, 15_000);
+    if (this.state.userId !== userId) return;
+    if (res.ok && res.data) {
+      const d = res.data;
+      this.patch({
+        mailConfigLoading: false,
+        mailConfig: {
+          shared_domain: typeof d.shared_domain === 'string' && d.shared_domain ? d.shared_domain : null,
+          max_echo_mailboxes: Number(d.max_echo_mailboxes) || 3,
+          echo_mailboxes_used: Number(d.echo_mailboxes_used) || 0,
+        },
+      });
+    } else {
+      // Not deployed yet or unreachable: Echo addresses show as "coming soon".
+      if (!res.ok) console.error('[mail] mail_config failed:', res.status, res.message);
+      this.patch({
+        mailConfigLoading: false,
+        mailConfig: this.state.mailConfig || { shared_domain: null, max_echo_mailboxes: 3, echo_mailboxes_used: 0 },
+      });
+    }
+  }
+
+  /** Live availability for an Echo address while the user types. */
+  public async checkMailboxName(localPart: string): Promise<MailboxNameCheck> {
+    const res = await invokeMail({ action: 'check_mailbox_name', local_part: localPart.trim().toLowerCase() }, 10_000);
+    if (res.ok) {
+      const d = res.data || {};
+      return {
+        ok: true,
+        available: Boolean(d.available),
+        reason: d.reason,
+        address: String(d.address || ''),
+        suggestions: Array.isArray(d.suggestions) ? d.suggestions.map(String).slice(0, 4) : [],
+      };
+    }
+    if (res.status === 429 || res.body?.rate_limited) {
+      return { ok: false, rateLimited: true, error: 'Checking too fast — pause a moment.' };
+    }
+    return { ok: false, error: res.message || "Couldn't check that name." };
+  }
+
+  /** Claims local@shared_domain for the user, sent and received through Echo. */
+  public async claimEchoMailbox(localPart: string, displayName: string): Promise<ClaimEchoResult> {
+    const res = await invokeMail({
+      action: 'claim_echo_mailbox',
+      local_part: localPart.trim().toLowerCase(),
+      display_name: displayName.trim(),
+    });
+    if (res.ok) {
+      const row = res.data?.mailbox;
+      const mailbox = row ? this.addMailbox(row) : null;
+      // Pick up is_default / limits as stored, and the new "x of 3" counter.
+      void this.reload();
+      void this.loadMailConfig(true);
+      return { mailbox };
+    }
+    const b = res.body || {};
+    const suggestions = Array.isArray(b.suggestions) ? b.suggestions.map(String).slice(0, 4) : [];
+    if (res.status === 409 || b.taken) {
+      return { code: 'taken', reason: 'taken', suggestions, error: 'That address was just taken. Pick another.' };
+    }
+    if (res.status === 422 || b.reason) {
+      const reason = (b.reason as MailboxNameReason) || 'invalid';
+      return { code: 'invalid', reason, suggestions, error: MAILBOX_NAME_REASON_COPY[reason] || res.message || 'That name can’t be used.' };
+    }
+    if (res.status === 429 && b.limit_reached) {
+      void this.loadMailConfig(true);
+      const max = this.state.mailConfig?.max_echo_mailboxes || 3;
+      return { code: 'limit_reached', error: `You already have ${max} Echo addresses — the most one account can have.` };
+    }
+    if (res.status === 503 || b.platform_unavailable) {
+      return { code: 'platform_unavailable', error: 'Echo email is temporarily unavailable. Please try again in a few minutes.' };
+    }
+    if (res.status === 429 || b.rate_limited) {
+      return { code: 'error', error: 'Too many requests. Please try again in a minute.' };
+    }
+    return { code: 'error', error: res.message || 'Could not create the address.' };
+  }
+
+  /** Opens Accounts with the "use your own inbox" dialog showing. */
+  public requestConnectInbox() {
+    this.patch({ activeSubView: 'accounts', connectInboxRequested: true });
+  }
+
+  public clearConnectInboxRequest() {
+    if (this.state.connectInboxRequested) this.patch({ connectInboxRequested: false });
   }
 
   public async removeDomain(domainId: string): Promise<{ ok: true } | { error: string }> {

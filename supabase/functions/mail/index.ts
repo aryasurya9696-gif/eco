@@ -16,12 +16,41 @@
 // refunded, and an identical resend is blocked until the user confirms
 // (confirm_resend: true). Provider error text never reaches the client.
 //
+// Echo mailboxes: `<name>@MAIL_SHARED_DOMAIN`, claimed in one call on the
+// shared platform domain (mail_domains.is_platform). At most 3 per user and
+// reserved names refused (enforced again by a trigger in 20261129), 40/day
+// each, 15/day for the first 7 days, and a platform-wide daily cap.
+//
+// Custom domains: add_domain detects the DNS provider (NS) and Domain Connect
+// support; verify_pending_domains (pg_cron every 10 min, x-cron-secret) checks
+// pending domains and creates the requested mailbox once one verifies.
+//
 // Secrets:
 //   supabase secrets set RESEND_API_KEY=re_...
+//   MAIL_SHARED_DOMAIN=<platform domain>      Echo mailboxes (unset = off)
+//   MAIL_PLATFORM_DAILY_CAP=2000              hosted sends/day on the platform domain
+//   DOMAIN_CONNECT_PROVIDER_ID=<id>           Domain Connect (unset = guide only)
+//   DOMAIN_CONNECT_SERVICE_ID=mail-sending
+//   DOMAIN_CONNECT_PRIVATE_KEY=<PKCS8 PEM>    optional: sign apply URLs
+//   DOMAIN_CONNECT_KEY_HOST=<_dck1>           optional: key host for the signature
+//   DOMAIN_CONNECT_REDIRECT_URI=<https url>   optional: return page after apply
+//   SWEEP_CRON_SECRET (or service_secrets 'sweep_cron_secret') gates the cron
 // ============================================================================
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import nodemailer from 'npm:nodemailer@6.9.16';
+import {
+  buildDomainConnectApplyUrl,
+  companyFromWebsite,
+  detectDnsProvider,
+  domainConnectApplyQuery,
+  domainConnectSettingsUrl,
+  domainConnectVars,
+  suggestionCandidates,
+  syncUxBase,
+  validateLocalPart,
+  type DnsProvider,
+} from './rules.ts';
 
 const RESEND_BASE = 'https://api.resend.com';
 
@@ -105,6 +134,23 @@ const RESEND_TIMEOUT_MS = 20_000;
 const HOSTED_DAILY_LIMIT = 40;
 const CONNECTED_DAILY_LIMIT = 150;
 
+/** Echo mailboxes on the shared platform domain. */
+const MAX_ECHO_MAILBOXES = 3;
+const WARMUP_DAYS = 7;
+const WARMUP_DAILY_LIMIT = 15;
+const DEFAULT_PLATFORM_DAILY_CAP = 2000;
+const MAX_SUGGESTIONS = 4;
+
+/** verify_pending_domains: how far back, how many, and how long per run. */
+const PENDING_DOMAIN_WINDOW_MS = 72 * 3600_000;
+const PENDING_DOMAIN_BATCH = 100;
+const PENDING_DOMAIN_BUDGET_MS = 90_000;
+const MIN_CRON_SECRET_LENGTH = 32;
+const DOMAIN_CONNECT_TIMEOUT_MS = 5_000;
+
+/** A mailbox name to create on a custom domain once it verifies (no "+"). */
+const AUTO_LOCAL_PART_RE = /^[a-z0-9]([a-z0-9._-]{0,62}[a-z0-9])?$/;
+
 const PRICE_OPS = { hosted: 'mail.send.hosted', connected: 'mail.send.connected' } as const;
 
 /** A held send with the same content inside this window is treated as in flight. */
@@ -182,6 +228,7 @@ const RATE_LIMITS = {
   connect: { bucket: 'mail.connect', limit: 10, windowSeconds: 3600, message: 'Too many connection attempts. Please try again later.' },
   domain: { bucket: 'mail.domain', limit: 30, windowSeconds: 3600, message: 'Too many domain requests. Please try again in a few minutes.' },
   write: { bucket: 'mail.write', limit: 300, windowSeconds: 3600, message: 'Too many changes in the last hour. Please try again later.' },
+  nameCheck: { bucket: 'mail.name_check', limit: 120, windowSeconds: 600, message: 'Too many name checks. Please wait a minute and try again.' },
 } satisfies Record<string, RateLimit>;
 
 async function enforceRateLimits(admin: any, userId: string, limits: RateLimit[]): Promise<Response | null> {
@@ -208,7 +255,8 @@ async function enforceRateLimits(admin: any, userId: string, limits: RateLimit[]
 const MAILBOX_COLUMNS =
   'id, user_id, kind, provider, address, display_name, domain_id, status, pause_reason, daily_send_limit, sent_today, sent_today_date, is_default, created_at';
 const DOMAIN_COLUMNS =
-  'id, user_id, domain, status, provider, dkim_tokens, dns_records, inbound_provider, verified_at, last_checked_at, created_at';
+  'id, user_id, domain, status, provider, dkim_tokens, dns_records, inbound_provider, verified_at, last_checked_at, created_at, ' +
+  'is_platform, auto_local_part, dns_provider, domain_connect';
 const THREAD_COLUMNS = '*, user_leads(status)';
 
 function shapeThread(row: any) {
@@ -396,7 +444,11 @@ async function resend(path: string, init: { method?: string; body?: unknown; ide
   return data;
 }
 
-type DnsRecord = { type: string; host: string; value: string; status: 'verified' | 'pending' | 'missing' };
+/**
+ * purpose 'receiving' marks the root MX that routes replies to Resend inbound.
+ * It replaces the domain's existing MX, so the UI should say so.
+ */
+type DnsRecord = { type: string; host: string; value: string; status: 'verified' | 'pending' | 'missing'; purpose?: 'receiving' };
 
 /** Resend's record list -> the DNS table the Domains panel renders. */
 function mapResendRecords(domain: string, records: any[]): DnsRecord[] {
@@ -406,7 +458,8 @@ function mapResendRecords(domain: string, records: any[]): DnsRecord[] {
     const value = r?.type === 'MX' && r?.priority != null ? `${r.priority} ${r.value}` : String(r?.value || '');
     const s = String(r?.status || '');
     const status: DnsRecord['status'] = s === 'verified' ? 'verified' : s === 'failed' ? 'missing' : 'pending';
-    return { type: String(r?.type || 'TXT'), host, value, status };
+    const type = String(r?.type || 'TXT');
+    return { type, host, value, status, ...(type === 'MX' && host === domain ? { purpose: 'receiving' as const } : {}) };
   });
   return out;
 }
@@ -654,13 +707,6 @@ Deno.serve(async (req: Request) => {
 });
 
 async function handleRequest(req: Request): Promise<Response> {
-  const userId = await requireUserId(req);
-  if (!userId) return fail('Unauthorized', 401);
-
-  const admin = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!, {
-    auth: { persistSession: false },
-  });
-
   let body: any;
   try {
     body = await req.json();
@@ -669,7 +715,27 @@ async function handleRequest(req: Request): Promise<Response> {
   }
   if (!body || typeof body !== 'object' || Array.isArray(body)) return fail('Invalid JSON body');
 
+  const admin = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!, {
+    auth: { persistSession: false },
+  });
+
+  // The cron caller has no user: it passes the gateway with the project's anon
+  // key and is authenticated here by x-cron-secret alone. It is never routed
+  // to a user action, and a user JWT never reaches this action.
+  if (body.action === 'verify_pending_domains') return verifyPendingDomains(admin, req);
+
+  const userId = await requireUserId(req);
+  if (!userId) return fail('Unauthorized', 401);
+
   switch (body.action) {
+    case 'mail_config':
+      return mailConfig(admin, userId);
+    case 'check_mailbox_name':
+      return checkMailboxName(admin, userId, body);
+    case 'claim_echo_mailbox':
+      return claimEchoMailbox(admin, userId, body);
+    case 'domain_connect_url':
+      return domainConnectUrl(admin, userId, body);
     case 'connect_app_password':
       return connectAppPassword(admin, userId, body);
     case 'create_hosted_mailbox':
@@ -826,6 +892,160 @@ async function createHostedMailbox(admin: any, userId: string, body: any): Promi
   return json({ ok: true, mailbox });
 }
 
+// ---------------------------------------------------------------------------
+// Echo mailboxes (shared platform domain)
+// ---------------------------------------------------------------------------
+
+interface PlatformDomain {
+  id: string;
+  domain: string;
+}
+
+/**
+ * The shared domain, only when MAIL_SHARED_DOMAIN is set AND the platform row
+ * exists for that same domain AND it is verified. Anything else: null (off).
+ */
+async function activePlatformDomain(admin: any): Promise<PlatformDomain | null> {
+  const shared = cleanDomainName(Deno.env.get('MAIL_SHARED_DOMAIN'));
+  if (!shared || !DOMAIN_RE.test(shared)) return null;
+  const { data, error } = await admin
+    .from('mail_domains')
+    .select('id, domain, status')
+    .eq('is_platform', true)
+    .maybeSingle();
+  if (error) {
+    console.error('[mail] platform domain read failed:', error.code || 'error');
+    return null;
+  }
+  if (!data || data.status !== 'verified' || String(data.domain).toLowerCase() !== shared) return null;
+  return { id: data.id, domain: shared };
+}
+
+async function echoMailboxCount(admin: any, userId: string, platform: PlatformDomain | null): Promise<number> {
+  if (!platform) return 0;
+  const { count } = await admin
+    .from('mailboxes')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('domain_id', platform.id);
+  return count ?? 0;
+}
+
+async function profileContext(admin: any, userId: string): Promise<{ fullName: string; company: string }> {
+  const { data } = await admin.from('profiles').select('full_name, website').eq('id', userId).maybeSingle();
+  return { fullName: String(data?.full_name || ''), company: companyFromWebsite(data?.website) };
+}
+
+/** Up to MAX_SUGGESTIONS candidates that are free right now on `domain`. */
+async function availableSuggestions(admin: any, domain: string, requested: string, ctx: { fullName: string; company: string }): Promise<string[]> {
+  const candidates = suggestionCandidates(requested, ctx).slice(0, 20);
+  if (candidates.length === 0) return [];
+  const addresses = candidates.map((c) => `${c}@${domain}`);
+  const { data, error } = await admin.from('mailboxes').select('address').in('address', addresses);
+  if (error) {
+    console.error('[mail] suggestion lookup failed:', error.code || 'error');
+    return [];
+  }
+  const taken = new Set((data || []).map((r: any) => String(r.address).toLowerCase()));
+  return candidates.filter((c) => !taken.has(`${c}@${domain}`)).slice(0, MAX_SUGGESTIONS);
+}
+
+async function addressTaken(admin: any, address: string): Promise<boolean> {
+  // Addresses are stored lower-case by every path (cleanEmail, built names), and
+  // the unique index on lower(address) catches anything this misses.
+  const { data } = await admin.from('mailboxes').select('id').eq('address', address.toLowerCase()).limit(1);
+  return Boolean(data?.length);
+}
+
+async function mailConfig(admin: any, userId: string): Promise<Response> {
+  const platform = await activePlatformDomain(admin);
+  return json({
+    ok: true,
+    shared_domain: platform?.domain ?? null,
+    max_echo_mailboxes: MAX_ECHO_MAILBOXES,
+    echo_mailboxes_used: await echoMailboxCount(admin, userId, platform),
+  });
+}
+
+const PLATFORM_UNAVAILABLE = 'Echo mailboxes are not available right now. Please try again later.';
+
+async function checkMailboxName(admin: any, userId: string, body: any): Promise<Response> {
+  const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.nameCheck]);
+  if (limited) return limited;
+
+  const platform = await activePlatformDomain(admin);
+  if (!platform) return fail(PLATFORM_UNAVAILABLE, 503, { platform_unavailable: true });
+
+  const v = validateLocalPart(body.local_part);
+  const address = `${v.local}@${platform.domain}`;
+  const ctx = await profileContext(admin, userId);
+  if (!v.ok) {
+    return json({ ok: true, available: false, reason: v.reason, address, suggestions: await availableSuggestions(admin, platform.domain, v.local, ctx) });
+  }
+  if (await addressTaken(admin, address)) {
+    return json({ ok: true, available: false, reason: 'taken', address, suggestions: await availableSuggestions(admin, platform.domain, v.local, ctx) });
+  }
+  return json({ ok: true, available: true, address, suggestions: [] });
+}
+
+const REASON_MESSAGES: Record<string, string> = {
+  invalid: 'Use letters, numbers, dots, dashes or underscores, starting and ending with a letter or number.',
+  too_short: 'Choose a name with at least 3 characters.',
+  reserved: 'That name is reserved. Please choose another.',
+};
+
+async function claimEchoMailbox(admin: any, userId: string, body: any): Promise<Response> {
+  const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.write]);
+  if (limited) return limited;
+
+  const platform = await activePlatformDomain(admin);
+  if (!platform) return fail(PLATFORM_UNAVAILABLE, 503, { platform_unavailable: true });
+
+  const v = validateLocalPart(body.local_part);
+  if (!v.ok) return fail(REASON_MESSAGES[v.reason], 422, { reason: v.reason });
+
+  const ctx = await profileContext(admin, userId);
+  const displayName = cleanName(body.display_name) || cleanName(ctx.fullName) || v.local;
+  const address = `${v.local}@${platform.domain}`;
+  const limitReached = () =>
+    fail(`You can have up to ${MAX_ECHO_MAILBOXES} Echo mailboxes. Remove one to create another.`, 429, {
+      limit_reached: true,
+      limit: MAX_ECHO_MAILBOXES,
+    });
+  const taken = async () =>
+    fail(`${address} is taken.`, 409, { taken: true, suggestions: await availableSuggestions(admin, platform.domain, v.local, ctx) });
+
+  if ((await echoMailboxCount(admin, userId, platform)) >= MAX_ECHO_MAILBOXES) return limitReached();
+  if (await addressTaken(admin, address)) return taken();
+
+  const first = await isFirstMailbox(admin, userId);
+  const { data: mailbox, error } = await admin
+    .from('mailboxes')
+    .insert({
+      user_id: userId,
+      kind: 'hosted',
+      provider: 'resend',
+      address,
+      display_name: displayName,
+      domain_id: platform.id,
+      daily_send_limit: HOSTED_DAILY_LIMIT,
+      is_default: first,
+    })
+    .select(MAILBOX_COLUMNS)
+    .single();
+  if (error) {
+    // The trigger and the global unique index are the real guards; the
+    // checks above only make the common answers friendlier.
+    const msg = String(error.message || '');
+    if (error.code === '23505') return taken();
+    if (msg.includes('mail_platform_mailbox_cap')) return limitReached();
+    if (msg.includes('mail_reserved_local_part')) return fail(REASON_MESSAGES.reserved, 422, { reason: 'reserved' });
+    console.error('[mail] echo mailbox insert failed:', error.code || 'error');
+    return fail('Could not create the mailbox.', 500);
+  }
+  return json({ ok: true, mailbox });
+}
+
 async function removeMailbox(admin: any, userId: string, body: any): Promise<Response> {
   if (!isUuid(body.mailbox_id)) return fail('Mailbox not found.', 404);
   const { data: removed, error } = await admin
@@ -872,9 +1092,112 @@ async function setDefaultMailbox(admin: any, userId: string, body: any): Promise
 // Domains
 // ---------------------------------------------------------------------------
 
+// ---- DNS provider and Domain Connect detection -----------------------------
+
+interface DomainConnectInfo {
+  supported: boolean;
+  provider_name?: string;
+}
+
+interface DnsSetup {
+  zone: string;
+  dns_provider: DnsProvider;
+  domain_connect: DomainConnectInfo;
+}
+
+const domainConnectEnv = () => ({
+  providerId: (Deno.env.get('DOMAIN_CONNECT_PROVIDER_ID') || '').trim(),
+  serviceId: (Deno.env.get('DOMAIN_CONNECT_SERVICE_ID') || 'mail-sending').trim(),
+});
+
+/** The zone that holds the domain's NS records: the domain itself or a parent. */
+async function findZone(domain: string): Promise<{ zone: string; ns: string[] }> {
+  const labels = domain.split('.');
+  for (let i = 0; i <= labels.length - 2; i++) {
+    const zone = labels.slice(i).join('.');
+    try {
+      const ns = await Deno.resolveDns(zone, 'NS');
+      if (ns.length) return { zone, ns };
+    } catch {
+      // NXDOMAIN / no NS here: try the parent.
+    }
+  }
+  return { zone: domain, ns: [] };
+}
+
+/**
+ * GET a small JSON document from a host named by the customer's own DNS. The
+ * host must resolve only to public addresses; https only, no redirects, short
+ * timeout, bounded size.
+ */
+async function fetchPublicJson(url: string): Promise<any | null> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'https:' || !(await resolvePublicAddress(parsed.hostname))) return null;
+  try {
+    const res = await fetch(parsed.toString(), {
+      redirect: 'error',
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(DOMAIN_CONNECT_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      await res.body?.cancel();
+      return null;
+    }
+    const text = (await res.text()).slice(0, 32_000);
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+async function domainConnectSettings(zone: string): Promise<any | null> {
+  let txt: string[][] = [];
+  try {
+    txt = await Deno.resolveDns(`_domainconnect.${zone}`, 'TXT');
+  } catch {
+    return null;
+  }
+  const value = txt.map((parts) => parts.join('')).find(Boolean);
+  const settingsUrl = value ? domainConnectSettingsUrl(value, zone) : null;
+  return settingsUrl ? fetchPublicJson(settingsUrl) : null;
+}
+
+/** True when the provider hosts our template (GET .../services/{id} answers 200). */
+async function templateSupported(settings: any): Promise<boolean> {
+  const { providerId, serviceId } = domainConnectEnv();
+  const api = typeof settings?.urlAPI === 'string' ? settings.urlAPI.trim().replace(/\/+$/, '') : '';
+  if (!providerId || !/^https:\/\/[A-Za-z0-9.-]+(:\d+)?(\/[A-Za-z0-9._~\/-]*)?$/.test(api)) return false;
+  const url = `${api}/v2/domainTemplates/providers/${encodeURIComponent(providerId)}/services/${encodeURIComponent(serviceId)}`;
+  return (await fetchPublicJson(url)) !== null;
+}
+
+async function detectDnsSetup(domain: string): Promise<DnsSetup> {
+  const { zone, ns } = await findZone(domain);
+  const dns_provider = detectDnsProvider(ns, zone);
+  const settings = await domainConnectSettings(zone);
+  const providerName = String(settings?.providerDisplayName || settings?.providerName || '').slice(0, 80);
+  const supported = Boolean(settings && syncUxBase(settings) && (await templateSupported(settings)));
+  return { zone, dns_provider, domain_connect: { supported, ...(providerName ? { provider_name: providerName } : {}) } };
+}
+
+// ---- Domains -----------------------------------------------------------------
+
 async function addDomain(admin: any, userId: string, body: any): Promise<Response> {
   const domain = cleanDomainName(body.domain);
   if (!DOMAIN_RE.test(domain)) return fail('Enter a valid domain, e.g. trycompany.com');
+
+  let autoLocalPart: string | null = null;
+  if (body.local_part != null && String(body.local_part).trim() !== '') {
+    autoLocalPart = String(body.local_part).trim().toLowerCase();
+    if (!AUTO_LOCAL_PART_RE.test(autoLocalPart) || /[._-]{2,}/.test(autoLocalPart)) {
+      return fail('Enter a valid address, e.g. alex.', 422, { reason: 'invalid' });
+    }
+  }
 
   const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.domain]);
   if (limited) return limited;
@@ -886,12 +1209,17 @@ async function addDomain(admin: any, userId: string, body: any): Promise<Respons
 
   let created: any;
   try {
-    created = await resend('/domains', { method: 'POST', body: { name: domain } });
+    // Receiving on: Resend then lists the MX that routes replies to its inbound.
+    created = await resend('/domains', {
+      method: 'POST',
+      body: { name: domain, capabilities: { sending: 'enabled', receiving: 'enabled' } },
+    });
   } catch (err: any) {
     return fail(err instanceof ProviderError ? err.message : 'Could not add the domain.', err?.status || 502);
   }
 
-  const records = [...mapResendRecords(domain, created?.records), await dmarcRecord(domain)];
+  const [setup, dmarc] = await Promise.all([detectDnsSetup(domain), dmarcRecord(domain)]);
+  const records = [...mapResendRecords(domain, created?.records), dmarc];
   const { data: row, error } = await admin
     .from('mail_domains')
     .insert({
@@ -902,7 +1230,10 @@ async function addDomain(admin: any, userId: string, body: any): Promise<Respons
       provider_domain_id: created?.id ?? null,
       dkim_tokens: [],
       dns_records: records,
-      inbound_provider: 'none',
+      inbound_provider: 'resend',
+      auto_local_part: autoLocalPart,
+      dns_provider: setup.dns_provider,
+      domain_connect: setup.domain_connect,
       last_checked_at: new Date().toISOString(),
     })
     .select(DOMAIN_COLUMNS)
@@ -914,14 +1245,104 @@ async function addDomain(admin: any, userId: string, body: any): Promise<Respons
     console.error('[mail] domain insert failed:', error.message);
     return fail('Could not save the domain.', 500);
   }
-  return json({ ok: true, domain: row });
+  return json({ ok: true, domain: row, dns_provider: setup.dns_provider, domain_connect: setup.domain_connect });
+}
+
+const VERIFY_SELECT =
+  'id, user_id, domain, status, provider_domain_id, verified_at, auto_local_part, dns_provider, domain_connect';
+
+/**
+ * Re-checks one custom domain at Resend and stores the result. Shared by the
+ * Check DNS button and the cron. On the first verification it creates the
+ * requested mailbox (auto_local_part) when the user has none on the domain.
+ * Throws ProviderError when Resend cannot be asked.
+ */
+async function verifyDomainRow(admin: any, dom: any): Promise<{ row: any; status: string; autoMailbox: any | null }> {
+  if (dom.status !== 'verified') {
+    await resend(`/domains/${dom.provider_domain_id}/verify`, { method: 'POST' });
+  }
+  const current = await resend(`/domains/${dom.provider_domain_id}`);
+
+  const status = mapDomainStatus(String(current?.status || ''));
+  const firstVerification = status === 'verified' && !dom.verified_at;
+  const records = [...mapResendRecords(dom.domain, current?.records), await dmarcRecord(dom.domain)];
+  const patch: Record<string, unknown> = {
+    status,
+    dns_records: records,
+    verified_at: status === 'verified' ? dom.verified_at || new Date().toISOString() : null,
+    last_checked_at: new Date().toISOString(),
+  };
+  // Rows added before detection existed get it on their next check.
+  if (!dom.dns_provider) {
+    const setup = await detectDnsSetup(dom.domain);
+    patch.dns_provider = setup.dns_provider;
+    patch.domain_connect = setup.domain_connect;
+  }
+  const { data: row, error } = await admin.from('mail_domains').update(patch).eq('id', dom.id).select(DOMAIN_COLUMNS).single();
+  if (error) throw new Error('domain_update_failed');
+
+  // Hosted mailboxes stop sending while their domain is not verified. Only a
+  // pause this code made is lifted: a deliverability pause stays.
+  if (status === 'verified') {
+    await admin
+      .from('mailboxes')
+      .update({ status: 'active', pause_reason: null })
+      .eq('domain_id', dom.id)
+      .eq('kind', 'hosted')
+      .eq('status', 'paused')
+      .eq('pause_reason', 'domain_unverified');
+  } else {
+    await admin
+      .from('mailboxes')
+      .update({ status: 'paused', pause_reason: 'domain_unverified' })
+      .eq('domain_id', dom.id)
+      .eq('kind', 'hosted')
+      .eq('status', 'active');
+  }
+
+  let autoMailbox: any = null;
+  if (firstVerification && dom.auto_local_part && dom.user_id) {
+    autoMailbox = await createAutoMailbox(admin, dom);
+  }
+  return { row, status, autoMailbox };
+}
+
+async function createAutoMailbox(admin: any, dom: any): Promise<any | null> {
+  const { count } = await admin
+    .from('mailboxes')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', dom.user_id)
+    .eq('domain_id', dom.id);
+  if ((count ?? 0) > 0) return null;
+  const ctx = await profileContext(admin, dom.user_id);
+  const first = await isFirstMailbox(admin, dom.user_id);
+  const { data, error } = await admin
+    .from('mailboxes')
+    .insert({
+      user_id: dom.user_id,
+      kind: 'hosted',
+      provider: 'resend',
+      address: `${dom.auto_local_part}@${dom.domain}`,
+      display_name: cleanName(ctx.fullName) || dom.auto_local_part,
+      domain_id: dom.id,
+      daily_send_limit: HOSTED_DAILY_LIMIT,
+      is_default: first,
+    })
+    .select(MAILBOX_COLUMNS)
+    .single();
+  if (error) {
+    // Taken meanwhile (e.g. created by hand): nothing to do.
+    if (error.code !== '23505') console.error('[mail] auto mailbox insert failed:', error.code || 'error');
+    return null;
+  }
+  return data;
 }
 
 async function verifyDomain(admin: any, userId: string, body: any): Promise<Response> {
   if (!isUuid(body.domain_id)) return fail('Domain not found.', 404);
   const { data: dom } = await admin
     .from('mail_domains')
-    .select('id, domain, status, provider_domain_id, verified_at')
+    .select(VERIFY_SELECT)
     .eq('id', body.domain_id)
     .eq('user_id', userId)
     .maybeSingle();
@@ -930,40 +1351,179 @@ async function verifyDomain(admin: any, userId: string, body: any): Promise<Resp
   const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.domain]);
   if (limited) return limited;
 
-  let current: any;
+  let result: Awaited<ReturnType<typeof verifyDomainRow>>;
   try {
-    if (dom.status !== 'verified') {
-      await resend(`/domains/${dom.provider_domain_id}/verify`, { method: 'POST' });
-    }
-    current = await resend(`/domains/${dom.provider_domain_id}`);
+    result = await verifyDomainRow(admin, dom);
   } catch (err: any) {
-    return fail(err instanceof ProviderError ? err.message : 'Could not check DNS.', err?.status || 502);
+    if (err instanceof ProviderError) return fail(err.message, err.status);
+    return fail('Could not save the DNS check.', 500);
+  }
+  return json({
+    ok: true,
+    domain: result.row,
+    dns_provider: result.row?.dns_provider ?? null,
+    domain_connect: result.row?.domain_connect ?? null,
+    ...(result.autoMailbox ? { mailbox: result.autoMailbox } : {}),
+  });
+}
+
+// ---- Cron: verify every pending custom domain ---------------------------------
+
+/** Constant-time string comparison (same approach as daily-sweep). */
+function timingSafeEqual(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const ab = enc.encode(a);
+  const bb = enc.encode(b);
+  if (ab.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i];
+  return diff === 0;
+}
+
+let cronSecretCache = '';
+
+/** SWEEP_CRON_SECRET edge secret, else service_secrets 'sweep_cron_secret' (as daily-sweep). */
+async function resolveCronSecret(admin: any): Promise<string> {
+  const env = Deno.env.get('SWEEP_CRON_SECRET') || '';
+  if (env) return env;
+  if (cronSecretCache) return cronSecretCache;
+  const { data, error } = await admin.from('service_secrets').select('value').eq('name', 'sweep_cron_secret').maybeSingle();
+  if (error) {
+    console.error('[mail] cron secret lookup failed:', error.code || 'error');
+    return '';
+  }
+  cronSecretCache = typeof data?.value === 'string' ? data.value : '';
+  return cronSecretCache;
+}
+
+async function verifyPendingDomains(admin: any, req: Request): Promise<Response> {
+  const provided = req.headers.get('x-cron-secret') ?? '';
+  const expected = await resolveCronSecret(admin);
+  if (!expected || expected.length < MIN_CRON_SECRET_LENGTH) {
+    console.error('[mail] cron secret not configured (or shorter than 32 characters) — refusing');
+    return fail('Not configured', 503);
+  }
+  if (!timingSafeEqual(provided, expected)) return fail('Unauthorized', 401);
+
+  const startedMs = Date.now();
+  const { data: rows, error } = await admin
+    .from('mail_domains')
+    .select(VERIFY_SELECT)
+    .eq('is_platform', false)
+    .in('status', ['pending', 'verifying'])
+    .not('provider_domain_id', 'is', null)
+    .gte('created_at', new Date(Date.now() - PENDING_DOMAIN_WINDOW_MS).toISOString())
+    .order('last_checked_at', { ascending: true, nullsFirst: true })
+    .limit(PENDING_DOMAIN_BATCH);
+  if (error) {
+    console.error('[mail] pending domain read failed:', error.code || 'error');
+    return fail('Could not read pending domains.', 500);
   }
 
-  const status = mapDomainStatus(String(current?.status || ''));
-  const records = [...mapResendRecords(dom.domain, current?.records), await dmarcRecord(dom.domain)];
-  const { data: row, error } = await admin
+  const counts = { ok: true, pending: rows?.length ?? 0, checked: 0, verified: 0, still_pending: 0, failed: 0, errors: 0, mailboxes_created: 0, skipped: 0 };
+  for (const dom of rows || []) {
+    if (Date.now() - startedMs > PENDING_DOMAIN_BUDGET_MS) {
+      counts.skipped++;
+      continue;
+    }
+    try {
+      const r = await verifyDomainRow(admin, dom);
+      counts.checked++;
+      if (r.status === 'verified') counts.verified++;
+      else if (r.status === 'failed') counts.failed++;
+      else counts.still_pending++;
+      if (r.autoMailbox) counts.mailboxes_created++;
+    } catch (err: any) {
+      counts.errors++;
+      console.error('[mail] cron verify failed:', err instanceof ProviderError ? err.code : err?.message || 'error');
+      // Resend says slow down: leave the rest for the next run.
+      if (err instanceof ProviderError && err.status === 429) {
+        counts.skipped += (rows?.length ?? 0) - counts.checked - counts.errors;
+        break;
+      }
+    }
+    // Resend allows ~2 requests/second and each check makes two.
+    await pause(1_000);
+  }
+  return json(counts);
+}
+
+// ---- Domain Connect apply URL --------------------------------------------------
+
+function pemToDer(pem: string): Uint8Array<ArrayBuffer> {
+  const b64 = pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+  const bin = atob(b64);
+  const out = new Uint8Array(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** RSA-SHA256 signature of the query string, base64 (Domain Connect sync signing). */
+async function signQuery(query: string, pem: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'pkcs8',
+    pemToDer(pem),
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = new Uint8Array(await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(query)));
+  let bin = '';
+  for (const b of sig) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+async function domainConnectUrl(admin: any, userId: string, body: any): Promise<Response> {
+  if (!isUuid(body.domain_id)) return fail('Domain not found.', 404);
+  const { providerId, serviceId } = domainConnectEnv();
+  const notConfigured = (why: string) =>
+    fail('Automatic setup is not available for this domain. Follow the guide to add the records.', 501, { not_configured: true, why });
+  if (!providerId) return notConfigured('provider_id');
+
+  const { data: dom } = await admin
     .from('mail_domains')
-    .update({
-      status,
-      dns_records: records,
-      verified_at: status === 'verified' ? dom.verified_at || new Date().toISOString() : null,
-      last_checked_at: new Date().toISOString(),
-    })
-    .eq('id', dom.id)
-    .select(DOMAIN_COLUMNS)
-    .single();
-  if (error) return fail('Could not save the DNS check.', 500);
+    .select('id, domain, dns_records')
+    .eq('id', body.domain_id)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (!dom) return fail('Domain not found.', 404);
 
-  // Hosted mailboxes stop sending while their domain is not verified.
-  await admin
-    .from('mailboxes')
-    .update({ status: status === 'verified' ? 'active' : 'paused', pause_reason: status === 'verified' ? null : 'domain_unverified' })
-    .eq('domain_id', dom.id)
-    .eq('kind', 'hosted')
-    .in('status', status === 'verified' ? ['paused'] : ['active']);
+  const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.domain]);
+  if (limited) return limited;
 
-  return json({ ok: true, domain: row });
+  const { zone } = await findZone(dom.domain);
+  const settings = await domainConnectSettings(zone);
+  const urlSyncUX = syncUxBase(settings);
+  if (!urlSyncUX || !(await templateSupported(settings))) return notConfigured('provider_unsupported');
+
+  const vars = domainConnectVars(dom.domain, Array.isArray(dom.dns_records) ? dom.dns_records : []);
+  if (!vars) return fail('The DNS records for this domain are not ready yet. Press Check DNS and try again.', 409);
+
+  const host = dom.domain === zone ? undefined : dom.domain.slice(0, -(zone.length + 1));
+  const redirect = (Deno.env.get('DOMAIN_CONNECT_REDIRECT_URI') || '').trim();
+  const input = {
+    urlSyncUX,
+    providerId,
+    serviceId,
+    domain: zone,
+    host,
+    vars,
+    state: dom.id,
+    ...(/^https:\/\//.test(redirect) ? { redirectUri: redirect } : {}),
+  };
+
+  const pem = Deno.env.get('DOMAIN_CONNECT_PRIVATE_KEY') || '';
+  const keyHost = (Deno.env.get('DOMAIN_CONNECT_KEY_HOST') || '').trim();
+  let signature: { sig: string; key: string } | undefined;
+  if (pem && keyHost) {
+    try {
+      signature = { sig: await signQuery(domainConnectApplyQuery(input), pem), key: keyHost };
+    } catch {
+      console.error('[mail] DOMAIN_CONNECT_PRIVATE_KEY could not be used to sign');
+      return notConfigured('signing_key');
+    }
+  }
+  return json({ ok: true, url: buildDomainConnectApplyUrl(input, signature) });
 }
 
 async function removeDomain(admin: any, userId: string, body: any): Promise<Response> {
@@ -1006,7 +1566,7 @@ async function ownedMailbox(admin: any, userId: string, mailboxId: unknown) {
   if (!isUuid(mailboxId)) return null;
   const { data } = await admin
     .from('mailboxes')
-    .select('id, kind, provider, address, display_name, status, domain_id, smtp_host, smtp_port, smtp_user, vault_secret_id')
+    .select('id, kind, provider, address, display_name, status, domain_id, smtp_host, smtp_port, smtp_user, vault_secret_id, created_at')
     .eq('id', mailboxId)
     .eq('user_id', userId)
     .maybeSingle();
@@ -1146,10 +1706,17 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
 
   let fromDomain = mailbox.address.split('@')[1];
   let smtpConnectAddress: string | undefined;
+  // Echo mailboxes on the shared domain: new ones warm up at a lower daily limit.
+  let platformDomainId: string | null = null;
+  let warmup = false;
   if (mailbox.kind === 'hosted') {
-    const { data: dom } = await admin.from('mail_domains').select('domain, status').eq('id', mailbox.domain_id).maybeSingle();
+    const { data: dom } = await admin.from('mail_domains').select('id, domain, status, is_platform').eq('id', mailbox.domain_id).maybeSingle();
     if (!dom || dom.status !== 'verified') return fail(`The domain for ${mailbox.address} isn't verified.`, 409);
     fromDomain = dom.domain;
+    if (dom.is_platform) {
+      platformDomainId = dom.id;
+      warmup = Date.now() - new Date(mailbox.created_at).getTime() < WARMUP_DAYS * 86_400_000;
+    }
   } else if (mailbox.kind === 'app_password') {
     // A custom host is re-checked at send time (its DNS may have changed since
     // it was connected) and the connection is pinned to the checked address.
@@ -1203,6 +1770,27 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
   const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.sendBurst, RATE_LIMITS.send]);
   if (limited) return limited;
 
+  // 0. Platform-wide daily cap on the shared domain: slots taken today across
+  // every Echo mailbox (a slot is taken before the send and returned on failure).
+  if (platformDomainId) {
+    const cap = Number(Deno.env.get('MAIL_PLATFORM_DAILY_CAP') || DEFAULT_PLATFORM_DAILY_CAP);
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: slots, error: capError } = await admin
+      .from('mailboxes')
+      .select('sent_today')
+      .eq('domain_id', platformDomainId)
+      .eq('sent_today_date', today)
+      .gt('sent_today', 0);
+    if (capError) {
+      console.error('[mail] platform cap read failed:', capError.code || 'error');
+      return fail('The service is busy. Please try again in a moment.', 503);
+    }
+    const used = (slots || []).reduce((n: number, r: any) => n + Number(r.sent_today || 0), 0);
+    if (Number.isFinite(cap) && used >= cap) {
+      return fail('Echo mail has reached its sending limit for today. Please try again tomorrow.', 429, { platform_cap: true });
+    }
+  }
+
   // 1. Daily limit slot.
   const { data: slot, error: slotError } = await admin.rpc('mail_take_send_slot', { p_mailbox_id: mailbox.id, p_user_id: userId });
   if (slotError) {
@@ -1220,6 +1808,15 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
     return fail('Mailbox not found.', 404);
   }
   const returnSlot = () => admin.rpc('mail_return_send_slot', { p_mailbox_id: mailbox.id, p_user_id: userId });
+  // Warm-up: the slot is already taken atomically, so its count decides.
+  if (warmup && Number(slot.sent_today) > WARMUP_DAILY_LIMIT) {
+    await returnSlot();
+    return fail(
+      `${mailbox.address} is new, so it can send ${WARMUP_DAILY_LIMIT} emails a day for its first ${WARMUP_DAYS} days. Send the rest tomorrow.`,
+      429,
+      { warmup: true, warmup_limit: WARMUP_DAILY_LIMIT },
+    );
+  }
 
   // 2. Credit hold. Mail is paid-only: welcome credits cover feed sweeps alone.
   const idempotencyKey = `mail:send:${userId}:${requestId}`;
@@ -1288,12 +1885,14 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
   // 3. Deliver.
   const fromName = cleanName(mailbox.display_name);
   const html = textToHtml(text);
-  let messageIdHeader: string | null = `<${crypto.randomUUID()}@${fromDomain}>`;
+  const messageIdHeader = `<${crypto.randomUUID()}@${fromDomain}>`;
   let providerMessageId: string | null = null;
   const usageMeta = { feature: 'mail', fingerprint, mailbox_id: mailbox.id };
   try {
     if (mailbox.kind === 'hosted') {
-      const headers: Record<string, string> = {};
+      // Our own Message-ID, stored below, so replies (In-Reply-To/References)
+      // thread back to this message; provider_message_id keeps Resend's id.
+      const headers: Record<string, string> = { 'Message-ID': messageIdHeader };
       if (inReplyTo) headers['In-Reply-To'] = inReplyTo;
       if (references) headers['References'] = references;
       const sent = await resend('/emails', {
@@ -1303,15 +1902,14 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
         body: {
           from: formatFrom(fromName, mailbox.address),
           to: to.map((p) => p.address),
+          reply_to: mailbox.address,
           subject,
           text,
           html,
-          // Resend assigns its own Message-ID, so ours is not sent or stored.
-          ...(Object.keys(headers).length ? { headers } : {}),
+          headers,
         },
       });
       providerMessageId = typeof sent?.id === 'string' ? sent.id : null;
-      messageIdHeader = null;
     } else {
       const { data: password } = await admin.rpc('get_mailbox_secret', { p_secret_id: mailbox.vault_secret_id });
       if (!password) throw new ProviderError('The saved password for this mailbox is missing. Reconnect it.', 409, 'no_secret');
@@ -1324,7 +1922,7 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
           subject,
           text,
           html,
-          messageId: messageIdHeader!,
+          messageId: messageIdHeader,
           ...(inReplyTo ? { inReplyTo } : {}),
           ...(references ? { references } : {}),
         });

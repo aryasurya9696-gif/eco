@@ -45,6 +45,8 @@ const FUNCTIONS = {
   mail: true,
   'daily-sweep': false,
   'billing-webhook': false,
+  // Resend webhooks: authenticated by the Svix signature (RESEND_WEBHOOK_SECRET).
+  'mail-inbound': false,
 };
 
 const only = process.argv.slice(2);

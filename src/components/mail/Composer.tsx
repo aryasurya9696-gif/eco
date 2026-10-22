@@ -486,9 +486,9 @@ export const Composer: React.FC<ComposerProps> = ({ mode: initialMode = 'drawer'
             <span className="w-11 h-11 rounded-full bg-[#f4f4f0] flex items-center justify-center">
               <Inbox className="w-5 h-5 text-[#71717a]" />
             </span>
-            <div className="mt-4 text-[15px] font-semibold text-[#18181b]">Connect a mailbox</div>
+            <div className="mt-4 text-[15px] font-semibold text-[#18181b]">Get an address to send from</div>
             <p className="mt-1.5 max-w-xs text-[13px] text-[#71717a] leading-relaxed">
-              Emails are sent from your own address. Connect a mailbox or create a hosted one, then come back to write
+              Create your free Echo email in one click, or connect your own inbox. Then come back to write
               {selectedLeadName ? ` to ${selectedLeadName}` : ' this email'}.
             </p>
             <button
@@ -496,7 +496,17 @@ export const Composer: React.FC<ComposerProps> = ({ mode: initialMode = 'drawer'
               onClick={goToMailAccounts}
               className="mt-5 inline-flex items-center gap-2 h-9 bg-[#18181b] hover:bg-black text-white px-4 text-[13px] font-medium rounded-lg transition-colors cursor-pointer"
             >
-              Go to Mail &gt; Accounts
+              Get your Echo email
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                goToMailAccounts();
+                mailStore.requestConnectInbox();
+              }}
+              className="mt-2 text-[13px] text-[#52525b] hover:text-[#18181b] underline underline-offset-2 cursor-pointer"
+            >
+              Use your own inbox (Gmail/Zoho)
             </button>
           </div>
         ) : (
