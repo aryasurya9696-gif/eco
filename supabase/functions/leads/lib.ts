@@ -298,6 +298,72 @@ export function cachedCompanyState(
 }
 
 // ---------------------------------------------------------------------------
+// Company news (treg.companies.news)
+// ---------------------------------------------------------------------------
+
+export const NEWS_HIT_TTL_MS = 7 * 24 * 3600_000;
+export const NEWS_MISS_TTL_MS = 3 * 24 * 3600_000;
+const MAX_ARTICLES = 10;
+
+export interface NewsArticle {
+  title: string;
+  url: string;
+  published_at: string | null;
+  source: string | null;
+}
+
+/** An absolute http(s) article link, kept whole (news sites key articles on the query string). */
+function articleUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > 1000) return null;
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Articles from a treg.companies.news answer (`output.articles`; a miss is an
+ * empty list). The article fields are the serving provider's own, so the
+ * common spellings are accepted; an article without a title or an http(s)
+ * link is dropped.
+ */
+export function mapNewsOutput(resJson: any): NewsArticle[] {
+  const list = Array.isArray(resJson?.output?.articles) ? resJson.output.articles : [];
+  const out: NewsArticle[] = [];
+  for (const a of list) {
+    const title = text(a?.title ?? a?.headline ?? a?.name, 300);
+    const url = articleUrl(a?.url ?? a?.link ?? a?.article_url);
+    if (!title || !url) continue;
+    const when = Date.parse(String(a?.published_at ?? a?.publishedAt ?? a?.date ?? a?.published ?? a?.found_at ?? ''));
+    out.push({
+      title,
+      url,
+      published_at: Number.isFinite(when) ? new Date(when).toISOString() : null,
+      source: text(a?.source?.name ?? a?.source ?? a?.publisher ?? a?.site_name, 100),
+    });
+    if (out.length >= MAX_ARTICLES) break;
+  }
+  return out;
+}
+
+/** Cached news state, like cachedCompanyState with the shorter news windows. */
+export function cachedNewsState(
+  row: { news?: unknown; news_at?: string | null; news_miss_at?: string | null } | null | undefined,
+  now = Date.now(),
+): 'hit' | 'miss' | 'stale' {
+  if (!row) return 'stale';
+  const hitAt = row.news_at ? Date.parse(row.news_at) : NaN;
+  const missAt = row.news_miss_at ? Date.parse(row.news_miss_at) : NaN;
+  if (Array.isArray(row.news) && row.news.length > 0 && Number.isFinite(hitAt) && !(missAt > hitAt) && now - hitAt < NEWS_HIT_TTL_MS) {
+    return 'hit';
+  }
+  if (Number.isFinite(missAt) && !(hitAt > missAt) && now - missAt < NEWS_MISS_TTL_MS) return 'miss';
+  return 'stale';
+}
+
+// ---------------------------------------------------------------------------
 // Person enrichment (treg.people.enrich)
 // ---------------------------------------------------------------------------
 

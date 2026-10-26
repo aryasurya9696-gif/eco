@@ -5,6 +5,27 @@
 
 ---
 
+## Status (2026-10-26)
+
+| Phase | State |
+|---|---|
+| 0 Spike | `scripts/treg-spike.cjs` is ready. It needs a real `TREG_TOKEN` to run; not run yet. |
+| 1 Company enrichment | Built: `companies` cache, `company-lookup` / `enrich-company`, CompanyPanel, the feed **Company** button on web mentions. |
+| 2 Person enrichment | Built: `enrich-person` for saved leads (fills blanks only), and the "Enrich profile" action. |
+| 3 Social reply | Built on **path D** (Echo's own OAuth apps) for X and Reddit: new `social` function, Settings → Connected social accounts, and "Reply as @handle" in the draft dialog. Path T stays open if treg confirms per-user connections. |
+| 4 Signals | Company news is built (`company-news`, "Recent news" on the profile). Funding and hiring signals are not built. |
+
+Decisions taken with defaults:
+- Q1: companies already in the cache are free.
+- Q3: replies on X that contain a link are refused.
+- Q2 (our own X app) is implied by path D. Nothing posts until `X_CLIENT_*` / `REDDIT_CLIENT_*` are set.
+
+Built differently from this plan:
+- No `monitored_posts.external_post_id` column. The post id is read from `post_url` at reply time, so the sweep functions are unchanged.
+- No seniority or headline columns. treg's routed person contract does not return them.
+
+---
+
 ## 0. What treg actually offers (verified)
 
 ### Enrichment — two routed endpoints, same call style we already use

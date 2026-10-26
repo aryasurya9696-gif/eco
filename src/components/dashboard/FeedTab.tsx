@@ -9,7 +9,20 @@ import { FeedCard } from './FeedCard';
 import { FeedSummary, FeedSkeleton } from './FeedSummary';
 import { ModalDialog } from './ModalDialog';
 import { SweepButton } from './SweepButton';
-import { Search, X, Sparkles, Clock, Trash2 } from 'lucide-react';
+import { Search, X, Sparkles, Clock, Trash2, Send, Loader2, CheckCircle2 } from 'lucide-react';
+import { ApiError } from '../../lib/api';
+import { usePricing } from '../../lib/pricing';
+import { formatCredits } from '../../lib/billing';
+import { walletStore, isWelcomeOnlyRefusal, WELCOME_ONLY_MESSAGE } from '../../lib/wallet-store';
+import {
+  loadSentReplies,
+  MAX_REPLY_LENGTH,
+  replyPlatformOf,
+  replyTextProblem,
+  socialStore,
+  SOCIAL_LABEL,
+  useSocialAccounts,
+} from '../../lib/social';
 
 type Tone = 'professional' | 'casual' | 'consultative' | 'direct';
 
@@ -136,6 +149,22 @@ export const FeedTab: React.FC<{ onNavigateBilling?: () => void; onNavigateKeywo
   const [draftSource, setDraftSource] = useState<DraftResult['source'] | null>(null);
   const [isGeneratingDraft, setIsGeneratingDraft] = useState<boolean>(false);
   const [copiedDraft, setCopiedDraft] = useState<boolean>(false);
+  const [isSendingReply, setIsSendingReply] = useState<boolean>(false);
+
+  // Connected accounts (who a reply is sent as) and the replies already sent,
+  // by post id, so a card can link to its reply.
+  const social = useSocialAccounts();
+  const { creditsFor } = usePricing();
+  const [sentReplies, setSentReplies] = useState<Record<string, string>>({});
+  useEffect(() => {
+    let live = true;
+    void loadSentReplies().then((map) => {
+      if (live) setSentReplies(map);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
 
   const toggleExpand = (id: string) =>
     setExpandedCards((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -198,6 +227,38 @@ export const FeedTab: React.FC<{ onNavigateBilling?: () => void; onNavigateKeywo
       setTimeout(() => setCopiedDraft(false), 2000);
     } catch {
       addToast('Could not access the clipboard.', 'error');
+    }
+  };
+
+  const replyPlatform = aiDraftModalPost ? replyPlatformOf(aiDraftModalPost.platform) : null;
+  const replyAccount = replyPlatform
+    ? social.accounts.find((a) => a.platform === replyPlatform && a.status === 'active') ?? null
+    : null;
+  const replyProblem = replyPlatform ? replyTextProblem(replyPlatform, draftText) : null;
+  const sentReplyUrl = aiDraftModalPost ? sentReplies[aiDraftModalPost.id] : undefined;
+  const handlePrefix = replyAccount?.platform === 'reddit' ? 'u/' : '@';
+
+  const handleSendReply = async () => {
+    const post = aiDraftModalPost;
+    if (!post || !replyAccount || replyProblem || isGeneratingDraft || isSendingReply) return;
+    setIsSendingReply(true);
+    try {
+      const res = await socialStore.reply(post.id, draftText.trim(), replyAccount.id);
+      setSentReplies((prev) => ({ ...prev, [post.id]: res.reply_url }));
+      // The server already moved the post to Contacted; this updates the feed.
+      void updatePostStatus(post.id, 'contacted');
+      addToast(`Reply posted as ${handlePrefix}${replyAccount.handle}.`, 'success');
+    } catch (err) {
+      const price = replyPlatform ? creditsFor(`social.reply.${replyPlatform}`) : undefined;
+      if (err instanceof ApiError && err.status === 402) {
+        addToast(isWelcomeOnlyRefusal(err, price) ? WELCOME_ONLY_MESSAGE : 'Not enough credits to send this reply.', 'error');
+      } else {
+        addToast((err as Error)?.message || 'Could not send the reply.', 'error');
+      }
+      if (err instanceof ApiError && err.status === 409) void socialStore.load(true);
+    } finally {
+      setIsSendingReply(false);
+      void walletStore.refresh();
     }
   };
 
@@ -483,6 +544,7 @@ export const FeedTab: React.FC<{ onNavigateBilling?: () => void; onNavigateKeywo
                     onToggleExpand={toggleExpand}
                     onStatusChange={updatePostStatus}
                     onOpenAiDraft={handleOpenAiDraft}
+                    replyUrl={sentReplies[post.id]}
                   />
                 ))}
               </div>
@@ -662,6 +724,14 @@ export const FeedTab: React.FC<{ onNavigateBilling?: () => void; onNavigateKeywo
                   isGeneratingDraft ? 'opacity-50' : ''
                 }`}
               />
+              {replyPlatform && !isGeneratingDraft && draftText.trim() && (
+                <p className={`flex justify-between gap-2 text-[10px] font-mono ${replyProblem ? 'text-red-700' : 'text-[#8a8a86]'}`}>
+                  <span>{replyProblem ?? ''}</span>
+                  <span className="tabular-nums">
+                    {[...draftText.trim()].length}/{MAX_REPLY_LENGTH[replyPlatform]}
+                  </span>
+                </p>
+              )}
             </div>
 
             <div className="flex items-center justify-between">
@@ -677,15 +747,61 @@ export const FeedTab: React.FC<{ onNavigateBilling?: () => void; onNavigateKeywo
               ) : (
                 <span />
               )}
-              <button
-                type="button"
-                onClick={() => void handleCopyDraft()}
-                disabled={isGeneratingDraft || !draftText.trim()}
-                className="inline-flex items-center gap-2 px-4 py-2 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {copiedDraft ? 'Copied' : 'Copy draft'}
-              </button>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleCopyDraft()}
+                  disabled={isGeneratingDraft || !draftText.trim()}
+                  className={`inline-flex items-center gap-2 px-4 py-2 text-xs font-mono transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
+                    replyAccount && !sentReplyUrl
+                      ? 'border border-[#deded8] bg-white text-[#141414] hover:bg-[#f6f6f4]'
+                      : 'bg-[#141414] hover:bg-black text-white'
+                  }`}
+                >
+                  {copiedDraft ? 'Copied' : 'Copy draft'}
+                </button>
+                {replyPlatform && sentReplyUrl && (
+                  <a
+                    href={safeHttpUrl(sentReplyUrl) ?? undefined}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 px-4 py-2 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-mono"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />
+                    View reply
+                  </a>
+                )}
+                {replyPlatform && !sentReplyUrl && replyAccount && (
+                  <button
+                    type="button"
+                    onClick={() => void handleSendReply()}
+                    disabled={isGeneratingDraft || isSendingReply || Boolean(replyProblem)}
+                    title={replyProblem ?? `Posts this reply on ${SOCIAL_LABEL[replyPlatform]} right away.`}
+                    className="inline-flex items-center gap-2 px-4 py-2 bg-[#141414] hover:bg-black text-white text-xs font-mono transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isSendingReply ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                    ) : (
+                      <Send className="w-3.5 h-3.5" aria-hidden="true" />
+                    )}
+                    Reply as {handlePrefix}
+                    {replyAccount.handle} · {formatCredits(creditsFor(`social.reply.${replyPlatform}`))} cr
+                  </button>
+                )}
+              </div>
             </div>
+            {replyPlatform && !sentReplyUrl && !replyAccount && social.loaded && (
+              <p className="text-[11px] font-mono text-[#8a8a86]">
+                {social.platforms.includes(replyPlatform) ? (
+                  <a href="#dashboard/settings" onClick={closeDraftModal} className="underline hover:text-[#141414]">
+                    Connect your {SOCIAL_LABEL[replyPlatform]} account in Settings
+                  </a>
+                ) : (
+                  `Replying on ${SOCIAL_LABEL[replyPlatform]} is not set up on this workspace yet`
+                )}{' '}
+                to post replies straight from Echo.
+              </p>
+            )}
           </div>
         </ModalDialog>
       )}

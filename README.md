@@ -84,7 +84,13 @@ wins when both are present.
 supabase functions deploy social-search
 supabase functions deploy ai
 supabase functions deploy daily-sweep --no-verify-jwt
+supabase functions deploy social --no-verify-jwt   # OAuth redirect has no JWT; actions check it themselves
 ```
+(`node scripts/deploy-functions.cjs` deploys every function with the right flag.)
+
+Social replies need an OAuth app per platform; see `.env.example` for the
+`X_CLIENT_*` / `REDDIT_CLIENT_*` secrets and the redirect URI to register.
+Without them the Connect buttons in Settings stay disabled.
 
 are unavailable. It never falls back to granting access for free.
 

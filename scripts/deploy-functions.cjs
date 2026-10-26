@@ -47,6 +47,9 @@ const FUNCTIONS = {
   'billing-webhook': false,
   // Resend webhooks: authenticated by the Svix signature (RESEND_WEBHOOK_SECRET).
   'mail-inbound': false,
+  // The OAuth redirect from X / Reddit is a plain browser GET with no JWT; the
+  // single-use state row is its gate. Every POST action checks the JWT itself.
+  social: false,
 };
 
 const only = process.argv.slice(2);

@@ -18,8 +18,10 @@ import {
   Clock,
   Inbox,
   Sparkles,
+  Link2,
 } from 'lucide-react';
 import { PlatformBadge } from '../common/PlatformBadge';
+import { SocialAccountsPanel } from './SocialAccountsPanel';
 import type { Platform } from '../../types';
 
 const CORE_OFFER_MAX = 280;
@@ -657,6 +659,15 @@ export const SettingsTab: React.FC = () => {
             format={(d) => RETENTION_OPTIONS.find((o) => o.days === d)?.label ?? `${d}d`}
           />
         </Field>
+      </Section>
+
+      {/* Connected accounts ---------------------------------------------- */}
+      <Section
+        icon={<Link2 className="w-4 h-4 text-[#141414]" />}
+        title="Connected social accounts"
+        description="Reply to X and Reddit mentions from the feed as yourself."
+      >
+        <SocialAccountsPanel />
       </Section>
     </form>
   );

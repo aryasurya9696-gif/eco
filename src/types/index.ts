@@ -174,6 +174,15 @@ export interface Company {
   website: string | null;
   logo_url: string | null;
   enriched_at: string | null;
+  /** Cached recent news: null when not looked up, [] when none was found. */
+  news?: CompanyNewsArticle[] | null;
+}
+
+export interface CompanyNewsArticle {
+  title: string;
+  url: string;
+  published_at: string | null;
+  source: string | null;
 }
 
 export interface B2BLead {

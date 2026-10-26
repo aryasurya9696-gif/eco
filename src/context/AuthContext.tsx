@@ -2,6 +2,8 @@ import React, { createContext, useCallback, useContext, useEffect, useRef, useSt
 import { supabase, isConfigured } from '../lib/supabase';
 import { leadsStore } from '../components/leads/leads-store';
 import { mailStore } from '../components/mail/mail-store';
+import { socialStore } from '../lib/social';
+import { companyStore } from '../components/leads/company-store';
 import type { Profile } from '../types';
 
 type AuthUser = { id: string; email: string };
@@ -307,6 +309,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // Lead results, reveals and the run sequence belong to the old account.
     leadsStore.reset();
     mailStore.init(null);
+    socialStore.reset();
+    companyStore.reset();
     currentUserIdRef.current = null;
     profileLoadRef.current = null;
     setUser(null);

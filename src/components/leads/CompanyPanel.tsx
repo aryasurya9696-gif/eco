@@ -1,10 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { Building2, ExternalLink, Loader2, MapPin, Users, CalendarDays, Factory, X, AlertCircle, ShieldCheck } from 'lucide-react';
+import { Building2, ExternalLink, Loader2, MapPin, Users, CalendarDays, Factory, X, AlertCircle, ShieldCheck, Newspaper } from 'lucide-react';
 import { ModalDialog } from '../dashboard/ModalDialog';
 import { usePricing } from '../../lib/pricing';
 import { useWallet } from '../../lib/wallet-store';
 import { creditsLabel, formatCredits } from '../../lib/billing';
-import { companyStore, useCompany } from './company-store';
+import { companyStore, useCompany, type CompanyEntry } from './company-store';
 import { LinkedinIcon } from './LeadCells';
 
 // ============================================================================
@@ -118,6 +118,7 @@ export const CompanyPanel: React.FC<CompanyPanelProps> = ({ domain, fallbackName
             {company.enriched_at && (
               <p className="text-xs text-muted">Profile updated {new Date(company.enriched_at).toLocaleDateString()}.</p>
             )}
+            {entry.status === 'found' && <NewsSection domain={domain} entry={entry} price={creditsFor('treg.companies.news')} />}
           </>
         )}
 
@@ -145,6 +146,57 @@ export const CompanyPanel: React.FC<CompanyPanelProps> = ({ domain, fallbackName
         )}
       </div>
     </ModalDialog>
+  );
+};
+
+/** Recent news: shown from the cache when present, otherwise offered as a paid lookup. */
+const NewsSection: React.FC<{ domain: string; entry: Extract<CompanyEntry, { status: 'found' }>; price: number }> = ({
+  domain,
+  entry,
+  price,
+}) => {
+  const news = entry.company.news;
+  return (
+    <section className="border-t border-line-soft pt-4 space-y-2" aria-label="Recent news">
+      <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted">
+        <Newspaper className="w-3.5 h-3.5" aria-hidden /> Recent news
+      </h3>
+      {news && news.length > 0 ? (
+        <ul className="space-y-2">
+          {news.map((a) => (
+            <li key={a.url}>
+              <a href={a.url} target="_blank" rel="noopener noreferrer" className="text-[13px] text-ink hover:underline line-clamp-2">
+                {a.title}
+              </a>
+              <p className="text-xs text-muted">
+                {[a.source, a.published_at ? new Date(a.published_at).toLocaleDateString() : null].filter(Boolean).join(' · ')}
+              </p>
+            </li>
+          ))}
+        </ul>
+      ) : news && news.length === 0 ? (
+        <p className="text-[13px] text-muted">No recent news was found for this company. Nothing was charged.</p>
+      ) : (
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-[13px] text-ink-2">Funding, hires and launches from the last few months.</p>
+          <button
+            type="button"
+            onClick={() => void companyStore.loadNews(domain)}
+            disabled={entry.newsLoading}
+            className="h-9 px-3 border border-line hover:bg-fill text-ink text-[13px] font-medium inline-flex items-center gap-2 shrink-0 cursor-pointer disabled:opacity-50 disabled:cursor-wait"
+          >
+            {entry.newsLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden /> : null}
+            {entry.newsLoading ? 'Looking up…' : `Get news · ${formatCredits(price)} cr`}
+          </button>
+        </div>
+      )}
+      {entry.newsError && (
+        <p role="alert" className="text-xs text-danger">
+          {entry.newsError}
+        </p>
+      )}
+      {!news && <p className="text-xs text-muted">Charged only when articles are found.</p>}
+    </section>
   );
 };
 

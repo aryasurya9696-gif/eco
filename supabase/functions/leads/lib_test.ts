@@ -4,6 +4,7 @@ import {
   affordableSearchLimit,
   allowedOrigins,
   cachedCompanyState,
+  cachedNewsState,
   COMPANY_HIT_TTL_MS,
   COMPANY_MISS_TTL_MS,
   classifyEmail,
@@ -14,6 +15,7 @@ import {
   hasRevealedEmail,
   hasUsableEmail,
   mapCompanyOutput,
+  mapNewsOutput,
   mapPersonOutput,
   maxSearchProviderCalls,
   mergeLeadRecord,
@@ -237,4 +239,36 @@ Deno.test('enrichmentPatch: fills blanks and placeholders only; never renames th
   // A LinkedIn-only lead gets its missing domain.
   assertEquals(enrichmentPatch({ full_name: 'Jane Doe', company_domain: '' }, found).company_domain, 'acme.com');
   assert(!('full_name' in enrichmentPatch({ full_name: 'Jane Doe' }, found)));
+});
+
+Deno.test('mapNewsOutput: common field spellings; no title or link drops the article', () => {
+  assertEquals(
+    mapNewsOutput({
+      output: {
+        articles: [
+          { title: 'Acme raises $20M', url: 'https://news.example/a?id=7', published_at: '2026-10-01T00:00:00Z', source: { name: 'TechNews' } },
+          { headline: 'Acme hires a CRO', link: 'http://blog.example/b', date: '2026-09-15', publisher: 'Blog' },
+          { title: 'No link' },
+          { title: 'Bad link', url: 'javascript:alert(1)' },
+        ],
+      },
+    }),
+    [
+      { title: 'Acme raises $20M', url: 'https://news.example/a?id=7', published_at: '2026-10-01T00:00:00.000Z', source: 'TechNews' },
+      { title: 'Acme hires a CRO', url: 'http://blog.example/b', published_at: '2026-09-15T00:00:00.000Z', source: 'Blog' },
+    ],
+  );
+  assertEquals(mapNewsOutput({ output: { articles: [] } }), []);
+  assertEquals(mapNewsOutput({}), []);
+});
+
+Deno.test('cachedNewsState: 7-day hits, 3-day misses', () => {
+  const now = Date.parse('2026-10-26T00:00:00Z');
+  const ago = (days: number) => new Date(now - days * 24 * 3600_000).toISOString();
+  const article = [{ title: 't', url: 'https://a.example', published_at: null, source: null }];
+  assertEquals(cachedNewsState({ news: article, news_at: ago(6) }, now), 'hit');
+  assertEquals(cachedNewsState({ news: article, news_at: ago(8) }, now), 'stale');
+  assertEquals(cachedNewsState({ news_miss_at: ago(2) }, now), 'miss');
+  assertEquals(cachedNewsState({ news_miss_at: ago(4) }, now), 'stale');
+  assertEquals(cachedNewsState(null, now), 'stale');
 });

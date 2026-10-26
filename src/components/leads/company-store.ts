@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { invokeFunction, ApiError } from '../../lib/api';
 import { walletStore } from '../../lib/wallet-store';
-import type { Company } from '../../types';
+import type { Company, CompanyNewsArticle } from '../../types';
 
 // ============================================================================
 // Company profiles by domain, shared by every view that shows a company.
@@ -19,7 +19,7 @@ export type CompanyEntry =
   /** Asked; nothing cached yet, so it can be enriched. */
   | { status: 'none' }
   | { status: 'enriching' }
-  | { status: 'found'; company: Company }
+  | { status: 'found'; company: Company; newsLoading?: boolean; newsError?: string }
   /** Enrichment ran and the providers had nothing. */
   | { status: 'not_found' }
   | { status: 'error'; message: string; noCredits?: boolean };
@@ -91,6 +91,30 @@ export const companyStore = {
         noCredits,
       });
       return 0;
+    } finally {
+      void walletStore.refresh();
+    }
+  },
+
+  /** Buys the company's recent news (charged only when articles come back). */
+  async loadNews(domain: string): Promise<void> {
+    const current = companyStore.get(domain);
+    if (current.status !== 'found' || current.newsLoading) return;
+    set(domain, { ...current, newsLoading: true, newsError: undefined });
+    try {
+      const res = await invokeFunction<{ ok: boolean; articles?: CompanyNewsArticle[] }>('leads', {
+        action: 'company-news',
+        domain,
+      });
+      const latest = companyStore.get(domain);
+      if (latest.status === 'found') {
+        set(domain, { status: 'found', company: { ...latest.company, news: res?.articles ?? [] } });
+      }
+    } catch (err) {
+      const latest = companyStore.get(domain);
+      if (latest.status === 'found') {
+        set(domain, { ...latest, newsLoading: false, newsError: (err as Error)?.message || 'The news lookup failed.' });
+      }
     } finally {
       void walletStore.refresh();
     }

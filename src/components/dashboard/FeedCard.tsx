@@ -25,6 +25,8 @@ interface FeedCardProps {
   onToggleExpand: (id: string) => void;
   onStatusChange: (id: string, status: LeadStatus) => void;
   onOpenAiDraft: (post: MonitoredPost) => void;
+  /** Link to the reply sent from Echo, when there is one. */
+  replyUrl?: string;
 }
 
 /**
@@ -149,6 +151,7 @@ export const FeedCard: React.FC<FeedCardProps> = ({
   onToggleExpand,
   onStatusChange,
   onOpenAiDraft,
+  replyUrl,
 }) => {
   const score = post.intent_score ?? 0;
   const band = intentBand(score);
@@ -188,11 +191,24 @@ export const FeedCard: React.FC<FeedCardProps> = ({
                 {post.author_handle}
               </span>
             )}
-            {isContacted && (
-              <span className="inline-flex items-center gap-1 text-[9.5px] font-mono uppercase tracking-wider text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 flex-shrink-0">
+            {replyUrl && safeHttpUrl(replyUrl) ? (
+              <a
+                href={safeHttpUrl(replyUrl) ?? undefined}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Open the reply you sent from Echo"
+                className="inline-flex items-center gap-1 text-[9.5px] font-mono uppercase tracking-wider text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 flex-shrink-0 hover:underline"
+              >
                 <CheckCircle2 className="w-2.5 h-2.5" />
-                Contacted
-              </span>
+                Replied
+              </a>
+            ) : (
+              isContacted && (
+                <span className="inline-flex items-center gap-1 text-[9.5px] font-mono uppercase tracking-wider text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 flex-shrink-0">
+                  <CheckCircle2 className="w-2.5 h-2.5" />
+                  Contacted
+                </span>
+              )
             )}
           </div>
 

@@ -12,6 +12,7 @@ import {
   affordableSearchLimit,
   allowedOrigins,
   cachedCompanyState,
+  cachedNewsState,
   corsOriginFor,
   classifyEmail,
   cleanDomain,
@@ -23,6 +24,7 @@ import {
   leadKey,
   linkedinSlug,
   mapCompanyOutput,
+  mapNewsOutput,
   mapPersonOutput,
   MAX_PROVIDER_CALLS,
   MAX_SEARCH_DOMAINS,
@@ -307,11 +309,13 @@ async function resolveToken(admin: any): Promise<string> {
  * per call vs 1 credit per billed call, email $0.015 vs 1 credit, phone
  * $0.03 vs 2 credits. A route that would cost more is not taken.
  */
-const MAX_COST = { search: '0.015', email: '0.015', phone: '0.03', company: '0.02', person: '0.03' } as const;
+const MAX_COST = { search: '0.015', email: '0.015', phone: '0.03', company: '0.02', person: '0.03', news: '0.01' } as const;
 // company: the cheapest children answer for $0.0005-$0.005 a hit and a few
 // bill misses, so $0.02 keeps a 0.5-credit hit ($0.025) above cost.
 // person: LinkedIn-URL lookups answer for $0.0005; name + domain ones run
 // $0.004-$0.03, under a 1-credit hit ($0.05).
+// news: one provider ($0.01, sent with X-Treg-Route-Waterfall: 0), which bills
+// misses too; a 1-credit hit ($0.05) covers that at a ~45% hit rate.
 
 /**
  * Credit prices, all from pricing_config. A price is null when its row is
@@ -334,18 +338,20 @@ interface Prices {
   company: number | null;
   /** Credits per person found (`treg.people.enrich`). */
   person: number | null;
+  /** Credits per news lookup that returns articles (`treg.companies.news`). */
+  news: number | null;
 }
 
 let priceCache: { at: number; prices: Prices } | null = null;
 
 async function loadPrices(admin: any): Promise<Prices> {
   if (priceCache && Date.now() - priceCache.at < 60_000) return priceCache.prices;
-  const prices: Prices = { email: null, phone: null, search: null, company: null, person: null };
+  const prices: Prices = { email: null, phone: null, search: null, company: null, person: null, news: null };
   try {
     const { data, error } = await admin
       .from('pricing_config')
       .select('operation, credits, enabled')
-      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'treg.people.search', 'treg.companies.enrich', 'treg.people.enrich']);
+      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'treg.people.search', 'treg.companies.enrich', 'treg.people.enrich', 'treg.companies.news']);
     if (error || !Array.isArray(data)) {
       console.warn('[leads] pricing lookup failed:', error?.message);
       return prices; // not cached: the next request retries the read
@@ -358,6 +364,7 @@ async function loadPrices(admin: any): Promise<Prices> {
       if (row.operation === 'treg.people.search') prices.search = credits;
       if (row.operation === 'treg.companies.enrich') prices.company = credits;
       if (row.operation === 'treg.people.enrich') prices.person = credits;
+      if (row.operation === 'treg.companies.news') prices.news = credits;
     }
   } catch (err: any) {
     console.warn('[leads] pricing lookup failed:', err?.message);
@@ -1277,6 +1284,7 @@ async function handleRequest(req: Request): Promise<Response> {
       search_credits_per_call: prices.search,
       company_credits: prices.company,
       person_credits: prices.person,
+      news_credits: prices.news,
       search_max_provider_calls_single: maxSearchProviderCalls(1, 1000),
       search_max_provider_calls_multi: MAX_PROVIDER_CALLS,
       search_free_leads: 0,
@@ -2885,11 +2893,17 @@ async function handleRequest(req: Request): Promise<Response> {
   if (action === 'company-lookup') {
     const domains = companyDomainsOf(body, MAX_COMPANY_LOOKUP);
     if (domains.length === 0) return json({ ok: true, companies: {} });
-    const { data, error } = await admin.from('companies').select(COMPANY_COLUMNS).in('domain', domains);
+    const { data, error } = await admin.from('companies').select(`${COMPANY_COLUMNS}, ${NEWS_COLUMNS}`).in('domain', domains);
     if (error) return fail('Could not read company data', 500);
     const companies: Record<string, unknown> = {};
     for (const row of data ?? []) {
-      if (cachedCompanyState(row) === 'hit') companies[row.domain] = publicCompany(row);
+      if (cachedCompanyState(row) !== 'hit') continue;
+      const news = cachedNewsState(row);
+      companies[row.domain] = {
+        ...publicCompany(row),
+        // null: not looked up (or stale); []: looked up recently, nothing found.
+        news: news === 'hit' ? row.news : news === 'miss' ? [] : null,
+      };
     }
     return json({ ok: true, companies });
   }
@@ -3093,6 +3107,71 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   }
 
+  // =========================================================================
+  // ACTION 12: COMPANY NEWS — treg.companies.news for one domain
+  // =========================================================================
+  if (action === 'company-news') {
+    const [domain] = companyDomainsOf(body, 1);
+    if (!domain) return fail('A valid company domain is required.');
+
+    const { data: cachedRow, error: cacheErr } = await admin.from('companies').select(`domain, ${NEWS_COLUMNS}`).eq('domain', domain).maybeSingle();
+    if (cacheErr) return fail('Could not read company data', 500);
+    const state = cachedNewsState(cachedRow);
+    if (state === 'hit') return json({ ok: true, status: 'cached', articles: cachedRow!.news, credits_charged: 0 });
+    if (state === 'miss') return json({ ok: true, status: 'not_found', articles: [], credits_charged: 0 });
+
+    const price = (await loadPrices(admin)).news;
+    if (price === null) return pricingUnavailable();
+    const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.companyBurst, RATE_LIMITS.company]);
+    if (limited) return limited;
+
+    const baseKey = `company_news:${userId}:${await shortHash(domain)}:${revealWindow()}`;
+    const { hold, key: runKey } = await reserveOnce(admin, userId, price, baseKey, { feature: 'company_news' }, openHolds);
+    if ('shortfall' in hold) return insufficientCredits(hold);
+    if (hold.duplicate) {
+      return fail('News for this company is already being looked up. Please wait a moment.', 409, { duplicate_request: true });
+    }
+
+    const usageStart = usage.rows.length;
+    let articles: ReturnType<typeof mapNewsOutput> | null = null;
+    try {
+      const res = await fetch(`${TREG_BASE}/call/treg.companies.news`, {
+        method: 'POST',
+        // No waterfall: every news provider bills misses, so one try only.
+        headers: tregHeaders(token, userId, 'company-news', MAX_COST.news, `echo:${baseKey}`, {
+          'X-Treg-Route-Waterfall': '0',
+        }),
+        body: JSON.stringify({ domain, limit: 10 }),
+        signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
+      });
+      const row = usage.track('treg.companies.news', res, { feature: 'company-news' }, hold.id);
+      if (res.ok) {
+        articles = mapNewsOutput(await res.json());
+        if (articles.length > 0) row.credits_charged = price;
+      }
+    } catch (err: any) {
+      console.warn('[leads] company news upstream warning:', err?.name || String(err?.message || '').slice(0, 200));
+    }
+
+    const providerCostUsd = usage.costSince(usageStart, 'treg.companies.news');
+    const now = new Date().toISOString();
+    if (articles === null) {
+      await settleHold(hold.id, 0, providerCostUsd, runKey, 'Company news: lookup failed - refund');
+      return fail('The news lookup failed. Nothing was charged; please try again.', 502);
+    }
+    if (articles.length === 0) {
+      await admin.from('companies').upsert({ domain, news_miss_at: now, updated_at: now }, { onConflict: 'domain' });
+      await settleHold(hold.id, 0, providerCostUsd, runKey, 'Company news: nothing found - refund');
+      return json({ ok: true, status: 'not_found', articles: [], credits_charged: 0 });
+    }
+    const { error: saveErr } = await admin
+      .from('companies')
+      .upsert({ domain, news: articles, news_at: now, news_miss_at: null, updated_at: now }, { onConflict: 'domain' });
+    if (saveErr) console.error('[leads] company news save error:', saveErr.message);
+    await settleHold(hold.id, price, providerCostUsd, runKey, `Company news: ${articles.length} articles`);
+    return json({ ok: true, status: 'found', articles, credits_charged: price });
+  }
+
   return fail(`Unknown action: ${String(action).slice(0, 50)}`);
   }
 }
@@ -3109,6 +3188,8 @@ const COMPANY_CONCURRENCY = 5;
 /** What the client may see: no provider answer, no provider name. */
 const COMPANY_COLUMNS =
   'domain, name, description, industry, employees, founded_year, location, linkedin_url, website, logo_url, enriched_at, miss_at';
+
+const NEWS_COLUMNS = 'news, news_at, news_miss_at';
 
 type CompanyStatus = 'found' | 'cached' | 'not_found' | 'failed';
 
