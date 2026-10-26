@@ -1,6 +1,6 @@
 # Echo — Supabase Backend
 
-Everything under `supabase/` is deployed to the project `fteoyqhogzuapfdledeg`.
+Everything under `supabase/` is deployed to one Supabase project. For a new project, follow [`../SETUP.md`](../SETUP.md).
 
 ---
 
@@ -201,7 +201,7 @@ select cron.schedule(
   'echo-daily-sweep',
   '0 * * * *',
   $$ select net.http_post(
-       url     := 'https://fteoyqhogzuapfdledeg.supabase.co/functions/v1/daily-sweep',
+       url     := 'https://<project-ref>.supabase.co/functions/v1/daily-sweep',
        headers := jsonb_build_object(
          'Content-Type', 'application/json',
          'x-sweep-secret', (select value from public.service_secrets
@@ -216,7 +216,7 @@ returned:
 
 ```sql
 select net.http_post(
-  url := 'https://fteoyqhogzuapfdledeg.supabase.co/functions/v1/daily-sweep',
+  url := 'https://<project-ref>.supabase.co/functions/v1/daily-sweep',
   headers := jsonb_build_object(
     'Content-Type', 'application/json',
     'x-sweep-secret', (select value from public.service_secrets

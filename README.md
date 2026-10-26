@@ -24,6 +24,9 @@ Echo monitors your keywords across **X (Twitter)**, **Reddit**, the **open web**
 
 ---
 
+> **Deploying to a new Supabase project?** Follow [SETUP.md](SETUP.md): every step, secret and
+> dashboard setting for a clean deploy, in order.
+
 ## ⚡ Quick Start
 
 ### 1. Install & run

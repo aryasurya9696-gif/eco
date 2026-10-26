@@ -163,6 +163,15 @@ async function main() {
     left.rows[0].n === 0 ? pass('suite rolled back (no test user left)') : fail('suite left its test user behind');
   }
 
+  const billing = await step(db, 'billing_review_acceptance.sql', read('supabase/tests/billing_review_acceptance.sql'));
+  if (billing) {
+    const set = billing.find((r) => r.fields?.some((f) => f.name === 'result'));
+    const rows = (set?.rows ?? []).map((r) => JSON.parse(r.result));
+    const bad = rows.filter((r) => !r.ok);
+    (rows.length && !bad.length ? pass : fail)(`refund/dispute checks ${rows.length - bad.length}/${rows.length}`);
+    for (const r of bad) console.log(`      FAILED ${r.test}: ${JSON.stringify(r.detail)}`);
+  }
+
   const social = await step(db, 'enrichment_social_acceptance.sql', read('supabase/tests/enrichment_social_acceptance.sql'));
   if (social) {
     const set = social.find((r) => r.fields?.some((f) => f.name === 'result'));

@@ -25,7 +25,10 @@
 //                     -> { ok, filters: { title, keywords[], country, location, company }, source }
 // ============================================================================
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient, type SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.118.0';
+
+/** The service-role client. Untyped schema: rows are checked where they are read. */
+type Db = SupabaseClient<any, 'public', any>;
 
 // CORS: ALLOWED_ORIGIN is a comma-separated allow-list of exact origins
 // (e.g. "https://app.example.com,https://www.example.com"). The request's
@@ -235,8 +238,8 @@ function modelPrice(model: string): { input: number; output: number; known: bool
   return base ? { ...MODEL_PRICES[base], known: true } : { ...MODEL_PRICES['gpt-4o-mini'], known: false };
 }
 
-let adminClient: ReturnType<typeof createClient> | null = null;
-function admin(): ReturnType<typeof createClient> | null {
+let adminClient: Db | null = null;
+function admin(): Db | null {
   if (adminClient) return adminClient;
   const supabaseUrl = Deno.env.get('SUPABASE_URL');
   const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');

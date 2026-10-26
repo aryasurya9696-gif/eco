@@ -208,6 +208,8 @@ Deno.test('isSpam', () => {
   assert(isSpam({ 'x-spam-status': 'Yes, score=7.1' }));
   assert(!isSpam({ 'x-spam-status': 'No, score=0.1' }));
   assert(isSpam({ 'X-SES-Spam-Verdict': 'FAIL' }));
+  assert(isSpam({ 'Authentication-Results': 'mx.resend.com; spf=pass; dkim=none; dmarc=fail (p=none) header.from=bank.example' }));
+  assert(!isSpam({ 'Authentication-Results': 'mx.resend.com; spf=pass; dkim=pass; dmarc=pass header.from=lead.example' }));
   assert(isSpam({}, { spam: true }));
   assert(!isSpam({}));
 });

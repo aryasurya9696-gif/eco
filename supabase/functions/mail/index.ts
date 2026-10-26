@@ -37,7 +37,7 @@
 //   SWEEP_CRON_SECRET (or service_secrets 'sweep_cron_secret') gates the cron
 // ============================================================================
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.118.0';
 import nodemailer from 'npm:nodemailer@6.9.16';
 import {
   buildDomainConnectApplyUrl,
@@ -1204,7 +1204,14 @@ async function addDomain(admin: any, userId: string, body: any): Promise<Respons
 
   const { data: taken } = await admin.from('mail_domains').select('user_id').ilike('domain', domain).maybeSingle();
   if (taken) {
-    return fail(taken.user_id === userId ? `${domain} is already added.` : `${domain} is already registered to another Echo workspace.`, 409);
+    // Does not say whose it is: that would tell anyone which domains other
+    // customers use. An unverified claim by someone else expires on its own.
+    return fail(
+      taken.user_id === userId
+        ? `${domain} is already added.`
+        : `${domain} can't be added right now. If it is yours, try again in 3 days or contact support.`,
+      409,
+    );
   }
 
   let created: any;
@@ -1420,7 +1427,34 @@ async function verifyPendingDomains(admin: any, req: Request): Promise<Response>
     return fail('Could not read pending domains.', 500);
   }
 
-  const counts = { ok: true, pending: rows?.length ?? 0, checked: 0, verified: 0, still_pending: 0, failed: 0, errors: 0, mailboxes_created: 0, skipped: 0 };
+  const counts = { ok: true, pending: rows?.length ?? 0, checked: 0, verified: 0, still_pending: 0, failed: 0, errors: 0, mailboxes_created: 0, skipped: 0, expired: 0 };
+
+  // A custom domain that never verified within the window is released: anyone
+  // can add any domain, so an unverified claim must not block the real owner
+  // forever.
+  {
+    const { data: stale, error: staleError } = await admin
+      .from('mail_domains')
+      .select('id, provider_domain_id')
+      .eq('is_platform', false)
+      .in('status', ['pending', 'verifying', 'failed'])
+      .lt('created_at', new Date(Date.now() - PENDING_DOMAIN_WINDOW_MS).toISOString())
+      .limit(50);
+    if (staleError) console.error('[mail] stale domain read failed:', staleError.code || 'error');
+    for (const dom of stale || []) {
+      const { error: delError } = await admin.from('mail_domains').delete().eq('id', dom.id);
+      if (delError) {
+        // Still referenced (for example by a mailbox): left for a human.
+        console.warn('[mail] stale domain not removed:', delError.code || 'error');
+        continue;
+      }
+      counts.expired++;
+      if (dom.provider_domain_id) {
+        await resend(`/domains/${dom.provider_domain_id}`, { method: 'DELETE' }).catch(() => {});
+        await pause(500);
+      }
+    }
+  }
   for (const dom of rows || []) {
     if (Date.now() - startedMs > PENDING_DOMAIN_BUDGET_MS) {
       counts.skipped++;
@@ -1770,27 +1804,6 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
   const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.sendBurst, RATE_LIMITS.send]);
   if (limited) return limited;
 
-  // 0. Platform-wide daily cap on the shared domain: slots taken today across
-  // every Echo mailbox (a slot is taken before the send and returned on failure).
-  if (platformDomainId) {
-    const cap = Number(Deno.env.get('MAIL_PLATFORM_DAILY_CAP') || DEFAULT_PLATFORM_DAILY_CAP);
-    const today = new Date().toISOString().slice(0, 10);
-    const { data: slots, error: capError } = await admin
-      .from('mailboxes')
-      .select('sent_today')
-      .eq('domain_id', platformDomainId)
-      .eq('sent_today_date', today)
-      .gt('sent_today', 0);
-    if (capError) {
-      console.error('[mail] platform cap read failed:', capError.code || 'error');
-      return fail('The service is busy. Please try again in a moment.', 503);
-    }
-    const used = (slots || []).reduce((n: number, r: any) => n + Number(r.sent_today || 0), 0);
-    if (Number.isFinite(cap) && used >= cap) {
-      return fail('Echo mail has reached its sending limit for today. Please try again tomorrow.', 429, { platform_cap: true });
-    }
-  }
-
   // 1. Daily limit slot.
   const { data: slot, error: slotError } = await admin.rpc('mail_take_send_slot', { p_mailbox_id: mailbox.id, p_user_id: userId });
   if (slotError) {
@@ -1816,6 +1829,31 @@ async function send(admin: any, userId: string, body: any): Promise<Response> {
       429,
       { warmup: true, warmup_limit: WARMUP_DAILY_LIMIT },
     );
+  }
+
+  // Platform-wide daily cap on the shared domain. Counted after this send's
+  // own slot is taken: every concurrent sender has already added itself, so
+  // the total can never pass the cap (at worst a send right at the edge is
+  // refused and its slot returned).
+  if (platformDomainId) {
+    const cap = Number(Deno.env.get('MAIL_PLATFORM_DAILY_CAP') || DEFAULT_PLATFORM_DAILY_CAP);
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: slots, error: capError } = await admin
+      .from('mailboxes')
+      .select('sent_today')
+      .eq('domain_id', platformDomainId)
+      .eq('sent_today_date', today)
+      .gt('sent_today', 0);
+    if (capError) {
+      await returnSlot();
+      console.error('[mail] platform cap read failed:', capError.code || 'error');
+      return fail('The service is busy. Please try again in a moment.', 503);
+    }
+    const used = (slots || []).reduce((n: number, r: any) => n + Number(r.sent_today || 0), 0);
+    if (Number.isFinite(cap) && used > cap) {
+      await returnSlot();
+      return fail('Echo mail has reached its sending limit for today. Please try again tomorrow.', 429, { platform_cap: true });
+    }
   }
 
   // 2. Credit hold. Mail is paid-only: welcome credits cover feed sweeps alone.

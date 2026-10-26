@@ -879,11 +879,19 @@ select public.wallet_release(((select v from _r2 where k = 'd_hold')->>'reservat
 insert into _r2 values ('d_lost', public.wallet_dispute_order('00000000-0000-4000-8000-0000000a2002'::uuid, 'lost'));
 
 insert into _results (test, ok, detail)
+-- The 50 held when the dispute opened is owed (revoke_pending) and taken the
+-- moment the hold is released (20261206), so 'lost' finds nothing left to take.
 select 'dispute_freezes_spendable_then_lost_takes_the_rest',
        ((select v from _r2 where k = 'd_open')->>'revoked')::numeric = 150
+       and ((select v from _r2 where k = 'd_open')->>'revoked')::numeric
+           + coalesce((select sum(-delta) from public.credit_ledger
+                        where user_id = pg_temp.acc() and kind = 'reversal'
+                          and note = 'refund (collected after hold)'), 0)
+           + ((select v from _r2 where k = 'd_lost')->>'revoked')::numeric = 200
        and ((select v from _r2 where k = 'd_open2')->>'revoked')::numeric = 0
-       and ((select v from _r2 where k = 'd_lost')->>'revoked')::numeric = 50
        and (select balance from public.wallet where user_id = pg_temp.acc()) = 0
+       and not exists (select 1 from public.credit_grants
+                        where user_id = pg_temp.acc() and revoke_pending > 0)
        and (select status from public.payment_orders
              where id = '00000000-0000-4000-8000-0000000a2002'::uuid) = 'refunded',
        jsonb_build_object('open', (select v from _r2 where k = 'd_open'),

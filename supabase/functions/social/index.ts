@@ -16,11 +16,12 @@
 // team, so through treg every Echo user would post as the same account. The
 // tokens are kept in Supabase Vault (social_accounts.vault_secret_id).
 //
-// Connecting is two steps on purpose. The redirect only parks the code on its
-// state row and sends the browser back to Echo; the signed-in user then calls
-// connect_finish, which refuses unless that user started the connection. A
-// consent URL forwarded to someone else therefore cannot attach their account
-// to the sender's workspace.
+// Connecting is two steps on purpose. The redirect stores nothing: it hands the
+// code back to Echo in the consenting browser, whose signed-in user then calls
+// connect_finish with it, and that is refused unless the same user started the
+// connection. The code never reaches the server unless the person who gave
+// consent is the one finishing, so a consent URL forwarded to someone else
+// cannot attach their account to the sender's workspace.
 //
 // A reply is charged from the wallet like a mail send: credits held before
 // the platform call, charged when the platform accepts it, released when it
@@ -40,7 +41,7 @@
 // Redirect URI to register with both apps: <SUPABASE_URL>/functions/v1/social
 // ============================================================================
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.118.0';
 import {
   authorizeUrl,
   checkReplyText,
@@ -246,6 +247,14 @@ async function accessTokenFor(db: Admin, account: any): Promise<string | 'reauth
       if (attempt === 5) return 'transient';
       continue;
     }
+    // Re-read under the lease: a refresh that finished between the first read
+    // and taking the lease has already rotated the refresh token.
+    const current = await readTokens(db, account.vault_secret_id);
+    if (current && !needsRefresh(current, Date.now())) {
+      await db.from('social_accounts').update({ refreshing_until: null }).eq('id', account.id);
+      return current.access_token;
+    }
+    if (current?.refresh_token) tokens.refresh_token = current.refresh_token;
 
     const platform = account.platform as SocialPlatform;
     const result = await tokenRequest(
@@ -290,31 +299,22 @@ async function handleCallback(url: URL): Promise<Response> {
   const code = url.searchParams.get('code') || '';
   if (!state || state.length > 128) return redirect({ error: 'invalid_state' });
 
-  const db = admin();
-  if (url.searchParams.get('error') || !code) {
-    await db.from('social_oauth_states').delete().eq('state', state);
+  if (url.searchParams.get('error') || !code || code.length > 2000) {
+    await admin().from('social_oauth_states').delete().eq('state', state);
     return redirect({ error: 'denied' });
   }
-  // Only a fresh state that has not been used yet takes a code.
-  const { data: parked } = await db
-    .from('social_oauth_states')
-    .update({ code: code.slice(0, 2000) })
-    .eq('state', state)
-    .is('code', null)
-    .gte('created_at', new Date(Date.now() - STATE_TTL_MS).toISOString())
-    .select('state');
-  if (!parked?.length) return redirect({ error: 'expired' });
-  return redirect({ finish: state });
+  return redirect({ finish: state, code });
 }
 
-/** Exchanges a parked code for the user who started the connection. */
+/** Exchanges the code for the user who started the connection, in the browser that gave consent. */
 async function connectFinish(db: Admin, userId: string, body: any): Promise<Response> {
   const state = typeof body.state === 'string' ? body.state : '';
-  if (!state || state.length > 128) return fail('Invalid connection request.');
+  const code = typeof body.code === 'string' ? body.code : '';
+  if (!state || state.length > 128 || !code || code.length > 2000) return fail('Invalid connection request.');
   // Single use: deleted as it is read.
   const { data: rows } = await db.from('social_oauth_states').delete().eq('state', state).select();
   const pending = rows?.[0];
-  if (!pending || !pending.code || Date.now() - Date.parse(pending.created_at) > STATE_TTL_MS) {
+  if (!pending || Date.now() - Date.parse(pending.created_at) > STATE_TTL_MS) {
     return fail('This connection expired. Please connect again.', 410, { reason: 'expired' });
   }
   if (pending.user_id !== userId) {
@@ -324,7 +324,7 @@ async function connectFinish(db: Admin, userId: string, body: any): Promise<Resp
 
   const exchanged = await tokenRequest(platform, {
     grant_type: 'authorization_code',
-    code: pending.code,
+    code,
     redirect_uri: REDIRECT_URI,
     ...(platform === 'x' ? { code_verifier: pending.code_verifier, client_id: clientCredentials('x')?.id ?? '' } : {}),
   });

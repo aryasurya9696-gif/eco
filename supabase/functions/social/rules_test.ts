@@ -67,7 +67,10 @@ Deno.test('checkReplyText: length per platform; links refused on X only', () => 
 Deno.test('replyUrl and returnUrl', () => {
   assertEquals(replyUrl('x', 'jane', '123'), 'https://x.com/jane/status/123');
   assertEquals(replyUrl('reddit', 'jane', 'abc', '/r/SaaS/comments/x/y/abc/'), 'https://www.reddit.com/r/SaaS/comments/x/y/abc/');
-  assertEquals(returnUrl('https://app.example/', { finish: 'abc' }), 'https://app.example/?social=finish&state=abc#dashboard/settings');
+  assertEquals(
+    returnUrl('https://app.example/', { finish: 'abc', code: 'c/1' }),
+    'https://app.example/?social=finish&state=abc&code=c%2F1#dashboard/settings',
+  );
   assertEquals(returnUrl('https://app.example', { error: 'denied' }), 'https://app.example/?social=error&reason=denied#dashboard/settings');
 });
 

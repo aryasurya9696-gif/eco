@@ -31,7 +31,10 @@
 //                api_usage and wallet settlement only)
 // ============================================================================
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient, type SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.118.0';
+
+/** The service-role client. Untyped schema: rows are checked where they are read. */
+type Db = SupabaseClient<any, 'public', any>;
 import {
   allowedOrigins,
   corsOriginFor,
@@ -98,7 +101,7 @@ async function requireUserId(req: Request): Promise<string | null> {
  * real load. Fails CLOSED: a limiter we cannot reach is treated as "no".
  */
 async function takeRateLimit(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   userId: string,
   bucket: string,
   limit: number,
@@ -364,7 +367,7 @@ function sinceDate(lookbackHours: number): string {
 
 let tregToken = Deno.env.get('TREG_TOKEN') || '';
 
-async function resolveToken(admin: ReturnType<typeof createClient>): Promise<string> {
+async function resolveToken(admin: Db): Promise<string> {
   if (tregToken) return tregToken;
   const { data, error } = await admin
     .from('service_secrets')
@@ -735,7 +738,7 @@ function record(tally: OperationTally, r: TregResult, keywordId: string): void {
  * into a free search by accident.
  */
 async function loadPricing(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
 ): Promise<Map<string, number>> {
   const { data, error } = await admin
     .from('pricing_config')
@@ -766,7 +769,7 @@ interface Reservation {
  * so an empty wallet costs nothing rather than everything.
  */
 async function reserveSweep(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   userId: string,
   credits: number,
   key: string,
@@ -797,7 +800,7 @@ async function reserveSweep(
 
 /** Settles a hold for what was actually billable, and returns the new balance. */
 async function settleSweep(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   reservationId: string,
   creditsCharged: number,
   providerCostUsd: number,
@@ -827,7 +830,7 @@ async function settleSweep(
 
 /** Returns a hold untouched. For every outcome treg does not bill. */
 async function releaseSweep(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   reservationId: string,
   reason: string,
 ): Promise<void> {
@@ -844,7 +847,7 @@ async function releaseSweep(
  * would mean holding public content twice.
  */
 async function recordUsage(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   userId: string,
   runKey: string,
   tallies: Map<string, OperationTally>,
@@ -1442,7 +1445,7 @@ async function handle(req: Request): Promise<Response> {
  * rather than to "unlimited" if the RPC is unavailable.
  */
 async function loadSweepShape(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
 ): Promise<{ maxKeywords: number; maxChannels: number }> {
   const fallback = { maxKeywords: FALLBACK_MAX_KEYWORDS, maxChannels: FALLBACK_MAX_CHANNELS };
   try {
@@ -1468,7 +1471,7 @@ async function loadSweepShape(
  * but never removes anything written by the sweep currently in flight.
  */
 async function pruneOldMentions(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   userId: string,
   keepAfter: string,
 ): Promise<number> {

@@ -22,7 +22,10 @@
 // Response: { ok: true, ... }
 // ============================================================================
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient, type SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.118.0';
+
+/** The service-role client. Untyped schema: rows are checked where they are read. */
+type Db = SupabaseClient<any, 'public', any>;
 
 const stripSlash = (s: string): string => s.replace(/\/+$/, '');
 
@@ -121,7 +124,7 @@ const OPERATION_OF: Record<string, string> = {
  * database that predates sweep_shape.
  */
 async function readSweepShape(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
 ): Promise<{ maxKeywords: number; maxChannels: number }> {
   const { data: shape } = await admin.rpc('sweep_shape');
   const k = Number(shape?.max_keywords);
@@ -171,7 +174,7 @@ function resolveAppOrigin(req: Request): string | null {
  * whatever is held for a sweep currently in flight. Showing raw balance as
  * "spendable" would overstate it exactly when a sweep is mid-flight.
  */
-async function actionBalance(admin: ReturnType<typeof createClient>, userId: string) {
+async function actionBalance(admin: Db, userId: string) {
   const { data: wallet, error } = await admin
     .from('wallet')
     // Revenue and service cost are our margin, not the customer's business, so
@@ -346,7 +349,7 @@ async function actionBalance(admin: ReturnType<typeof createClient>, userId: str
 }
 
 /** What can be bought. Read from the database so the screen cannot show a stale price. */
-async function actionPackages(admin: ReturnType<typeof createClient>) {
+async function actionPackages(admin: Db) {
   const { data, error } = await admin
     .from('topup_packages')
     .select('code, display_name, gross_usd, credits, bonus_credits, currency')
@@ -376,7 +379,7 @@ async function actionPackages(admin: ReturnType<typeof createClient>) {
  * The price list the frontend renders (N14): enabled operations only, and only
  * what the customer pays. Provider cost, cost source and margin stay server-side.
  */
-async function actionPricing(admin: ReturnType<typeof createClient>) {
+async function actionPricing(admin: Db) {
   const { data, error } = await admin
     .from('pricing_config')
     .select('operation, display_name, credits')
@@ -396,7 +399,7 @@ async function actionPricing(admin: ReturnType<typeof createClient>) {
 }
 
 /** Ledger, payments and recent usage — the three histories the tab shows. */
-async function actionHistory(admin: ReturnType<typeof createClient>, userId: string) {
+async function actionHistory(admin: Db, userId: string) {
   const [ledger, payments, usage] = await Promise.all([
     admin.from('credit_ledger')
       .select('id, delta, balance_after, kind, note, created_at')
@@ -449,7 +452,7 @@ async function actionHistory(admin: ReturnType<typeof createClient>, userId: str
  * than failing on a 402 after the user has already waited.
  */
 async function actionQuote(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   userId: string,
   channels: string[],
 ) {
@@ -485,7 +488,7 @@ async function actionQuote(
  * which is the correct outcome: better no credits than free credits.
  */
 async function actionCheckout(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   req: Request,
   userId: string,
   userEmail: string | null,
@@ -634,7 +637,7 @@ async function actionCheckout(
 }
 
 /** Polls one order. Lets the page show "processing" while the webhook lands. */
-async function actionStatus(admin: ReturnType<typeof createClient>, userId: string, orderId: string) {
+async function actionStatus(admin: Db, userId: string, orderId: string) {
   // A malformed id is "not found", not a Postgres uuid cast error surfacing as 500.
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(orderId)) {
     return { __status: 404, ok: false, error: 'order_not_found' };

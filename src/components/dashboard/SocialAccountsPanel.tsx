@@ -34,10 +34,11 @@ export const SocialAccountsPanel: React.FC = () => {
     const outcome = params.get('social');
     if (!outcome) return;
     const state = params.get('state') || '';
-    if (outcome === 'finish' && state && !finishedStates.has(state)) {
+    const code = params.get('code') || '';
+    if (outcome === 'finish' && state && code && !finishedStates.has(state)) {
       finishedStates.add(state);
       socialStore
-        .finish(state)
+        .finish(state, code)
         .then((res) =>
           addToast(
             `${SOCIAL_LABEL[res.platform]} account ${res.platform === 'reddit' ? 'u/' : '@'}${res.handle} connected. You can now reply from the feed.`,
@@ -48,7 +49,8 @@ export const SocialAccountsPanel: React.FC = () => {
     } else if (outcome === 'error') {
       addToast(RETURN_REASONS[params.get('reason') || ''] || 'Could not connect the account. Please try again.', 'error');
     }
-    for (const key of ['social', 'state', 'platform', 'reason']) params.delete(key);
+    // The code is single-use, but it should not sit in the address bar or history.
+    for (const key of ['social', 'state', 'code', 'platform', 'reason']) params.delete(key);
     const search = params.toString();
     window.history.replaceState(window.history.state, '', `${window.location.pathname}${search ? `?${search}` : ''}${window.location.hash}`);
   }, [addToast]);

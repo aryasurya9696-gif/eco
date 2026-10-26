@@ -152,12 +152,15 @@ export function replyUrl(platform: SocialPlatform, handle: string, id: string, p
 
 /**
  * Where the OAuth callback sends the browser back to: Settings, with either
- * the state to finish (the signed-in app then calls connect_finish) or why
- * the connection stopped.
+ * the state and code to finish (the signed-in app then calls connect_finish)
+ * or why the connection stopped. The code travels only through the browser
+ * that gave consent; the server never stores it.
  */
-export function returnUrl(appOrigin: string, outcome: { finish: string } | { error: string }): string {
+export function returnUrl(appOrigin: string, outcome: { finish: string; code: string } | { error: string }): string {
   const q = new URLSearchParams(
-    'finish' in outcome ? { social: 'finish', state: outcome.finish } : { social: 'error', reason: outcome.error.slice(0, 60) },
+    'finish' in outcome
+      ? { social: 'finish', state: outcome.finish, code: outcome.code }
+      : { social: 'error', reason: outcome.error.slice(0, 60) },
   );
   return `${appOrigin.replace(/\/+$/, '')}/?${q.toString()}#dashboard/settings`;
 }

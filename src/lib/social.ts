@@ -108,10 +108,11 @@ export const socialStore = {
   },
 
   /** Completes a connection after the consent screen (the signed-in user must be the one who started it). */
-  async finish(state: string): Promise<{ platform: SocialPlatform; handle: string }> {
+  async finish(state: string, code: string): Promise<{ platform: SocialPlatform; handle: string }> {
     const res = await invokeFunction<{ ok: boolean; platform: SocialPlatform; handle: string }>('social', {
       action: 'connect_finish',
       state,
+      code,
     });
     await socialStore.load(true);
     return res;

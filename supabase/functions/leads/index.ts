@@ -6,7 +6,7 @@
 // Powered by Treg.to catalog routing (26+ upstream providers).
 // ============================================================================
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.118.0';
 import {
   acceptNameOnlyMatch,
   affordableSearchLimit,
@@ -137,6 +137,15 @@ function sanitizeSearchLimit(raw: unknown): number {
  */
 const SEARCH_TIMEOUT_MS = 25_000;
 const ENRICH_TIMEOUT_MS = 20_000;
+
+/**
+ * No new lookup wave starts after this much of a request has gone by. A wave
+ * can take up to ENRICH_TIMEOUT_MS, and the edge runtime ends a request at
+ * about 150 s: a request killed there leaves its hold with no usage written,
+ * so the reaper releases it and every lookup made is paid for and lost. The
+ * leads left over are reported as failed, which the client retries for free.
+ */
+const LOOKUP_BUDGET_MS = 110_000;
 
 /** Longest free-text filter forwarded to the provider. */
 const MAX_FILTER_LENGTH = 200;
@@ -789,6 +798,11 @@ async function settleCredits(
     console.error('[billing] wallet_settle failed:', error.message);
     return null;
   }
+  // A refused settle (an already closed hold, say) is not a success.
+  if ((data as any)?.ok === false) {
+    console.error('[billing] wallet_settle refused:', (data as any)?.error);
+    return null;
+  }
   return Number((data as any)?.balance_after ?? 0);
 }
 
@@ -881,9 +895,28 @@ function isUuid(value?: string | null): boolean {
  * `_` matches any single character, so "Ann_Smith" would otherwise also match
  * "Ann Smith" and the lookup could settle on somebody else's row.
  */
+/**
+ * One record per user_leads conflict key (company_domain, full_name). When two
+ * records collapse onto one row, the one with more contact data wins, so a
+ * found email or phone is never dropped for a duplicate without it.
+ */
+function uniqueByLeadKey<T extends Record<string, any>>(records: T[]): T[] {
+  const score = (r: T) => (r.work_email ? 2 : 0) + (r.phone_number ? 1 : 0);
+  const byKey = new Map<string, T>();
+  for (const r of records) {
+    const key = `${r.company_domain}::${r.full_name}`;
+    const prev = byKey.get(key);
+    byKey.set(key, prev && score(prev) > score(r) ? { ...r, ...prev } : prev ? { ...prev, ...r } : r);
+  }
+  return [...byKey.values()];
+}
+
 function escapeLike(value?: string | null): string {
   if (!value || typeof value !== 'string') return '';
-  return value.replace(/([\\%_])/g, '\\$1');
+  // PostgREST reads `*` in a like/ilike pattern as `%`, and a backslash does
+  // not escape it. Turned into `_` (exactly one character), so a name of "*"
+  // can never match every row.
+  return value.replace(/([\\%_])/g, '\\$1').replace(/\*/g, '_');
 }
 
 function slugOfRow(row: any): string | null {
@@ -1212,6 +1245,7 @@ Deno.serve(async (req: Request) => {
 });
 
 async function handleRequest(req: Request): Promise<Response> {
+  const requestStartedAt = Date.now();
   const maybeUserId = await requireUserId(req);
   if (!maybeUserId) {
     return fail('Unauthorized', 401);
@@ -1575,36 +1609,17 @@ async function handleRequest(req: Request): Promise<Response> {
         if (normalized.length >= requestedLimit) break;
       }
 
-      // Cross-check against user's already revealed/saved leads in database.
-      // Fetch only the rows whose domain matches this result set: a full-table
-      // select is capped by PostgREST at 1000 rows, so a power user's oldest
-      // leads silently dropped out of the cross-check and re-revealing them
-      // charged a second credit.
-      const resultDomains = [...new Set(normalized.map((l: any) => (l.company_domain || '').trim().toLowerCase()).filter(Boolean))];
+      // Cross-check against user's already revealed/saved leads in database:
+      // paged and including the empty-domain (LinkedIn-only) rows. If it fails,
+      // auto-enrich is skipped below rather than re-buying contacts the user
+      // already has.
       let existingLeads: any[] = [];
-      if (resultDomains.length > 0) {
-        const { data } = await admin
-          .from('user_leads')
-          .select('*')
-          .eq('user_id', userId)
-          .in('company_domain', resultDomains);
-        if (data) existingLeads = existingLeads.concat(data);
-      }
-      // LinkedIn-only leads carry an empty domain; fetch those separately so
-      // they can still be matched instead of being skipped.
-      if (normalized.some((l: any) => !(l.company_domain || '').trim())) {
-        const { data: nullRows } = await admin
-          .from('user_leads')
-          .select('*')
-          .eq('user_id', userId)
-          .is('company_domain', null);
-        if (nullRows) existingLeads = existingLeads.concat(nullRows);
-        const { data: emptyRows } = await admin
-          .from('user_leads')
-          .select('*')
-          .eq('user_id', userId)
-          .eq('company_domain', '');
-        if (emptyRows) existingLeads = existingLeads.concat(emptyRows);
+      let crossCheckFailed = false;
+      try {
+        existingLeads = await loadExistingRows(admin, userId, normalized);
+      } catch (err: any) {
+        crossCheckFailed = true;
+        console.error('[leads] saved-lead cross-check failed:', String(err?.message || '').slice(0, 200));
       }
 
       // The saved row behind each result, for merging on a later upsert.
@@ -1658,7 +1673,7 @@ async function handleRequest(req: Request): Promise<Response> {
       // Enrichment spends credits, so it has to be an explicit opt-in. A
       // caller that omitted the flag (an older client, a script) used to be
       // charged for up to 60 reveals it never asked for.
-      if (body.auto_enrich === true && normalized.length > 0) {
+      if (body.auto_enrich === true && normalized.length > 0 && !crossCheckFailed) {
         // Cap what one search may resolve, to keep it inside its time budget;
         // anything over it still comes back with a per-row reveal button.
         const leadsToEnrich = normalized
@@ -1708,6 +1723,8 @@ async function handleRequest(req: Request): Promise<Response> {
             // Parallel enrichment batches of 5
             const BATCH_SIZE = 5;
             for (let i = 0; i < targetBatch.length; i += BATCH_SIZE) {
+              // The rest keep their Reveal button; nothing is charged for them.
+              if (Date.now() - requestStartedAt > LOOKUP_BUDGET_MS) break;
               const chunk = targetBatch.slice(i, i + BATCH_SIZE);
               await Promise.all(
                 chunk.map(async (lead) => {
@@ -1998,7 +2015,10 @@ async function handleRequest(req: Request): Promise<Response> {
         // unknown / pending / invalid → not usable: a 404, never a free reveal.
         const verdict = classifyEmail(resJson);
         emailFound = isEmailAddress(rawEmail) && verdict.usable ? rawEmail.trim() : null;
-        emailCharge = emailFound && verdict.charge ? emailPrice : 0;
+        // A replayed answer was paid for by the earlier attempt (whose save
+        // failed, or it would have been found above): not charged twice.
+        const replay = tregRes.headers.get('x-treg-idempotent-replay') === 'true';
+        emailCharge = emailFound && verdict.charge && !replay ? emailPrice : 0;
         emailRow.credits_charged = emailCharge;
         emailStatus = verdict.status;
         emailConfidence = resJson?.output?.confidence || (verdict.charge ? 0.95 : 0.5);
@@ -2162,6 +2182,10 @@ async function handleRequest(req: Request): Promise<Response> {
 
     try {
       for (let i = 0; i < batch.length; i += 5) {
+        if (Date.now() - requestStartedAt > LOOKUP_BUDGET_MS) {
+          for (const left of batch.slice(i)) failedKeys.push(...left.client_keys);
+          break;
+        }
         await Promise.all(
           batch.slice(i, i + 5).map(async (lead: any, j: number) => {
             try {
@@ -2242,7 +2266,9 @@ async function handleRequest(req: Request): Promise<Response> {
       if (records.length > 0) {
         const { data, error: saveErr } = await admin
           .from('user_leads')
-          .upsert(records, { onConflict: 'user_id,company_domain,full_name' })
+          // Merging onto stored rows can map two inputs to one stored key,
+          // which Postgres refuses in one upsert ("cannot affect row a second time").
+          .upsert(uniqueByLeadKey(records), { onConflict: 'user_id,company_domain,full_name' })
           .select();
         if (saveErr) {
           // Fail loudly (audit H5). Nothing was saved, so nothing is charged:
@@ -2373,6 +2399,10 @@ async function handleRequest(req: Request): Promise<Response> {
 
     try {
       for (let i = 0; i < batch.length; i += 5) {
+        if (Date.now() - requestStartedAt > LOOKUP_BUDGET_MS) {
+          for (const left of batch.slice(i)) failedKeys.push(...left.client_keys);
+          break;
+        }
         await Promise.all(
           batch.slice(i, i + 5).map(async (lead: any, j: number) => {
             try {
@@ -2442,7 +2472,7 @@ async function handleRequest(req: Request): Promise<Response> {
       if (records.length > 0) {
         const { data, error: saveErr } = await admin
           .from('user_leads')
-          .upsert(records, { onConflict: 'user_id,company_domain,full_name' })
+          .upsert(uniqueByLeadKey(records), { onConflict: 'user_id,company_domain,full_name' })
           .select();
         if (saveErr) {
           // Fail loudly (audit H5): nothing saved, nothing charged.
@@ -2527,6 +2557,12 @@ async function handleRequest(req: Request): Promise<Response> {
       });
     }
 
+    // A number found for a contact with no saved row and no name could not be
+    // stored (full_name is NOT NULL), so it would be bought again every time.
+    if (!existing?.id && !resolvedName) {
+      return fail('Add the person’s name (or a LinkedIn profile URL) to look up their phone.');
+    }
+
     const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.revealBurst, RATE_LIMITS.reveal]);
     if (limited) return limited;
 
@@ -2546,6 +2582,7 @@ async function handleRequest(req: Request): Promise<Response> {
 
     let phoneFound: string | null = null;
     let phoneType = 'mobile';
+    let phoneReplay = false;
     const phoneUsageStart = usage.rows.length;
 
     try {
@@ -2569,7 +2606,9 @@ async function handleRequest(req: Request): Promise<Response> {
         const resJson = await tregRes.json();
         phoneFound = clampText(resJson?.output?.phone || resJson?.raw?.data?.employee_phone, 50) || null;
         phoneType = clampText(resJson?.output?.line_type, 32) || 'mobile';
-        if (phoneFound) singlePhoneRow.credits_charged = phonePrice;
+        // A replayed answer was paid for by the earlier attempt, whose save failed.
+        phoneReplay = tregRes.headers.get('x-treg-idempotent-replay') === 'true';
+        if (phoneFound && !phoneReplay) singlePhoneRow.credits_charged = phonePrice;
       }
     } catch (err: any) {
       console.warn('[leads] phone find error:', err?.name || String(err?.message || '').slice(0, 200));
@@ -2577,8 +2616,9 @@ async function handleRequest(req: Request): Promise<Response> {
 
     // Settled with Treg's actual charge for the lookup, hit or miss.
     const providerCostUsd = usage.costSince(phoneUsageStart, 'treg.people.phone.find');
+    const phoneCharge = phoneReplay ? 0 : phonePrice;
     if (phoneFound) {
-      await settleHold(hold.id, phonePrice, providerCostUsd, runKey, `Revealed phone (lead ${leadRef})`);
+      await settleHold(hold.id, phoneCharge, providerCostUsd, runKey, `Revealed phone (lead ${leadRef})`);
     } else {
       await settleHold(hold.id, 0, providerCostUsd, runKey, `No phone found (lead ${leadRef}) - refund`);
       return fail('No direct mobile number found for this lead. Zero credits charged.', 404, { no_hit: true });
@@ -2637,7 +2677,7 @@ async function handleRequest(req: Request): Promise<Response> {
     return json({
       ok: true,
       lead: updatedLead || { ...input, client_key: undefined, email_hint: undefined, full_name: resolvedName, ...updatePayload },
-      credits_charged: phonePrice,
+      credits_charged: phoneCharge,
     });
   }
 
@@ -2695,7 +2735,7 @@ async function handleRequest(req: Request): Promise<Response> {
       }),
     );
     // Merging onto stored rows can map two inputs to one stored key.
-    const uniqueRecords = [...new Map(records.map((r) => [`${r.company_domain}::${r.full_name}`, r])).values()];
+    const uniqueRecords = uniqueByLeadKey(records);
 
     const { data, error } = await admin
       .from('user_leads')

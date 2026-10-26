@@ -27,3 +27,6 @@ supabase/.temp
 *.sln
 *.sw?
 .claude
+
+# Edge function secrets for `supabase secrets set --env-file` (see SETUP.md)
+*.secrets.env

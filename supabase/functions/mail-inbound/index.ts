@@ -22,7 +22,7 @@
 // Secrets: RESEND_WEBHOOK_SECRET, RESEND_API_KEY
 // ============================================================================
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.118.0';
 import {
   deliveryEventOf,
   escapeLike,
@@ -123,21 +123,40 @@ async function fetchReceivedEmail(emailId: string): Promise<any> {
 // Lookups
 // ---------------------------------------------------------------------------
 
-async function findMailbox(admin: Admin, recipients: string[]): Promise<Mailbox | null> {
-  const found: Mailbox[] = [];
-  for (const addr of recipients.slice(0, 20)) {
+/**
+ * Every Echo mailbox a message is for, at most one per user.
+ *
+ * Only hosted mailboxes receive through this webhook, and only on a domain
+ * that may receive for them: the shared platform domain, or a verified domain
+ * owned by the same user. A connected Gmail/SMTP mailbox, or an address on a
+ * domain someone else registered, never matches, so a forged To: header
+ * cannot drop mail into another workspace.
+ */
+async function findMailboxes(admin: Admin, recipients: string[]): Promise<Mailbox[]> {
+  const out: Mailbox[] = [];
+  const seenUsers = new Set<string>();
+  for (const addr of [...new Set(recipients.map((a) => a.toLowerCase()))].slice(0, 20)) {
     const { data, error } = await admin
       .from('mailboxes')
-      .select('id, user_id, address')
+      .select('id, user_id, address, kind, domain_id')
       .ilike('address', escapeLike(addr))
+      .eq('kind', 'hosted')
       .order('created_at', { ascending: true })
       .limit(1);
     if (error) throw new Error(`mailbox_lookup: ${error.code ?? 'error'}`);
-    if (data?.[0]) found.push(data[0] as Mailbox);
+    const mb = data?.[0];
+    if (!mb || seenUsers.has(mb.user_id) || !mb.domain_id) continue;
+    const { data: domain, error: domainError } = await admin
+      .from('mail_domains')
+      .select('user_id, is_platform, status')
+      .eq('id', mb.domain_id)
+      .maybeSingle();
+    if (domainError) throw new Error(`domain_lookup: ${domainError.code ?? 'error'}`);
+    if (!domain || domain.status !== 'verified' || !(domain.is_platform || domain.user_id === mb.user_id)) continue;
+    seenUsers.add(mb.user_id);
+    out.push({ id: mb.id, user_id: mb.user_id, address: mb.address } as Mailbox);
   }
-  if (!found.length) return null;
-  const hit = matchRecipient(recipients, found.map((m) => m.address));
-  return found.find((m) => m.address.toLowerCase() === hit) ?? null;
+  return out;
 }
 
 async function threadById(admin: Admin, id: string, userId: string): Promise<Thread | null> {
@@ -205,13 +224,17 @@ async function handleReceived(admin: Admin, data: any): Promise<{ status: 'proce
   const emailId = typeof data?.email_id === 'string' ? data.email_id : null;
   if (!emailId || !SAFE_ID_RE.test(emailId)) return { status: 'ignored', note: 'no_email_id' };
 
-  // Recipients are known from the webhook itself, so an unknown recipient is
-  // dropped before spending a Receiving API call.
-  const metaRecipients = [
-    ...parseAddressList(data?.to), ...parseAddressList(data?.cc), ...parseAddressList(data?.received_for),
-  ].map((p) => p.address);
-  let mailbox = metaRecipients.length ? await findMailbox(admin, metaRecipients) : null;
-  if (metaRecipients.length && !mailbox) {
+  // The envelope recipients (received_for) say who the message was really
+  // delivered to; the To/Cc headers are only used when the envelope is
+  // missing. Known from the webhook itself, so an unknown recipient is dropped
+  // before spending a Receiving API call.
+  const recipientsOf = (envelope: Party[], headerTo: Party[], headerCc: Party[]) =>
+    (envelope.length ? envelope : [...headerTo, ...headerCc]).map((p) => p.address);
+  const metaRecipients = recipientsOf(
+    parseAddressList(data?.received_for), parseAddressList(data?.to), parseAddressList(data?.cc),
+  );
+  let mailboxes = metaRecipients.length ? await findMailboxes(admin, metaRecipients) : [];
+  if (metaRecipients.length && !mailboxes.length) {
     console.log(`[mail-inbound] ${emailId}: no mailbox for recipient - dropped`);
     return { status: 'ignored', note: 'unknown_recipient' };
   }
@@ -222,11 +245,11 @@ async function handleReceived(admin: Admin, data: any): Promise<{ status: 'proce
   const to = parseAddressList(email?.to ?? data?.to);
   const cc = parseAddressList(email?.cc ?? data?.cc);
   const receivedFor = parseAddressList(email?.received_for ?? data?.received_for);
-  if (!mailbox) {
-    const recipients = [...to, ...cc, ...receivedFor].map((p) => p.address);
-    mailbox = recipients.length ? await findMailbox(admin, recipients) : null;
+  if (!mailboxes.length) {
+    const recipients = recipientsOf(receivedFor, to, cc);
+    mailboxes = recipients.length ? await findMailboxes(admin, recipients) : [];
   }
-  if (!mailbox) {
+  if (!mailboxes.length) {
     console.log(`[mail-inbound] ${emailId}: no mailbox for recipient - dropped`);
     return { status: 'ignored', note: 'unknown_recipient' };
   }
@@ -234,18 +257,11 @@ async function handleReceived(admin: Admin, data: any): Promise<{ status: 'proce
   const sender: Party | null =
     parseAddress(headerValue(headers, 'from')) ?? parseAddress(email?.from ?? data?.from);
   if (!sender) return { status: 'ignored', note: 'no_sender' };
+  const from: Party = sender;
 
-  const subject = String(email?.subject ?? data?.subject ?? '').slice(0, 998);
+  // No line breaks: a reply reuses this subject as a header.
+  const subject = String(email?.subject ?? data?.subject ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, 998);
   const messageId = normaliseMessageId(email?.message_id ?? data?.message_id ?? headerValue(headers, 'message-id'), emailId);
-
-  // Redelivery of a message we already stored (another webhook id, or the
-  // same mail delivered to two of our mailboxes).
-  {
-    const { data: dup, error } = await admin
-      .from('mail_messages').select('id').eq('message_id_header', messageId).limit(1);
-    if (error) throw new Error(`dup_lookup: ${error.code ?? 'error'}`);
-    if (dup?.length) return { status: 'processed', note: 'duplicate_message' };
-  }
 
   const inReplyToRaw = headerValue(headers, 'in-reply-to');
   const referencesRaw = headerValue(headers, 'references');
@@ -262,9 +278,30 @@ async function handleReceived(admin: Admin, data: any): Promise<{ status: 'proce
   const receivedAt = typeof email?.created_at === 'string' ? email.created_at : new Date().toISOString();
   const attachments: any[] = Array.isArray(email?.attachments) ? email.attachments : [];
 
+  // One copy per Echo user the message was delivered to (a mail can cc two
+  // customers, or one Echo user can write to another).
+  const notes: string[] = [];
+  for (const mailbox of mailboxes) {
+    const note = await storeFor(mailbox);
+    if (note) notes.push(note);
+  }
+  return { status: 'processed', note: notes.length ? notes.join(',').slice(0, 200) : null };
+
+  async function storeFor(mailbox: Mailbox): Promise<string | null> {
+  // Redelivery of a message this user already has (another webhook id). The
+  // check is per user: the same Message-ID is legitimately stored once for
+  // the from's Sent copy and once for each Echo recipient.
+  {
+    const { data: dup, error } = await admin
+      .from('mail_messages').select('id')
+      .eq('user_id', mailbox.user_id).eq('message_id_header', messageId).limit(1);
+    if (error) throw new Error(`dup_lookup: ${error.code ?? 'error'}`);
+    if (dup?.length) return 'duplicate_message';
+  }
+
   // 1. Thread.
   let thread = await threadByHeaders(admin, mailbox.user_id, threadIds);
-  if (!thread) thread = await threadBySubject(admin, mailbox, subject, sender.address);
+  if (!thread) thread = await threadBySubject(admin, mailbox, subject, from.address);
   let createdThread = false;
   if (!thread) {
     const { data: created, error } = await admin
@@ -274,7 +311,7 @@ async function handleReceived(admin: Admin, data: any): Promise<{ status: 'proce
         mailbox_id: mailbox.id,
         subject,
         snippet,
-        participants: [{ address: sender.address, name: sender.name }],
+        participants: [{ address: from.address, name: from.name }],
         folder: spam ? 'spam' : 'inbox',
         unread_count: 0,
         has_attachments: false,
@@ -298,7 +335,7 @@ async function handleReceived(admin: Admin, data: any): Promise<{ status: 'proce
       direction: 'in',
       status: 'received',
       is_auto_reply: autoReply,
-      from_addr: sender.address,
+      from_addr: from.address,
       to_addrs: to,
       cc_addrs: cc,
       subject,
@@ -316,7 +353,7 @@ async function handleReceived(admin: Admin, data: any): Promise<{ status: 'proce
     .single();
   if (msgError || !msg) {
     if (createdThread) await admin.from('mail_threads').delete().eq('id', thread.id);
-    if (msgError?.code === '23505') return { status: 'processed', note: 'duplicate_message' };
+    if (msgError?.code === '23505') return 'duplicate_message';
     throw new Error(`message_insert: ${msgError?.code ?? 'error'}`);
   }
 
@@ -327,7 +364,7 @@ async function handleReceived(admin: Admin, data: any): Promise<{ status: 'proce
     .slice(0, 50)
     .map((a) => ({
       message_id: msg.id,
-      user_id: mailbox!.user_id,
+      user_id: mailbox.user_id,
       filename: String(a.filename ?? 'attachment').slice(0, 255),
       content_type: String(a.content_type ?? 'application/octet-stream').slice(0, 255),
       size_bytes: Number.isFinite(Number(a.size)) ? Math.max(0, Math.trunc(Number(a.size))) : 0,
@@ -354,7 +391,7 @@ async function handleReceived(admin: Admin, data: any): Promise<{ status: 'proce
       unread_count: (Number(thread.unread_count) || 0) + 1,
       ...(newer ? { last_message_at: receivedAt, snippet } : {}),
       folder,
-      participants: withParticipant(thread.participants, sender),
+      participants: withParticipant(thread.participants, from),
       has_attachments: thread.has_attachments || attRows.length > 0,
     })
     .eq('id', thread.id);
@@ -376,14 +413,23 @@ async function handleReceived(admin: Admin, data: any): Promise<{ status: 'proce
     `[mail-inbound] received ${emailId} thread=${thread.id} new_thread=${createdThread} ` +
     `auto=${autoReply} spam=${spam} attachments=${attRows.length}`,
   );
-  return { status: 'processed', note: attachmentNote };
+  return attachmentNote;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Delivery events
 // ---------------------------------------------------------------------------
 
-async function handleDelivery(admin: Admin, event: 'bounced' | 'complained' | 'delivered', data: any): Promise<{ status: 'processed' | 'ignored'; note: string | null }> {
+/** A delivery event for a message we have not stored yet is retried for this long. */
+const DELIVERY_RETRY_WINDOW_MS = 30 * 60_000;
+
+async function handleDelivery(
+  admin: Admin,
+  event: 'bounced' | 'complained' | 'delivered',
+  data: any,
+  createdAt: unknown,
+): Promise<{ status: 'processed' | 'ignored'; note: string | null }> {
   const emailId = typeof data?.email_id === 'string' ? data.email_id : null;
   if (!emailId || !SAFE_ID_RE.test(emailId)) return { status: 'ignored', note: 'no_email_id' };
 
@@ -399,6 +445,13 @@ async function handleDelivery(admin: Admin, event: 'bounced' | 'complained' | 'd
       return { status: 'ignored', note: 'rpc_missing' };
     }
     throw new Error(`delivery_rpc: ${error.code ?? 'error'}`);
+  }
+  if (out?.error === 'message_not_found') {
+    // A fast webhook can beat the send's own row insert. Retried for a while
+    // (Resend redelivers on a non-2xx) so a bounce still counts.
+    const age = Date.now() - Date.parse(String(createdAt ?? ''));
+    if (Number.isFinite(age) && age < DELIVERY_RETRY_WINDOW_MS) throw new Error('message_not_found_yet');
+    return { status: 'processed', note: 'message_not_found' };
   }
   console.log(`[mail-inbound] ${event} ${emailId} matched=${out?.matched ?? out?.ok ?? '-'}`);
   return { status: 'processed', note: null };
@@ -476,7 +529,7 @@ Deno.serve(async (req) => {
   try {
     const delivery = deliveryEventOf(eventType);
     const result = delivery
-      ? await handleDelivery(admin, delivery, data)
+      ? await handleDelivery(admin, delivery, data, event?.created_at)
       : await handleReceived(admin, data);
     await markEvent(result.status, result.note);
     return json({ ok: true });

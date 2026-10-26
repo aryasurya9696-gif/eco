@@ -314,7 +314,11 @@ export function isAutoReply(headers: RawHeaders, subject: string | null | undefi
   return AUTO_SUBJECT_RE.test(s) || AUTO_SUBJECT_RE.test(String(subject ?? ''));
 }
 
-/** Spam verdict from the headers a receiving MTA adds. */
+/**
+ * Spam verdict from the headers a receiving MTA adds. A message whose sender
+ * fails DMARC is treated as spam too: its From: may be forged, so it must not
+ * mark a lead as replied.
+ */
 export function isSpam(headers: RawHeaders, extra?: { spam?: unknown; spam_verdict?: unknown }): boolean {
   if (extra?.spam === true) return true;
   const verdict = typeof extra?.spam_verdict === 'string' ? extra.spam_verdict.toLowerCase() : '';
@@ -325,6 +329,8 @@ export function isSpam(headers: RawHeaders, extra?: { spam?: unknown; spam_verdi
   if (/^yes\b/.test(status)) return true;
   const ses = (headerValue(headers, 'x-ses-spam-verdict') ?? '').trim().toUpperCase();
   if (ses === 'FAIL') return true;
+  const auth = (headerValue(headers, 'authentication-results') ?? '').toLowerCase();
+  if (/\bdmarc=fail\b/.test(auth)) return true;
   return false;
 }
 

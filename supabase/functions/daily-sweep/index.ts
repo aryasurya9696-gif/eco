@@ -29,7 +29,10 @@
 //          supabase secrets set TREG_TOKEN=treg_...
 // ============================================================================
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient, type SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.118.0';
+
+/** The service-role client. Untyped schema: rows are checked where they are read. */
+type Db = SupabaseClient<any, 'public', any>;
 import {
   CALL_TIMEOUT_MS,
   canStartBatch,
@@ -83,7 +86,7 @@ function timingSafeEqual(a: string, b: string): boolean {
  * sweep_cron_secret row. Only that row is read; the old query pulled every
  * service secret into memory just to find one.
  */
-async function resolveCronSecret(admin: ReturnType<typeof createClient>): Promise<string> {
+async function resolveCronSecret(admin: Db): Promise<string> {
   if (SWEEP_CRON_SECRET) return SWEEP_CRON_SECRET;
   const { data, error } = await admin
     .from('service_secrets')
@@ -99,7 +102,7 @@ async function resolveCronSecret(admin: ReturnType<typeof createClient>): Promis
 }
 
 /** Provider token, read only after the caller has authenticated. */
-async function resolveTregToken(admin: ReturnType<typeof createClient>): Promise<string> {
+async function resolveTregToken(admin: Db): Promise<string> {
   if (tregToken) return tregToken;
   const { data, error } = await admin
     .from('service_secrets')
@@ -669,7 +672,7 @@ function record(tally: OperationTally, r: TregResult, keywordId: string): void {
  * into a free search by accident.
  */
 async function loadPricing(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
 ): Promise<Map<string, number>> {
   const { data, error } = await admin
     .from('pricing_config')
@@ -700,7 +703,7 @@ interface Reservation {
  * so an empty wallet costs nothing rather than everything.
  */
 async function reserveSweep(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   userId: string,
   credits: number,
   key: string,
@@ -731,7 +734,7 @@ async function reserveSweep(
 
 /** Settles a hold for what was actually billable, and returns the new balance. */
 async function settleSweep(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   reservationId: string,
   creditsCharged: number,
   providerCostUsd: number,
@@ -761,7 +764,7 @@ async function settleSweep(
 
 /** Returns a hold untouched. For every outcome treg does not bill. */
 async function releaseSweep(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   reservationId: string,
   reason: string,
 ): Promise<void> {
@@ -778,7 +781,7 @@ async function releaseSweep(
  * would mean holding public content twice.
  */
 async function recordUsage(
-  admin: ReturnType<typeof createClient>,
+  admin: Db,
   userId: string,
   runKey: string,
   tallies: Map<string, OperationTally>,
@@ -959,7 +962,7 @@ interface RunAcc {
 }
 
 interface ChunkCtx {
-  supabase: ReturnType<typeof createClient>;
+  supabase: Db;
   slot: string;
   runId: string;
   pricing: Map<string, number>;
@@ -1066,7 +1069,7 @@ Deno.serve(async (req) => {
 });
 
 async function runChunk(
-  supabase: ReturnType<typeof createClient>,
+  supabase: Db,
   req: { slot: string; chunk: number; after: string | null; runId: string; startedMs: number; balanceUsd: number | null },
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const { slot, chunk, after, runId, startedMs } = req;
@@ -1251,7 +1254,7 @@ async function runChunk(
  * scan, and the due filter is applied before `limit` is.
  */
 async function loadDueProfiles(
-  supabase: ReturnType<typeof createClient>,
+  supabase: Db,
   hourUtc: number,
   after: string | null,
   limit: number,
@@ -1280,7 +1283,7 @@ async function loadDueProfiles(
  * until an empty page, then capped per user to the oldest MAX_KEYWORDS_PER_USER.
  */
 async function loadKeywords(
-  supabase: ReturnType<typeof createClient>,
+  supabase: Db,
   userIds: string[],
 ): Promise<Map<string, Array<{ id: string; keyword: string }>> | { error: string }> {
   if (userIds.length === 0) return new Map();

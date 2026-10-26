@@ -33,7 +33,10 @@
 // Secret:  DODO_PAYMENTS_WEBHOOK_KEY=whsec_...
 // ============================================================================
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient, type SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.118.0';
+
+/** The service-role client. Untyped schema: rows are checked where they are read. */
+type Db = SupabaseClient<any, 'public', any>;
 
 // Replays outside this window are refused even with a valid signature, so a
 // captured request cannot be resent indefinitely.
@@ -157,7 +160,7 @@ const num = (v: unknown): number => {
  */
 let webhookSecret = Deno.env.get('DODO_PAYMENTS_WEBHOOK_KEY') || '';
 
-async function resolveSecret(admin: ReturnType<typeof createClient>): Promise<string> {
+async function resolveSecret(admin: Db): Promise<string> {
   if (webhookSecret) return webhookSecret;
   const { data, error } = await admin
     .from('service_secrets')
@@ -236,7 +239,7 @@ const ORDER_COLUMNS = 'id, status, gross_usd, currency, refunded_usd';
  * (refunds and disputes usually carry only payment_id). A metadata id that is
  * not a real order falls through to the refs rather than being trusted.
  */
-async function findOrder(admin: ReturnType<typeof createClient>, data: any): Promise<OrderRow | null> {
+async function findOrder(admin: Db, data: any): Promise<OrderRow | null> {
   const metaId = data?.metadata?.order_id;
   if (typeof metaId === 'string' && UUID_RE.test(metaId)) {
     const { data: row, error } = await admin
@@ -381,7 +384,7 @@ Deno.serve(async (req) => {
       if (settleError) throw new Error(`topup failed: ${settleError.message}`);
 
       if (settle?.ok === false) {
-        if (settle.error === 'amount_mismatch' || settle.error === 'currency_mismatch') {
+        if (settle.error === 'amount_mismatch' || settle.error === 'currency_mismatch' || settle.error === 'account_deleted') {
           // The database has parked the order in 'review'. Retrying cannot
           // change what was paid, so this is final for the webhook: processed,
           // with the reason kept for whoever reviews it.
@@ -414,12 +417,13 @@ Deno.serve(async (req) => {
       const order = await findOrder(admin, data);
 
       if (!order) {
-        // Not "processed": a refund we cannot attach to an order means money
-        // went back and credits may not have. Failed, so it shows up for a
-        // human. Answered 200 because a provider retry cannot produce the order.
-        await markEvent('failed', 'refund_order_not_found');
-        console.error(`[webhook] ${eventType} with no matching order; provider ref ${providerRef}`);
-        return json({ ok: false, error: 'refund_order_not_found' });
+        // Usually the refund arrived before payment.succeeded: refunds carry
+        // only the payment id, which is stored on the order when the payment
+        // event is processed. Left for a retry (not acknowledged), so it is
+        // applied once the order can be found instead of being lost while the
+        // late payment grants the full package.
+        console.error(`[webhook] ${eventType} with no matching order yet; provider ref ${providerRef}; asking for a retry`);
+        throw new Error('refund_order_not_found');
       }
 
       // A refund event carries its own amount (incremental); a payment.refunded
@@ -431,9 +435,20 @@ Deno.serve(async (req) => {
       // currency is parked in 'review' instead of being guessed at.
       const cumulative = eventType === 'payment.refunded';
       const refundCurrency = typeof data?.currency === 'string' ? data.currency.toUpperCase() : null;
-      const refundAmount = cumulative
-        ? toMajor(data?.refund_amount ?? data?.total_refunded ?? data?.total_amount, refundCurrency ?? order.currency)
-        : toMajor(data?.amount ?? data?.refund_amount, refundCurrency ?? order.currency);
+      // No fallback to the payment total: a partial refund whose amount is
+      // missing must not revoke the whole order.
+      const rawAmount = cumulative ? (data?.refund_amount ?? data?.total_refunded) : (data?.amount ?? data?.refund_amount);
+      if (rawAmount === undefined || rawAmount === null) {
+        const { error: parkError } = await admin
+          .from('payment_orders')
+          .update({ status: 'review', review_reason: `refund_amount_unknown: ${eventType} ${webhookId}` })
+          .eq('id', order.id);
+        if (parkError) throw new Error(`order update failed: ${parkError.message}`);
+        await markEvent('processed', 'review: refund amount unknown');
+        console.error(`[webhook] ${eventType} on order ${order.id} carries no refund amount; parked for review`);
+        return json({ ok: true, refunded: false, review: 'refund_amount_unknown' });
+      }
+      const refundAmount = toMajor(rawAmount, refundCurrency ?? order.currency);
       const refundId = refundIdOf(eventType, data) ?? (cumulative ? null : `webhook:${webhookId}`);
 
       const { data: out, error: refundError } = await admin.rpc('wallet_refund_order', {
@@ -479,9 +494,10 @@ Deno.serve(async (req) => {
     if (eventType === 'dispute.opened' || eventType === 'dispute.created') {
       const order = await findOrder(admin, data);
       if (!order) {
-        await markEvent('ignored', 'no matching order');
-        console.warn(`[webhook] ${eventType} with no matching order; provider ref ${providerRef}`);
-        return json({ ok: true, matched: false });
+        // As with refunds: most likely ahead of payment.succeeded. Retried so
+        // the freeze is applied once the order can be found.
+        console.warn(`[webhook] ${eventType} with no matching order yet; provider ref ${providerRef}; asking for a retry`);
+        throw new Error('dispute_order_not_found');
       }
 
       // Freeze: the money is contested, so the unspent credits it bought stop
@@ -498,7 +514,9 @@ Deno.serve(async (req) => {
       return json({ ok: true, disputed: true });
     }
 
-    if (eventType === 'dispute.won') {
+    // Cancelled and expired disputes end like a won one: the merchant keeps the
+    // money, so the order is released from 'disputed' and nothing more is owed.
+    if (eventType === 'dispute.won' || eventType === 'dispute.cancelled' || eventType === 'dispute.expired') {
       const order = await findOrder(admin, data);
       if (order && order.status === 'disputed') {
         const { data: out, error } = await admin.rpc('wallet_dispute_order', {

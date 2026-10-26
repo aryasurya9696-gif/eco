@@ -1,6 +1,9 @@
 // Proves the cron-driven path actually reaches the function.
 //
-//   node scripts/verify-sweep-cron.mjs
+//   node scripts/verify-sweep-cron.cjs
+//
+// The function URL is built from service_secrets.project_url, the same value
+// configure_echo_cron() uses, so it always tests the project you are connected to.
 //
 // cron.job_run_details.status = 'succeeded' only means the SQL ran. net.http_post
 // returns a request id immediately and does not wait for the response, so a
@@ -33,7 +36,7 @@ function sql(text) {
 
 const FIRE = `
   select net.http_post(
-    url := 'https://fteoyqhogzuapfdledeg.supabase.co/functions/v1/daily-sweep',
+    url := (select rtrim(value, '/') from public.service_secrets where name = 'project_url') || '/functions/v1/daily-sweep',
     headers := jsonb_build_object(
       'Content-Type', 'application/json',
       'x-sweep-secret', (select value from public.service_secrets
@@ -45,18 +48,31 @@ const FIRE = `
 
 const FIRE_NO_SECRET = `
   select net.http_post(
-    url := 'https://fteoyqhogzuapfdledeg.supabase.co/functions/v1/daily-sweep',
+    url := (select rtrim(value, '/') from public.service_secrets where name = 'project_url') || '/functions/v1/daily-sweep',
     headers := jsonb_build_object('Content-Type', 'application/json'),
     body := '{}'::jsonb,
     timeout_milliseconds := 60000
   );`;
 
-function statusFor(id) {
-  const out = sql(
-    `select coalesce(status_code::text || ' ' || left(content, 200), 'pending')
-       from net._http_response where id = ${id}`,
-  );
-  return out || 'pending (still in flight)';
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+/** pg_net answers asynchronously: poll for up to `seconds` before giving up. */
+function statusFor(id, seconds = 150) {
+  for (let i = 0; i < seconds; i++) {
+    const out = sql(
+      `select coalesce(status_code::text || ' ' || left(content, 200), 'error ' || coalesce(error_msg, ''))
+         from net._http_response where id = ${id}`,
+    );
+    if (out) return out;
+    sleep(1000);
+  }
+  return 'pending (still in flight)';
+}
+
+const configured = sql(`select count(*) from public.service_secrets where name = 'project_url'`);
+if (configured !== '1') {
+  console.error("service_secrets.project_url is not set (see SETUP.md step 3).");
+  process.exit(1);
 }
 
 function check(label, ok, detail) {
@@ -68,7 +84,8 @@ let bad = 0;
 
 console.log('firing the sweep with the cron secret');
 const withId = sql(FIRE);
-bad += check('cron reaches the function', statusFor(withId).startsWith('200'), statusFor(withId));
+const withRes = statusFor(withId);
+bad += check('cron reaches the function', withRes.startsWith('200'), withRes);
 
 console.log('firing the same request with no secret');
 const noId = sql(FIRE_NO_SECRET);

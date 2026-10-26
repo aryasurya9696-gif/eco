@@ -1,7 +1,7 @@
 // Deploys every edge function with the auth mode it is supposed to have.
 //
-//   node scripts/deploy-functions.mjs
-//   node scripts/deploy-functions.mjs daily-sweep
+//   SUPABASE_PROJECT_REF=<ref> node scripts/deploy-functions.cjs
+//   SUPABASE_PROJECT_REF=<ref> node scripts/deploy-functions.cjs daily-sweep
 //
 // This exists because the flag is not part of the function's source, so nothing
 // in review catches a wrong value, and getting it wrong is invisible until a
@@ -31,8 +31,15 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
-const PROJECT_REF =
-  process.env.SUPABASE_PROJECT_REF || 'fteoyqhogzuapfdledeg';
+// Required, with no default: a fallback ref once meant a deploy for a new
+// project went silently into the old one.
+const PROJECT_REF = (process.env.SUPABASE_PROJECT_REF || '').trim();
+if (!/^[a-z0-9]{20}$/.test(PROJECT_REF)) {
+  console.error('Set SUPABASE_PROJECT_REF to the target project ref (20 lowercase letters/digits), e.g.');
+  console.error('  SUPABASE_PROJECT_REF=abcdefghijklmnopqrst node scripts/deploy-functions.cjs');
+  process.exit(1);
+}
+console.log(`target project: ${PROJECT_REF}`);
 
 // verify_jwt: true  -> the Supabase gateway validates the caller's JWT.
 // verify_jwt: false -> the function authenticates the caller itself. Only valid
