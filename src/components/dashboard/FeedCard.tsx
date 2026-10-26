@@ -11,10 +11,12 @@ import {
   MessageSquare,
   EyeOff,
   Undo2,
+  Building2,
 } from 'lucide-react';
 import type { MonitoredPost, LeadStatus } from '../../types';
 import { safeHttpUrl } from '../../lib/url';
 import { channelLabel } from '../../lib/constants';
+import { CompanyPanel } from '../leads/CompanyPanel';
 
 interface FeedCardProps {
   post: MonitoredPost;
@@ -87,6 +89,31 @@ function relativeTime(iso: string | null, now: number): string {
 const platformName = (p: MonitoredPost['platform']): string => channelLabel(p);
 
 /** Small muted action button shared by the card footer. */
+/**
+ * Sites that host other people's posts. A web mention found on one of these
+ * says nothing about the author's company, so it gets no company lookup.
+ */
+const HOSTING_SITES = [
+  'reddit.com', 'quora.com', 'medium.com', 'substack.com', 'youtube.com', 'x.com', 'twitter.com',
+  'linkedin.com', 'facebook.com', 'instagram.com', 'tiktok.com', 'github.com', 'stackoverflow.com',
+  'stackexchange.com', 'news.ycombinator.com', 'producthunt.com', 'g2.com', 'capterra.com',
+  'trustpilot.com', 'wikipedia.org', 'google.com',
+];
+
+/**
+ * The company a mention can be looked up as: the site of a web result. News
+ * results are left out (the site is the publisher, not a buyer), as are X and
+ * Reddit, whose authors cannot be enriched from a handle.
+ */
+function mentionCompanyDomain(post: MonitoredPost): string | null {
+  if (post.platform !== 'google') return null;
+  const url = safeHttpUrl(post.post_url);
+  if (!url) return null;
+  const host = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+  if (!host.includes('.') || HOSTING_SITES.some((h) => host === h || host.endsWith(`.${h}`))) return null;
+  return host;
+}
+
 const GhostButton: React.FC<{
   onClick?: () => void;
   href?: string;
@@ -131,6 +158,8 @@ export const FeedCard: React.FC<FeedCardProps> = ({
   const isSaved = post.status === 'saved';
   const isContacted = post.status === 'contacted';
   const isDismissed = post.status === 'dismissed';
+  const companyDomain = mentionCompanyDomain(post);
+  const [companyOpen, setCompanyOpen] = React.useState(false);
 
   return (
     <article
@@ -306,6 +335,13 @@ export const FeedCard: React.FC<FeedCardProps> = ({
             <span className="hidden sm:inline">Draft reply</span>
           </button>
 
+          {companyDomain && (
+            <GhostButton title={`Company profile for ${companyDomain}`} onClick={() => setCompanyOpen(true)}>
+              <Building2 className="w-3 h-3" aria-hidden="true" />
+              <span className="hidden sm:inline">Company</span>
+            </GhostButton>
+          )}
+
           {safeHttpUrl(post.post_url) && (
             <GhostButton title="Open the original post" href={safeHttpUrl(post.post_url) ?? undefined}>
               <ExternalLink className="w-3 h-3" />
@@ -313,6 +349,9 @@ export const FeedCard: React.FC<FeedCardProps> = ({
           )}
         </div>
       </div>
+      {companyOpen && companyDomain && (
+        <CompanyPanel domain={companyDomain} onClose={() => setCompanyOpen(false)} />
+      )}
     </article>
   );
 };

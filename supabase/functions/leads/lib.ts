@@ -298,6 +298,67 @@ export function cachedCompanyState(
 }
 
 // ---------------------------------------------------------------------------
+// Person enrichment (treg.people.enrich)
+// ---------------------------------------------------------------------------
+
+/** What treg.people.enrich found about one person. */
+export interface PersonFound {
+  full_name: string;
+  first_name: string | null;
+  last_name: string | null;
+  title: string | null;
+  company_name: string | null;
+  company_domain: string | null;
+  /** Unchecked: the caller passes it through its own LinkedIn URL filter. */
+  linkedin_url: string | null;
+  location: string | null;
+}
+
+/**
+ * The person in a treg.people.enrich answer, or null on a miss. treg maps
+ * every child provider onto one contract under `output` (full_name,
+ * first_name, last_name, title, company, company_domain, linkedin_url,
+ * location); a miss is `output.full_name == null`.
+ */
+export function mapPersonOutput(resJson: any): PersonFound | null {
+  const out = resJson?.output ?? {};
+  const first = text(out.first_name, 200);
+  const last = text(out.last_name, 200);
+  const full = text(out.full_name, 200) ?? (first || last ? [first, last].filter(Boolean).join(' ') : null);
+  if (!full) return null;
+  const domain = cleanDomain(typeof out.company_domain === 'string' ? out.company_domain : '');
+  return {
+    full_name: full,
+    first_name: first,
+    last_name: last,
+    title: text(out.title, 200),
+    company_name: text(out.company, 200),
+    company_domain: /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain) ? domain : null,
+    linkedin_url: text(out.linkedin_url, 500),
+    location: text(out.location, 200),
+  };
+}
+
+/** Fields enrichment may fill on a saved lead. Name and domain are its identity and are left alone. */
+const ENRICH_FILLS = ['first_name', 'last_name', 'title', 'company_name', 'linkedin_url', 'location'] as const;
+
+/**
+ * The update for a saved lead: only the fields that are blank or a
+ * placeholder on the stored row. Enrichment never overwrites what the user
+ * already has, and never changes the row's identity (full_name,
+ * company_domain), except to give a LinkedIn-only lead its missing domain.
+ */
+export function enrichmentPatch(existing: any, found: PersonFound): Record<string, string> {
+  const patch: Record<string, string> = {};
+  for (const key of ENRICH_FILLS) {
+    const value = found[key];
+    if (value && !isBlank(key, value) && isBlank(key, existing?.[key])) patch[key] = value;
+  }
+  if (found.company_domain && !existing?.company_domain) patch.company_domain = found.company_domain;
+  return patch;
+}
+
+// ---------------------------------------------------------------------------
 // Usage log
 // ---------------------------------------------------------------------------
 

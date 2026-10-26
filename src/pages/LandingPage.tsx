@@ -12,6 +12,7 @@ import {
   KEYWORD_LIMIT,
   MAX_SWEEP_CREDITS,
   PEOPLE_SEARCH_CREDITS,
+  PERSON_ENRICH_CREDITS,
   VERIFIED_EMAIL_CREDITS,
   WELCOME_CREDITS,
   channelLabel,
@@ -59,6 +60,7 @@ const COST_GROUPS: CostGroup[] = [
       { label: 'Verified work email', credits: VERIFIED_EMAIL_CREDITS, note: 'per email revealed' },
       { label: 'Direct phone', credits: DIRECT_PHONE_CREDITS, note: 'per phone revealed' },
       { label: 'Company profile', credits: COMPANY_ENRICH_CREDITS, note: 'per company found; already-known companies are free' },
+      { label: 'Person profile', credits: PERSON_ENRICH_CREDITS, note: 'per saved lead whose profile is found' },
     ],
   },
   {

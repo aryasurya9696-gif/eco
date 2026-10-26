@@ -228,6 +228,8 @@ export interface B2BLead {
   status?: B2BPipelineStatus;
   notes?: string | null;
   is_saved?: boolean;
+  /** Last successful person enrichment of this saved lead; set by the server. */
+  person_enriched_at?: string | null;
   created_at?: string;
   updated_at?: string;
 }

@@ -9,10 +9,12 @@ import {
   classifyEmail,
   corsOriginFor,
   dedupeLeads,
+  enrichmentPatch,
   DEV_ORIGINS,
   hasRevealedEmail,
   hasUsableEmail,
   mapCompanyOutput,
+  mapPersonOutput,
   maxSearchProviderCalls,
   mergeLeadRecord,
   UsageLog,
@@ -197,4 +199,42 @@ Deno.test('cachedCompanyState: fresh hit, recent miss, stale; the newer lookup w
   // A re-buy that missed after an older hit: the miss is newer.
   assertEquals(cachedCompanyState({ name: 'A', enriched_at: ago(5000), miss_at: ago(1000) }, now), 'miss');
   assertEquals(cachedCompanyState({ name: 'A', enriched_at: ago(1000), miss_at: ago(5000) }, now), 'hit');
+});
+
+Deno.test('mapPersonOutput: maps the contract; a missing name is a miss', () => {
+  assertEquals(mapPersonOutput({
+    output: {
+      first_name: 'Jane',
+      last_name: 'Doe',
+      title: 'VP Marketing',
+      company: 'Acme',
+      company_domain: 'https://www.Acme.com/about',
+      linkedin_url: 'https://www.linkedin.com/in/jane-doe',
+      location: 'Austin, TX',
+    },
+  }), {
+    full_name: 'Jane Doe',
+    first_name: 'Jane',
+    last_name: 'Doe',
+    title: 'VP Marketing',
+    company_name: 'Acme',
+    company_domain: 'acme.com',
+    linkedin_url: 'https://www.linkedin.com/in/jane-doe',
+    location: 'Austin, TX',
+  });
+  assertEquals(mapPersonOutput({ output: { full_name: null } }), null);
+  assertEquals(mapPersonOutput({ output: { full_name: 'A B', company_domain: 'not a domain' } })?.company_domain, null);
+});
+
+Deno.test('enrichmentPatch: fills blanks and placeholders only; never renames the lead', () => {
+  const found = mapPersonOutput({
+    output: { full_name: 'Jane Q. Doe', title: 'VP Marketing', company: 'Acme', company_domain: 'acme.com', location: 'Austin' },
+  })!;
+  assertEquals(
+    enrichmentPatch({ full_name: 'Jane Doe', title: 'Executive', company_name: 'Acme Inc', company_domain: 'acme.com', location: null }, found),
+    { title: 'VP Marketing', location: 'Austin' },
+  );
+  // A LinkedIn-only lead gets its missing domain.
+  assertEquals(enrichmentPatch({ full_name: 'Jane Doe', company_domain: '' }, found).company_domain, 'acme.com');
+  assert(!('full_name' in enrichmentPatch({ full_name: 'Jane Doe' }, found)));
 });

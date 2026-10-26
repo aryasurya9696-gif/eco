@@ -16,12 +16,14 @@ import {
   classifyEmail,
   cleanDomain,
   dedupeLeads,
+  enrichmentPatch,
   hasRevealedEmail,
   hasUsableEmail,
   isEmailAddress,
   leadKey,
   linkedinSlug,
   mapCompanyOutput,
+  mapPersonOutput,
   MAX_PROVIDER_CALLS,
   MAX_SEARCH_DOMAINS,
   maxSearchProviderCalls,
@@ -305,9 +307,11 @@ async function resolveToken(admin: any): Promise<string> {
  * per call vs 1 credit per billed call, email $0.015 vs 1 credit, phone
  * $0.03 vs 2 credits. A route that would cost more is not taken.
  */
-const MAX_COST = { search: '0.015', email: '0.015', phone: '0.03', company: '0.02' } as const;
+const MAX_COST = { search: '0.015', email: '0.015', phone: '0.03', company: '0.02', person: '0.03' } as const;
 // company: the cheapest children answer for $0.0005-$0.005 a hit and a few
 // bill misses, so $0.02 keeps a 0.5-credit hit ($0.025) above cost.
+// person: LinkedIn-URL lookups answer for $0.0005; name + domain ones run
+// $0.004-$0.03, under a 1-credit hit ($0.05).
 
 /**
  * Credit prices, all from pricing_config. A price is null when its row is
@@ -328,18 +332,20 @@ interface Prices {
   search: number | null;
   /** Credits per company found (`treg.companies.enrich`); cache hits are free. */
   company: number | null;
+  /** Credits per person found (`treg.people.enrich`). */
+  person: number | null;
 }
 
 let priceCache: { at: number; prices: Prices } | null = null;
 
 async function loadPrices(admin: any): Promise<Prices> {
   if (priceCache && Date.now() - priceCache.at < 60_000) return priceCache.prices;
-  const prices: Prices = { email: null, phone: null, search: null, company: null };
+  const prices: Prices = { email: null, phone: null, search: null, company: null, person: null };
   try {
     const { data, error } = await admin
       .from('pricing_config')
       .select('operation, credits, enabled')
-      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'treg.people.search', 'treg.companies.enrich']);
+      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'treg.people.search', 'treg.companies.enrich', 'treg.people.enrich']);
     if (error || !Array.isArray(data)) {
       console.warn('[leads] pricing lookup failed:', error?.message);
       return prices; // not cached: the next request retries the read
@@ -351,6 +357,7 @@ async function loadPrices(admin: any): Promise<Prices> {
       if (row.operation === 'treg.people.phone.find') prices.phone = credits;
       if (row.operation === 'treg.people.search') prices.search = credits;
       if (row.operation === 'treg.companies.enrich') prices.company = credits;
+      if (row.operation === 'treg.people.enrich') prices.person = credits;
     }
   } catch (err: any) {
     console.warn('[leads] pricing lookup failed:', err?.message);
@@ -1269,6 +1276,7 @@ async function handleRequest(req: Request): Promise<Response> {
       // per-block fee is gone.
       search_credits_per_call: prices.search,
       company_credits: prices.company,
+      person_credits: prices.person,
       search_max_provider_calls_single: maxSearchProviderCalls(1, 1000),
       search_max_provider_calls_multi: MAX_PROVIDER_CALLS,
       search_free_leads: 0,
@@ -2980,6 +2988,109 @@ async function handleRequest(req: Request): Promise<Response> {
         : `Company enrichment: nothing found - refund`,
     );
     return json({ ok: true, results, credits_charged: charged });
+  }
+
+  // =========================================================================
+  // ACTION 11: ENRICH PERSON — treg.people.enrich for one saved lead
+  // =========================================================================
+  if (action === 'enrich-person') {
+    if (!isUuid(body.lead_id)) return fail('lead_id is required.');
+    const { data: lead, error: leadErr } = await admin
+      .from('user_leads')
+      .select('*')
+      .eq('id', body.lead_id)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (leadErr) return fail('Could not read the lead', 500);
+    if (!lead) return fail('Lead not found', 404);
+    if (lead.person_enriched_at) return json({ ok: true, already_enriched: true, lead, credits_charged: 0 });
+
+    // Everything treg can match on. A LinkedIn URL is the cheapest and most
+    // reliable key; an email or name + domain also work.
+    const identity: Record<string, string> = {};
+    const linkedin = safeLinkedin(lead.linkedin_url);
+    if (linkedin) identity.linkedin_url = linkedin;
+    const email = safeEmail(lead.work_email);
+    if (email) identity.email = email;
+    if (lead.company_domain && lead.full_name) {
+      identity.domain = lead.company_domain;
+      identity.full_name = lead.full_name;
+    }
+    if (Object.keys(identity).length === 0) {
+      return fail('This lead needs a LinkedIn URL, an email, or a name and company domain to enrich.');
+    }
+
+    const price = (await loadPrices(admin)).person;
+    if (price === null) return pricingUnavailable();
+    const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.revealBurst, RATE_LIMITS.reveal]);
+    if (limited) return limited;
+
+    const leadRef = await shortHash(leadIdentity(lead));
+    const baseKey = `enrich_person:${userId}:${leadRef}:${revealWindow()}`;
+    const { hold, key: runKey } = await reserveOnce(admin, userId, price, baseKey, {
+      feature: 'person_enrich',
+      lead_ref: leadRef,
+    }, openHolds);
+    if ('shortfall' in hold) return insufficientCredits(hold);
+    if (hold.duplicate) {
+      return fail('This lead is already being enriched. Please wait a moment.', 409, { duplicate_request: true });
+    }
+
+    const usageStart = usage.rows.length;
+    let found: ReturnType<typeof mapPersonOutput> = null;
+    try {
+      const res = await fetch(`${TREG_BASE}/call/treg.people.enrich`, {
+        method: 'POST',
+        headers: tregHeaders(token, userId, 'person-enrich', MAX_COST.person, `echo:${baseKey}`),
+        body: JSON.stringify(identity),
+        signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
+      });
+      const row = usage.track('treg.people.enrich', res, { feature: 'person-enrich' }, hold.id);
+      if (res.ok) {
+        found = mapPersonOutput(await res.json());
+        if (found) row.credits_charged = price;
+      }
+    } catch (err: any) {
+      console.warn('[leads] person enrich upstream warning:', err?.name || String(err?.message || '').slice(0, 200));
+    }
+
+    const providerCostUsd = usage.costSince(usageStart, 'treg.people.enrich');
+    if (!found) {
+      await settleHold(hold.id, 0, providerCostUsd, runKey, `Person enrichment (lead ${leadRef}): nothing found - refund`);
+      return fail('No profile found for this lead. Zero credits charged.', 404, { no_hit: true });
+    }
+    await settleHold(hold.id, price, providerCostUsd, runKey, `Enriched person profile (lead ${leadRef})`);
+
+    // Only blank fields are filled; a found LinkedIn URL must pass the same
+    // filter as one the user typed.
+    const patch: Record<string, unknown> = enrichmentPatch(lead, {
+      ...found,
+      linkedin_url: safeLinkedin(found.linkedin_url),
+    });
+    const update = async (fields: Record<string, unknown>) =>
+      admin
+        .from('user_leads')
+        .update({ ...fields, person_enriched_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('id', lead.id)
+        .eq('user_id', userId)
+        .select()
+        .single();
+    let { data: saved, error: saveErr } = await update(patch);
+    if (saveErr?.code === '23505' && 'company_domain' in patch) {
+      // The new domain would collide with another saved row for the same
+      // person; keep this row's identity and save the rest.
+      const { company_domain: _dropped, ...rest } = patch;
+      ({ data: saved, error: saveErr } = await update(rest));
+    }
+    if (saveErr) console.error('[leads] person enrich update error:', saveErr.message);
+
+    return json({
+      ok: true,
+      lead: saved || { ...lead, ...patch },
+      person: found,
+      credits_charged: price,
+      persisted: !saveErr,
+    });
   }
 
   return fail(`Unknown action: ${String(action).slice(0, 50)}`);

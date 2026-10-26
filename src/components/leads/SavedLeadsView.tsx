@@ -4,6 +4,7 @@ import { downloadCsv, downloadTextFile } from '../../lib/csv';
 import { EmailCell, PhoneCell, StageSelect, LinkedinIcon } from './LeadCells';
 import { emailState, initialsOf, linkedinHref, previewEmail, foundEmail, revealedPhone } from './lead-utils';
 import { CompanyName } from './CompanyPanel';
+import { EnrichPersonButton } from './EnrichPersonButton';
 import {
   Search,
   Bookmark,
@@ -475,6 +476,7 @@ export const SavedLeadsView: React.FC<SavedLeadsViewProps> = ({
                                 )}
                               </div>
                               <p className="text-[13px] text-ink-2 line-clamp-2 break-words" title={lead.title}>{lead.title || '—'}</p>
+                              <EnrichPersonButton lead={lead} />
                             </div>
                           </div>
                         </td>
@@ -534,6 +536,7 @@ export const SavedLeadsView: React.FC<SavedLeadsViewProps> = ({
                       <div className="min-w-0 flex-1">
                         <p className="font-semibold text-ink truncate">{lead.full_name || 'Unnamed lead'}</p>
                         <p className="text-[13px] text-ink-2 truncate">{[lead.title, lead.company_name].filter(Boolean).join(' · ') || '—'}</p>
+                        <EnrichPersonButton lead={lead} />
                       </div>
                       {deleteControl(lead)}
                     </div>
