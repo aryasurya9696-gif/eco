@@ -6989,3 +6989,38 @@ drop index if exists public.uq_mail_messages_message_id_header;
 
 create unique index if not exists uq_mail_messages_user_message_id_header
   on public.mail_messages (user_id, message_id_header) where message_id_header is not null;
+
+-- ============================================================================
+-- Migration: 20261208_remaining_fixes.sql
+-- Description: Remaining DB-side fixes (indexes + pricing_audit.changed_by).
+-- Idempotent: safe to run more than once.
+-- ============================================================================
+
+create index if not exists api_usage_reservation_id_idx
+  on public.api_usage (reservation_id)
+  where reservation_id is not null;
+
+create index if not exists credit_ledger_grant_id_idx
+  on public.credit_ledger (grant_id)
+  where grant_id is not null;
+
+create index if not exists credit_ledger_payment_order_id_idx
+  on public.credit_ledger (payment_order_id)
+  where payment_order_id is not null;
+
+do \$\$
+begin
+  if to_regclass('public.mail_messages') is not null then
+    create index if not exists mail_messages_thread_id_idx on public.mail_messages (thread_id);
+    create index if not exists mail_messages_mailbox_id_idx on public.mail_messages (mailbox_id);
+  end if;
+  if to_regclass('public.mail_attachments') is not null then
+    create index if not exists mail_attachments_message_id_idx on public.mail_attachments (message_id);
+  end if;
+  if to_regclass('public.mail_threads') is not null then
+    create index if not exists mail_threads_mailbox_id_idx on public.mail_threads (mailbox_id);
+  end if;
+  if to_regclass('public.pricing_audit') is not null then
+    alter table public.pricing_audit add column if not exists changed_by uuid;
+  end if;
+end \$\$;

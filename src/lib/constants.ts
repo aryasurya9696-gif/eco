@@ -73,7 +73,7 @@ export const CHANNEL_LIMIT = 3;
 /** Credits per keyword, per sweep, on each channel. News is free. Fractional. */
 export const CHANNEL_SEARCH_CREDITS: Record<Platform, number> = {
   twitter: 0.1,
-  reddit: 0.1,
+  reddit: 0.2,
   google: 0.1,
   news: 0,
 };
@@ -89,9 +89,9 @@ export const PUBLIC_PRICES: Record<string, number> = {
   'treg.people.email.find': 1,
   'treg.people.phone.find': 2,
   /** Per company found; companies already in the shared cache are free. */
-  'treg.companies.enrich': 0.5,
+  'treg.companies.enrich': 1,
   /** Per saved lead whose profile is found. */
-  'treg.people.enrich': 1,
+  'treg.people.enrich': 2,
   /** Per news lookup that finds articles; cached news is free for 7 days. */
   'treg.companies.news': 1,
   /** Per funding lookup that finds rounds; cached for 30 days. */
@@ -150,3 +150,4 @@ export const MAX_SWEEP_CREDITS =
         .reduce((sum, c) => sum + c, 0) *
       100,
   ) / 100;
+

@@ -108,9 +108,12 @@ select jobname, schedule from cron.job order by jobname;
 
 ## 4. Edge function secrets
 
-Put them in a local file that is **never committed**, for example `supabase/.secrets.env`, then push it in one go:
+Start from the template, fill it in, then push it in one go. The filled-in
+copy is git-ignored (`*.secrets.env`), so it is **never committed**:
 
 ```bash
+cp supabase/secrets.example.env supabase/.secrets.env
+# fill in supabase/.secrets.env; optional features are commented out
 npx supabase secrets set --project-ref <ref> --env-file supabase/.secrets.env
 ```
 
@@ -259,7 +262,7 @@ SUPABASE_PROJECT_REF=<ref> node scripts/deploy-functions.cjs social
 
 ## 10. Frontend
 
-- [ ] Create `.env` from [`.env.example`](.env.example) with only the two public values:
+- [ ] Update `.env` (copy [`.env.example`](.env.example) if it does not exist) so it points at the **new** project. It holds only these two public values:
 
 ```env
 VITE_SUPABASE_URL=https://<ref>.supabase.co
