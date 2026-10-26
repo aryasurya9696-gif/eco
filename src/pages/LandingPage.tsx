@@ -5,6 +5,7 @@ import { supabase, isConfigured } from '../lib/supabase';
 import {
   CHANNEL_LIMIT,
   CHANNEL_SEARCH_CREDITS,
+  COMPANY_ENRICH_CREDITS,
   CONNECTED_SEND_CREDITS,
   DIRECT_PHONE_CREDITS,
   HOSTED_SEND_CREDITS,
@@ -57,6 +58,7 @@ const COST_GROUPS: CostGroup[] = [
       { label: 'People search', credits: PEOPLE_SEARCH_CREDITS, note: 'per billed provider call; one search can make several' },
       { label: 'Verified work email', credits: VERIFIED_EMAIL_CREDITS, note: 'per email revealed' },
       { label: 'Direct phone', credits: DIRECT_PHONE_CREDITS, note: 'per phone revealed' },
+      { label: 'Company profile', credits: COMPANY_ENRICH_CREDITS, note: 'per company found; already-known companies are free' },
     ],
   },
   {

@@ -88,6 +88,8 @@ export const PUBLIC_PRICES: Record<string, number> = {
   'treg.people.search': 1,
   'treg.people.email.find': 1,
   'treg.people.phone.find': 2,
+  /** Per company found; companies already in the shared cache are free. */
+  'treg.companies.enrich': 0.5,
   'mail.send.connected': 0.05,
   'mail.send.hosted': 0.1,
 };
@@ -95,6 +97,7 @@ export const PUBLIC_PRICES: Record<string, number> = {
 export const PEOPLE_SEARCH_CREDITS = PUBLIC_PRICES['treg.people.search'];
 export const VERIFIED_EMAIL_CREDITS = PUBLIC_PRICES['treg.people.email.find'];
 export const DIRECT_PHONE_CREDITS = PUBLIC_PRICES['treg.people.phone.find'];
+export const COMPANY_ENRICH_CREDITS = PUBLIC_PRICES['treg.companies.enrich'];
 export const CONNECTED_SEND_CREDITS = PUBLIC_PRICES['mail.send.connected'];
 export const HOSTED_SEND_CREDITS = PUBLIC_PRICES['mail.send.hosted'];
 

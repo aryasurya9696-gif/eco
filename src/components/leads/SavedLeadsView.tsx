@@ -3,6 +3,7 @@ import type { B2BLead, B2BPipelineStatus } from '../../types';
 import { downloadCsv, downloadTextFile } from '../../lib/csv';
 import { EmailCell, PhoneCell, StageSelect, LinkedinIcon } from './LeadCells';
 import { emailState, initialsOf, linkedinHref, previewEmail, foundEmail, revealedPhone } from './lead-utils';
+import { CompanyName } from './CompanyPanel';
 import {
   Search,
   Bookmark,
@@ -479,7 +480,7 @@ export const SavedLeadsView: React.FC<SavedLeadsViewProps> = ({
                         </td>
                         <td className="px-2.5 py-3.5">
                           <div className="w-[150px] 2xl:w-[210px]">
-                            <p className="font-medium text-ink line-clamp-2 break-words">{lead.company_name || '—'}</p>
+                            <p className="font-medium text-ink line-clamp-2 break-words"><CompanyName name={lead.company_name} domain={lead.company_domain} /></p>
                             {lead.company_domain && (
                               <a
                                 href={`https://${lead.company_domain}`}

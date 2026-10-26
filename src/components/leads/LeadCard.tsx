@@ -3,6 +3,7 @@ import type { B2BLead, B2BPipelineStatus } from '../../types';
 import { ExternalLink, MapPin, Users, TrendingUp, Bookmark, BookmarkCheck } from 'lucide-react';
 import { EmailCell, PhoneCell, StageSelect, LinkedinIcon, ContactStatusBadge } from './LeadCells';
 import { initialsOf, linkedinHref } from './lead-utils';
+import { CompanyName } from './CompanyPanel';
 
 interface LeadCardProps {
   lead: B2BLead;
@@ -85,7 +86,7 @@ export const LeadCard: React.FC<LeadCardProps> = ({
           <p className="text-[13px] text-ink-2 truncate" title={lead.title}>{lead.title || '—'}</p>
           <ContactStatusBadge lead={lead} wantPhone={wantPhone} />
           <p className="mt-0.5 text-[13px] text-ink truncate">
-            <span className="font-medium">{lead.company_name || '—'}</span>
+            <CompanyName name={lead.company_name} domain={lead.company_domain} className="font-medium" />
             {lead.company_domain && (
               <>
                 {' · '}

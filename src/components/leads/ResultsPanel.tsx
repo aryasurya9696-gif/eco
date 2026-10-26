@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { B2BLead, B2BPipelineStatus } from '../../types';
 import { LeadCard } from './LeadCard';
+import { CompanyName } from './CompanyPanel';
 import { ConfirmRevealModal } from './ConfirmRevealModal';
 import { EmailCell, PhoneCell, StageSelect, LinkedinIcon, ContactStatusBadge } from './LeadCells';
 import { useLeadPricing, type EnrichmentRun } from './leads-store';
@@ -524,7 +525,7 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
                             <td className="px-2.5 py-3.5">
                               <div className="w-[160px] 2xl:w-[200px]">
                               <p className="font-medium text-ink line-clamp-2 break-words" title={lead.company_name}>
-                                {lead.company_name || '—'}
+                                <CompanyName name={lead.company_name} domain={lead.company_domain} />
                               </p>
                               {lead.company_domain ? (
                                 <a

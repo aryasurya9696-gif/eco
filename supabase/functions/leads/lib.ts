@@ -208,6 +208,96 @@ export function affordableSearchLimit(
 }
 
 // ---------------------------------------------------------------------------
+// Company enrichment (treg.companies.enrich)
+// ---------------------------------------------------------------------------
+
+/** A cached company is re-bought after this long; a cached miss is retried after the shorter one. */
+export const COMPANY_HIT_TTL_MS = 90 * 24 * 3600_000;
+export const COMPANY_MISS_TTL_MS = 30 * 24 * 3600_000;
+
+/** One `companies` row, as the leads function writes it. */
+export interface CompanyRow {
+  domain: string;
+  name: string;
+  description: string | null;
+  industry: string | null;
+  employees: string | null;
+  founded_year: number | null;
+  location: string | null;
+  linkedin_url: string | null;
+  website: string | null;
+  logo_url: string | null;
+  served_by: string | null;
+}
+
+function text(value: unknown, max: number): string | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value).slice(0, max);
+  if (typeof value !== 'string') return null;
+  const t = value.trim();
+  return t ? t.slice(0, max) : null;
+}
+
+/** An https URL on one of `hosts` (or any host when omitted), else null. Rendered as links, so nothing else gets through. */
+function httpsUrl(value: unknown, hosts?: string[]): string | null {
+  if (typeof value !== 'string' || value.length > 500) return null;
+  let url: URL;
+  try {
+    url = new URL(/^https?:\/\//i.test(value.trim()) ? value.trim() : `https://${value.trim()}`);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+  const host = url.hostname.toLowerCase();
+  if (hosts && !hosts.some((h) => host === h || host.endsWith(`.${h}`))) return null;
+  return `https://${host}${url.pathname}`.replace(/\/+$/, '');
+}
+
+/**
+ * The `companies` row for a treg.companies.enrich answer, or null on a miss.
+ *
+ * treg normalises every child provider onto one contract under `output`
+ * (name, domain, website, description, industry, employees, founded,
+ * location, linkedin_url); a miss is `output.name == null`. A logo is not in
+ * the contract, so it is taken from the provider's own answer when present.
+ */
+export function mapCompanyOutput(resJson: any, domain: string): CompanyRow | null {
+  const out = resJson?.output ?? {};
+  const name = text(out.name, 200);
+  if (!name) return null;
+  const raw = resJson?.raw ?? {};
+  const founded = Number(out.founded);
+  const year = new Date().getUTCFullYear();
+  return {
+    domain,
+    name,
+    description: text(out.description, 2000),
+    industry: text(out.industry, 200),
+    employees: text(out.employees, 50),
+    founded_year: Number.isInteger(founded) && founded >= 1600 && founded <= year ? founded : null,
+    location: text(out.location, 200),
+    linkedin_url: httpsUrl(out.linkedin_url, ['linkedin.com']),
+    website: httpsUrl(out.website),
+    logo_url: httpsUrl(raw.logo_url ?? raw.logo ?? raw.data?.logo_url ?? raw.data?.logo),
+    served_by: text(resJson?._treg?.served_by, 100),
+  };
+}
+
+/** What a cached row is worth: a usable hit, a recent miss, or nothing (absent or stale). */
+export function cachedCompanyState(
+  row: { enriched_at?: string | null; miss_at?: string | null; name?: string | null } | null | undefined,
+  now = Date.now(),
+): 'hit' | 'miss' | 'stale' {
+  if (!row) return 'stale';
+  const at = (v?: string | null) => (v ? Date.parse(v) : NaN);
+  const hitAt = at(row.enriched_at);
+  const missAt = at(row.miss_at);
+  // Whichever lookup is newer decides.
+  if (row.name && Number.isFinite(hitAt) && !(missAt > hitAt) && now - hitAt < COMPANY_HIT_TTL_MS) return 'hit';
+  if (Number.isFinite(missAt) && !(hitAt > missAt) && now - missAt < COMPANY_MISS_TTL_MS) return 'miss';
+  return 'stale';
+}
+
+// ---------------------------------------------------------------------------
 // Usage log
 // ---------------------------------------------------------------------------
 

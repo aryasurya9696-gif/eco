@@ -290,6 +290,7 @@ export function creditsToUsd(credits: number | null | undefined, packages: Packa
 function usageLabel(note: string | null | undefined): string {
   const n = (note ?? '').toLowerCase();
   if (n.startsWith('lead search')) return 'People search';
+  if (/compan(y|ies)/.test(n)) return 'Company enrichment';
   if (/reveal|enrich|email|phone/.test(n)) return 'Lead reveal';
   if (/keywords? across/.test(n)) return 'Sweep';
   return 'Usage';

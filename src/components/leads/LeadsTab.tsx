@@ -9,6 +9,7 @@ import type { ProspectorSearchParams } from './prospector-types';
 import { QuickLookupView } from './QuickLookupView';
 import { SavedLeadsView } from './SavedLeadsView';
 import { leadsStore, useLeadsStore } from './leads-store';
+import { companyStore } from './company-store';
 import { walletStore, useWallet, isWelcomeOnlyRefusal, WELCOME_ONLY_MESSAGE } from '../../lib/wallet-store';
 import { foundEmail, leadKey, revealedEmail, revealedPhone } from './lead-utils';
 import { Search, Zap, Bookmark, Wallet as WalletIcon, Plus } from 'lucide-react';
@@ -53,6 +54,10 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ onNavigateBilling }) => {
   useEffect(() => {
     leadsStore.init(uid, addToast);
   }, [uid, addToast]);
+
+  useEffect(() => {
+    companyStore.reset();
+  }, [uid]);
 
   useEffect(() => {
     // The wallet store also re-reads on window focus (a top-up happens on

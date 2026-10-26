@@ -160,6 +160,22 @@ export type B2BLookupState = 'queued' | 'processing' | 'not_found' | 'failed' | 
 
 export type B2BPipelineStatus = 'new' | 'contacted' | 'replied' | 'dismissed';
 
+/** A company profile from the shared enrichment cache (leads `company-lookup` / `enrich-company`). */
+export interface Company {
+  domain: string;
+  name: string | null;
+  description: string | null;
+  industry: string | null;
+  /** Headcount or a range, as the provider states it. */
+  employees: string | null;
+  founded_year: number | null;
+  location: string | null;
+  linkedin_url: string | null;
+  website: string | null;
+  logo_url: string | null;
+  enriched_at: string | null;
+}
+
 export interface B2BLead {
   id: string;
   /**

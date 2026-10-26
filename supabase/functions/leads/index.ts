@@ -11,6 +11,7 @@ import {
   acceptNameOnlyMatch,
   affordableSearchLimit,
   allowedOrigins,
+  cachedCompanyState,
   corsOriginFor,
   classifyEmail,
   cleanDomain,
@@ -20,6 +21,7 @@ import {
   isEmailAddress,
   leadKey,
   linkedinSlug,
+  mapCompanyOutput,
   MAX_PROVIDER_CALLS,
   MAX_SEARCH_DOMAINS,
   maxSearchProviderCalls,
@@ -303,7 +305,9 @@ async function resolveToken(admin: any): Promise<string> {
  * per call vs 1 credit per billed call, email $0.015 vs 1 credit, phone
  * $0.03 vs 2 credits. A route that would cost more is not taken.
  */
-const MAX_COST = { search: '0.015', email: '0.015', phone: '0.03' } as const;
+const MAX_COST = { search: '0.015', email: '0.015', phone: '0.03', company: '0.02' } as const;
+// company: the cheapest children answer for $0.0005-$0.005 a hit and a few
+// bill misses, so $0.02 keeps a 0.5-credit hit ($0.025) above cost.
 
 /**
  * Credit prices, all from pricing_config. A price is null when its row is
@@ -322,18 +326,20 @@ interface Prices {
    * (audit H4). `leads.search.extra_50` is no longer read.
    */
   search: number | null;
+  /** Credits per company found (`treg.companies.enrich`); cache hits are free. */
+  company: number | null;
 }
 
 let priceCache: { at: number; prices: Prices } | null = null;
 
 async function loadPrices(admin: any): Promise<Prices> {
   if (priceCache && Date.now() - priceCache.at < 60_000) return priceCache.prices;
-  const prices: Prices = { email: null, phone: null, search: null };
+  const prices: Prices = { email: null, phone: null, search: null, company: null };
   try {
     const { data, error } = await admin
       .from('pricing_config')
       .select('operation, credits, enabled')
-      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'treg.people.search']);
+      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'treg.people.search', 'treg.companies.enrich']);
     if (error || !Array.isArray(data)) {
       console.warn('[leads] pricing lookup failed:', error?.message);
       return prices; // not cached: the next request retries the read
@@ -344,6 +350,7 @@ async function loadPrices(admin: any): Promise<Prices> {
       if (row.operation === 'treg.people.email.find') prices.email = credits;
       if (row.operation === 'treg.people.phone.find') prices.phone = credits;
       if (row.operation === 'treg.people.search') prices.search = credits;
+      if (row.operation === 'treg.companies.enrich') prices.company = credits;
     }
   } catch (err: any) {
     console.warn('[leads] pricing lookup failed:', err?.message);
@@ -441,6 +448,20 @@ const RATE_LIMITS = {
     limit: 2,
     windowSeconds: 10,
     message: 'A bulk lookup is already running. Please wait a few seconds and try again.',
+  },
+  // Per request (up to MAX_COMPANY_BATCH domains each), so at most 300 company
+  // lookups an hour, the same bound as contact reveals.
+  company: {
+    bucket: 'leads.company',
+    limit: 30,
+    windowSeconds: 3600,
+    message: 'You have reached the hourly company lookup limit. Please try again later.',
+  },
+  companyBurst: {
+    bucket: 'leads.company.burst',
+    limit: 5,
+    windowSeconds: 10,
+    message: 'Too many company lookups at once. Please wait a few seconds and try again.',
   },
   bulkSave: {
     bucket: 'leads.bulk-save',
@@ -1247,6 +1268,7 @@ async function handleRequest(req: Request): Promise<Response> {
       // multi-company search. The block fields stay for older clients: the
       // per-block fee is gone.
       search_credits_per_call: prices.search,
+      company_credits: prices.company,
       search_max_provider_calls_single: maxSearchProviderCalls(1, 1000),
       search_max_provider_calls_multi: MAX_PROVIDER_CALLS,
       search_free_leads: 0,
@@ -2849,6 +2871,162 @@ async function handleRequest(req: Request): Promise<Response> {
     return fail('lead_id, lead_ids, or both company_domain and full_name are required for deletion', 400);
   }
 
+  // =========================================================================
+  // ACTION 9: COMPANY LOOKUP — what the shared cache already knows (free)
+  // =========================================================================
+  if (action === 'company-lookup') {
+    const domains = companyDomainsOf(body, MAX_COMPANY_LOOKUP);
+    if (domains.length === 0) return json({ ok: true, companies: {} });
+    const { data, error } = await admin.from('companies').select(COMPANY_COLUMNS).in('domain', domains);
+    if (error) return fail('Could not read company data', 500);
+    const companies: Record<string, unknown> = {};
+    for (const row of data ?? []) {
+      if (cachedCompanyState(row) === 'hit') companies[row.domain] = publicCompany(row);
+    }
+    return json({ ok: true, companies });
+  }
+
+  // =========================================================================
+  // ACTION 10: ENRICH COMPANY — treg.companies.enrich for one or more domains
+  // =========================================================================
+  if (action === 'enrich-company') {
+    const domains = companyDomainsOf(body, MAX_COMPANY_BATCH);
+    if (domains.length === 0) return fail('A valid company domain is required.');
+
+    // 1. The shared cache: a fresh hit or a recent miss costs nothing and
+    // makes no provider call.
+    const { data: cachedRows, error: cacheErr } = await admin.from('companies').select(COMPANY_COLUMNS).in('domain', domains);
+    if (cacheErr) return fail('Could not read company data', 500);
+    const cached = new Map<string, any>((cachedRows ?? []).map((r: any) => [r.domain, r]));
+    const results: Record<string, { status: CompanyStatus; company?: unknown }> = {};
+    const toBuy: string[] = [];
+    for (const d of domains) {
+      const row = cached.get(d);
+      const state = cachedCompanyState(row);
+      if (state === 'hit') results[d] = { status: 'cached', company: publicCompany(row) };
+      else if (state === 'miss') results[d] = { status: 'not_found' };
+      else toBuy.push(d);
+    }
+    if (toBuy.length === 0) return json({ ok: true, results, credits_charged: 0 });
+
+    const price = (await loadPrices(admin)).company;
+    if (price === null) return pricingUnavailable();
+    const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.companyBurst, RATE_LIMITS.company]);
+    if (limited) return limited;
+
+    // 2. Hold the most this can cost (every domain a hit).
+    const batchRef = await shortHash([...toBuy].sort().join(','));
+    const baseKey = `enrich_company:${userId}:${batchRef}:${revealWindow()}`;
+    const { hold, key: runKey } = await reserveOnce(admin, userId, price * toBuy.length, baseKey, {
+      feature: 'company_enrich',
+      domains: toBuy.length,
+    }, openHolds);
+    if ('shortfall' in hold) return insufficientCredits(hold);
+    if (hold.duplicate) {
+      return fail('These companies are already being looked up. Please wait a moment.', 409, { duplicate_request: true });
+    }
+
+    // 3. treg, a few at a time.
+    const usageStart = usage.rows.length;
+    let hits = 0;
+    const enrichOne = async (domain: string) => {
+      try {
+        const res = await fetch(`${TREG_BASE}/call/treg.companies.enrich`, {
+          method: 'POST',
+          headers: tregHeaders(token, userId, 'company-enrich', MAX_COST.company, `echo:${baseKey}:${domain}`),
+          body: JSON.stringify({ domain }),
+          signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
+        });
+        const row = usage.track('treg.companies.enrich', res, { feature: 'company-enrich' }, hold.id);
+        if (!res.ok) {
+          results[domain] = { status: 'failed' };
+          return;
+        }
+        const resJson = await res.json();
+        const now = new Date().toISOString();
+        const company = mapCompanyOutput(resJson, domain);
+        if (!company) {
+          // Only miss_at is written, so an older hit's fields survive and are
+          // still shown below.
+          await admin.from('companies').upsert({ domain, miss_at: now, updated_at: now }, { onConflict: 'domain' });
+          const old = cached.get(domain);
+          results[domain] = old?.name ? { status: 'cached', company: publicCompany(old) } : { status: 'not_found' };
+          return;
+        }
+        row.credits_charged = price;
+        hits++;
+        const stored = { ...company, raw: resJson?.raw ?? null, enriched_at: now, miss_at: null, updated_at: now };
+        const { error } = await admin.from('companies').upsert(stored, { onConflict: 'domain' });
+        if (error) console.error('[leads] company upsert error:', error.message);
+        results[domain] = { status: 'found', company: publicCompany(stored) };
+      } catch (err: any) {
+        console.warn('[leads] company enrich upstream warning:', err?.name || String(err?.message || '').slice(0, 200));
+        results[domain] = { status: 'failed' };
+      }
+    };
+    for (let i = 0; i < toBuy.length; i += COMPANY_CONCURRENCY) {
+      await Promise.all(toBuy.slice(i, i + COMPANY_CONCURRENCY).map(enrichOne));
+    }
+
+    // 4. Charged only for companies found; misses and failures are refunded.
+    const charged = hits * price;
+    await settleHold(
+      hold.id,
+      charged,
+      usage.costSince(usageStart, 'treg.companies.enrich'),
+      runKey,
+      hits > 0
+        ? `Enriched ${hits} ${hits === 1 ? 'company' : 'companies'}`
+        : `Company enrichment: nothing found - refund`,
+    );
+    return json({ ok: true, results, credits_charged: charged });
+  }
+
   return fail(`Unknown action: ${String(action).slice(0, 50)}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Company enrichment helpers
+// ---------------------------------------------------------------------------
+
+/** Domains per enrich-company request, and per company-lookup (cache only). */
+const MAX_COMPANY_BATCH = 10;
+const MAX_COMPANY_LOOKUP = 200;
+const COMPANY_CONCURRENCY = 5;
+
+/** What the client may see: no provider answer, no provider name. */
+const COMPANY_COLUMNS =
+  'domain, name, description, industry, employees, founded_year, location, linkedin_url, website, logo_url, enriched_at, miss_at';
+
+type CompanyStatus = 'found' | 'cached' | 'not_found' | 'failed';
+
+const DOMAIN_RE = /^(?=.{3,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+
+/** `domain` or `domains[]` from a request body: cleaned, valid, deduped, capped. */
+function companyDomainsOf(body: any, max: number): string[] {
+  const input: unknown[] = Array.isArray(body?.domains) ? body.domains.slice(0, max * 2) : [body?.domain];
+  const out = new Set<string>();
+  for (const value of input) {
+    const d = cleanDomain(typeof value === 'string' ? value : '');
+    if (DOMAIN_RE.test(d)) out.add(d);
+    if (out.size >= max) break;
+  }
+  return [...out];
+}
+
+function publicCompany(row: any) {
+  return {
+    domain: row.domain,
+    name: row.name ?? null,
+    description: row.description ?? null,
+    industry: row.industry ?? null,
+    employees: row.employees ?? null,
+    founded_year: row.founded_year ?? null,
+    location: row.location ?? null,
+    linkedin_url: row.linkedin_url ?? null,
+    website: row.website ?? null,
+    logo_url: row.logo_url ?? null,
+    enriched_at: row.enriched_at ?? null,
+  };
 }

@@ -3,12 +3,16 @@ import {
   acceptNameOnlyMatch,
   affordableSearchLimit,
   allowedOrigins,
+  cachedCompanyState,
+  COMPANY_HIT_TTL_MS,
+  COMPANY_MISS_TTL_MS,
   classifyEmail,
   corsOriginFor,
   dedupeLeads,
   DEV_ORIGINS,
   hasRevealedEmail,
   hasUsableEmail,
+  mapCompanyOutput,
   maxSearchProviderCalls,
   mergeLeadRecord,
   UsageLog,
@@ -137,4 +141,60 @@ Deno.test('CORS allow-list', () => {
   assertEquals(corsOriginFor('https://b.example.com', list), 'https://b.example.com');
   assertEquals(corsOriginFor('https://evil.example', list), 'https://app.example.com');
   assertEquals(corsOriginFor('https://x', allowedOrigins('*', undefined)), '*');
+});
+
+Deno.test('mapCompanyOutput: a hit maps the contract, a null name is a miss', () => {
+  const row = mapCompanyOutput({
+    output: {
+      name: ' Stripe ',
+      description: 'Payments infrastructure',
+      industry: 'Financial Services',
+      employees: '5001-10000',
+      founded: 2010,
+      location: 'South San Francisco, CA',
+      linkedin_url: 'linkedin.com/company/stripe/',
+      website: 'http://stripe.com',
+    },
+    raw: { logo_url: 'https://logo.example/stripe.png' },
+    _treg: { served_by: 'hunter.companies.enrich' },
+  }, 'stripe.com');
+  assertEquals(row, {
+    domain: 'stripe.com',
+    name: 'Stripe',
+    description: 'Payments infrastructure',
+    industry: 'Financial Services',
+    employees: '5001-10000',
+    founded_year: 2010,
+    location: 'South San Francisco, CA',
+    linkedin_url: 'https://linkedin.com/company/stripe',
+    website: 'https://stripe.com',
+    logo_url: 'https://logo.example/stripe.png',
+    served_by: 'hunter.companies.enrich',
+  });
+  assertEquals(mapCompanyOutput({ output: { name: null } }, 'x.com'), null);
+  assertEquals(mapCompanyOutput({}, 'x.com'), null);
+});
+
+Deno.test('mapCompanyOutput: unsafe links and impossible years are dropped', () => {
+  const row = mapCompanyOutput({
+    output: { name: 'Acme', linkedin_url: 'https://evil.example/company/acme', website: 'javascript:alert(1)', founded: 3000 },
+    raw: { logo: 'data:image/png;base64,xx' },
+  }, 'acme.com')!;
+  assertEquals(row.linkedin_url, null);
+  assertEquals(row.website, null);
+  assertEquals(row.founded_year, null);
+  assertEquals(row.logo_url, null);
+});
+
+Deno.test('cachedCompanyState: fresh hit, recent miss, stale; the newer lookup wins', () => {
+  const now = Date.parse('2026-10-26T00:00:00Z');
+  const ago = (ms: number) => new Date(now - ms).toISOString();
+  assertEquals(cachedCompanyState(null, now), 'stale');
+  assertEquals(cachedCompanyState({ name: 'A', enriched_at: ago(1000) }, now), 'hit');
+  assertEquals(cachedCompanyState({ name: 'A', enriched_at: ago(COMPANY_HIT_TTL_MS + 1) }, now), 'stale');
+  assertEquals(cachedCompanyState({ miss_at: ago(1000) }, now), 'miss');
+  assertEquals(cachedCompanyState({ miss_at: ago(COMPANY_MISS_TTL_MS + 1) }, now), 'stale');
+  // A re-buy that missed after an older hit: the miss is newer.
+  assertEquals(cachedCompanyState({ name: 'A', enriched_at: ago(5000), miss_at: ago(1000) }, now), 'miss');
+  assertEquals(cachedCompanyState({ name: 'A', enriched_at: ago(1000), miss_at: ago(5000) }, now), 'hit');
 });
