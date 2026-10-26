@@ -174,8 +174,26 @@ export interface Company {
   website: string | null;
   logo_url: string | null;
   enriched_at: string | null;
-  /** Cached recent news: null when not looked up, [] when none was found. */
+  /** Cached signals: null when not looked up, [] when a recent lookup found none. */
   news?: CompanyNewsArticle[] | null;
+  funding?: CompanyFundingRound[] | null;
+  jobs?: CompanyJobOpening[] | null;
+}
+
+export type CompanySignalKind = 'news' | 'funding' | 'jobs';
+
+export interface CompanyFundingRound {
+  name: string;
+  stage: string | null;
+  announced_on: string | null;
+  amount_usd: number | null;
+}
+
+export interface CompanyJobOpening {
+  title: string;
+  url: string | null;
+  location: string | null;
+  posted_at: string | null;
 }
 
 export interface CompanyNewsArticle {

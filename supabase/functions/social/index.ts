@@ -6,6 +6,7 @@
 //   POST {action}            the signed-in user's requests (JWT checked here)
 //     providers              which platforms are set up on this deployment
 //     connect_start          returns the platform's consent URL
+//     connect_finish         completes a connection after the consent screen
 //     list_accounts          the user's connected accounts
 //     disconnect             revokes the tokens and removes the account
 //     reply                  posts a reply under a feed post
@@ -15,10 +16,18 @@
 // team, so through treg every Echo user would post as the same account. The
 // tokens are kept in Supabase Vault (social_accounts.vault_secret_id).
 //
+// Connecting is two steps on purpose. The redirect only parks the code on its
+// state row and sends the browser back to Echo; the signed-in user then calls
+// connect_finish, which refuses unless that user started the connection. A
+// consent URL forwarded to someone else therefore cannot attach their account
+// to the sender's workspace.
+//
 // A reply is charged from the wallet like a mail send: credits held before
-// the platform call, charged only when the platform accepts it, released
-// otherwise. Purchased credits only. A human always clicks Send on text they
-// can see; nothing here posts on a schedule.
+// the platform call, charged when the platform accepts it, released when it
+// refuses. A call that times out is "uncertain": it may have been posted, so
+// it is charged and the post stays blocked until the user confirms a resend
+// (confirm_resend: true). Purchased credits only. A human always clicks Send
+// on text they can see; nothing here posts on a schedule.
 //
 // Deploy with JWT verification OFF (the OAuth redirect carries no JWT); every
 // POST action checks the caller's JWT itself and fails closed.
@@ -46,6 +55,8 @@ import {
   replyTarget,
   replyUrl,
   returnUrl,
+  STALE_CLAIM_MS,
+  tokenFailureKind,
   type SocialPlatform,
   type StoredTokens,
 } from './rules.ts';
@@ -104,6 +115,8 @@ async function requireUserId(req: Request): Promise<string | null> {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PLATFORM_TIMEOUT_MS = 15_000;
 const STATE_TTL_MS = 10 * 60_000;
+/** How long one request may hold an account's refresh lease. */
+const REFRESH_LEASE_MS = 30_000;
 const PRICE_OP: Record<SocialPlatform, string> = { x: 'social.reply.x', reddit: 'social.reply.reddit' };
 /** What the platform charges Echo per reply (X bills the app owner per post). */
 const PROVIDER_COST_USD: Record<SocialPlatform, number> = { x: 0.015, reddit: 0 };
@@ -135,18 +148,22 @@ function admin() {
 }
 type Admin = ReturnType<typeof admin>;
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 // ---------------------------------------------------------------------------
 // OAuth token handling
 // ---------------------------------------------------------------------------
 
-/** POSTs a form to a platform's token endpoint; the parsed tokens, or null. */
+type TokenResult = { tokens: StoredTokens } | { error: 'invalid' | 'transient' };
+
+/** POSTs a form to a platform's token endpoint. */
 async function tokenRequest(
   platform: SocialPlatform,
   form: Record<string, string>,
   previousRefresh: string | null = null,
-): Promise<StoredTokens | null> {
+): Promise<TokenResult> {
   const creds = clientCredentials(platform);
-  if (!creds) return null;
+  if (!creds) return { error: 'transient' };
   try {
     const res = await fetch(OAUTH[platform].token, {
       method: 'POST',
@@ -158,14 +175,16 @@ async function tokenRequest(
       body: new URLSearchParams(form).toString(),
       signal: AbortSignal.timeout(PLATFORM_TIMEOUT_MS),
     });
+    const body = await res.json().catch(() => null);
     if (!res.ok) {
       console.warn(`[social] ${platform} token request failed: ${res.status}`);
-      return null;
+      return { error: tokenFailureKind(res.status, body) };
     }
-    return parseTokenResponse(await res.json(), Date.now(), previousRefresh);
+    const tokens = parseTokenResponse(body, Date.now(), previousRefresh);
+    return tokens ? { tokens } : { error: tokenFailureKind(res.status, body) };
   } catch (err: any) {
     console.warn(`[social] ${platform} token request error:`, err?.name || err?.message);
-    return null;
+    return { error: 'transient' };
   }
 }
 
@@ -187,78 +206,138 @@ async function whoAmI(platform: SocialPlatform, accessToken: string): Promise<{ 
   }
 }
 
-/**
- * A usable access token for an account, refreshed when it is about to expire.
- * null means the account has to be connected again (it is marked so).
- */
-async function accessTokenFor(db: Admin, account: any): Promise<string | null> {
-  if (!account.vault_secret_id) return null;
-  const { data: raw, error } = await db.rpc('get_social_secret', { p_secret_id: account.vault_secret_id });
+async function readTokens(db: Admin, secretId: string): Promise<StoredTokens | null> {
+  const { data: raw, error } = await db.rpc('get_social_secret', { p_secret_id: secretId });
   if (error || typeof raw !== 'string') return null;
-  let tokens: StoredTokens;
   try {
-    tokens = JSON.parse(raw);
+    return JSON.parse(raw) as StoredTokens;
   } catch {
     return null;
   }
-  if (!needsRefresh(tokens, Date.now())) return tokens.access_token;
+}
 
-  const platform = account.platform as SocialPlatform;
-  const fresh = tokens.refresh_token
-    ? await tokenRequest(platform, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token }, tokens.refresh_token)
-    : null;
-  if (!fresh) {
-    await db.from('social_accounts').update({ status: 'needs_reauth', updated_at: new Date().toISOString() }).eq('id', account.id);
-    return null;
+/**
+ * A usable access token for an account, refreshed when it is about to expire.
+ *
+ * X refresh tokens are single-use, so two requests refreshing at once would
+ * strand the account: only the holder of a short lease
+ * (social_accounts.refreshing_until) refreshes, and the others wait and
+ * re-read the tokens it saved. Only a dead grant marks the account
+ * needs_reauth; a timeout or 5xx is reported as `transient`.
+ */
+async function accessTokenFor(db: Admin, account: any): Promise<string | 'reauth' | 'transient'> {
+  if (!account.vault_secret_id) return 'reauth';
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const tokens = await readTokens(db, account.vault_secret_id);
+    if (!tokens) return 'reauth';
+    if (!needsRefresh(tokens, Date.now())) return tokens.access_token;
+    if (!tokens.refresh_token) break;
+
+    const now = new Date();
+    const { data: lease } = await db
+      .from('social_accounts')
+      .update({ refreshing_until: new Date(now.getTime() + REFRESH_LEASE_MS).toISOString() })
+      .eq('id', account.id)
+      .or(`refreshing_until.is.null,refreshing_until.lt."${now.toISOString()}"`)
+      .select('id');
+    if (!lease?.length) {
+      // Another request is refreshing: wait for the tokens it saves.
+      await sleep(1000);
+      if (attempt === 5) return 'transient';
+      continue;
+    }
+
+    const platform = account.platform as SocialPlatform;
+    const result = await tokenRequest(
+      platform,
+      { grant_type: 'refresh_token', refresh_token: tokens.refresh_token, ...(platform === 'x' ? { client_id: clientCredentials('x')?.id ?? '' } : {}) },
+      tokens.refresh_token,
+    );
+    if ('error' in result) {
+      await db.from('social_accounts').update({ refreshing_until: null }).eq('id', account.id);
+      if (result.error === 'transient') return 'transient';
+      break;
+    }
+    // The rotated refresh token must be saved, or the account is dead at the next refresh.
+    let saved = false;
+    for (let i = 0; i < 3 && !saved; i++) {
+      const { error } = await db.rpc('update_social_secret', {
+        p_secret_id: account.vault_secret_id,
+        p_secret: JSON.stringify(result.tokens),
+      });
+      saved = !error;
+      if (error) console.error('[social] token refresh not saved:', error.message);
+    }
+    await db.from('social_accounts').update({ refreshing_until: null }).eq('id', account.id);
+    if (!saved) break;
+    return result.tokens.access_token;
   }
-  const { error: saveErr } = await db.rpc('update_social_secret', {
-    p_secret_id: account.vault_secret_id,
-    p_secret: JSON.stringify(fresh),
-  });
-  // X rotates refresh tokens: losing the new one would strand the account.
-  if (saveErr) console.error('[social] token refresh not saved:', saveErr.message);
-  return fresh.access_token;
+  await db.from('social_accounts').update({ status: 'needs_reauth', updated_at: new Date().toISOString() }).eq('id', account.id);
+  return 'reauth';
 }
 
 // ---------------------------------------------------------------------------
-// OAuth redirect (GET, no JWT)
+// OAuth redirect (GET, no JWT): parks the code and sends the browser home
 // ---------------------------------------------------------------------------
 
 async function handleCallback(url: URL): Promise<Response> {
   const redirect = (outcome: Parameters<typeof returnUrl>[1]) =>
     APP_ORIGIN
       ? new Response(null, { status: 302, headers: { Location: returnUrl(APP_ORIGIN, outcome) } })
-      : json(outcome, outcome.ok ? 200 : 400);
+      : json(outcome, 'error' in outcome ? 400 : 200);
 
   const state = url.searchParams.get('state') || '';
   const code = url.searchParams.get('code') || '';
-  if (!state || state.length > 128) return redirect({ ok: false, reason: 'invalid_state' });
+  if (!state || state.length > 128) return redirect({ error: 'invalid_state' });
 
   const db = admin();
-  // Single use: the state row is deleted as it is read.
+  if (url.searchParams.get('error') || !code) {
+    await db.from('social_oauth_states').delete().eq('state', state);
+    return redirect({ error: 'denied' });
+  }
+  // Only a fresh state that has not been used yet takes a code.
+  const { data: parked } = await db
+    .from('social_oauth_states')
+    .update({ code: code.slice(0, 2000) })
+    .eq('state', state)
+    .is('code', null)
+    .gte('created_at', new Date(Date.now() - STATE_TTL_MS).toISOString())
+    .select('state');
+  if (!parked?.length) return redirect({ error: 'expired' });
+  return redirect({ finish: state });
+}
+
+/** Exchanges a parked code for the user who started the connection. */
+async function connectFinish(db: Admin, userId: string, body: any): Promise<Response> {
+  const state = typeof body.state === 'string' ? body.state : '';
+  if (!state || state.length > 128) return fail('Invalid connection request.');
+  // Single use: deleted as it is read.
   const { data: rows } = await db.from('social_oauth_states').delete().eq('state', state).select();
   const pending = rows?.[0];
-  if (!pending || Date.now() - Date.parse(pending.created_at) > STATE_TTL_MS) {
-    return redirect({ ok: false, reason: 'expired' });
+  if (!pending || !pending.code || Date.now() - Date.parse(pending.created_at) > STATE_TTL_MS) {
+    return fail('This connection expired. Please connect again.', 410, { reason: 'expired' });
+  }
+  if (pending.user_id !== userId) {
+    return fail('This connection was started from a different Echo account. Nothing was connected.', 403, { reason: 'wrong_user' });
   }
   const platform = pending.platform as SocialPlatform;
-  if (url.searchParams.get('error') || !code) return redirect({ ok: false, reason: 'denied' });
 
-  const tokens = await tokenRequest(platform, {
+  const exchanged = await tokenRequest(platform, {
     grant_type: 'authorization_code',
-    code,
+    code: pending.code,
     redirect_uri: REDIRECT_URI,
     ...(platform === 'x' ? { code_verifier: pending.code_verifier, client_id: clientCredentials('x')?.id ?? '' } : {}),
   });
-  if (!tokens) return redirect({ ok: false, reason: 'token_exchange_failed' });
+  if ('error' in exchanged) return fail(`${PLATFORM_LABEL[platform]} did not confirm the connection. Please try again.`, 502);
+  const tokens = exchanged.tokens;
   const me = await whoAmI(platform, tokens.access_token);
-  if (!me) return redirect({ ok: false, reason: 'profile_unavailable' });
+  if (!me) return fail(`Could not read your ${PLATFORM_LABEL[platform]} profile. Please try again.`, 502);
 
   // Reconnecting the same account replaces its tokens; the old secret is dropped.
   const { data: existing } = await db
     .from('social_accounts')
     .select('id, vault_secret_id')
-    .eq('user_id', pending.user_id)
+    .eq('user_id', userId)
     .eq('platform', platform)
     .eq('external_user_id', me.id)
     .maybeSingle();
@@ -266,32 +345,32 @@ async function handleCallback(url: URL): Promise<Response> {
     p_secret: JSON.stringify(tokens),
     p_name: null,
   });
-  if (secretErr || !secretId) return redirect({ ok: false, reason: 'storage_failed' });
+  if (secretErr || !secretId) return fail('Could not save the connection. Please try again.', 500);
 
-  const now = new Date().toISOString();
   const row = {
-    user_id: pending.user_id,
+    user_id: userId,
     platform,
     handle: me.handle,
     external_user_id: me.id,
     vault_secret_id: secretId,
     scopes: [...OAUTH[platform].scopes],
     status: 'active',
-    updated_at: now,
+    refreshing_until: null,
+    updated_at: new Date().toISOString(),
   };
   const { error: saveErr } = existing
     ? await db.from('social_accounts').update(row).eq('id', existing.id)
     : await db.from('social_accounts').insert(row);
   if (saveErr) {
     await db.rpc('delete_social_secret', { p_secret_id: secretId });
-    return redirect({ ok: false, reason: 'storage_failed' });
+    return fail('Could not save the connection. Please try again.', 500);
   }
   if (existing?.vault_secret_id) await db.rpc('delete_social_secret', { p_secret_id: existing.vault_secret_id });
-  return redirect({ ok: true, platform });
+  return json({ ok: true, platform, handle: me.handle });
 }
 
 // ---------------------------------------------------------------------------
-// Billing (same two-phase hold as leads and mail)
+// Billing and limits (same two-phase hold as leads and mail)
 // ---------------------------------------------------------------------------
 
 async function loadPrice(db: Admin, platform: SocialPlatform): Promise<number | null> {
@@ -331,7 +410,7 @@ async function handleAction(userId: string, body: any): Promise<Response> {
     const platform = body.platform;
     if (!isSocialPlatform(platform)) return fail('Unknown platform.');
     const creds = clientCredentials(platform);
-    if (!creds || !SUPABASE_URL) return fail(`${PLATFORM_LABEL[platform]} is not set up on this workspace yet.`, 503);
+    if (!creds || !SUPABASE_URL || !APP_ORIGIN) return fail(`${PLATFORM_LABEL[platform]} is not set up on this workspace yet.`, 503);
     const ok = await takeSlot(db, userId, 'social.connect', 20, 3600);
     if (ok === null) return fail('The service is busy. Please try again in a moment.', 503);
     if (!ok) return fail('Too many connection attempts. Please try again later.', 429);
@@ -347,6 +426,8 @@ async function handleAction(userId: string, body: any): Promise<Response> {
       url: authorizeUrl(platform, { clientId: creds.id, redirectUri: REDIRECT_URI, state, challenge: await pkceChallenge(verifier) }),
     });
   }
+
+  if (action === 'connect_finish') return connectFinish(db, userId, body);
 
   if (action === 'list_accounts') {
     const { data, error } = await db
@@ -372,11 +453,9 @@ async function handleAction(userId: string, body: any): Promise<Response> {
     // the Vault copy somehow survived.
     const platform = account.platform as SocialPlatform;
     const creds = clientCredentials(platform);
-    if (creds && account.vault_secret_id) {
-      const { data: raw } = await db.rpc('get_social_secret', { p_secret_id: account.vault_secret_id });
+    const tokens = creds && account.vault_secret_id ? await readTokens(db, account.vault_secret_id) : null;
+    if (creds && tokens) {
       try {
-        const tokens = JSON.parse(String(raw)) as StoredTokens;
-        const token = tokens.refresh_token || tokens.access_token;
         await fetch(OAUTH[platform].revoke, {
           method: 'POST',
           headers: platformHeaders(platform, {
@@ -384,7 +463,7 @@ async function handleAction(userId: string, body: any): Promise<Response> {
             'Content-Type': 'application/x-www-form-urlencoded',
           }),
           body: new URLSearchParams({
-            token,
+            token: tokens.refresh_token || tokens.access_token,
             token_type_hint: tokens.refresh_token ? 'refresh_token' : 'access_token',
             ...(platform === 'x' ? { client_id: creds.id } : {}),
           }).toString(),
@@ -404,6 +483,9 @@ async function handleAction(userId: string, body: any): Promise<Response> {
 
   return fail(`Unknown action: ${String(action).slice(0, 50)}`);
 }
+
+const UNCERTAIN_MESSAGE =
+  'The platform did not answer in time, so the reply may already be posted (it was charged). Check the post first; press Send again only if it is not there.';
 
 async function reply(db: Admin, userId: string, body: any): Promise<Response> {
   if (typeof body.post_id !== 'string' || !UUID_RE.test(body.post_id)) return fail('post_id is required.');
@@ -437,22 +519,37 @@ async function reply(db: Admin, userId: string, body: any): Promise<Response> {
   const price = await loadPrice(db, platform);
   if (price === null) return fail('Replies are temporarily unavailable (pricing is not configured).', 503);
 
-  // 3. Limits: a short burst guard per user, the account's own daily cap.
-  for (const [bucket, limit, window] of [
-    ['social.reply.burst', 3, 10],
-    [`social.reply.${account.id}`, account.daily_reply_cap, 86_400],
-  ] as const) {
-    const ok = await takeSlot(db, userId, bucket, limit, window);
-    if (ok === null) return fail('The service is busy. Please try again in a moment.', 503);
-    if (!ok) {
-      return fail(
-        bucket === 'social.reply.burst'
-          ? 'Too many replies at once. Please wait a few seconds.'
-          : `@${account.handle} has reached its ${account.daily_reply_cap} replies for today.`,
-        429,
-        { rate_limited: true },
-      );
-    }
+  const burst = await takeSlot(db, userId, 'social.reply.burst', 3, 10);
+  if (burst === null) return fail('The service is busy. Please try again in a moment.', 503);
+  if (!burst) return fail('Too many replies at once. Please wait a few seconds.', 429, { rate_limited: true });
+
+  // 3. Earlier attempts on this post. A claim whose request died is treated
+  // as uncertain (it may have been posted); an uncertain one blocks a resend
+  // until the user confirms it.
+  await db
+    .from('social_replies')
+    .update({ status: 'uncertain', error_code: 'abandoned', updated_at: new Date().toISOString() })
+    .eq('post_id', post.id)
+    .eq('status', 'sending')
+    .lt('created_at', new Date(Date.now() - STALE_CLAIM_MS).toISOString());
+  const { data: earlier } = await db
+    .from('social_replies')
+    .select('id, status, reply_url')
+    .eq('post_id', post.id)
+    .in('status', ['sending', 'sent', 'uncertain']);
+  const live = earlier ?? [];
+  const sentBefore = live.find((r: any) => r.status === 'sent');
+  if (sentBefore) return fail('You have already replied to this post.', 409, { already_replied: true, reply_url: sentBefore.reply_url });
+  if (live.some((r: any) => r.status === 'sending')) {
+    return fail('This reply is already being sent. Please wait a moment.', 409, { in_flight: true });
+  }
+  if (live.some((r: any) => r.status === 'uncertain')) {
+    if (body.confirm_resend !== true) return fail(UNCERTAIN_MESSAGE, 409, { uncertain: true });
+    await db
+      .from('social_replies')
+      .update({ status: 'failed', error_code: 'resend_confirmed', updated_at: new Date().toISOString() })
+      .eq('post_id', post.id)
+      .eq('status', 'uncertain');
   }
 
   // 4. Claim the post. The partial unique index allows one live reply per post.
@@ -462,7 +559,7 @@ async function reply(db: Admin, userId: string, body: any): Promise<Response> {
     .select('id')
     .single();
   if (claimErr || !claimed) {
-    if (claimErr?.code === '23505') return fail('You have already replied to this post.', 409, { already_replied: true });
+    if (claimErr?.code === '23505') return fail('This reply is already being sent. Please wait a moment.', 409, { in_flight: true });
     return fail('Could not send the reply. Please try again.', 500);
   }
   const replyId = claimed.id as string;
@@ -482,23 +579,46 @@ async function reply(db: Admin, userId: string, body: any): Promise<Response> {
   if (holdErr || !reserve?.ok) {
     await finish({ status: 'failed', error_code: 'insufficient_credits' });
     if (holdErr) return fail('Could not reserve credits. Please try again.', 503);
-    return fail(`Replies need purchased credits. Needed: ${reserve?.required ?? price}, available: ${reserve?.available ?? 0}.`, 402, {
+    const required = reserve?.required ?? price;
+    const available = reserve?.available ?? 0;
+    return fail(`Not enough credits for this reply. Needed: ${required}, available: ${available}.`, 402, {
       insufficient_credits: true,
-      required: reserve?.required ?? price,
-      available: reserve?.available ?? 0,
+      required,
+      available,
     });
   }
   const reservationId: string | null = typeof reserve.reservation_id === 'string' ? reserve.reservation_id : null;
   const release = (reason: string) =>
     reservationId ? db.rpc('wallet_release', { p_reservation_id: reservationId, p_reason: reason }) : Promise.resolve();
+  const settle = (note: string) =>
+    reservationId
+      ? db.rpc('wallet_settle', {
+          p_reservation_id: reservationId,
+          p_credits_charged: price,
+          p_provider_cost: PROVIDER_COST_USD[platform],
+          p_idempotency_key: holdKey,
+          p_note: note,
+        })
+      : Promise.resolve({ error: null });
 
-  // 6. Post it.
+  // 6. The account's daily cap, counted only for replies that go to the platform.
+  const capOk = await takeSlot(db, userId, `social.reply.${account.id}`, account.daily_reply_cap, 86_400);
+  if (capOk !== true) {
+    await finish({ status: 'failed', error_code: capOk === null ? 'busy' : 'daily_cap' });
+    await release('social reply: limit');
+    return capOk === null
+      ? fail('The service is busy. Please try again in a moment.', 503)
+      : fail(`@${account.handle} has reached its ${account.daily_reply_cap} replies for today.`, 429, { rate_limited: true });
+  }
+
+  // 7. Post it.
   const accessToken = await accessTokenFor(db, account);
-  if (!accessToken) {
-    await finish({ status: 'failed', error_code: 'needs_reauth' });
-    await release('social reply: account needs reconnecting');
-    await db.from('social_accounts').update({ status: 'needs_reauth' }).eq('id', account.id);
-    return fail(`Reconnect @${account.handle} in Settings, then try again.`, 409, { needs_account: true, reauth: true });
+  if (accessToken === 'reauth' || accessToken === 'transient') {
+    await finish({ status: 'failed', error_code: accessToken === 'reauth' ? 'needs_reauth' : 'token_unavailable' });
+    await release('social reply: no usable token');
+    return accessToken === 'reauth'
+      ? fail(`Reconnect @${account.handle} in Settings, then try again.`, 409, { needs_account: true, reauth: true })
+      : fail(`${PLATFORM_LABEL[platform]} is not responding right now. Nothing was charged; please try again.`, 503);
   }
 
   const started = Date.now();
@@ -529,9 +649,10 @@ async function reply(db: Admin, userId: string, body: any): Promise<Response> {
 
   // Reddit answers 200 with errors in the body (e.g. RATELIMIT, THREAD_LOCKED).
   const redditErrors: any[] = platform === 'reddit' ? resJson?.json?.errors ?? [] : [];
-  const created =
-    platform === 'x' ? resJson?.data : resJson?.json?.data?.things?.[0]?.data;
+  const created = platform === 'x' ? resJson?.data : resJson?.json?.data?.things?.[0]?.data;
   const sent = Boolean(res?.ok && redditErrors.length === 0 && created?.id);
+  // No answer, or a success status whose body could not be read: it may have been posted.
+  const uncertain = !sent && (!res || (res.ok && redditErrors.length === 0));
 
   await db.from('api_usage').upsert(
     {
@@ -540,10 +661,10 @@ async function reply(db: Admin, userId: string, body: any): Promise<Response> {
       operation: PRICE_OP[platform],
       provider: platform,
       provider_call_id: created?.id ? String(created.id) : null,
-      provider_cost_usd: sent ? PROVIDER_COST_USD[platform] : 0,
-      credits_charged: sent ? price : 0,
+      provider_cost_usd: sent || uncertain ? PROVIDER_COST_USD[platform] : 0,
+      credits_charged: sent || uncertain ? price : 0,
       revenue_usd: 0,
-      outcome: !res ? 'uncertain' : sent ? 'success' : 'not_billed',
+      outcome: uncertain ? 'uncertain' : sent ? 'success' : 'not_billed',
       http_status: res?.status ?? null,
       duration_ms: Date.now() - started,
       reservation_id: reservationId,
@@ -551,17 +672,25 @@ async function reply(db: Admin, userId: string, body: any): Promise<Response> {
     },
     { onConflict: 'idempotency_key', ignoreDuplicates: true },
   );
+  await db.from('social_accounts').update({ last_used_at: new Date().toISOString() }).eq('id', account.id);
+
+  if (uncertain) {
+    await finish({ status: 'uncertain', error_code: res ? 'unreadable_response' : 'timeout', credits_charged: price });
+    const { error } = await settle(`Replied on ${PLATFORM_LABEL[platform]} as @${account.handle} (unconfirmed)`);
+    if (error) console.error('[social] wallet_settle failed:', error.message);
+    return fail(UNCERTAIN_MESSAGE, 504, { uncertain: true });
+  }
 
   if (!sent) {
-    const code = !res ? 'timeout' : res.status === 401 ? 'unauthorized' : redditErrors[0]?.[0] ? String(redditErrors[0][0]).slice(0, 50) : `http_${res.status}`;
+    const code = res!.status === 401 ? 'unauthorized' : redditErrors[0]?.[0] ? String(redditErrors[0][0]).slice(0, 50) : `http_${res!.status}`;
     await finish({ status: 'failed', error_code: code });
     await release(`social reply failed: ${code}`);
-    if (res?.status === 401) {
+    if (res!.status === 401) {
       await db.from('social_accounts').update({ status: 'needs_reauth' }).eq('id', account.id);
       return fail(`Reconnect @${account.handle} in Settings, then try again.`, 409, { needs_account: true, reauth: true });
     }
     const message =
-      res?.status === 403 || res?.status === 404
+      res!.status === 403 || res!.status === 404
         ? 'This post no longer accepts replies (it was deleted, or the author limited who can reply). Nothing was charged.'
         : code === 'RATELIMIT'
           ? 'Reddit is rate-limiting this account. Please wait a few minutes. Nothing was charged.'
@@ -569,21 +698,12 @@ async function reply(db: Admin, userId: string, body: any): Promise<Response> {
     return fail(message, 502, { reply_failed: true, error_code: code });
   }
 
-  // 7. Sent: record it, move the post to Contacted, charge.
+  // 8. Sent: record it, move the post to Contacted, charge.
   const url = replyUrl(platform, account.handle, String(created.id), created?.permalink ?? null);
   await finish({ status: 'sent', external_reply_id: String(created.id), reply_url: url, credits_charged: price });
   await db.from('monitored_posts').update({ status: 'contacted' }).eq('id', post.id).eq('user_id', userId);
-  await db.from('social_accounts').update({ last_used_at: new Date().toISOString() }).eq('id', account.id);
-  if (reservationId) {
-    const { error } = await db.rpc('wallet_settle', {
-      p_reservation_id: reservationId,
-      p_credits_charged: price,
-      p_provider_cost: PROVIDER_COST_USD[platform],
-      p_idempotency_key: holdKey,
-      p_note: `Replied on ${PLATFORM_LABEL[platform]} as @${account.handle}`,
-    });
-    if (error) console.error('[social] wallet_settle failed:', error.message);
-  }
+  const { error: settleErr } = await settle(`Replied on ${PLATFORM_LABEL[platform]} as @${account.handle}`);
+  if (settleErr) console.error('[social] wallet_settle failed:', settleErr.message);
 
   return json({ ok: true, reply_url: url, credits_charged: price, handle: account.handle, platform, feed_platform: FEED_PLATFORM[platform] });
 }

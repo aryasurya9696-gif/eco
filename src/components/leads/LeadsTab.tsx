@@ -10,6 +10,7 @@ import { QuickLookupView } from './QuickLookupView';
 import { SavedLeadsView } from './SavedLeadsView';
 import { leadsStore, useLeadsStore } from './leads-store';
 import { companyStore } from './company-store';
+import { usePendingProspectorDomain } from './prospector-prefill';
 import { walletStore, useWallet, isWelcomeOnlyRefusal, WELCOME_ONLY_MESSAGE } from '../../lib/wallet-store';
 import { foundEmail, leadKey, revealedEmail, revealedPhone } from './lead-utils';
 import { Search, Zap, Bookmark, Wallet as WalletIcon, Plus } from 'lucide-react';
@@ -41,6 +42,9 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ onNavigateBilling }) => {
   const { addToast } = useEcho();
   const { user } = useAuth();
   const [activeSubTab, setActiveSubTab] = useState<SubTab>('prospector');
+  // A company profile asked for its people: the Prospector takes the domain.
+  const pendingDomain = usePendingProspectorDomain();
+  if (pendingDomain && activeSubTab !== 'prospector') setActiveSubTab('prospector');
 
   // Bind the workspace store to this user before reading it, so a refresh
   // restores this user's results and never another account's.
@@ -120,6 +124,8 @@ export const LeadsTab: React.FC<LeadsTabProps> = ({ onNavigateBilling }) => {
         title: lead.title,
         linkedin_url: lead.linkedin_url,
         location: lead.location,
+        industry: lead.industry,
+        country_code: lead.country_code,
         work_email: kind === 'phone' ? revealedEmail(lead) || undefined : undefined,
       });
       const saved = res?.lead;

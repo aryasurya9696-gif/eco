@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { B2BLead, B2BPipelineStatus } from '../../types';
 import { LeadCard } from './LeadCard';
 import { CompanyName } from './CompanyPanel';
+import { BulkEnrichPeopleButton, EnrichPersonButton } from './EnrichPersonButton';
 import { ConfirmRevealModal } from './ConfirmRevealModal';
 import { EmailCell, PhoneCell, StageSelect, LinkedinIcon, ContactStatusBadge } from './LeadCells';
 import { useLeadPricing, type EnrichmentRun } from './leads-store';
@@ -426,6 +427,7 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
                   {isBulkSaving ? <Loader2 className="w-4 h-4 animate-spin" aria-hidden /> : <Bookmark className="w-4 h-4" aria-hidden />}
                   {selectedUnsaved === 0 ? 'All in pipeline' : `Save ${selectedUnsaved} to pipeline`}
                 </button>
+                <BulkEnrichPeopleButton leads={selectedLeads} />
                 <button
                   type="button"
                   onClick={() => exportLeads(selectedLeads, 'selected')}
@@ -518,6 +520,7 @@ export const ResultsPanel: React.FC<ResultsPanelProps> = ({
                                     {lead.title || '—'}
                                   </p>
                                   <ContactStatusBadge lead={lead} wantPhone={wantPhone} />
+                                  <EnrichPersonButton lead={lead} />
                                 </div>
                               </div>
                             </td>

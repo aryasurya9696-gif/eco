@@ -6,6 +6,8 @@ import {
   CHANNEL_LIMIT,
   CHANNEL_SEARCH_CREDITS,
   COMPANY_ENRICH_CREDITS,
+  COMPANY_FUNDING_CREDITS,
+  COMPANY_JOBS_CREDITS,
   COMPANY_NEWS_CREDITS,
   CONNECTED_SEND_CREDITS,
   DIRECT_PHONE_CREDITS,
@@ -67,6 +69,8 @@ const COST_GROUPS: CostGroup[] = [
       { label: 'Company profile', credits: COMPANY_ENRICH_CREDITS, note: 'per company found; already-known companies are free' },
       { label: 'Person profile', credits: PERSON_ENRICH_CREDITS, note: 'per saved lead whose profile is found' },
       { label: 'Company news', credits: COMPANY_NEWS_CREDITS, note: 'per lookup that finds articles; cached for 7 days' },
+      { label: 'Funding rounds', credits: COMPANY_FUNDING_CREDITS, note: 'per lookup that finds rounds; cached for 30 days' },
+      { label: 'Open jobs', credits: COMPANY_JOBS_CREDITS, note: 'per lookup that finds openings; cached for 7 days' },
     ],
   },
   {

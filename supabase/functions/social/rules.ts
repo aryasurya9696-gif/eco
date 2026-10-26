@@ -150,10 +150,28 @@ export function replyUrl(platform: SocialPlatform, handle: string, id: string, p
   return `https://www.reddit.com/comments/${encodeURIComponent(id)}`;
 }
 
-/** Where the OAuth callback sends the browser back to: Settings, with the outcome in the query. */
-export function returnUrl(appOrigin: string, outcome: { ok: true; platform: SocialPlatform } | { ok: false; reason: string }): string {
+/**
+ * Where the OAuth callback sends the browser back to: Settings, with either
+ * the state to finish (the signed-in app then calls connect_finish) or why
+ * the connection stopped.
+ */
+export function returnUrl(appOrigin: string, outcome: { finish: string } | { error: string }): string {
   const q = new URLSearchParams(
-    outcome.ok ? { social: 'connected', platform: outcome.platform } : { social: 'error', reason: outcome.reason.slice(0, 60) },
+    'finish' in outcome ? { social: 'finish', state: outcome.finish } : { social: 'error', reason: outcome.error.slice(0, 60) },
   );
   return `${appOrigin.replace(/\/+$/, '')}/?${q.toString()}#dashboard/settings`;
 }
+
+/**
+ * How a failed token request should be treated: `invalid` (the grant is dead,
+ * the user must reconnect) only for the OAuth error codes and statuses that
+ * mean so; anything else (timeouts, 5xx, 429) is `transient` and retried later.
+ */
+export function tokenFailureKind(status: number | null, body: any): 'invalid' | 'transient' {
+  if (body?.error === 'invalid_grant' || body?.error === 'invalid_client' || body?.error === 'unauthorized_client') return 'invalid';
+  if (status === 400 || status === 401) return 'invalid';
+  return 'transient';
+}
+
+/** A claimed reply older than this with no outcome belongs to a request that died. */
+export const STALE_CLAIM_MS = 2 * 60_000;

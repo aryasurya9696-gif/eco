@@ -10,6 +10,7 @@ import {
   replyTarget,
   replyUrl,
   returnUrl,
+  tokenFailureKind,
 } from './rules.ts';
 
 Deno.test('pkceChallenge: unpadded base64url SHA-256 of the verifier (RFC 7636 S256)', async () => {
@@ -66,6 +67,15 @@ Deno.test('checkReplyText: length per platform; links refused on X only', () => 
 Deno.test('replyUrl and returnUrl', () => {
   assertEquals(replyUrl('x', 'jane', '123'), 'https://x.com/jane/status/123');
   assertEquals(replyUrl('reddit', 'jane', 'abc', '/r/SaaS/comments/x/y/abc/'), 'https://www.reddit.com/r/SaaS/comments/x/y/abc/');
-  assertEquals(returnUrl('https://app.example/', { ok: true, platform: 'x' }), 'https://app.example/?social=connected&platform=x#dashboard/settings');
-  assertEquals(returnUrl('https://app.example', { ok: false, reason: 'denied' }), 'https://app.example/?social=error&reason=denied#dashboard/settings');
+  assertEquals(returnUrl('https://app.example/', { finish: 'abc' }), 'https://app.example/?social=finish&state=abc#dashboard/settings');
+  assertEquals(returnUrl('https://app.example', { error: 'denied' }), 'https://app.example/?social=error&reason=denied#dashboard/settings');
+});
+
+Deno.test('tokenFailureKind: only a dead grant forces a reconnect', () => {
+  assertEquals(tokenFailureKind(400, { error: 'invalid_grant' }), 'invalid');
+  assertEquals(tokenFailureKind(401, null), 'invalid');
+  assertEquals(tokenFailureKind(200, { error: 'invalid_grant' }), 'invalid');
+  assertEquals(tokenFailureKind(503, null), 'transient');
+  assertEquals(tokenFailureKind(429, { error: 'rate_limited' }), 'transient');
+  assertEquals(tokenFailureKind(null, null), 'transient');
 });

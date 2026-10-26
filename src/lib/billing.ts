@@ -291,6 +291,8 @@ function usageLabel(note: string | null | undefined): string {
   const n = (note ?? '').toLowerCase();
   if (n.startsWith('lead search')) return 'People search';
   if (n.startsWith('company news')) return 'Company news';
+  if (n.startsWith('company funding')) return 'Company funding';
+  if (n.startsWith('company jobs')) return 'Company jobs';
   if (/compan(y|ies)/.test(n)) return 'Company enrichment';
   if (/person/.test(n)) return 'Person enrichment';
   if (n.startsWith('replied on')) return 'Social reply';

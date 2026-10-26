@@ -9,11 +9,11 @@
 
 | Phase | State |
 |---|---|
-| 0 Spike | `scripts/treg-spike.cjs` is ready. It needs a real `TREG_TOKEN` to run; not run yet. |
-| 1 Company enrichment | Built: `companies` cache, `company-lookup` / `enrich-company`, CompanyPanel, the feed **Company** button on web mentions. |
-| 2 Person enrichment | Built: `enrich-person` for saved leads (fills blanks only), and the "Enrich profile" action. |
-| 3 Social reply | Built on **path D** (Echo's own OAuth apps) for X and Reddit: new `social` function, Settings → Connected social accounts, and "Reply as @handle" in the draft dialog. Path T stays open if treg confirms per-user connections. |
-| 4 Signals | Company news is built (`company-news`, "Recent news" on the profile). Funding and hiring signals are not built. |
+| 0 Spike | `scripts/treg-spike.cjs` is ready. It needs a real `TREG_TOKEN`; not run yet. |
+| 1 Company enrichment | Built: `companies` cache, `company-lookup` / `enrich-company`, CompanyPanel, the feed **Company** button, and "Find people at this company" (opens the Prospector with the domain filled in). |
+| 2 Person enrichment | Built: `enrich-person` for saved and unsaved leads, a row action in results, cards and saved leads, a bulk action, and company size/industry filled from the cache. Industry and country are now saved on leads. |
+| 3 Social reply | Built on **path D** (Echo's own OAuth apps) for X and Reddit. A timed-out reply is "uncertain": charged, and a resend needs confirmation. The OAuth code is finished by the signed-in user who started it. Token refreshes are serialised. |
+| 4 Signals | Built: news, funding rounds (Aviato) and open jobs (treg jobs search) through `company-signal`, each cached and charged only when something is found. |
 
 Decisions taken with defaults:
 - Q1: companies already in the cache are free.
@@ -21,8 +21,15 @@ Decisions taken with defaults:
 - Q2 (our own X app) is implied by path D. Nothing posts until `X_CLIENT_*` / `REDDIT_CLIENT_*` are set.
 
 Built differently from this plan:
-- No `monitored_posts.external_post_id` column. The post id is read from `post_url` at reply time, so the sweep functions are unchanged.
+- No `monitored_posts.external_post_id` column. The post id is read from `post_url` at reply time.
 - No seniority or headline columns. treg's routed person contract does not return them.
+- Quick Lookup does not enrich automatically, which would cost a credit on every lookup. The result card has its own Enrich action instead.
+
+Verified locally:
+- `node scripts/verify-deploy-local.cjs`: every migration applies and re-applies on PGlite. `enrichment_social_acceptance.sql` passes.
+- `deno test` passes for `leads` and `social`, and `deno check` passes for both functions.
+
+Not verified: anything against live treg, X or Reddit.
 
 ---
 

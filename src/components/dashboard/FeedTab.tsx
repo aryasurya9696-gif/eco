@@ -150,6 +150,8 @@ export const FeedTab: React.FC<{ onNavigateBilling?: () => void; onNavigateKeywo
   const [isGeneratingDraft, setIsGeneratingDraft] = useState<boolean>(false);
   const [copiedDraft, setCopiedDraft] = useState<boolean>(false);
   const [isSendingReply, setIsSendingReply] = useState<boolean>(false);
+  /** Post whose last reply attempt timed out: the next Send must confirm a resend. */
+  const [uncertainReplyFor, setUncertainReplyFor] = useState<string | null>(null);
 
   // Connected accounts (who a reply is sent as) and the replies already sent,
   // by post id, so a card can link to its reply.
@@ -243,13 +245,20 @@ export const FeedTab: React.FC<{ onNavigateBilling?: () => void; onNavigateKeywo
     if (!post || !replyAccount || replyProblem || isGeneratingDraft || isSendingReply) return;
     setIsSendingReply(true);
     try {
-      const res = await socialStore.reply(post.id, draftText.trim(), replyAccount.id);
+      const res = await socialStore.reply(post.id, draftText.trim(), replyAccount.id, uncertainReplyFor === post.id);
+      setUncertainReplyFor(null);
       setSentReplies((prev) => ({ ...prev, [post.id]: res.reply_url }));
       // The server already moved the post to Contacted; this updates the feed.
       void updatePostStatus(post.id, 'contacted');
       addToast(`Reply posted as ${handlePrefix}${replyAccount.handle}.`, 'success');
     } catch (err) {
       const price = replyPlatform ? creditsFor(`social.reply.${replyPlatform}`) : undefined;
+      const details = err instanceof ApiError ? err.details : null;
+      if (details?.uncertain) setUncertainReplyFor(post.id);
+      const existingUrl = typeof details?.reply_url === 'string' ? details.reply_url : null;
+      if (details?.already_replied && existingUrl) {
+        setSentReplies((prev) => ({ ...prev, [post.id]: existingUrl }));
+      }
       if (err instanceof ApiError && err.status === 402) {
         addToast(isWelcomeOnlyRefusal(err, price) ? WELCOME_ONLY_MESSAGE : 'Not enough credits to send this reply.', 'error');
       } else {
@@ -784,7 +793,7 @@ export const FeedTab: React.FC<{ onNavigateBilling?: () => void; onNavigateKeywo
                     ) : (
                       <Send className="w-3.5 h-3.5" aria-hidden="true" />
                     )}
-                    Reply as {handlePrefix}
+                    {uncertainReplyFor === aiDraftModalPost.id ? 'Send anyway' : 'Reply'} as {handlePrefix}
                     {replyAccount.handle} · {formatCredits(creditsFor(`social.reply.${replyPlatform}`))} cr
                   </button>
                 )}

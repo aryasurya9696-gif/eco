@@ -4,6 +4,7 @@ import { ExternalLink, MapPin, Users, TrendingUp, Bookmark, BookmarkCheck } from
 import { EmailCell, PhoneCell, StageSelect, LinkedinIcon, ContactStatusBadge } from './LeadCells';
 import { initialsOf, linkedinHref } from './lead-utils';
 import { CompanyName } from './CompanyPanel';
+import { EnrichPersonButton } from './EnrichPersonButton';
 
 interface LeadCardProps {
   lead: B2BLead;
@@ -85,6 +86,7 @@ export const LeadCard: React.FC<LeadCardProps> = ({
           </div>
           <p className="text-[13px] text-ink-2 truncate" title={lead.title}>{lead.title || '—'}</p>
           <ContactStatusBadge lead={lead} wantPhone={wantPhone} />
+          <EnrichPersonButton lead={lead} />
           <p className="mt-0.5 text-[13px] text-ink truncate">
             <CompanyName name={lead.company_name} domain={lead.company_domain} className="font-medium" />
             {lead.company_domain && (

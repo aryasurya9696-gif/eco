@@ -11,11 +11,14 @@ import { supabase, isConfigured } from './supabase';
 
 export class ApiError extends Error {
   status: number;
+  /** The function's JSON error body, when it sent one (flags such as `uncertain`). */
+  details: Record<string, unknown> | null;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, details: Record<string, unknown> | null = null) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.details = details;
   }
 }
 
@@ -57,7 +60,8 @@ export async function invokeFunction<T = unknown>(
         error.context instanceof Response
           ? await readErrorBody(error.context)
           : error.message;
-      throw new ApiError(message || `Request to "${name}" failed.`, status || 500);
+      const details = error.context instanceof Response ? await readErrorDetails(error.context) : null;
+      throw new ApiError(message || `Request to "${name}" failed.`, status || 500, details);
     }
 
     return data as T;
@@ -92,5 +96,13 @@ async function readErrorBody(res: Response): Promise<string> {
     return body?.message || body?.error || '';
   } catch {
     return '';
+  }
+}
+async function readErrorDetails(res: Response): Promise<Record<string, unknown> | null> {
+  try {
+    const body = await res.clone().json();
+    return body && typeof body === 'object' && !Array.isArray(body) ? body : null;
+  } catch {
+    return null;
   }
 }

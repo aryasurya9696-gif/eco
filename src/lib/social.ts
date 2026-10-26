@@ -56,6 +56,8 @@ interface SocialState {
 
 let state: SocialState = { accounts: [], platforms: [], loaded: false, loading: false, error: null };
 let inflight: Promise<void> | null = null;
+/** Bumped by reset(): a request started before it must not write afterwards. */
+let generation = 0;
 const listeners = new Set<() => void>();
 
 function setState(next: Partial<SocialState>) {
@@ -77,17 +79,21 @@ export const socialStore = {
     if (inflight) return inflight;
     if (state.loaded && !force) return Promise.resolve();
     setState({ loading: true });
+    const gen = generation;
     inflight = Promise.all([
       invokeFunction<{ ok: boolean; accounts?: SocialAccount[] }>('social', { action: 'list_accounts' }),
       invokeFunction<{ ok: boolean; platforms?: SocialPlatform[] }>('social', { action: 'providers' }),
     ])
       .then(([accounts, providers]) => {
+        if (gen !== generation) return;
         setState({ accounts: accounts?.accounts ?? [], platforms: providers?.platforms ?? [], loaded: true, error: null });
       })
       .catch((err: unknown) => {
+        if (gen !== generation) return;
         setState({ loaded: true, error: (err as Error)?.message || 'Could not load connected accounts.' });
       })
       .finally(() => {
+        if (gen !== generation) return;
         setState({ loading: false });
         inflight = null;
       });
@@ -101,24 +107,37 @@ export const socialStore = {
     window.location.assign(res.url);
   },
 
+  /** Completes a connection after the consent screen (the signed-in user must be the one who started it). */
+  async finish(state: string): Promise<{ platform: SocialPlatform; handle: string }> {
+    const res = await invokeFunction<{ ok: boolean; platform: SocialPlatform; handle: string }>('social', {
+      action: 'connect_finish',
+      state,
+    });
+    await socialStore.load(true);
+    return res;
+  },
+
   async disconnect(accountId: string): Promise<void> {
     await invokeFunction('social', { action: 'disconnect', account_id: accountId });
     setState({ accounts: state.accounts.filter((a) => a.id !== accountId) });
   },
 
   /** Posts a reply under a feed post. Throws ApiError with the server's message on refusal. */
-  async reply(postId: string, text: string, accountId?: string) {
+  async reply(postId: string, text: string, accountId?: string, confirmResend = false) {
     const res = await invokeFunction<{ ok: boolean; reply_url: string; credits_charged: number; handle: string }>('social', {
       action: 'reply',
       post_id: postId,
       text,
       account_id: accountId,
+      confirm_resend: confirmResend || undefined,
     });
     void socialStore.load(true);
     return res;
   },
 
   reset() {
+    generation++;
+    inflight = null;
     state = { accounts: [], platforms: [], loaded: false, loading: false, error: null };
     for (const l of listeners) l();
   },

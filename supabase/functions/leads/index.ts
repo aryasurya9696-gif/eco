@@ -12,7 +12,7 @@ import {
   affordableSearchLimit,
   allowedOrigins,
   cachedCompanyState,
-  cachedNewsState,
+  cachedSignalState,
   corsOriginFor,
   classifyEmail,
   cleanDomain,
@@ -24,6 +24,8 @@ import {
   leadKey,
   linkedinSlug,
   mapCompanyOutput,
+  mapFundingOutput,
+  mapJobsOutput,
   mapNewsOutput,
   mapPersonOutput,
   MAX_PROVIDER_CALLS,
@@ -31,6 +33,8 @@ import {
   maxSearchProviderCalls,
   mergeLeadRecord,
   PAID_CREDITS_MESSAGE,
+  SIGNAL_KINDS,
+  type SignalKind,
   UsageLog,
 } from './lib.ts';
 
@@ -309,7 +313,7 @@ async function resolveToken(admin: any): Promise<string> {
  * per call vs 1 credit per billed call, email $0.015 vs 1 credit, phone
  * $0.03 vs 2 credits. A route that would cost more is not taken.
  */
-const MAX_COST = { search: '0.015', email: '0.015', phone: '0.03', company: '0.02', person: '0.03', news: '0.01' } as const;
+const MAX_COST = { search: '0.015', email: '0.015', phone: '0.03', company: '0.02', person: '0.03', news: '0.01', funding: '0.01', jobs: '0.04' } as const;
 // company: the cheapest children answer for $0.0005-$0.005 a hit and a few
 // bill misses, so $0.02 keeps a 0.5-credit hit ($0.025) above cost.
 // person: LinkedIn-URL lookups answer for $0.0005; name + domain ones run
@@ -340,18 +344,22 @@ interface Prices {
   person: number | null;
   /** Credits per news lookup that returns articles (`treg.companies.news`). */
   news: number | null;
+  /** Credits per funding lookup that returns rounds (`treg.companies.funding`). */
+  funding: number | null;
+  /** Credits per jobs lookup that returns openings (`treg.companies.jobs`). */
+  jobs: number | null;
 }
 
 let priceCache: { at: number; prices: Prices } | null = null;
 
 async function loadPrices(admin: any): Promise<Prices> {
   if (priceCache && Date.now() - priceCache.at < 60_000) return priceCache.prices;
-  const prices: Prices = { email: null, phone: null, search: null, company: null, person: null, news: null };
+  const prices: Prices = { email: null, phone: null, search: null, company: null, person: null, news: null, funding: null, jobs: null };
   try {
     const { data, error } = await admin
       .from('pricing_config')
       .select('operation, credits, enabled')
-      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'treg.people.search', 'treg.companies.enrich', 'treg.people.enrich', 'treg.companies.news']);
+      .in('operation', ['treg.people.email.find', 'treg.people.phone.find', 'treg.people.search', 'treg.companies.enrich', 'treg.people.enrich', 'treg.companies.news', 'treg.companies.funding', 'treg.companies.jobs']);
     if (error || !Array.isArray(data)) {
       console.warn('[leads] pricing lookup failed:', error?.message);
       return prices; // not cached: the next request retries the read
@@ -365,6 +373,8 @@ async function loadPrices(admin: any): Promise<Prices> {
       if (row.operation === 'treg.companies.enrich') prices.company = credits;
       if (row.operation === 'treg.people.enrich') prices.person = credits;
       if (row.operation === 'treg.companies.news') prices.news = credits;
+      if (row.operation === 'treg.companies.funding') prices.funding = credits;
+      if (row.operation === 'treg.companies.jobs') prices.jobs = credits;
     }
   } catch (err: any) {
     console.warn('[leads] pricing lookup failed:', err?.message);
@@ -601,6 +611,11 @@ function safeLinkedin(value: unknown): string | null {
   return out.length <= MAX_URL_FIELD ? out : null;
 }
 
+/** An ISO 3166-1 alpha-2 code, upper-cased, or null (user_leads checks the format). */
+function countryCode(value: unknown): string | null {
+  return typeof value === 'string' && /^[a-z]{2}$/i.test(value.trim()) ? value.trim().toUpperCase() : null;
+}
+
 function safeEmail(value: unknown): string | null {
   return isEmailAddress(value) && value.trim().length <= 254 ? value.trim() : null;
 }
@@ -639,6 +654,8 @@ function sanitizeLead(l: any) {
     company_revenue: clampText(l?.company_revenue) || null,
     company_phone: clampText(l?.company_phone, 50) || null,
     location: clampText(l?.location) || null,
+    industry: clampText(l?.industry) || null,
+    country_code: countryCode(l?.country_code),
     linkedin_url: safeLinkedin(l?.linkedin_url),
     email_hint: hint,
     status: isAllowedStatus(l?.status) ? l.status : null,
@@ -1285,6 +1302,8 @@ async function handleRequest(req: Request): Promise<Response> {
       company_credits: prices.company,
       person_credits: prices.person,
       news_credits: prices.news,
+      funding_credits: prices.funding,
+      jobs_credits: prices.jobs,
       search_max_provider_calls_single: maxSearchProviderCalls(1, 1000),
       search_max_provider_calls_multi: MAX_PROVIDER_CALLS,
       search_free_leads: 0,
@@ -1754,6 +1773,8 @@ async function handleRequest(req: Request): Promise<Response> {
                       last_name: lead.last_name,
                       title: lead.title,
                       location: lead.location,
+                      industry: clampText(lead.industry) || null,
+                      country_code: countryCode(lead.country_code),
                       linkedin_url: lead.linkedin_url,
                       work_email: email,
                       email_status: verdict.status,
@@ -2028,6 +2049,8 @@ async function handleRequest(req: Request): Promise<Response> {
       company_revenue: company_revenue || null,
       linkedin_url: linkedin_url || null,
       location: location || null,
+      industry: input.industry,
+      country_code: input.country_code,
       work_email: emailFound,
       email_status: emailStatus,
       email_confidence: emailConfidence,
@@ -2198,6 +2221,8 @@ async function handleRequest(req: Request): Promise<Response> {
                 company_revenue: lead.company_revenue || null,
                 linkedin_url: lead.linkedin_url || null,
                 location: lead.location || null,
+                industry: clampText(lead.industry) || null,
+                country_code: countryCode(lead.country_code),
                 work_email: email,
                 email_status: verdict.status,
                 email_confidence: verdict.charge ? 0.95 : 0.5,
@@ -2398,6 +2423,8 @@ async function handleRequest(req: Request): Promise<Response> {
                 company_domain: domain || '',
                 linkedin_url: lead.linkedin_url || null,
                 location: lead.location || null,
+                industry: clampText(lead.industry) || null,
+                country_code: countryCode(lead.country_code),
                 phone_number: clampText(phone, 50),
                 phone_type: clampText(data?.output?.line_type, 32) || 'mobile',
                 status: null,
@@ -2591,6 +2618,8 @@ async function handleRequest(req: Request): Promise<Response> {
             company_domain: finalDomain || '',
             linkedin_url: linkedin_url || null,
             location: input.location || null,
+            industry: clampText(input.industry) || null,
+            country_code: countryCode(input.country_code),
             status: null,
             ...updatePayload,
           }),
@@ -2658,6 +2687,8 @@ async function handleRequest(req: Request): Promise<Response> {
         company_phone: l.company_phone,
         linkedin_url: l.linkedin_url,
         location: l.location,
+        industry: clampText(l.industry) || null,
+        country_code: countryCode(l.country_code),
         // An explicit, valid stage from the client wins; otherwise the stored one.
         status: l.status || null,
         updated_at: new Date().toISOString(),
@@ -2810,6 +2841,8 @@ async function handleRequest(req: Request): Promise<Response> {
             company_domain: company_domain || '',
             linkedin_url: input.linkedin_url,
             location: input.location,
+            industry: clampText(input.industry) || null,
+            country_code: countryCode(input.country_code),
             status: status || 'new',
             notes: notes || null,
             updated_at: new Date().toISOString(),
@@ -2893,17 +2926,19 @@ async function handleRequest(req: Request): Promise<Response> {
   if (action === 'company-lookup') {
     const domains = companyDomainsOf(body, MAX_COMPANY_LOOKUP);
     if (domains.length === 0) return json({ ok: true, companies: {} });
-    const { data, error } = await admin.from('companies').select(`${COMPANY_COLUMNS}, ${NEWS_COLUMNS}`).in('domain', domains);
+    const { data, error } = await admin.from('companies').select(`${COMPANY_COLUMNS}, ${SIGNAL_COLUMNS}`).in('domain', domains);
     if (error) return fail('Could not read company data', 500);
     const companies: Record<string, unknown> = {};
     for (const row of data ?? []) {
       if (cachedCompanyState(row) !== 'hit') continue;
-      const news = cachedNewsState(row);
-      companies[row.domain] = {
-        ...publicCompany(row),
-        // null: not looked up (or stale); []: looked up recently, nothing found.
-        news: news === 'hit' ? row.news : news === 'miss' ? [] : null,
-      };
+      const out: Record<string, unknown> = publicCompany(row);
+      // Per signal: null when not looked up (or stale), [] when a recent
+      // lookup found nothing.
+      for (const kind of SIGNAL_KINDS) {
+        const state = cachedSignalState(row, kind);
+        out[kind] = state === 'hit' ? row[kind] : state === 'miss' ? [] : null;
+      }
+      companies[row.domain] = out;
     }
     return json({ ok: true, companies });
   }
@@ -3008,27 +3043,41 @@ async function handleRequest(req: Request): Promise<Response> {
   // ACTION 11: ENRICH PERSON — treg.people.enrich for one saved lead
   // =========================================================================
   if (action === 'enrich-person') {
-    if (!isUuid(body.lead_id)) return fail('lead_id is required.');
-    const { data: lead, error: leadErr } = await admin
-      .from('user_leads')
-      .select('*')
-      .eq('id', body.lead_id)
-      .eq('user_id', userId)
-      .maybeSingle();
-    if (leadErr) return fail('Could not read the lead', 500);
-    if (!lead) return fail('Lead not found', 404);
-    if (lead.person_enriched_at) return json({ ok: true, already_enriched: true, lead, credits_charged: 0 });
+    // A saved lead (lead_id) is enriched in place. An unsaved one (a search
+    // result or a Quick Lookup) sends what it knows and gets the profile back;
+    // nothing is stored until the user saves or reveals it.
+    let lead: any = null;
+    if (body.lead_id !== undefined) {
+      if (!isUuid(body.lead_id)) return fail('lead_id must be a saved lead id.');
+      const { data, error: leadErr } = await admin
+        .from('user_leads')
+        .select('*')
+        .eq('id', body.lead_id)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (leadErr) return fail('Could not read the lead', 500);
+      if (!data) return fail('Lead not found', 404);
+      if (data.person_enriched_at) return json({ ok: true, already_enriched: true, lead: data, credits_charged: 0 });
+      lead = data;
+    }
+    const input = lead ? null : sanitizeLead(body);
+    const subject = lead ?? {
+      linkedin_url: input!.linkedin_url,
+      work_email: safeEmail(body.email) ?? input!.email_hint,
+      company_domain: input!.company_domain,
+      full_name: input!.full_name,
+    };
 
     // Everything treg can match on. A LinkedIn URL is the cheapest and most
     // reliable key; an email or name + domain also work.
     const identity: Record<string, string> = {};
-    const linkedin = safeLinkedin(lead.linkedin_url);
+    const linkedin = safeLinkedin(subject.linkedin_url);
     if (linkedin) identity.linkedin_url = linkedin;
-    const email = safeEmail(lead.work_email);
+    const email = safeEmail(subject.work_email);
     if (email) identity.email = email;
-    if (lead.company_domain && lead.full_name) {
-      identity.domain = lead.company_domain;
-      identity.full_name = lead.full_name;
+    if (subject.company_domain && subject.full_name) {
+      identity.domain = subject.company_domain;
+      identity.full_name = subject.full_name;
     }
     if (Object.keys(identity).length === 0) {
       return fail('This lead needs a LinkedIn URL, an email, or a name and company domain to enrich.');
@@ -3039,7 +3088,7 @@ async function handleRequest(req: Request): Promise<Response> {
     const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.revealBurst, RATE_LIMITS.reveal]);
     if (limited) return limited;
 
-    const leadRef = await shortHash(leadIdentity(lead));
+    const leadRef = await shortHash(leadIdentity(subject));
     const baseKey = `enrich_person:${userId}:${leadRef}:${revealWindow()}`;
     const { hold, key: runKey } = await reserveOnce(admin, userId, price, baseKey, {
       feature: 'person_enrich',
@@ -3074,17 +3123,38 @@ async function handleRequest(req: Request): Promise<Response> {
       return fail('No profile found for this lead. Zero credits charged.', 404, { no_hit: true });
     }
     await settleHold(hold.id, price, providerCostUsd, runKey, `Enriched person profile (lead ${leadRef})`);
+    // A found LinkedIn URL must pass the same filter as one the user typed.
+    const person = { ...found, linkedin_url: safeLinkedin(found.linkedin_url) };
 
-    // Only blank fields are filled; a found LinkedIn URL must pass the same
-    // filter as one the user typed.
-    const patch: Record<string, unknown> = enrichmentPatch(lead, {
-      ...found,
-      linkedin_url: safeLinkedin(found.linkedin_url),
-    });
-    const update = async (fields: Record<string, unknown>) =>
+    // The company's cached profile (free) fills its size and industry too.
+    const companyDomain = (lead?.company_domain || person.company_domain || subject.company_domain || '') as string;
+    let company: any = null;
+    if (companyDomain) {
+      const { data } = await admin.from('companies').select(COMPANY_COLUMNS).eq('domain', companyDomain).maybeSingle();
+      if (cachedCompanyState(data) === 'hit') company = data;
+    }
+
+    if (!lead) {
+      return json({
+        ok: true,
+        person,
+        company: company ? publicCompany(company) : null,
+        credits_charged: price,
+        persisted: false,
+      });
+    }
+
+    // Only blank fields are filled.
+    const patch: Record<string, unknown> = enrichmentPatch(lead, person);
+    if (company) {
+      if (!lead.company_size && company.employees) patch.company_size = String(company.employees).slice(0, 200);
+      if (!lead.industry && company.industry) patch.industry = String(company.industry).slice(0, 200);
+    }
+    const stamp = () => ({ person_enriched_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const update = (fields: Record<string, unknown>) =>
       admin
         .from('user_leads')
-        .update({ ...fields, person_enriched_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .update({ ...fields, ...stamp() })
         .eq('id', lead.id)
         .eq('user_id', userId)
         .select()
@@ -3096,80 +3166,84 @@ async function handleRequest(req: Request): Promise<Response> {
       const { company_domain: _dropped, ...rest } = patch;
       ({ data: saved, error: saveErr } = await update(rest));
     }
-    if (saveErr) console.error('[leads] person enrich update error:', saveErr.message);
+    if (saveErr) {
+      // The profile is paid for: at least record that, so it is never bought twice.
+      console.error('[leads] person enrich update error:', saveErr.message);
+      ({ data: saved, error: saveErr } = await update({}));
+    }
 
     return json({
       ok: true,
       lead: saved || { ...lead, ...patch },
-      person: found,
+      person,
       credits_charged: price,
       persisted: !saveErr,
     });
   }
 
   // =========================================================================
-  // ACTION 12: COMPANY NEWS — treg.companies.news for one domain
+  // ACTION 12: COMPANY SIGNAL — news, funding rounds or open jobs for a domain
   // =========================================================================
-  if (action === 'company-news') {
+  if (action === 'company-signal' || action === 'company-news') {
+    const kind: SignalKind = action === 'company-news' ? 'news' : body.kind;
+    const signal = SIGNALS[kind];
+    if (!signal) return fail('Unknown signal.');
     const [domain] = companyDomainsOf(body, 1);
     if (!domain) return fail('A valid company domain is required.');
 
-    const { data: cachedRow, error: cacheErr } = await admin.from('companies').select(`domain, ${NEWS_COLUMNS}`).eq('domain', domain).maybeSingle();
+    const { data: cachedRow, error: cacheErr } = await admin.from('companies').select(`domain, ${SIGNAL_COLUMNS}`).eq('domain', domain).maybeSingle();
     if (cacheErr) return fail('Could not read company data', 500);
-    const state = cachedNewsState(cachedRow);
-    if (state === 'hit') return json({ ok: true, status: 'cached', articles: cachedRow!.news, credits_charged: 0 });
-    if (state === 'miss') return json({ ok: true, status: 'not_found', articles: [], credits_charged: 0 });
+    const state = cachedSignalState(cachedRow, kind);
+    if (state === 'hit') return json({ ok: true, status: 'cached', items: cachedRow![kind], credits_charged: 0 });
+    if (state === 'miss') return json({ ok: true, status: 'not_found', items: [], credits_charged: 0 });
 
-    const price = (await loadPrices(admin)).news;
+    const price = (await loadPrices(admin))[kind];
     if (price === null) return pricingUnavailable();
     const limited = await enforceRateLimits(admin, userId, [RATE_LIMITS.companyBurst, RATE_LIMITS.company]);
     if (limited) return limited;
 
-    const baseKey = `company_news:${userId}:${await shortHash(domain)}:${revealWindow()}`;
-    const { hold, key: runKey } = await reserveOnce(admin, userId, price, baseKey, { feature: 'company_news' }, openHolds);
+    const baseKey = `company_${kind}:${userId}:${await shortHash(domain)}:${revealWindow()}`;
+    const { hold, key: runKey } = await reserveOnce(admin, userId, price, baseKey, { feature: `company_${kind}` }, openHolds);
     if ('shortfall' in hold) return insufficientCredits(hold);
     if (hold.duplicate) {
-      return fail('News for this company is already being looked up. Please wait a moment.', 409, { duplicate_request: true });
+      return fail(`${signal.label} for this company is already being looked up. Please wait a moment.`, 409, { duplicate_request: true });
     }
 
     const usageStart = usage.rows.length;
-    let articles: ReturnType<typeof mapNewsOutput> | null = null;
+    let items: unknown[] | null = null;
     try {
-      const res = await fetch(`${TREG_BASE}/call/treg.companies.news`, {
-        method: 'POST',
-        // No waterfall: every news provider bills misses, so one try only.
-        headers: tregHeaders(token, userId, 'company-news', MAX_COST.news, `echo:${baseKey}`, {
-          'X-Treg-Route-Waterfall': '0',
-        }),
-        body: JSON.stringify({ domain, limit: 10 }),
+      const res = await fetch(`${TREG_BASE}/call/${signal.endpoint(domain)}`, {
+        method: signal.method,
+        headers: tregHeaders(token, userId, `company-${kind}`, MAX_COST[kind], `echo:${baseKey}`, signal.headers),
+        body: signal.method === 'POST' ? JSON.stringify(signal.body!(domain)) : undefined,
         signal: AbortSignal.timeout(ENRICH_TIMEOUT_MS),
       });
-      const row = usage.track('treg.companies.news', res, { feature: 'company-news' }, hold.id);
+      const row = usage.track(signal.operation, res, { feature: `company-${kind}` }, hold.id);
       if (res.ok) {
-        articles = mapNewsOutput(await res.json());
-        if (articles.length > 0) row.credits_charged = price;
+        items = signal.map(await res.json());
+        if (items.length > 0) row.credits_charged = price;
       }
     } catch (err: any) {
-      console.warn('[leads] company news upstream warning:', err?.name || String(err?.message || '').slice(0, 200));
+      console.warn(`[leads] company ${kind} upstream warning:`, err?.name || String(err?.message || '').slice(0, 200));
     }
 
-    const providerCostUsd = usage.costSince(usageStart, 'treg.companies.news');
+    const providerCostUsd = usage.costSince(usageStart, signal.operation);
     const now = new Date().toISOString();
-    if (articles === null) {
-      await settleHold(hold.id, 0, providerCostUsd, runKey, 'Company news: lookup failed - refund');
-      return fail('The news lookup failed. Nothing was charged; please try again.', 502);
+    if (items === null) {
+      await settleHold(hold.id, 0, providerCostUsd, runKey, `Company ${kind}: lookup failed - refund`);
+      return fail(`The ${signal.label.toLowerCase()} lookup failed. Nothing was charged; please try again.`, 502);
     }
-    if (articles.length === 0) {
-      await admin.from('companies').upsert({ domain, news_miss_at: now, updated_at: now }, { onConflict: 'domain' });
-      await settleHold(hold.id, 0, providerCostUsd, runKey, 'Company news: nothing found - refund');
-      return json({ ok: true, status: 'not_found', articles: [], credits_charged: 0 });
+    if (items.length === 0) {
+      await admin.from('companies').upsert({ domain, [`${kind}_miss_at`]: now, updated_at: now }, { onConflict: 'domain' });
+      await settleHold(hold.id, 0, providerCostUsd, runKey, `Company ${kind}: nothing found - refund`);
+      return json({ ok: true, status: 'not_found', items: [], credits_charged: 0 });
     }
     const { error: saveErr } = await admin
       .from('companies')
-      .upsert({ domain, news: articles, news_at: now, news_miss_at: null, updated_at: now }, { onConflict: 'domain' });
-    if (saveErr) console.error('[leads] company news save error:', saveErr.message);
-    await settleHold(hold.id, price, providerCostUsd, runKey, `Company news: ${articles.length} articles`);
-    return json({ ok: true, status: 'found', articles, credits_charged: price });
+      .upsert({ domain, [kind]: items, [`${kind}_at`]: now, [`${kind}_miss_at`]: null, updated_at: now }, { onConflict: 'domain' });
+    if (saveErr) console.error(`[leads] company ${kind} save error:`, saveErr.message);
+    await settleHold(hold.id, price, providerCostUsd, runKey, `Company ${kind}: ${items.length} found`);
+    return json({ ok: true, status: 'found', items, credits_charged: price });
   }
 
   return fail(`Unknown action: ${String(action).slice(0, 50)}`);
@@ -3189,7 +3263,53 @@ const COMPANY_CONCURRENCY = 5;
 const COMPANY_COLUMNS =
   'domain, name, description, industry, employees, founded_year, location, linkedin_url, website, logo_url, enriched_at, miss_at';
 
-const NEWS_COLUMNS = 'news, news_at, news_miss_at';
+// A literal, so supabase-js can type the selected columns.
+const SIGNAL_COLUMNS =
+  'news, news_at, news_miss_at, funding, funding_at, funding_miss_at, jobs, jobs_at, jobs_miss_at';
+
+/**
+ * Where each company signal comes from. News and jobs are treg routes sent
+ * with no waterfall, because every provider behind them bills misses too;
+ * funding is Aviato direct, which bills only when it finds rounds.
+ */
+const SIGNALS: Record<SignalKind, {
+  label: string;
+  operation: string;
+  method: 'GET' | 'POST';
+  endpoint: (domain: string) => string;
+  body?: (domain: string) => Record<string, unknown>;
+  headers: Record<string, string>;
+  map: (resJson: any) => unknown[];
+}> = {
+  news: {
+    label: 'News',
+    operation: 'treg.companies.news',
+    method: 'POST',
+    endpoint: () => 'treg.companies.news',
+    body: (domain) => ({ domain, limit: 10 }),
+    headers: { 'X-Treg-Route-Waterfall': '0' },
+    map: mapNewsOutput,
+  },
+  funding: {
+    label: 'Funding',
+    operation: 'treg.companies.funding',
+    method: 'GET',
+    endpoint: (domain) => `aviato.companies.funding_rounds?${new URLSearchParams({ website: domain, perPage: '10', page: '0' })}`,
+    headers: {},
+    map: mapFundingOutput,
+  },
+  jobs: {
+    label: 'Jobs',
+    operation: 'treg.companies.jobs',
+    method: 'POST',
+    endpoint: () => 'treg.companies.jobs.search',
+    // Domain only: PredictLeads answers by domain (~65% of companies); the
+    // name-matching providers find far fewer.
+    body: (domain) => ({ domain, limit: 10 }),
+    headers: { 'X-Treg-Route-Waterfall': '0' },
+    map: mapJobsOutput,
+  },
+};
 
 type CompanyStatus = 'found' | 'cached' | 'not_found' | 'failed';
 

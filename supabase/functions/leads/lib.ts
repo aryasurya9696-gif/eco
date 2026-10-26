@@ -293,17 +293,27 @@ export function cachedCompanyState(
   const missAt = at(row.miss_at);
   // Whichever lookup is newer decides.
   if (row.name && Number.isFinite(hitAt) && !(missAt > hitAt) && now - hitAt < COMPANY_HIT_TTL_MS) return 'hit';
-  if (Number.isFinite(missAt) && !(hitAt > missAt) && now - missAt < COMPANY_MISS_TTL_MS) return 'miss';
+  // A recent miss on a re-check: the providers have nothing newer, so an
+  // older profile keeps being served rather than vanishing.
+  if (Number.isFinite(missAt) && !(hitAt > missAt) && now - missAt < COMPANY_MISS_TTL_MS) return row.name ? 'hit' : 'miss';
   return 'stale';
 }
 
 // ---------------------------------------------------------------------------
-// Company news (treg.companies.news)
+// Company signals: news, funding rounds, open jobs
 // ---------------------------------------------------------------------------
 
-export const NEWS_HIT_TTL_MS = 7 * 24 * 3600_000;
-export const NEWS_MISS_TTL_MS = 3 * 24 * 3600_000;
-const MAX_ARTICLES = 10;
+export type SignalKind = 'news' | 'funding' | 'jobs';
+export const SIGNAL_KINDS: readonly SignalKind[] = ['news', 'funding', 'jobs'];
+
+const DAY_MS = 24 * 3600_000;
+/** How long a cached answer is reused: one with items, and an empty one. */
+export const SIGNAL_TTL_MS: Record<SignalKind, { hit: number; miss: number }> = {
+  news: { hit: 7 * DAY_MS, miss: 3 * DAY_MS },
+  funding: { hit: 30 * DAY_MS, miss: 14 * DAY_MS },
+  jobs: { hit: 7 * DAY_MS, miss: 3 * DAY_MS },
+};
+const MAX_ITEMS = 10;
 
 export interface NewsArticle {
   title: string;
@@ -312,7 +322,21 @@ export interface NewsArticle {
   source: string | null;
 }
 
-/** An absolute http(s) article link, kept whole (news sites key articles on the query string). */
+export interface FundingRound {
+  name: string;
+  stage: string | null;
+  announced_on: string | null;
+  amount_usd: number | null;
+}
+
+export interface JobOpening {
+  title: string;
+  url: string | null;
+  location: string | null;
+  posted_at: string | null;
+}
+
+/** An absolute http(s) link, kept whole (news and job sites key pages on the query string). */
 function articleUrl(value: unknown): string | null {
   if (typeof value !== 'string' || value.length > 1000) return null;
   try {
@@ -321,6 +345,12 @@ function articleUrl(value: unknown): string | null {
   } catch {
     return null;
   }
+}
+
+function isoDate(value: unknown): string | null {
+  if (value === null || value === undefined || value === '') return null;
+  const when = Date.parse(String(value));
+  return Number.isFinite(when) ? new Date(when).toISOString() : null;
 }
 
 /**
@@ -336,31 +366,70 @@ export function mapNewsOutput(resJson: any): NewsArticle[] {
     const title = text(a?.title ?? a?.headline ?? a?.name, 300);
     const url = articleUrl(a?.url ?? a?.link ?? a?.article_url);
     if (!title || !url) continue;
-    const when = Date.parse(String(a?.published_at ?? a?.publishedAt ?? a?.date ?? a?.published ?? a?.found_at ?? ''));
     out.push({
       title,
       url,
-      published_at: Number.isFinite(when) ? new Date(when).toISOString() : null,
+      published_at: isoDate(a?.published_at ?? a?.publishedAt ?? a?.date ?? a?.published ?? a?.found_at),
       source: text(a?.source?.name ?? a?.source ?? a?.publisher ?? a?.site_name, 100),
     });
-    if (out.length >= MAX_ARTICLES) break;
+    if (out.length >= MAX_ITEMS) break;
   }
   return out;
 }
 
-/** Cached news state, like cachedCompanyState with the shorter news windows. */
-export function cachedNewsState(
-  row: { news?: unknown; news_at?: string | null; news_miss_at?: string | null } | null | undefined,
-  now = Date.now(),
-): 'hit' | 'miss' | 'stale' {
+/** Rounds from Aviato's funding-rounds answer (`fundingRounds`), newest first. */
+export function mapFundingOutput(resJson: any): FundingRound[] {
+  const list = Array.isArray(resJson?.fundingRounds) ? resJson.fundingRounds : [];
+  const out: FundingRound[] = [];
+  for (const r of list) {
+    const name = text(r?.name ?? r?.stage, 200);
+    if (!name) continue;
+    const amount = Number(r?.moneyRaised);
+    out.push({
+      name,
+      stage: text(r?.stage, 100),
+      announced_on: isoDate(r?.announcedOn),
+      amount_usd: Number.isFinite(amount) && amount > 0 ? amount : null,
+    });
+  }
+  out.sort((a, b) => (b.announced_on ?? '').localeCompare(a.announced_on ?? ''));
+  return out.slice(0, MAX_ITEMS);
+}
+
+/** Openings from a treg.companies.jobs.search answer (`output.jobs`; a miss is an empty list). */
+export function mapJobsOutput(resJson: any): JobOpening[] {
+  const list = Array.isArray(resJson?.output?.jobs) ? resJson.output.jobs : [];
+  const out: JobOpening[] = [];
+  for (const j of list) {
+    const title = text(j?.title ?? j?.job_title ?? j?.name, 200);
+    if (!title) continue;
+    out.push({
+      title,
+      url: articleUrl(j?.url ?? j?.link ?? j?.job_url ?? j?.apply_url),
+      location: text(j?.location?.name ?? j?.location ?? j?.city, 200),
+      posted_at: isoDate(j?.posted_at ?? j?.date_posted ?? j?.first_seen_at ?? j?.found_at ?? j?.date),
+    });
+    if (out.length >= MAX_ITEMS) break;
+  }
+  return out;
+}
+
+/** What a cached signal is worth: items to show, a recent empty answer, or nothing usable. */
+export function cachedSignalState(row: Record<string, any> | null | undefined, kind: SignalKind, now = Date.now()): 'hit' | 'miss' | 'stale' {
   if (!row) return 'stale';
-  const hitAt = row.news_at ? Date.parse(row.news_at) : NaN;
-  const missAt = row.news_miss_at ? Date.parse(row.news_miss_at) : NaN;
-  if (Array.isArray(row.news) && row.news.length > 0 && Number.isFinite(hitAt) && !(missAt > hitAt) && now - hitAt < NEWS_HIT_TTL_MS) {
+  const hitAt = row[`${kind}_at`] ? Date.parse(row[`${kind}_at`]) : NaN;
+  const missAt = row[`${kind}_miss_at`] ? Date.parse(row[`${kind}_miss_at`]) : NaN;
+  const ttl = SIGNAL_TTL_MS[kind];
+  if (Array.isArray(row[kind]) && row[kind].length > 0 && Number.isFinite(hitAt) && !(missAt > hitAt) && now - hitAt < ttl.hit) {
     return 'hit';
   }
-  if (Number.isFinite(missAt) && !(hitAt > missAt) && now - missAt < NEWS_MISS_TTL_MS) return 'miss';
+  if (Number.isFinite(missAt) && !(hitAt > missAt) && now - missAt < ttl.miss) return 'miss';
   return 'stale';
+}
+
+/** cachedSignalState for news. */
+export function cachedNewsState(row: Record<string, any> | null | undefined, now = Date.now()): 'hit' | 'miss' | 'stale' {
+  return cachedSignalState(row, 'news', now);
 }
 
 // ---------------------------------------------------------------------------

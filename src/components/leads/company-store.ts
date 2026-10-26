@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { invokeFunction, ApiError } from '../../lib/api';
 import { walletStore } from '../../lib/wallet-store';
-import type { Company, CompanyNewsArticle } from '../../types';
+import type { Company, CompanySignalKind } from '../../types';
 
 // ============================================================================
 // Company profiles by domain, shared by every view that shows a company.
@@ -19,7 +19,13 @@ export type CompanyEntry =
   /** Asked; nothing cached yet, so it can be enriched. */
   | { status: 'none' }
   | { status: 'enriching' }
-  | { status: 'found'; company: Company; newsLoading?: boolean; newsError?: string }
+  | {
+      status: 'found';
+      company: Company;
+      /** Signals being looked up, and the last error per signal. */
+      signalLoading?: Partial<Record<CompanySignalKind, boolean>>;
+      signalError?: Partial<Record<CompanySignalKind, string>>;
+    }
   /** Enrichment ran and the providers had nothing. */
   | { status: 'not_found' }
   | { status: 'error'; message: string; noCredits?: boolean };
@@ -27,9 +33,12 @@ export type CompanyEntry =
 const IDLE: CompanyEntry = { status: 'idle' };
 
 let entries: Record<string, CompanyEntry> = {};
+/** Bumped by reset(): a request started before it must not write afterwards. */
+let generation = 0;
 const listeners = new Set<() => void>();
 
-function set(domain: string, entry: CompanyEntry) {
+function set(domain: string, entry: CompanyEntry, gen = generation) {
+  if (gen !== generation) return;
   entries = { ...entries, [domain]: entry };
   for (const l of listeners) l();
 }
@@ -55,6 +64,7 @@ export const companyStore = {
   async load(domain: string): Promise<void> {
     const current = companyStore.get(domain).status;
     if (current !== 'idle' && current !== 'error') return;
+    const gen = generation;
     set(domain, { status: 'loading' });
     try {
       const res = await invokeFunction<{ ok: boolean; companies?: Record<string, Company> }>('leads', {
@@ -62,25 +72,26 @@ export const companyStore = {
         domains: [domain],
       });
       const company = res?.companies?.[domain];
-      set(domain, company ? { status: 'found', company } : { status: 'none' });
+      set(domain, company ? { status: 'found', company } : { status: 'none' }, gen);
     } catch {
       // A failed cache read still lets the user enrich.
-      set(domain, { status: 'none' });
+      set(domain, { status: 'none' }, gen);
     }
   },
 
   /** Buys the profile. Returns the credits charged (0 when cached or not found). */
   async enrich(domain: string): Promise<number> {
+    const gen = generation;
     set(domain, { status: 'enriching' });
     try {
       const res = await invokeFunction<EnrichResponse>('leads', { action: 'enrich-company', domain });
       const result = res?.results?.[domain];
       if (result?.company && (result.status === 'found' || result.status === 'cached')) {
-        set(domain, { status: 'found', company: result.company });
+        set(domain, { status: 'found', company: result.company }, gen);
       } else if (result?.status === 'not_found') {
-        set(domain, { status: 'not_found' });
+        set(domain, { status: 'not_found' }, gen);
       } else {
-        set(domain, { status: 'error', message: 'The lookup failed. Nothing was charged; please try again.' });
+        set(domain, { status: 'error', message: 'The lookup failed. Nothing was charged; please try again.' }, gen);
       }
       return res?.credits_charged ?? 0;
     } catch (err) {
@@ -89,32 +100,35 @@ export const companyStore = {
         status: 'error',
         message: (err as Error)?.message || 'The lookup failed. Please try again.',
         noCredits,
-      });
+      }, gen);
       return 0;
     } finally {
       void walletStore.refresh();
     }
   },
 
-  /** Buys the company's recent news (charged only when articles come back). */
-  async loadNews(domain: string): Promise<void> {
+  /** Buys one signal (news, funding or jobs); charged only when something is found. */
+  async loadSignal(domain: string, kind: CompanySignalKind): Promise<void> {
     const current = companyStore.get(domain);
-    if (current.status !== 'found' || current.newsLoading) return;
-    set(domain, { ...current, newsLoading: true, newsError: undefined });
+    if (current.status !== 'found' || current.signalLoading?.[kind]) return;
+    const gen = generation;
+    const patch = (latest: CompanyEntry, loading: boolean, error?: string): CompanyEntry =>
+      latest.status === 'found'
+        ? {
+            ...latest,
+            signalLoading: { ...latest.signalLoading, [kind]: loading },
+            signalError: { ...latest.signalError, [kind]: error },
+          }
+        : latest;
+    set(domain, patch(current, true));
     try {
-      const res = await invokeFunction<{ ok: boolean; articles?: CompanyNewsArticle[] }>('leads', {
-        action: 'company-news',
-        domain,
-      });
+      const res = await invokeFunction<{ ok: boolean; items?: unknown[] }>('leads', { action: 'company-signal', kind, domain });
       const latest = companyStore.get(domain);
       if (latest.status === 'found') {
-        set(domain, { status: 'found', company: { ...latest.company, news: res?.articles ?? [] } });
+        set(domain, patch({ ...latest, company: { ...latest.company, [kind]: res?.items ?? [] } }, false), gen);
       }
     } catch (err) {
-      const latest = companyStore.get(domain);
-      if (latest.status === 'found') {
-        set(domain, { ...latest, newsLoading: false, newsError: (err as Error)?.message || 'The news lookup failed.' });
-      }
+      set(domain, patch(companyStore.get(domain), false, (err as Error)?.message || 'The lookup failed.'), gen);
     } finally {
       void walletStore.refresh();
     }
@@ -122,6 +136,7 @@ export const companyStore = {
 
   /** Forgets everything (sign-out / account switch). */
   reset() {
+    generation++;
     entries = {};
     for (const l of listeners) l();
   },

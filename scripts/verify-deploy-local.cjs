@@ -16,7 +16,8 @@
 //   * with pg_cron / pg_net stand-ins, the reaper job and the sweep job are
 //     scheduled from service_secrets.project_url, and a placeholder job is
 //     removed (N6, H6)
-//   * credit_wallet_acceptance.sql passes inside BEGIN ... ROLLBACK and leaves
+//   * credit_wallet_acceptance.sql and enrichment_social_acceptance.sql pass inside
+//     BEGIN ... ROLLBACK and leave
 //     no rows behind
 //
 // PGlite is single-connection, so credit_wallet_concurrency.sql cannot run here;
@@ -65,6 +66,10 @@ create view vault.decrypted_secrets as select *, secret as decrypted_secret from
 create function vault.create_secret(new_secret text, new_name text default null, new_description text default '')
 returns uuid language sql as
   $$ insert into vault.secrets (secret, name, description) values (new_secret, new_name, new_description) returning id $$;
+create function vault.update_secret(secret_id uuid, new_secret text default null, new_name text default null, new_description text default null)
+returns void language sql as
+  $$ update vault.secrets set secret = coalesce(new_secret, secret), name = coalesce(new_name, name),
+       description = coalesce(new_description, description) where id = secret_id $$;
 grant usage on schema public to anon, authenticated, service_role;
 `;
 
@@ -156,6 +161,17 @@ async function main() {
     for (const r of bad) console.log(`      FAILED ${r.test}: ${JSON.stringify(r.detail)}`);
     const left = await db.query(`select count(*)::int n from auth.users where id = '00000000-0000-4000-8000-0000000acc01'`);
     left.rows[0].n === 0 ? pass('suite rolled back (no test user left)') : fail('suite left its test user behind');
+  }
+
+  const social = await step(db, 'enrichment_social_acceptance.sql', read('supabase/tests/enrichment_social_acceptance.sql'));
+  if (social) {
+    const set = social.find((r) => r.fields?.some((f) => f.name === 'result'));
+    const rows = (set?.rows ?? []).map((r) => JSON.parse(r.result));
+    const bad = rows.filter((r) => !r.ok);
+    (rows.length && !bad.length ? pass : fail)(`enrichment/social checks ${rows.length - bad.length}/${rows.length}`);
+    for (const r of bad) console.log(`      FAILED ${r.test}: ${JSON.stringify(r.detail)}`);
+    const left = await db.query(`select count(*)::int n from auth.users where id = '00000000-0000-4000-8000-0000000acc02'`);
+    left.rows[0].n === 0 ? pass('enrichment/social suite rolled back') : fail('enrichment/social suite left its test user behind');
   }
 
   // ---- Run B: with pg_cron / pg_net stand-ins --------------------------------

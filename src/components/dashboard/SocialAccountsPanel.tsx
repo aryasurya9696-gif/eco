@@ -8,6 +8,9 @@ import { SOCIAL_LABEL, socialStore, useSocialAccounts, type SocialPlatform } fro
 
 const FEED_PLATFORM: Record<SocialPlatform, 'twitter' | 'reddit'> = { x: 'twitter', reddit: 'reddit' };
 
+/** States already finished, so a re-run effect (StrictMode, remount) never submits one twice. */
+const finishedStates = new Set<string>();
+
 const RETURN_REASONS: Record<string, string> = {
   denied: 'You cancelled the connection.',
   expired: 'The connection took too long. Please try again.',
@@ -30,14 +33,22 @@ export const SocialAccountsPanel: React.FC = () => {
     const params = new URLSearchParams(window.location.search);
     const outcome = params.get('social');
     if (!outcome) return;
-    if (outcome === 'connected') {
-      const platform = params.get('platform');
-      addToast(`${platform === 'reddit' ? 'Reddit' : 'X'} account connected. You can now reply from the feed.`, 'success');
-      void socialStore.load(true);
-    } else {
+    const state = params.get('state') || '';
+    if (outcome === 'finish' && state && !finishedStates.has(state)) {
+      finishedStates.add(state);
+      socialStore
+        .finish(state)
+        .then((res) =>
+          addToast(
+            `${SOCIAL_LABEL[res.platform]} account ${res.platform === 'reddit' ? 'u/' : '@'}${res.handle} connected. You can now reply from the feed.`,
+            'success',
+          ),
+        )
+        .catch((err) => addToast((err as Error)?.message || 'Could not connect the account. Please try again.', 'error'));
+    } else if (outcome === 'error') {
       addToast(RETURN_REASONS[params.get('reason') || ''] || 'Could not connect the account. Please try again.', 'error');
     }
-    for (const key of ['social', 'platform', 'reason']) params.delete(key);
+    for (const key of ['social', 'state', 'platform', 'reason']) params.delete(key);
     const search = params.toString();
     window.history.replaceState(window.history.state, '', `${window.location.pathname}${search ? `?${search}` : ''}${window.location.hash}`);
   }, [addToast]);

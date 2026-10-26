@@ -5,6 +5,7 @@ import {
   allowedOrigins,
   cachedCompanyState,
   cachedNewsState,
+  cachedSignalState,
   COMPANY_HIT_TTL_MS,
   COMPANY_MISS_TTL_MS,
   classifyEmail,
@@ -15,6 +16,8 @@ import {
   hasRevealedEmail,
   hasUsableEmail,
   mapCompanyOutput,
+  mapFundingOutput,
+  mapJobsOutput,
   mapNewsOutput,
   mapPersonOutput,
   maxSearchProviderCalls,
@@ -198,8 +201,9 @@ Deno.test('cachedCompanyState: fresh hit, recent miss, stale; the newer lookup w
   assertEquals(cachedCompanyState({ name: 'A', enriched_at: ago(COMPANY_HIT_TTL_MS + 1) }, now), 'stale');
   assertEquals(cachedCompanyState({ miss_at: ago(1000) }, now), 'miss');
   assertEquals(cachedCompanyState({ miss_at: ago(COMPANY_MISS_TTL_MS + 1) }, now), 'stale');
-  // A re-buy that missed after an older hit: the miss is newer.
-  assertEquals(cachedCompanyState({ name: 'A', enriched_at: ago(5000), miss_at: ago(1000) }, now), 'miss');
+  // A re-check that missed after an older hit keeps the older profile (no re-buy).
+  assertEquals(cachedCompanyState({ name: 'A', enriched_at: ago(COMPANY_HIT_TTL_MS + 5000), miss_at: ago(1000) }, now), 'hit');
+  assertEquals(cachedCompanyState({ name: 'A', enriched_at: ago(COMPANY_HIT_TTL_MS + 5000), miss_at: ago(COMPANY_MISS_TTL_MS + 1) }, now), 'stale');
   assertEquals(cachedCompanyState({ name: 'A', enriched_at: ago(1000), miss_at: ago(5000) }, now), 'hit');
 });
 
@@ -271,4 +275,49 @@ Deno.test('cachedNewsState: 7-day hits, 3-day misses', () => {
   assertEquals(cachedNewsState({ news_miss_at: ago(2) }, now), 'miss');
   assertEquals(cachedNewsState({ news_miss_at: ago(4) }, now), 'stale');
   assertEquals(cachedNewsState(null, now), 'stale');
+});
+
+Deno.test('mapFundingOutput: Aviato rounds, newest first; unnamed rounds dropped', () => {
+  assertEquals(
+    mapFundingOutput({
+      fundingRounds: [
+        { name: 'Series A - Acme', stage: 'Series A', announcedOn: '2024-03-01T00:00:00.000Z', moneyRaised: 12000000 },
+        { name: 'Series B - Acme', stage: 'Series B', announcedOn: '2026-01-15T00:00:00.000Z', moneyRaised: 0 },
+        { stage: null },
+      ],
+    }),
+    [
+      { name: 'Series B - Acme', stage: 'Series B', announced_on: '2026-01-15T00:00:00.000Z', amount_usd: null },
+      { name: 'Series A - Acme', stage: 'Series A', announced_on: '2024-03-01T00:00:00.000Z', amount_usd: 12000000 },
+    ],
+  );
+  assertEquals(mapFundingOutput({}), []);
+});
+
+Deno.test('mapJobsOutput: titles kept, links checked', () => {
+  assertEquals(
+    mapJobsOutput({
+      output: {
+        jobs: [
+          { title: 'Account Executive', url: 'https://jobs.example/ae?id=1', location: 'Remote', first_seen_at: '2026-10-01' },
+          { job_title: 'SDR', link: 'javascript:void(0)', location: { name: 'Austin' } },
+          { url: 'https://jobs.example/no-title' },
+        ],
+      },
+    }),
+    [
+      { title: 'Account Executive', url: 'https://jobs.example/ae?id=1', location: 'Remote', posted_at: '2026-10-01T00:00:00.000Z' },
+      { title: 'SDR', url: null, location: 'Austin', posted_at: null },
+    ],
+  );
+  assertEquals(mapJobsOutput({ output: { jobs: [] } }), []);
+});
+
+Deno.test('cachedSignalState: funding is kept 30 days, jobs 7', () => {
+  const now = Date.parse('2026-10-26T00:00:00Z');
+  const ago = (days: number) => new Date(now - days * 24 * 3600_000).toISOString();
+  const item = [{ name: 'x' }];
+  assertEquals(cachedSignalState({ funding: item, funding_at: ago(20) }, 'funding', now), 'hit');
+  assertEquals(cachedSignalState({ jobs: item, jobs_at: ago(20) }, 'jobs', now), 'stale');
+  assertEquals(cachedSignalState({ funding_miss_at: ago(10) }, 'funding', now), 'miss');
 });

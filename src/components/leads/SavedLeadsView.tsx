@@ -4,7 +4,7 @@ import { downloadCsv, downloadTextFile } from '../../lib/csv';
 import { EmailCell, PhoneCell, StageSelect, LinkedinIcon } from './LeadCells';
 import { emailState, initialsOf, linkedinHref, previewEmail, foundEmail, revealedPhone } from './lead-utils';
 import { CompanyName } from './CompanyPanel';
-import { EnrichPersonButton } from './EnrichPersonButton';
+import { BulkEnrichPeopleButton, EnrichPersonButton } from './EnrichPersonButton';
 import {
   Search,
   Bookmark,
@@ -148,7 +148,7 @@ export const SavedLeadsView: React.FC<SavedLeadsViewProps> = ({
   const exportCSV = (targetLeads: B2BLead[]) => {
     if (targetLeads.length === 0) return;
     downloadCsv(`pipeline_${targetLeads.length}_${stamp()}.csv`, [
-      ['Full Name', 'Title', 'Company', 'Domain', 'Work Email', 'Email Status', 'Company Email (unverified)', 'Phone', 'LinkedIn', 'Stage', 'Location', 'Added'],
+      ['Full Name', 'Title', 'Company', 'Domain', 'Industry', 'Company Size', 'Work Email', 'Email Status', 'Company Email (unverified)', 'Phone', 'LinkedIn', 'Stage', 'Location', 'Added'],
       ...targetLeads.map((l) => {
         const state = emailState(l);
         return [
@@ -156,6 +156,8 @@ export const SavedLeadsView: React.FC<SavedLeadsViewProps> = ({
           l.title || '',
           l.company_name || '',
           l.company_domain || '',
+          l.industry || '',
+          l.company_size || '',
           foundEmail(l) || '',
           state.kind === 'verified' || state.kind === 'unconfirmed' ? state.label : '',
           previewEmail(l) || '',
@@ -335,6 +337,7 @@ export const SavedLeadsView: React.FC<SavedLeadsViewProps> = ({
               </button>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <BulkEnrichPeopleButton leads={selectedLeads} />
               <button
                 type="button"
                 onClick={() => exportCSV(selectedLeads)}
@@ -493,6 +496,9 @@ export const SavedLeadsView: React.FC<SavedLeadsViewProps> = ({
                                 <span className="truncate">{lead.company_domain}</span>
                                 <ExternalLink className="w-3 h-3 shrink-0" aria-hidden />
                               </a>
+                            )}
+                            {(lead.industry || lead.company_size) && (
+                              <p className="text-xs text-muted truncate">{[lead.industry, lead.company_size].filter(Boolean).join(' · ')}</p>
                             )}
                           </div>
                         </td>

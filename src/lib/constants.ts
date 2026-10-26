@@ -94,6 +94,10 @@ export const PUBLIC_PRICES: Record<string, number> = {
   'treg.people.enrich': 1,
   /** Per news lookup that finds articles; cached news is free for 7 days. */
   'treg.companies.news': 1,
+  /** Per funding lookup that finds rounds; cached for 30 days. */
+  'treg.companies.funding': 0.5,
+  /** Per open-jobs lookup that finds openings; cached for 7 days. */
+  'treg.companies.jobs': 2,
   /** Per reply posted from the feed through a connected account. */
   'social.reply.x': 1,
   'social.reply.reddit': 0.1,
@@ -107,6 +111,8 @@ export const DIRECT_PHONE_CREDITS = PUBLIC_PRICES['treg.people.phone.find'];
 export const COMPANY_ENRICH_CREDITS = PUBLIC_PRICES['treg.companies.enrich'];
 export const PERSON_ENRICH_CREDITS = PUBLIC_PRICES['treg.people.enrich'];
 export const COMPANY_NEWS_CREDITS = PUBLIC_PRICES['treg.companies.news'];
+export const COMPANY_FUNDING_CREDITS = PUBLIC_PRICES['treg.companies.funding'];
+export const COMPANY_JOBS_CREDITS = PUBLIC_PRICES['treg.companies.jobs'];
 export const X_REPLY_CREDITS = PUBLIC_PRICES['social.reply.x'];
 export const REDDIT_REPLY_CREDITS = PUBLIC_PRICES['social.reply.reddit'];
 export const CONNECTED_SEND_CREDITS = PUBLIC_PRICES['mail.send.connected'];

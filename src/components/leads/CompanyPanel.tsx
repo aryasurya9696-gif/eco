@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import { Building2, ExternalLink, Loader2, MapPin, Users, CalendarDays, Factory, X, AlertCircle, ShieldCheck, Newspaper } from 'lucide-react';
+import { Building2, ExternalLink, Loader2, MapPin, Users, CalendarDays, Factory, X, AlertCircle, ShieldCheck, Newspaper, Landmark, Briefcase } from 'lucide-react';
 import { ModalDialog } from '../dashboard/ModalDialog';
 import { usePricing } from '../../lib/pricing';
 import { useWallet } from '../../lib/wallet-store';
 import { creditsLabel, formatCredits } from '../../lib/billing';
 import { companyStore, useCompany, type CompanyEntry } from './company-store';
+import { prospectorPrefill } from './prospector-prefill';
+import type { CompanyFundingRound, CompanyJobOpening, CompanyNewsArticle, CompanySignalKind } from '../../types';
 import { LinkedinIcon } from './LeadCells';
 
 // ============================================================================
@@ -118,7 +120,10 @@ export const CompanyPanel: React.FC<CompanyPanelProps> = ({ domain, fallbackName
             {company.enriched_at && (
               <p className="text-xs text-muted">Profile updated {new Date(company.enriched_at).toLocaleDateString()}.</p>
             )}
-            {entry.status === 'found' && <NewsSection domain={domain} entry={entry} price={creditsFor('treg.companies.news')} />}
+            {entry.status === 'found' &&
+              SIGNALS.map((signal) => (
+                <SignalSection key={signal.kind} domain={domain} entry={entry} signal={signal} price={creditsFor(signal.operation)} />
+              ))}
           </>
         )}
 
@@ -144,58 +149,127 @@ export const CompanyPanel: React.FC<CompanyPanelProps> = ({ domain, fallbackName
             busy={busy}
           />
         )}
+
+        <button
+          type="button"
+          onClick={() => {
+            onClose();
+            prospectorPrefill.open(domain);
+          }}
+          disabled={busy}
+          className="w-full h-10 border border-line hover:bg-fill text-ink text-sm font-medium inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+        >
+          <Users className="w-4 h-4" aria-hidden />
+          Find people at {company?.name || fallbackName || domain}
+        </button>
       </div>
     </ModalDialog>
   );
 };
 
-/** Recent news: shown from the cache when present, otherwise offered as a paid lookup. */
-const NewsSection: React.FC<{ domain: string; entry: Extract<CompanyEntry, { status: 'found' }>; price: number }> = ({
+type FoundEntry = Extract<CompanyEntry, { status: 'found' }>;
+
+interface SignalConfig {
+  kind: CompanySignalKind;
+  operation: string;
+  title: string;
+  icon: React.ElementType;
+  blurb: string;
+  empty: string;
+  /** One row: the main line, an optional link, and the detail line. */
+  row: (item: any) => { main: string; href: string | null; detail: string };
+}
+
+const date = (iso: string | null) => (iso ? new Date(iso).toLocaleDateString() : null);
+const money = (usd: number | null) =>
+  usd === null ? null : usd >= 1e9 ? `$${(usd / 1e9).toFixed(1)}B` : usd >= 1e6 ? `$${(usd / 1e6).toFixed(1)}M` : `$${Math.round(usd / 1e3)}K`;
+
+const SIGNALS: SignalConfig[] = [
+  {
+    kind: 'news',
+    operation: 'treg.companies.news',
+    title: 'Recent news',
+    icon: Newspaper,
+    blurb: 'Launches, hires and announcements from the last few months.',
+    empty: 'No recent news was found for this company.',
+    row: (a: CompanyNewsArticle) => ({ main: a.title, href: a.url, detail: [a.source, date(a.published_at)].filter(Boolean).join(' · ') }),
+  },
+  {
+    kind: 'funding',
+    operation: 'treg.companies.funding',
+    title: 'Funding rounds',
+    icon: Landmark,
+    blurb: 'Rounds raised, with amounts and dates.',
+    empty: 'No funding rounds were found for this company.',
+    row: (r: CompanyFundingRound) => ({ main: r.name, href: null, detail: [money(r.amount_usd), date(r.announced_on)].filter(Boolean).join(' · ') }),
+  },
+  {
+    kind: 'jobs',
+    operation: 'treg.companies.jobs',
+    title: 'Open jobs',
+    icon: Briefcase,
+    blurb: 'Roles they are hiring for right now: a sign of where they are growing.',
+    empty: 'No open jobs were found for this company.',
+    row: (j: CompanyJobOpening) => ({ main: j.title, href: j.url, detail: [j.location, date(j.posted_at)].filter(Boolean).join(' · ') }),
+  },
+];
+
+/** One signal: shown from the cache when present, otherwise offered as a paid lookup. */
+const SignalSection: React.FC<{ domain: string; entry: FoundEntry; signal: SignalConfig; price: number }> = ({
   domain,
   entry,
+  signal,
   price,
 }) => {
-  const news = entry.company.news;
+  const items = entry.company[signal.kind] as unknown[] | null | undefined;
+  const loading = Boolean(entry.signalLoading?.[signal.kind]);
+  const error = entry.signalError?.[signal.kind];
+  const Icon = signal.icon;
   return (
-    <section className="border-t border-line-soft pt-4 space-y-2" aria-label="Recent news">
+    <section className="border-t border-line-soft pt-4 space-y-2" aria-label={signal.title}>
       <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted">
-        <Newspaper className="w-3.5 h-3.5" aria-hidden /> Recent news
+        <Icon className="w-3.5 h-3.5" aria-hidden /> {signal.title}
       </h3>
-      {news && news.length > 0 ? (
+      {items && items.length > 0 ? (
         <ul className="space-y-2">
-          {news.map((a) => (
-            <li key={a.url}>
-              <a href={a.url} target="_blank" rel="noopener noreferrer" className="text-[13px] text-ink hover:underline line-clamp-2">
-                {a.title}
-              </a>
-              <p className="text-xs text-muted">
-                {[a.source, a.published_at ? new Date(a.published_at).toLocaleDateString() : null].filter(Boolean).join(' · ')}
-              </p>
-            </li>
-          ))}
+          {items.map((item, i) => {
+            const r = signal.row(item);
+            return (
+              <li key={`${r.main}-${i}`}>
+                {r.href ? (
+                  <a href={r.href} target="_blank" rel="noopener noreferrer" className="text-[13px] text-ink hover:underline line-clamp-2">
+                    {r.main}
+                  </a>
+                ) : (
+                  <p className="text-[13px] text-ink line-clamp-2">{r.main}</p>
+                )}
+                {r.detail && <p className="text-xs text-muted">{r.detail}</p>}
+              </li>
+            );
+          })}
         </ul>
-      ) : news && news.length === 0 ? (
-        <p className="text-[13px] text-muted">No recent news was found for this company. Nothing was charged.</p>
+      ) : items && items.length === 0 ? (
+        <p className="text-[13px] text-muted">{signal.empty} Nothing was charged.</p>
       ) : (
         <div className="flex items-center justify-between gap-3">
-          <p className="text-[13px] text-ink-2">Funding, hires and launches from the last few months.</p>
+          <p className="text-[13px] text-ink-2">{signal.blurb}</p>
           <button
             type="button"
-            onClick={() => void companyStore.loadNews(domain)}
-            disabled={entry.newsLoading}
+            onClick={() => void companyStore.loadSignal(domain, signal.kind)}
+            disabled={loading}
             className="h-9 px-3 border border-line hover:bg-fill text-ink text-[13px] font-medium inline-flex items-center gap-2 shrink-0 cursor-pointer disabled:opacity-50 disabled:cursor-wait"
           >
-            {entry.newsLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden /> : null}
-            {entry.newsLoading ? 'Looking up…' : `Get news · ${formatCredits(price)} cr`}
+            {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden /> : null}
+            {loading ? 'Looking up…' : `Get · ${formatCredits(price)} cr`}
           </button>
         </div>
       )}
-      {entry.newsError && (
+      {error && (
         <p role="alert" className="text-xs text-danger">
-          {entry.newsError}
+          {error}
         </p>
       )}
-      {!news && <p className="text-xs text-muted">Charged only when articles are found.</p>}
+      {!items && <p className="text-xs text-muted">Charged only when something is found.</p>}
     </section>
   );
 };

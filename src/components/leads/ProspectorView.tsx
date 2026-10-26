@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import type { B2BLead, B2BPipelineStatus } from '../../types';
 import { SearchBar } from './SearchBar';
 import { ResultsPanel } from './ResultsPanel';
@@ -22,6 +22,7 @@ import {
 } from './prospector-types';
 import { AlertCircle, RefreshCw, Search, Sparkles, Bookmark, ArrowRight } from 'lucide-react';
 import { WELCOME_ONLY_MESSAGE } from '../../lib/wallet-store';
+import { prospectorPrefill, usePendingProspectorDomain } from './prospector-prefill';
 import { creditsLabel, formatCredits } from '../../lib/billing';
 
 export type { ProspectorSearchParams, LastSearch, SearchStatus } from './prospector-types';
@@ -63,6 +64,20 @@ export const ProspectorView: React.FC<ProspectorViewProps> = (props) => {
   const [form, setForm] = useState<SearchForm>(() => paramsToForm(lastSearch?.params));
   const [recent, setRecent] = useState<ProspectorSearchParams[]>(() => loadRecentSearches(userId));
   const [dismissedError, setDismissedError] = useState<SearchStatus | null>(null);
+
+  // "Find people at this company" from a company profile: a fresh form with
+  // just that domain. The search waits for the user's click.
+  const pendingDomain = usePendingProspectorDomain();
+  const [appliedDomain, setAppliedDomain] = useState<string | null>(null);
+  if (pendingDomain && pendingDomain !== appliedDomain) {
+    setAppliedDomain(pendingDomain);
+    setForm({ ...paramsToForm(null), companyDomain: pendingDomain });
+  } else if (!pendingDomain && appliedDomain) {
+    setAppliedDomain(null);
+  }
+  useEffect(() => {
+    if (pendingDomain) prospectorPrefill.take();
+  }, [pendingDomain]);
 
   const isSearching = searchStatus.kind === 'searching';
   const params = formToParams(form);
